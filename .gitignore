@@ -1,0 +1,18 @@
+# Node.js (Next.js) のノイズを遮断
+node_modules/
+.next/
+out/
+build/
+*.tsbuildinfo
+
+# Go のバイナリやノイズを遮断
+bin/
+dist/
+/apps/go-api/docs/
+
+# OSが勝手に作る透明なファイル
+.DS_Store
+Thmubs.db
+
+# 環境変数の秘密ファイル（もし今後作っても大丈夫なように）
+.env*.local
