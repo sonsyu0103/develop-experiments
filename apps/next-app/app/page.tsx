@@ -1,43 +1,43 @@
 import React from 'react';
-// { components } の前に「type」を明示してあげるの
 import type { components } from '../schema';
 
 type ThreadDTO = components['schemas']['ThreadDTO'];
 
+// APIのレスポンス全体の型定義（ { threads: ThreadDTO[] } の形 ）
+type ApiResponse = {
+  threads: ThreadDTO[];
+};
+
 async function getThreads(): Promise<ThreadDTO[]> {
-  // Goのバックエンドサーバー（8080番ポート）に繋ぎにいく
-  // cache: 'no-store' をつけて、常に最新の並列集計データを取得するの
-  const res = await fetch('http://localhost:8080/threads', { cache: 'no-store' });
+  // 環境変数があればそれを使う（Docker用）、なければ localhost（ローカル用）
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
   
+  const res = await fetch(`${apiUrl}/threads`, { cache: 'no-store' });
   if (!res.ok) {
-    throw new Error('ワイヤードからの応答がありません。');
+    throw new Error('Failed to fetch threads from wired network');
   }
-  
-  const data = await res.json();
-  return data.threads;
+
+  // レンスポンスを一度オブジェクトとして受け取る
+  const data = (await res.json()) as ApiResponse;
+
+  // もしデータや threads が存在しない場合の安全弁をつけて、配列を返す
+  return data?.threads || [];
 }
 
 export default async function Page() {
   const threads = await getThreads();
 
   return (
-    <div>
-      <h1 style={{ borderBottom: '1px solid #334155', paddingBottom: '0.5rem', color: '#38bdf8' }}>
-        Wired Thread List
-      </h1>
-      <div style={{ marginTop: '2rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+    <div style={{ backgroundColor: '#000', color: '#00f', minHeight: '100vh', padding: '2rem', fontFamily: 'monospace' }}>
+      <h1 style={{ borderBottom: '1px solid #00f', paddingBottom: '0.5rem' }}>Wired Thread List</h1>
+      <ul style={{ listStyle: 'none', padding: 0 }}>
         {threads.map((thread) => (
-          <div 
-            key={thread.id} 
-            style={{ border: '1px solid #1e293b', padding: '1rem', borderRadius: '4px', backgroundColor: '#111827' }}
-          >
-            <h2 style={{ margin: 0, fontSize: '1.25rem' }}>{thread.title}</h2>
-            <p style={{ margin: '0.5rem 0 0 0', color: '#94a3b8', fontSize: '0.875rem' }}>
-              コメント数: <span style={{ color: '#f43f5e', fontWeight: 'bold' }}>{thread.commentCount}</span>
-            </p>
-          </div>
+          <li key={thread.id} style={{ margin: '1rem 0', padding: '1rem', border: '1px dashed #00f' }}>
+            <h2 style={{ fontSize: '1.2rem', margin: '0 0 0.5rem 0' }}>{thread.title}</h2>
+            <p style={{ color: '#55f', margin: 0 }}>コメント数: {thread.commentCount}</p>
+          </li>
         ))}
-      </div>
+      </ul>
     </div>
   );
 }

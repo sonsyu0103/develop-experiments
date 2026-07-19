@@ -1,5 +1,6 @@
 import React, {useEffect, useState} from 'react'
-import {Thread} from '../../types/api'
+// { Thread } の前に「type」を明示してあげる
+import type { Thread } from '../../types/api';
 
 export default function ThreadsPage() {
   const [threads, setThreads] = useState<Thread[]>([])
