@@ -1,0 +1,27 @@
+openapi: 3.1.0
+info:
+  title: Sample Threads API
+  version: 1.0.0
+paths:
+  /threads:
+    get:
+      summary: List threads
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    title:
+                      type: string
+                    commentsCount:
+                      type: integer
+servers:
+  - url: http://localhost:8080
+    description: Local Go API server

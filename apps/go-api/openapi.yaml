@@ -1,0 +1,46 @@
+components:
+    schemas:
+        ThreadDTO:
+            properties:
+                commentCount:
+                    example: 7
+                    type: integer
+                id:
+                    example: 1
+                    type: integer
+                title:
+                    example: 並列処理を学ぶ部屋
+                    type: string
+            type: object
+info:
+    description: 巨大事業のための、並列処理を組み込んだ掲示板API
+    title: Develop Experiments API
+    version: "1.0"
+openapi: 3.0.3
+paths:
+    /threads:
+        get:
+            description: 並列処理でコメント数を集計したスレッド一覧を返します
+            responses:
+                "200":
+                    content:
+                        application/json:
+                            schema:
+                                properties:
+                                    threads:
+                                        items:
+                                            properties:
+                                                commentCount:
+                                                    example: 7
+                                                    type: integer
+                                                id:
+                                                    example: 1
+                                                    type: integer
+                                                title:
+                                                    example: 並列処理を学ぶ部屋
+                                                    type: string
+                                            type: object
+                                        type: array
+                                type: object
+                    description: 成功
+            summary: スレッド一覧の取得

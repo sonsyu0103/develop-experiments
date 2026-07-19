@@ -1,0 +1,27 @@
+services:
+  go-api:
+    build:
+      context: ./apps/go-api
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./apps/go-api:/app
+    environment:
+      - ENV=development
+
+  next-app:
+    build:
+      context: ./apps/next-app
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./apps/next-app:/app
+      - /app/node_modules
+      - /app/.next
+    environment:
+      - NODE_ENV=development
+      - NEXT_PUBLIC_API_URL=http://go-api:8080
+    depends_on:
+      - go-api
