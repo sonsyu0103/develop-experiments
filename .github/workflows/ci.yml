@@ -24,6 +24,9 @@ jobs:
           go-version: '1.22'
           cache-dependency-path: apps/go-api/go.sum
 
+      - name: Download Go modules
+        run: go mod download
+
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
