@@ -28,7 +28,7 @@ jobs:
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.58
-          working-directory: backend # 先頭の ./ を取った相対パス指定にする
+          # working-directory 指定を削除（defaultsで./backendにいるため）
 
       - name: Run Vulnerability Check (govulncheck)
         run: |
@@ -52,9 +52,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22' # Node 22 (LTS) に変更
-          cache: 'npm'
-          cache-dependency-path: 'frontend/package-lock.json'
+          node-version: '22'
 
       - name: Install dependencies
         run: npm ci
