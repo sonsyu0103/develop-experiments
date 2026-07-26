@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ./backend
+        working-directory: ./apps/go-api
     steps:
       - uses: actions/checkout@v4
 
@@ -22,13 +22,13 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          cache-dependency-path: backend/go.sum
+          cache-dependency-path: apps/go-api/go.sum
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
           version: v1.58
-          # working-directory 指定を削除（defaultsで./backendにいるため）
+          working-directory: apps/go-api
 
       - name: Run Vulnerability Check (govulncheck)
         run: |
@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: ./frontend
+        working-directory: ./apps/next-app
     steps:
       - uses: actions/checkout@v4
 
