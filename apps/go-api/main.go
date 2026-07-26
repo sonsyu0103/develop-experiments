@@ -33,5 +33,7 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"threads": data})
 	})
 
-	r.Run(":8080")
+	if err := r.Run(":8080"); err != nil {
+		panic(err)
+	}
 }
