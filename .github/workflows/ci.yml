@@ -6,11 +6,27 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+# 同じブランチに続けて push したとき、古い実行を打ち切る
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.25'
+  NODE_VERSION: '22'
+  # バージョンを固定する理由:
+  #   @latest だと、リンタ側のルール追加で CI が突然赤くなる。
+  #   更新は「意図した変更」としてコミットに残したい。
+  GOLANGCI_LINT_VERSION: v2.12.2
+  SQLC_VERSION: v1.31.1
+  OAPI_CODEGEN_VERSION: v2.8.0
+
 jobs:
   # --------------------------------------------------
   # Go Backend Checks
   # --------------------------------------------------
   go-ci:
+    name: Go Checks
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -21,20 +37,27 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version: ${{ env.GO_VERSION }}
           check-latest: true
           cache-dependency-path: apps/go-api/go.sum
 
       - name: Download Go modules
         run: go mod download
 
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum \
+            || (echo "go.mod / go.sum が最新ではありません。'go mod tidy' を実行してコミットしてください。"; exit 1)
+
       - name: Run golangci-lint
         run: |
           export GOTOOLCHAIN=auto
-          go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${{ env.GOLANGCI_LINT_VERSION }}
           golangci-lint run ./...
 
       - name: Run Vulnerability Check (govulncheck)
+        # 脆弱性データベースは新しいほうが良いので、ここだけは latest を使う
         run: |
           export GOTOOLCHAIN=auto
           go install golang.org/x/vuln/cmd/govulncheck@latest
@@ -47,6 +70,7 @@ jobs:
   # Next.js Frontend Checks
   # --------------------------------------------------
   next-ci:
+    name: Next.js Checks
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -57,7 +81,9 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/next-app/package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -65,5 +91,130 @@ jobs:
       - name: TypeScript Type Check
         run: npx tsc --noEmit
 
+      # Next.js 16 で `next lint` は削除されたため、eslint を直接呼ぶ。
+      # 設定は apps/next-app/eslint.config.mjs (フラット設定)。
       - name: Run ESLint
         run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+  # --------------------------------------------------
+  # 生成物のドリフト検出
+  # --------------------------------------------------
+  # 「OpenAPI スキーマを起点とした駆動開発」を名乗る以上、
+  # 生成物が古いまま気づかない状態は避けたい。
+  # ここで再生成して差分が出たら CI を落とす。
+  generated-ci:
+    name: Generated Code Drift Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: apps/go-api/go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/next-app/package-lock.json
+
+      - name: Install code generators
+        run: |
+          export GOTOOLCHAIN=auto
+          go install github.com/sqlc-dev/sqlc/cmd/sqlc@${{ env.SQLC_VERSION }}
+          go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@${{ env.OAPI_CODEGEN_VERSION }}
+
+      - name: Install npm dependencies
+        working-directory: ./apps/next-app
+        run: npm ci
+
+      - name: Regenerate sqlc code
+        working-directory: ./apps/go-api
+        run: sqlc generate
+
+      - name: Regenerate Go server stubs from the spec
+        working-directory: ./apps/go-api
+        run: oapi-codegen -config oapi-codegen.yaml ../../api/openapi.yaml
+
+      - name: Regenerate TypeScript types
+        working-directory: ./apps/next-app
+        run: npm run gen:types
+
+      - name: Fail if generated files are stale
+        run: |
+          if ! git diff --exit-code -- \
+              apps/go-api/internal/httpapi/oapigen \
+              apps/go-api/internal/infrastructure/postgres/sqlcgen \
+              apps/next-app/schema.d.ts; then
+            echo ""
+            echo "::error::生成物が最新ではありません。'make generate' の結果をコミットしてください。"
+            exit 1
+          fi
+
+  # --------------------------------------------------
+  # マイグレーションの適用と巻き戻しの検証
+  # --------------------------------------------------
+  # up / down の両方を通すことで、down マイグレーションの書き忘れや
+  # 壊れた SQL を検出する。
+  migration-ci:
+    name: Migration Check
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: bbs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d bbs"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install golang-migrate
+        run: |
+          curl -sSfL https://github.com/golang-migrate/migrate/releases/download/v4.18.1/migrate.linux-amd64.tar.gz \
+            | tar xvz -C /tmp migrate
+          sudo mv /tmp/migrate /usr/local/bin/migrate
+          migrate -version
+
+      - name: Apply migrations
+        run: |
+          migrate -path apps/go-api/db/migrations \
+            -database "postgres://app:password@localhost:5432/bbs?sslmode=disable" up
+
+      - name: Load seed data
+        run: |
+          PGPASSWORD=password psql -h localhost -U app -d bbs \
+            -v ON_ERROR_STOP=1 -f apps/go-api/db/seed/seed.sql
+
+      - name: Verify partition pruning is effective
+        run: |
+          PGPASSWORD=password psql -h localhost -U app -d bbs -v ON_ERROR_STOP=1 -c \
+            "EXPLAIN (COSTS OFF) SELECT * FROM comments WHERE thread_id = 1;" \
+            | tee /tmp/plan.txt
+          # thread_id を等値指定したとき、8 パーティション中 1 つだけを走査するはず。
+          # 全パーティションが出てきたら pruning が効いていない。
+          scanned=$(grep -c 'comments_p' /tmp/plan.txt || true)
+          echo "走査対象パーティション数: $scanned"
+          if [ "$scanned" -ne 1 ]; then
+            echo "::error::パーティション pruning が効いていません (走査数=$scanned, 期待=1)"
+            exit 1
+          fi
+
+      - name: Roll back migrations
+        run: |
+          migrate -path apps/go-api/db/migrations \
+            -database "postgres://app:password@localhost:5432/bbs?sslmode=disable" down -all

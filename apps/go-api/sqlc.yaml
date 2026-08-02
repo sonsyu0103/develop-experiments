@@ -1,0 +1,30 @@
+version: "2"
+sql:
+  - engine: postgresql
+    # golang-migrate 形式の *.down.sql は sqlc が自動で無視する
+    schema: db/migrations
+    queries: db/query
+    gen:
+      go:
+        package: sqlcgen
+        out: internal/infrastructure/postgres/sqlcgen
+        sql_package: pgx/v5
+        # 生成物はドメイン層に露出させないので JSON タグは不要
+        emit_json_tags: false
+        # nil スライスではなく空スライスを返す (JSON で null にならない)
+        emit_empty_slices: true
+        # ユースケース層からモックできるよう Querier インターフェースを出す
+        emit_interface: true
+        emit_pointers_for_null_types: true
+        # HASH パーティションの子テーブル (comments_p0..p7) は
+        # クエリから直接参照しないので、構造体を生成しない
+        omit_unused_structs: true
+        overrides:
+          # pgtype.Timestamptz をドメイン層に漏らさず time.Time で受ける
+          - db_type: "timestamptz"
+            go_type: "time.Time"
+          - db_type: "timestamptz"
+            nullable: true
+            go_type:
+              type: "time.Time"
+              pointer: true

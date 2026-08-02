@@ -9,10 +9,14 @@ build/
 bin/
 dist/
 /apps/go-api/docs/
+# カバレッジプロファイル
+*.out
 
 # OSが勝手に作る透明なファイル
 .DS_Store
-Thmubs.db
+Thumbs.db
 
-# 環境変数の秘密ファイル（もし今後作っても大丈夫なように）
+# 環境変数の秘密ファイル
+# .env.example はコミットする (雛形なので)
+.env
 .env*.local

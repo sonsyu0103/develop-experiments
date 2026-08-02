@@ -4,6 +4,47 @@
  */
 
 export interface paths {
+    "/healthz": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Liveness プローブ
+         * @description プロセスが生きているかだけを返します。DB の状態は見ません。
+         *     ここで DB を見ると、DB の一時的な不調でコンテナが再起動ループに入ります。
+         */
+        get: operations["getHealthz"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/readyz": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Readiness プローブ
+         * @description DB への疎通を含め、リクエストを受けられる状態かを返します。
+         */
+        get: operations["getReadyz"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/threads": {
         parameters: {
             query?: never;
@@ -13,39 +54,64 @@ export interface paths {
         };
         /**
          * スレッド一覧の取得
-         * @description 並列処理でコメント数を集計したスレッド一覧を返します
+         * @description スレッドを新しい順に、コメント数つきで取得します。
+         *
+         *     コメント数は LEFT JOIN と COUNT(*) FILTER による単一クエリで集計しています。
+         *     スレッドごとに COUNT を投げる実装 (N+1) を goroutine で並列化しても
+         *     DB へのラウンドトリップ回数は減らないため、単一クエリのほうが有利です。
          */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
+        get: operations["listThreads"];
+        put?: never;
+        /** スレッドの作成 */
+        post: operations["createThread"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/threads/{threadId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
             };
-            requestBody?: never;
-            responses: {
-                /** @description 成功 */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            threads?: {
-                                /** @example 7 */
-                                commentCount?: number;
-                                /** @example 1 */
-                                id?: number;
-                                /** @example 並列処理を学ぶ部屋 */
-                                title?: string;
-                            }[];
-                        };
-                    };
-                };
-            };
+            cookie?: never;
         };
+        /** スレッドの取得 */
+        get: operations["getThread"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/threads/{threadId}/comments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * コメント一覧の取得
+         * @description 指定スレッドのコメントを新しい順に取得します。
+         *
+         *     comments テーブルは thread_id による HASH パーティションなので、
+         *     thread_id を等値指定するこのクエリでは partition pruning が効き、
+         *     8 分割中 1 パーティションのみを走査します。
+         */
+        get: operations["listComments"];
+        put?: never;
+        /** コメントの投稿 */
+        post: operations["createComment"];
         delete?: never;
         options?: never;
         head?: never;
@@ -56,20 +122,361 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        ThreadDTO: {
-            /** @example 7 */
-            commentCount?: number;
-            /** @example 1 */
-            id?: number;
-            /** @example 並列処理を学ぶ部屋 */
-            title?: string;
+        HealthStatus: {
+            /** @example ok */
+            status: string;
+            /**
+             * @description 異常時のみ設定されます
+             * @example database
+             */
+            reason?: string;
+        };
+        Thread: {
+            /**
+             * Format: int64
+             * @example 1
+             */
+            id: number;
+            /** @example Go の並列処理を学ぶ部屋 */
+            title: string;
+            /**
+             * Format: int64
+             * @description 論理削除されていないコメントの件数
+             * @example 7
+             */
+            commentCount: number;
+            /**
+             * Format: date-time
+             * @example 2026-08-02T12:00:00Z
+             */
+            createdAt: string;
+        };
+        Comment: {
+            /**
+             * Format: int64
+             * @example 10
+             */
+            id: number;
+            /**
+             * Format: int64
+             * @example 1
+             */
+            threadId: number;
+            /** @example 名無しさん */
+            authorName: string;
+            /** @example ふぁ〜、眠いよ〜 */
+            body: string;
+            /**
+             * Format: date-time
+             * @example 2026-08-02T12:00:00Z
+             */
+            createdAt: string;
+        };
+        ThreadList: {
+            threads: components["schemas"]["Thread"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        CommentList: {
+            comments: components["schemas"]["Comment"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        /**
+         * Format: int64
+         * @description 次ページ取得用のカーソル。これ以上ページがない場合は null。
+         * @example 42
+         */
+        NextCursor: number | null;
+        CreateThreadRequest: {
+            /**
+             * @description DB 側の CHECK 制約 threads_title_length と同じ上限です
+             * @example 新しいスレッド
+             */
+            title: string;
+        };
+        CreateCommentRequest: {
+            /**
+             * @description 省略時は「名無しさん」になります
+             * @example ホシノ
+             */
+            authorName?: string;
+            /** @example ふぁ〜、眠いよ〜 */
+            body: string;
+        };
+        Error: {
+            error: {
+                /**
+                 * @description 機械可読なエラー種別。クライアントはこの値で分岐します。
+                 * @example NOT_FOUND
+                 * @enum {string}
+                 */
+                code: "INVALID_ARGUMENT" | "NOT_FOUND" | "CONFLICT" | "INTERNAL";
+                /**
+                 * @description 人間向けの説明。文言は予告なく変わるため分岐に使わないでください。
+                 * @example 対象のリソースが見つかりません
+                 */
+                message: string;
+            };
         };
     };
-    responses: never;
-    parameters: never;
+    responses: {
+        /** @description リクエストが不正 */
+        BadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description 対象が存在しない */
+        NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description サーバ内部エラー */
+        InternalError: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+    };
+    parameters: {
+        /** @description スレッド ID */
+        ThreadId: number;
+        /** @description この ID より小さい行を取得します。省略すると先頭ページ。 */
+        Cursor: number;
+        /**
+         * @description 取得件数。省略時は 20。
+         *     上限を設けないと、1 リクエストで全件走査させられてしまいます。
+         */
+        Size: number;
+    };
     requestBodies: never;
     headers: never;
     pathItems: never;
 }
 export type $defs = Record<string, never>;
-export type operations = Record<string, never>;
+export interface operations {
+    getHealthz: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 正常 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HealthStatus"];
+                };
+            };
+        };
+    };
+    getReadyz: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description リクエスト受付可能 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HealthStatus"];
+                };
+            };
+            /** @description 依存先が利用できない */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HealthStatus"];
+                };
+            };
+        };
+    };
+    listThreads: {
+        parameters: {
+            query?: {
+                /** @description この ID より小さい行を取得します。省略すると先頭ページ。 */
+                cursor?: components["parameters"]["Cursor"];
+                /**
+                 * @description 取得件数。省略時は 20。
+                 *     上限を設けないと、1 リクエストで全件走査させられてしまいます。
+                 */
+                size?: components["parameters"]["Size"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ThreadList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createThread: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateThreadRequest"];
+            };
+        };
+        responses: {
+            /** @description 作成成功 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Thread"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getThread: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Thread"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listComments: {
+        parameters: {
+            query?: {
+                /** @description この ID より小さい行を取得します。省略すると先頭ページ。 */
+                cursor?: components["parameters"]["Cursor"];
+                /**
+                 * @description 取得件数。省略時は 20。
+                 *     上限を設けないと、1 リクエストで全件走査させられてしまいます。
+                 */
+                size?: components["parameters"]["Size"];
+            };
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommentList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createComment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateCommentRequest"];
+            };
+        };
+        responses: {
+            /** @description 投稿成功 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Comment"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description 親スレッドが存在しない */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description 同時更新が競合しました。再試行可能です。
+             *     SERIALIZABLE 分離レベルでの直列化失敗 (SQLSTATE 40001) や
+             *     デッドロック (40P01) がここに対応します。
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+}

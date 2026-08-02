@@ -1,0 +1,24 @@
+# api/openapi.yaml から Go のサーバスタブと型を生成する設定。
+#
+# 生成物 (internal/httpapi/oapigen) は編集しないこと。
+# エンドポイントを追加・変更するときは api/openapi.yaml を編集して
+# `make generate` を実行する。
+package: oapigen
+output: internal/httpapi/oapigen/oapigen.gen.go
+
+generate:
+  # gin 用の ServerInterface と RegisterHandlers を生成する。
+  # ハンドラがこのインターフェースを実装するため、
+  # 仕様にあるのに未実装のエンドポイントはコンパイルエラーになる。
+  gin-server: true
+  # リクエスト/レスポンスのスキーマから Go の型を生成する
+  models: true
+  # 仕様書自体をバイナリに埋め込む。
+  # 実行中のサーバが自分の仕様を配信できるようにするため。
+  embedded-spec: true
+
+output-options:
+  # 生成コードがリンタに引っかからないよう、コメントを整える
+  skip-prune: false
+  # レスポンス型は自前の DTO を使うので生成しない
+  skip-fmt: false
