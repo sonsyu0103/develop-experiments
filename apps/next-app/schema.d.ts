@@ -209,7 +209,7 @@ export interface components {
                  * @example NOT_FOUND
                  * @enum {string}
                  */
-                code: "INVALID_ARGUMENT" | "NOT_FOUND" | "CONFLICT" | "INTERNAL";
+                code: "INVALID_ARGUMENT" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "INTERNAL";
                 /**
                  * @description 人間向けの説明。文言は予告なく変わるため分岐に使わないでください。
                  * @example 対象のリソースが見つかりません

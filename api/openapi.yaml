@@ -393,6 +393,7 @@ components:
               enum:
                 - INVALID_ARGUMENT
                 - NOT_FOUND
+                - METHOD_NOT_ALLOWED
                 - CONFLICT
                 - INTERNAL
               example: NOT_FOUND

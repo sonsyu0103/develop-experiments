@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/getkin/kin-openapi/routers"
 	"github.com/gin-gonic/gin"
 
 	"develop-experiments/apps/go-api/internal/apperr"
@@ -55,18 +56,26 @@ func respondError(c *gin.Context, err error) {
 // respondSpecError は仕様書に基づく検証で弾かれた場合の応答です。
 // oapigen の生成コードと、仕様検証ミドルウェアの両方から呼ばれます。
 //
-// ミドルウェアは「未定義のパス」に対して 404 を返すため、
-// ステータスコードを握り潰さず、対応するエラー種別に振り分けます。
+// ミドルウェアは未定義パスにのみ 404 を割り当て、
+// それ以外 (メソッド不一致を含む) をすべて 400 に丸めてしまいます。
+// 「定義済みのパスに未定義のメソッド」は本来 405 が正しいため、
+// ここで振り分け直します。
 func respondSpecError(c *gin.Context, status int, message string) {
-	code := oapigen.INVALIDARGUMENT
-	if status == http.StatusNotFound {
-		code = oapigen.NOTFOUND
-		message = "そのエンドポイントは存在しません"
+	switch {
+	case message == routers.ErrMethodNotAllowed.Error():
+		c.AbortWithStatusJSON(http.StatusMethodNotAllowed,
+			newErrorBody(oapigen.METHODNOTALLOWED, "そのメソッドは許可されていません"))
+
+	case status == http.StatusNotFound:
+		c.AbortWithStatusJSON(http.StatusNotFound,
+			newErrorBody(oapigen.NOTFOUND, "そのエンドポイントは存在しません"))
+
+	default:
+		if status < http.StatusBadRequest {
+			status = http.StatusBadRequest
+		}
+		c.AbortWithStatusJSON(status, newErrorBody(oapigen.INVALIDARGUMENT, message))
 	}
-	if status < http.StatusBadRequest {
-		status = http.StatusBadRequest
-	}
-	c.AbortWithStatusJSON(status, newErrorBody(code, message))
 }
 
 // respondBadRequest はリクエストボディの解析失敗など、

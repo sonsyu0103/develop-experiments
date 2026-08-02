@@ -354,13 +354,19 @@ func TestSpecValidation_UnknownPathIs404(t *testing.T) {
 	}
 }
 
-// 仕様書に無いメソッドも同様に弾かれる。
-func TestSpecValidation_UndefinedMethodIsRejected(t *testing.T) {
+// 定義済みパスに未定義のメソッドを投げた場合は 405。
+//
+// 検証ミドルウェアはメソッド不一致も 400 に丸めてしまうため、
+// respondSpecError で 405 に振り分け直している。
+func TestSpecValidation_UndefinedMethodIs405(t *testing.T) {
 	env := newTestEnv(t)
 
 	rec := env.do(t, http.MethodDelete, "/threads/2", "")
-	if rec.Code == http.StatusOK {
-		t.Fatalf("status = 200 だが、DELETE は仕様書に定義していない (body=%s)", rec.Body.String())
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if code := decodeError(t, rec).Error.Code; code != oapigen.METHODNOTALLOWED {
+		t.Errorf("code = %q, want METHOD_NOT_ALLOWED", code)
 	}
 }
 

@@ -201,18 +201,7 @@ jobs:
             -v ON_ERROR_STOP=1 -f apps/go-api/db/seed/seed.sql
 
       - name: Verify partition pruning is effective
-        run: |
-          PGPASSWORD=password psql -h localhost -U app -d bbs -v ON_ERROR_STOP=1 -c \
-            "EXPLAIN (COSTS OFF) SELECT * FROM comments WHERE thread_id = 1;" \
-            | tee /tmp/plan.txt
-          # thread_id を等値指定したとき、8 パーティション中 1 つだけを走査するはず。
-          # 全パーティションが出てきたら pruning が効いていない。
-          scanned=$(grep -c 'comments_p' /tmp/plan.txt || true)
-          echo "走査対象パーティション数: $scanned"
-          if [ "$scanned" -ne 1 ]; then
-            echo "::error::パーティション pruning が効いていません (走査数=$scanned, 期待=1)"
-            exit 1
-          fi
+        run: bash .github/scripts/verify-partition-pruning.sh
 
       - name: Roll back migrations
         run: |
