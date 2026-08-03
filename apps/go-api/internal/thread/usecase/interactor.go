@@ -1,52 +1,109 @@
+// Package usecase はスレッドに関するアプリケーションロジックを担います。
 package usecase
 
 import (
 	"context"
-	"develop-experiments/apps/go-api/internal/thread/domain/model"
-	"sync"
 	"time"
+
+	"develop-experiments/apps/go-api/internal/pagination"
+	"develop-experiments/apps/go-api/internal/thread/domain/model"
+	"develop-experiments/apps/go-api/internal/thread/domain/repository"
 )
 
-// ThreadInteractor は「スレッド一覧を取得して集計する」ユースケースを担当します
-type ThreadInteractor struct{}
-
-// ThreadDTO はフロントエンドに返すスレッドのデータ構造です
-// @Description スレッドの集計情報
+// ThreadDTO はフロントエンドに返すスレッドのデータ構造です。
 type ThreadDTO struct {
-	ID           int    `json:"id" example:"1"`            // スレッドID
-	Title        string `json:"title" example:"並列処理を学ぶ部屋"` // スレッドタイトル
-	CommentCount int    `json:"commentCount" example:"7"`  // 並列集計されたコメント数
+	ID           int64     `json:"id"`
+	Title        string    `json:"title"`
+	CommentCount int64     `json:"commentCount"`
+	CreatedAt    time.Time `json:"createdAt"`
 }
 
-// FetchThreadList はスレッド一覧を並列処理で集計して取得します
-func (i *ThreadInteractor) FetchThreadList(ctx context.Context) ([]ThreadDTO, error) {
+// ThreadListResult はスレッド一覧と、次ページ取得用のカーソルです。
+// NextCursor が nil の場合は、それ以上ページがないことを意味します。
+type ThreadListResult struct {
+	Threads    []ThreadDTO `json:"threads"`
+	NextCursor *int64      `json:"nextCursor"`
+}
 
-	threads := []*model.Thread{
-		model.NewThread(1, "Goの並列処理を学ぶ部屋"),
-		model.NewThread(2, "やっぱり君と開発する部屋"),
+// ThreadInteractor は「スレッドを取得・作成する」ユースケースを担当します。
+type ThreadInteractor struct {
+	repo repository.ThreadRepository
+}
+
+// NewThreadInteractor はリポジトリを注入してインタラクターを生成します。
+func NewThreadInteractor(repo repository.ThreadRepository) *ThreadInteractor {
+	return &ThreadInteractor{repo: repo}
+}
+
+// FetchThreadList はスレッド一覧をコメント数つきで取得します。
+//
+// コメント数の集計は goroutine では並列化せず、
+// LEFT JOIN + COUNT(*) FILTER の単一クエリで行います。
+// スレッドごとに COUNT を投げる実装 (N+1) を goroutine で並列化しても、
+// DB へのラウンドトリップ回数そのものは減らないため、
+// 単一クエリのほうがほぼ常に速いからです。
+//
+// 「goroutine で並列集計」した版は FetchThreadListNPlusOne に残してあり、
+// Phase 4 のベンチマークで両者を比較します。
+func (i *ThreadInteractor) FetchThreadList(ctx context.Context, page pagination.Page) (ThreadListResult, error) {
+	summaries, err := i.repo.ListSummaries(ctx, page)
+	if err != nil {
+		return ThreadListResult{}, err
+	}
+	return buildListResult(summaries, page.Size), nil
+}
+
+// FetchThread は 1 件のスレッドをコメント数つきで取得します。
+// 存在しない場合は apperr.ErrNotFound を返します。
+func (i *ThreadInteractor) FetchThread(ctx context.Context, id int64) (ThreadDTO, error) {
+	summary, err := i.repo.FindSummaryByID(ctx, id)
+	if err != nil {
+		return ThreadDTO{}, err
+	}
+	return toDTO(*summary), nil
+}
+
+// CreateThread は新しいスレッドを作成します。
+func (i *ThreadInteractor) CreateThread(ctx context.Context, title string) (ThreadDTO, error) {
+	thread, err := model.NewThread(title)
+	if err != nil {
+		return ThreadDTO{}, err
 	}
 
-	var wg sync.WaitGroup
-	results := make([]ThreadDTO, len(threads))
-
-	for index, t := range threads {
-		wg.Add(1)
-
-		go func(idx int, thread *model.Thread) {
-			defer wg.Done()
-
-			// 0.5秒の重い処理のシミュレーション
-			time.Sleep(500 * time.Millisecond)
-
-			results[idx] = ThreadDTO{
-				ID:           thread.ID,
-				Title:        thread.Title,
-				CommentCount: (idx + 1) * 7,
-			}
-		}(index, t)
+	created, err := i.repo.Create(ctx, thread)
+	if err != nil {
+		return ThreadDTO{}, err
 	}
 
-	wg.Wait()
+	return toDTO(model.Summary{Thread: *created, CommentCount: 0}), nil
+}
 
-	return results, nil
+func toDTO(s model.Summary) ThreadDTO {
+	return ThreadDTO{
+		ID:           s.ID,
+		Title:        s.Title,
+		CommentCount: s.CommentCount,
+		CreatedAt:    s.CreatedAt,
+	}
+}
+
+// buildListResult は取得結果を DTO に詰め替え、次ページ用のカーソルを決めます。
+//
+// 「size 件ちょうど返ってきたら次ページがあるかもしれない」という判断なので、
+// 最終ページがちょうど size 件だった場合、次ページが空になることがあります。
+// 厳密にするには size+1 件取得して 1 件捨てる必要がありますが、
+// 空ページを 1 回引く程度のコストなので、ここでは単純さを優先しています。
+func buildListResult(summaries []model.Summary, size int32) ThreadListResult {
+	dtos := make([]ThreadDTO, 0, len(summaries))
+	for _, s := range summaries {
+		dtos = append(dtos, toDTO(s))
+	}
+
+	var next *int64
+	if len(dtos) > 0 && len(dtos) == int(size) {
+		last := dtos[len(dtos)-1].ID
+		next = &last
+	}
+
+	return ThreadListResult{Threads: dtos, NextCursor: next}
 }

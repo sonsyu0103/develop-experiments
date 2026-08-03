@@ -1,43 +1,76 @@
-import React from 'react';
 import type { components } from '../schema';
 
-type ThreadDTO = components['schemas']['ThreadDTO'];
+// schema.d.ts は openapi.yaml から自動生成される (npm run gen:types)。
+// ここで手書きの型を作らないことで、API とフロントの定義が必ず一致する。
+type Thread = components['schemas']['Thread'];
+type ThreadList = components['schemas']['ThreadList'];
 
-// APIのレスポンス全体の型定義（ { threads: ThreadDTO[] } の形 ）
-type ApiResponse = {
-  threads: ThreadDTO[];
-};
+async function getThreads(): Promise<ThreadList> {
+  // Server Components はコンテナ内から叩くので、サーバ間通信用の API_URL を優先する。
+  // NEXT_PUBLIC_ 接頭辞つきの変数はブラウザにも露出するため、
+  // サーバ専用の宛先はそちらに入れない。
+  const apiUrl =
+    process.env.API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8080';
 
-async function getThreads(): Promise<ThreadDTO[]> {
-  // 環境変数があればそれを使う（Docker用）、なければ localhost（ローカル用）
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080';
-  
   const res = await fetch(`${apiUrl}/threads`, { cache: 'no-store' });
   if (!res.ok) {
-    throw new Error('Failed to fetch threads from wired network');
+    throw new Error(`Failed to fetch threads: ${res.status} ${res.statusText}`);
   }
 
-  // レンスポンスを一度オブジェクトとして受け取る
-  const data = (await res.json()) as ApiResponse;
+  return (await res.json()) as ThreadList;
+}
 
-  // もしデータや threads が存在しない場合の安全弁をつけて、配列を返す
-  return data?.threads || [];
+// Server Component なので、日時の整形はコンテナのタイムゾーンで行われる。
+// compose で TZ を指定していない環境では UTC になり、9 時間ずれる。
+// 実行環境に依存させないよう timeZone を明示する。
+function ThreadCard({ thread }: { thread: Thread }) {
+  return (
+    <li style={{ margin: '1rem 0', padding: '1rem', border: '1px dashed #00f' }}>
+      <h2 style={{ fontSize: '1.2rem', margin: '0 0 0.5rem 0' }}>{thread.title}</h2>
+      <p style={{ color: '#55f', margin: 0 }}>
+        コメント数: {thread.commentCount}
+        <span style={{ marginLeft: '1rem', opacity: 0.7 }}>
+          {new Date(thread.createdAt).toLocaleString('ja-JP', {
+            timeZone: 'Asia/Tokyo',
+          })}
+        </span>
+      </p>
+    </li>
+  );
 }
 
 export default async function Page() {
-  const threads = await getThreads();
+  const { threads, nextCursor } = await getThreads();
 
   return (
-    <div style={{ backgroundColor: '#000', color: '#00f', minHeight: '100vh', padding: '2rem', fontFamily: 'monospace' }}>
-      <h1 style={{ borderBottom: '1px solid #00f', paddingBottom: '0.5rem' }}>Wired Thread List</h1>
-      <ul style={{ listStyle: 'none', padding: 0 }}>
-        {threads.map((thread) => (
-          <li key={thread.id} style={{ margin: '1rem 0', padding: '1rem', border: '1px dashed #00f' }}>
-            <h2 style={{ fontSize: '1.2rem', margin: '0 0 0.5rem 0' }}>{thread.title}</h2>
-            <p style={{ color: '#55f', margin: 0 }}>コメント数: {thread.commentCount}</p>
-          </li>
-        ))}
-      </ul>
+    <div
+      style={{
+        backgroundColor: '#000',
+        color: '#00f',
+        minHeight: '100vh',
+        padding: '2rem',
+        fontFamily: 'monospace',
+      }}
+    >
+      <h1 style={{ borderBottom: '1px solid #00f', paddingBottom: '0.5rem' }}>
+        Wired Thread List
+      </h1>
+
+      {threads.length === 0 ? (
+        <p style={{ color: '#55f' }}>スレッドがまだありません。</p>
+      ) : (
+        <ul style={{ listStyle: 'none', padding: 0 }}>
+          {threads.map((thread) => (
+            <ThreadCard key={thread.id} thread={thread} />
+          ))}
+        </ul>
+      )}
+
+      {nextCursor !== null && (
+        <p style={{ color: '#55f', opacity: 0.7 }}>
+          次ページのカーソル: {nextCursor}
+        </p>
+      )}
     </div>
   );
 }

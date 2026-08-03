@@ -1,14 +1,89 @@
 services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: bbs
+      # ロケールを C に固定する理由:
+      #   - 照合順序が「バイト順」になり、比較のたびに ICU/libc を呼ばなくなるので
+      #     ソートとインデックス走査が速い
+      #   - LIKE 'prefix%' が B-Tree インデックスで効くようになる
+      #     (C 以外のロケールでは text_pattern_ops を明示する必要がある)
+      #   - glibc のバージョン差でインデックスが壊れる事故を避けられる
+      # 日本語の「辞書順」ソートが必要になったら、その列だけ COLLATE を指定する。
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command:
+      - postgres
+      # pg_stat_statements: クエリ単位の実行時間・呼び出し回数を集計する拡張。
+      #   「どのクエリが重いか」を実測して README に残すために有効化している。
+      # auto_explain: SQL 拡張ではなく共有ライブラリなので、
+      #   CREATE EXTENSION ではなくここで読み込む必要がある。
+      - -c
+      - shared_preload_libraries=pg_stat_statements,auto_explain
+      # 開発中は全クエリをログに出して、N+1 の発生を目視できるようにする。
+      # 本番でこの設定にするとログが爆発するので注意。
+      - -c
+      - log_statement=all
+      # 100ms 以上かかったクエリに実行計画を添えて出力する。
+      - -c
+      - auto_explain.log_min_duration=100ms
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./apps/go-api/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # pg_isready だけだと初期化スクリプト実行中でも通ってしまうため、
+      # 実際にクエリを投げて確認する。
+      test: ["CMD-SHELL", "pg_isready -U app -d bbs && psql -U app -d bbs -c 'SELECT 1' > /dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # マイグレーションを実行して終了する使い捨てコンテナ。
+  # go-api はこれの正常終了を待ってから起動する。
+  migrate:
+    image: migrate/migrate:v4.18.1
+    volumes:
+      - ./apps/go-api/db/migrations:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://app:password@postgres:5432/bbs?sslmode=disable
+      - up
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: on-failure
+
   go-api:
     build:
       context: ./apps/go-api
       dockerfile: Dockerfile
+      target: dev
     ports:
       - "8080:8080"
     volumes:
       - ./apps/go-api:/app
+      # ホストの GOPATH と混ざらないよう、モジュールキャッシュはボリュームに逃がす
+      - go-mod-cache:/go/pkg/mod
     environment:
-      - ENV=development
+      ENV: development
+      ADDR: ":8080"
+      DATABASE_URL: postgres://app:password@postgres:5432/bbs?sslmode=disable
+      CORS_ALLOWED_ORIGINS: http://localhost:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
 
   next-app:
     build:
@@ -21,7 +96,15 @@ services:
       - /app/node_modules
       - /app/.next
     environment:
-      - NODE_ENV=development
-      - NEXT_PUBLIC_API_URL=http://go-api:8080
+      NODE_ENV: development
+      # Server Components はコンテナ内から叩くのでサービス名で解決する
+      API_URL: http://go-api:8080
+      # ブラウザから叩く経路はホスト側のポートを見る
+      NEXT_PUBLIC_API_URL: http://localhost:8080
     depends_on:
-      - go-api
+      go-api:
+        condition: service_started
+
+volumes:
+  postgres-data:
+  go-mod-cache:
