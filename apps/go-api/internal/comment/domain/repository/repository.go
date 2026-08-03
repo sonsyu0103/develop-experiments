@@ -32,5 +32,11 @@ type CommentRepository interface {
 
 	// SoftDelete はコメントを論理削除します。
 	// 対象が存在しない (すでに削除済みを含む) 場合は apperr.ErrNotFound を返します。
+	//
+	// 【現時点で HTTP エンドポイントからは呼ばれていません】
+	// 削除 API を公開するかは未決です (docs/adr/0003-open-questions.md の項目 7)。
+	// 認証が無い現状で公開すると誰でも他人のコメントを消せてしまうため、
+	// 認証の方針 (同 項目 6) とセットで決める必要があります。
+	// 決まるまでは永続化層のみを用意した状態で保留します。
 	SoftDelete(ctx context.Context, threadID, id int64) error
 }

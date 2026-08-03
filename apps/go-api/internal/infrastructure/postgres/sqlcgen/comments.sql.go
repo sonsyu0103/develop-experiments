@@ -89,7 +89,18 @@ type ListCommentsByThreadIDRow struct {
 
 // thread_id を等値で指定しているため、HASH パーティションの pruning が効き、
 // 8 分割中 1 パーティションだけを走査する。
-// EXPLAIN で "Partitions removed" が確認できることを README に記録している。
+//
+// 【なぜスレッドの存在確認を同じクエリに含めないか】
+// 「存在しないスレッド」と「コメント 0 件のスレッド」を 1 クエリで
+// 区別するには、threads を駆動表にした LEFT JOIN LATERAL が必要になる。
+// しかしその形ではコメント側の列が NULL になりうるのに対し、
+// sqlc は LEFT JOIN の NULL 許容を推論できず int64 / string を生成する
+// (実測: コメント 0 件のスレッドで comment_id と author_name が NULL 返却)。
+// 結果として Scan が実行時に失敗する。
+//
+// 往復 1 回を節約するために実行時エラーの危険を持ち込むのは割に合わないため、
+// 存在確認は呼び出し側 (CommentInteractor) の別クエリに分けている。
+// どちらも主キー / 部分インデックスで完結する軽いクエリである。
 func (q *Queries) ListCommentsByThreadID(ctx context.Context, arg ListCommentsByThreadIDParams) ([]ListCommentsByThreadIDRow, error) {
 	rows, err := q.db.Query(ctx, listCommentsByThreadID, arg.ThreadID, arg.CursorID, arg.PageSize)
 	if err != nil {
@@ -150,6 +161,8 @@ type SoftDeleteCommentParams struct {
 	ID       int64
 }
 
+// 現時点で HTTP エンドポイントからは呼ばれていない。
+// 削除 API を公開するかは未決 (docs/adr/0003-open-questions.md 項目 7)。
 func (q *Queries) SoftDeleteComment(ctx context.Context, arg SoftDeleteCommentParams) (int64, error) {
 	result, err := q.db.Exec(ctx, softDeleteComment, arg.ThreadID, arg.ID)
 	if err != nil {

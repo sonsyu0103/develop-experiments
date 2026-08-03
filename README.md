@@ -131,7 +131,20 @@ CI の `generated-ci` ジョブが再生成して差分を検査するため、
 レイテンシは「最も遅いクエリ + 接続プール待ち」に律速される。
 DB 側の負荷も N 倍になる。
 
-本番経路は `LEFT JOIN` + `COUNT(*) FILTER` の単一クエリで集計している。
+本番経路は単一クエリで集計している。ただし素直な `LEFT JOIN` + `GROUP BY` は
+**20 件返すために 20 スレッド分のコメント実データを読んでしまう**ため、
+先に `LIMIT` でスレッドを絞ってから相関サブクエリで数える形にしている。
+
+2,005 スレッド / 200,016 コメントでの実測 (`EXPLAIN ANALYZE`、各 3 回):
+
+| 実装 | 実行時間 | shared buffers |
+| --- | --- | --- |
+| `LEFT JOIN` + `GROUP BY` | 5.84 – 7.43 ms | 2,054 |
+| **採用した形** | **1.04 – 1.11 ms** | **59** |
+
+約 5.5 倍速く、バッファ読み取りは 35 分の 1。結果が一致することも確認済み。
+部分インデックスによる `Index Only Scan` (`Heap Fetches: 0`) が効くためで、
+この差は visibility map が整備された状態 (VACUUM 後) で現れる。
 
 比較用の N+1 実装は
 [`interactor_nplus1.go`](apps/go-api/internal/thread/usecase/interactor_nplus1.go)

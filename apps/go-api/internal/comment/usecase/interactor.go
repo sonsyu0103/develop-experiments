@@ -48,6 +48,12 @@ func NewCommentInteractor(
 // 「コメント 0 件」という誤った 200 を返してしまいます。
 // また論理削除済みスレッドの中身が読めてしまい、
 // 「削除したはずのものが API から見える」状態になります。
+//
+// 存在確認と取得の間にスレッドが削除される競合は残りますが、
+// その場合に起きるのは「削除直後のコメントが 1 回だけ返る」ことだけで、
+// 不正な書き込みは生じません。投稿側 (PostComment) は書き込みを伴うため
+// SQL 側で 1 文に閉じており、こちらとは要求される厳密さが異なります。
+// 1 クエリ化できない理由は db/query/comments.sql のコメントを参照してください。
 func (i *CommentInteractor) FetchComments(
 	ctx context.Context, threadID int64, page pagination.Page,
 ) (CommentListResult, error) {
