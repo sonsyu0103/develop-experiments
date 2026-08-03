@@ -27,8 +27,66 @@ linters:
     - misspell
     # 命名規則、エクスポート識別子のコメント有無など
     - revive
+    # モジュール境界とレイヤの依存方向を強制する。
+    # 規約のままでは規模が増えたときに必ず崩れるので CI で落とす。
+    # 設計の背景は docs/adr/0004-modular-monolith.md
+    - depguard
 
   settings:
+    depguard:
+      rules:
+        # thread モジュールの内側から外を見ない
+        thread-module:
+          files:
+            - "**/internal/thread/**"
+          deny:
+            - pkg: develop-experiments/apps/go-api/internal/comment
+              desc: >-
+                モジュール境界の違反。相手モジュールを直接 import せず、
+                必要な操作だけのインターフェースを自モジュール側に定義して
+                cmd/api で実装を注入する
+                (例: comment/domain/repository.ThreadExistenceChecker)
+            - pkg: develop-experiments/apps/go-api/internal/httpapi
+              desc: 依存方向の違反。HTTP 層はモジュールの外側なので内側からは見えない
+            - pkg: develop-experiments/apps/go-api/internal/infrastructure
+              desc: 依存方向の違反。永続化層は domain/repository のインターフェース経由で使う
+            - pkg: github.com/jackc/pgx
+              desc: DB ドライバの漏れ。SQL に依存する処理は infrastructure/postgres に置く
+            - pkg: github.com/gin-gonic/gin
+              desc: Web フレームワークの漏れ。context.Context と素の値で受ける
+
+        # comment モジュールの内側から外を見ない (thread-module の対称形)
+        comment-module:
+          files:
+            - "**/internal/comment/**"
+          deny:
+            - pkg: develop-experiments/apps/go-api/internal/thread
+              desc: >-
+                モジュール境界の違反。相手モジュールを直接 import せず、
+                必要な操作だけのインターフェースを自モジュール側に定義して
+                cmd/api で実装を注入する
+                (例: comment/domain/repository.ThreadExistenceChecker)
+            - pkg: develop-experiments/apps/go-api/internal/httpapi
+              desc: 依存方向の違反。HTTP 層はモジュールの外側なので内側からは見えない
+            - pkg: develop-experiments/apps/go-api/internal/infrastructure
+              desc: 依存方向の違反。永続化層は domain/repository のインターフェース経由で使う
+            - pkg: github.com/jackc/pgx
+              desc: DB ドライバの漏れ。SQL に依存する処理は infrastructure/postgres に置く
+            - pkg: github.com/gin-gonic/gin
+              desc: Web フレームワークの漏れ。context.Context と素の値で受ける
+
+        # domain 層は usecase 層を知らない。
+        # モジュールの外側は上の 2 ルールで塞いであるので、
+        # ここで塞ぐのは同一モジュール内の domain -> usecase だけ
+        domain-layer:
+          files:
+            - "**/internal/*/domain/**"
+          deny:
+            - pkg: develop-experiments/apps/go-api/internal/thread/usecase
+              desc: 依存方向の違反。domain は usecase を知らない
+            - pkg: develop-experiments/apps/go-api/internal/comment/usecase
+              desc: 依存方向の違反。domain は usecase を知らない
+
     errcheck:
       # 型アサーションの失敗も検査する
       check-type-assertions: true
