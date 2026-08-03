@@ -126,6 +126,18 @@ CI の `generated-ci` ジョブが再生成して差分を検査するため、
 
 判断の根拠は `docs/adr/` に記録している。要点だけ挙げる。
 
+### モジュール境界を lint で強制している
+
+`internal/` は機能単位の縦割り (`thread/` / `comment/`) と、
+その中のレイヤ (`domain/` → `usecase/`) で構成している。
+モジュール間は相手を直接 import せず、
+必要な操作だけのインターフェースを利用側が定義して結線する。
+
+この向きは規約でしかないため、`depguard` で CI から検査している。
+境界を越える import はビルドではなく `make lint` で落ちる。
+
+詳細は [ADR 0004](docs/adr/0004-modular-monolith.md)。
+
 ### コメント数の集計に goroutine を使っていない
 
 スレッドごとに `COUNT` を投げて goroutine で並列化しても、
