@@ -3,6 +3,7 @@ package postgres
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -39,11 +40,20 @@ func translateError(op string, err error) error {
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
 		case codeForeignKeyViolation:
-			// 親スレッドが存在しない、または削除済み。
+			// 参照先が存在しない。
+			// ErrNotFound は固定文言で応答されるため、ここは詳細を残してよい。
 			return fmt.Errorf("%s: 参照先が存在しません (%s): %w", op, pgErr.ConstraintName, apperr.ErrNotFound)
 		case codeCheckViolation:
 			// アプリ側の検証をすり抜けた場合の最後の砦。
-			return fmt.Errorf("%s: 制約違反 (%s): %w", op, pgErr.ConstraintName, apperr.ErrInvalidArgument)
+			//
+			// ハンドラは ErrInvalidArgument のメッセージをそのまま
+			// クライアントへ返すため、ここに操作名や制約名を含めてはいけない。
+			// 詳細はログにだけ残す。
+			slog.Warn("DB の CHECK 制約に違反した (アプリ側の検証漏れの可能性)",
+				slog.String("op", op),
+				slog.String("constraint", pgErr.ConstraintName),
+			)
+			return fmt.Errorf("入力値が制約を満たしていません: %w", apperr.ErrInvalidArgument)
 		case codeSerializationFailure, codeDeadlockDetected:
 			return fmt.Errorf("%s: 直列化に失敗しました (%s): %w", op, pgErr.Code, apperr.ErrConflict)
 		}

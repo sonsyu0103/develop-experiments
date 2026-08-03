@@ -62,7 +62,11 @@ endif
 
 .PHONY: seed
 seed: ## 開発用のシードデータを投入する (既存データは消える)
-	docker compose exec -T postgres psql -U app -d bbs < $(GO_API_DIR)/db/seed/seed.sql
+	# ON_ERROR_STOP=1 が無いと、途中の失敗で psql が続行し、
+	# BEGIN/COMMIT の中なので COMMIT が ROLLBACK に化けたうえで
+	# 終了コード 0 を返す。「成功したのに空のまま」を防ぐ。
+	docker compose exec -T postgres psql -U app -d bbs -v ON_ERROR_STOP=1 \
+		< $(GO_API_DIR)/db/seed/seed.sql
 
 # ---------------------------------------------------------------------------
 # コード生成

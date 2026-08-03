@@ -50,9 +50,12 @@ func run() error {
 	}
 	defer pool.Close()
 
+	// スレッドのリポジトリは、コメント側の親スレッド存在確認にも使い回す。
+	threadRepo := postgres.NewThreadRepository(pool)
+
 	server := httpapi.NewServer(
-		threadusecase.NewThreadInteractor(postgres.NewThreadRepository(pool)),
-		commentusecase.NewCommentInteractor(postgres.NewCommentRepository(pool)),
+		threadusecase.NewThreadInteractor(threadRepo),
+		commentusecase.NewCommentInteractor(postgres.NewCommentRepository(pool), threadRepo),
 		pool,
 	)
 

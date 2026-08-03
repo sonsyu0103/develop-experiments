@@ -36,7 +36,11 @@ psql_query() {
 # comments_p0_pkey からも comments_p0 が取れるため、
 # ヒープ走査とインデックス走査が同じパーティションを指していれば 1 と数えられる。
 count_scanned_partitions() {
-  grep -oE 'comments_p[0-9]+' | sort -u | wc -l | tr -d ' '
+  # grep は一致が無いと終了コード 1 を返す。set -o pipefail の下では
+  # それがそのまま伝播し、set -e でスクリプトが即死してしまう。
+  # そうなると下の ::error:: 診断が出力されないまま CI が落ち、
+  # 「原因不明の非ゼロ終了」になる。0 件も正常な計測結果として扱う。
+  { grep -oE 'comments_p[0-9]+' || true; } | sort -u | wc -l | tr -d ' '
 }
 
 echo "=============================================================="

@@ -12,7 +12,11 @@ import (
 
 const createComment = `-- name: CreateComment :one
 INSERT INTO comments (thread_id, author_name, body)
-VALUES ($1, $2, $3)
+SELECT $1, $2, $3
+WHERE EXISTS (
+    SELECT 1 FROM threads
+    WHERE id = $1 AND deleted_at IS NULL
+)
 RETURNING id, thread_id, author_name, body, created_at
 `
 
@@ -30,6 +34,17 @@ type CreateCommentRow struct {
 	CreatedAt  time.Time
 }
 
+// 親スレッドが「生存している」場合にだけ挿入する。
+//
+// 外部キー制約だけでは不十分である。threads は論理削除 (deleted_at) なので、
+// 削除済みスレッドでも行は残っており FK は満たされてしまう。
+// その結果「GET /threads/{id} は 404 なのにコメントは投稿できる」という
+// 矛盾が生じる。
+//
+// 事前に SELECT で存在確認してから INSERT する方法は、
+// 確認と挿入の間に削除される競合 (TOCTOU) を許してしまう。
+// INSERT ... SELECT ... WHERE EXISTS なら 1 文で完結し、競合しない。
+// 挿入されなかった場合は 0 行が返るため、pgx.ErrNoRows として検出できる。
 func (q *Queries) CreateComment(ctx context.Context, arg CreateCommentParams) (CreateCommentRow, error) {
 	row := q.db.QueryRow(ctx, createComment, arg.ThreadID, arg.AuthorName, arg.Body)
 	var i CreateCommentRow

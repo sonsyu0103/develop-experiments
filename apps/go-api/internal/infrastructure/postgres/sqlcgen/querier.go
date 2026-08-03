@@ -10,6 +10,17 @@ import (
 
 type Querier interface {
 	CountCommentsByThreadID(ctx context.Context, threadID int64) (int64, error)
+	// 親スレッドが「生存している」場合にだけ挿入する。
+	//
+	// 外部キー制約だけでは不十分である。threads は論理削除 (deleted_at) なので、
+	// 削除済みスレッドでも行は残っており FK は満たされてしまう。
+	// その結果「GET /threads/{id} は 404 なのにコメントは投稿できる」という
+	// 矛盾が生じる。
+	//
+	// 事前に SELECT で存在確認してから INSERT する方法は、
+	// 確認と挿入の間に削除される競合 (TOCTOU) を許してしまう。
+	// INSERT ... SELECT ... WHERE EXISTS なら 1 文で完結し、競合しない。
+	// 挿入されなかった場合は 0 行が返るため、pgx.ErrNoRows として検出できる。
 	CreateComment(ctx context.Context, arg CreateCommentParams) (CreateCommentRow, error)
 	// RETURNING により INSERT と採番値の取得が 1 往復で完結する。
 	// MySQL では LAST_INSERT_ID() を別クエリで叩く必要がある。

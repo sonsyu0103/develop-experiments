@@ -110,8 +110,15 @@ CI の `generated-ci` ジョブが再生成して差分を検査するため、
 { "error": { "code": "NOT_FOUND", "message": "対象のリソースが見つかりません" } }
 ```
 
-`code` は `INVALID_ARGUMENT` / `NOT_FOUND` / `CONFLICT` / `INTERNAL` のいずれか。
-`message` は変わりうるので分岐に使わないこと。
+`code` は以下のいずれか。`message` は変わりうるので分岐に使わないこと。
+
+| code | HTTP | 意味 |
+| --- | --- | --- |
+| `INVALID_ARGUMENT` | 400 | パラメータやボディが仕様を満たさない |
+| `NOT_FOUND` | 404 | 対象が存在しない、またはパスが未定義 |
+| `METHOD_NOT_ALLOWED` | 405 | パスは存在するがそのメソッドは未定義 |
+| `CONFLICT` | 409 | 同時更新の競合。再試行可能 |
+| `INTERNAL` | 500 | サーバ内部エラー |
 
 ## 設計上の判断
 

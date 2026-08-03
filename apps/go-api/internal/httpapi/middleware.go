@@ -19,17 +19,22 @@ import (
 // 併用できるようにするためです (* との併用はブラウザが拒否します)。
 func cors(allowedOrigins []string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		origin := c.GetHeader("Origin")
+		h := c.Writer.Header()
 
+		// Vary は「許可したときだけ」ではなく、このミドルウェアが触る
+		// 全レスポンスに付ける必要がある。
+		// 許可ヘッダの無い応答に Vary が無いと、共有キャッシュ / CDN が
+		// それをオリジン非依存として保存し、許可オリジンからの
+		// リクエストにも使い回してしまう。
+		// ブラウザ側では CORS ヘッダ欠落として弾かれ、断続的に失敗する。
+		h.Add("Vary", "Origin")
+
+		origin := c.GetHeader("Origin")
 		if origin != "" && slices.Contains(allowedOrigins, origin) {
-			h := c.Writer.Header()
 			h.Set("Access-Control-Allow-Origin", origin)
 			h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			h.Set("Access-Control-Allow-Headers", "Content-Type")
 			h.Set("Access-Control-Max-Age", "600")
-			// オリジンごとにレスポンスが変わることをキャッシュに伝える。
-			// これがないと CDN が別オリジン向けの応答を使い回してしまう。
-			h.Add("Vary", "Origin")
 		}
 
 		if c.Request.Method == http.MethodOptions {

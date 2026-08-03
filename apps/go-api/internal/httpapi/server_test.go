@@ -67,7 +67,19 @@ func (f *fakeThreadRepo) Create(_ context.Context, th *threadmodel.Thread) (*thr
 	return threadmodel.Reconstruct(99, th.Title, time.Unix(0, 0).UTC()), nil
 }
 
-func (f *fakeThreadRepo) Exists(context.Context, int64) (bool, error) { return true, f.err }
+// Exists は summaries に含まれるスレッドだけを「生存している」とみなす。
+// 論理削除されたスレッドは summaries から除かれる想定。
+func (f *fakeThreadRepo) Exists(_ context.Context, id int64) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	for _, s := range f.summaries {
+		if s.ID == id {
+			return true, nil
+		}
+	}
+	return false, nil
+}
 
 type fakeCommentRepo struct {
 	comments []commentmodel.Comment
@@ -128,7 +140,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	router, err := NewRouter(Deps{
 		Server: NewServer(
 			threadusecase.NewThreadInteractor(threads),
-			commentusecase.NewCommentInteractor(comments),
+			commentusecase.NewCommentInteractor(comments, threads),
 			pinger,
 		),
 		AllowedOrigins: []string{"http://localhost:3000"},
@@ -386,6 +398,36 @@ func TestGetThread_NotFound(t *testing.T) {
 	}
 }
 
+// スレッドが存在しなければ「コメント 0 件」ではなく 404 を返す。
+//
+// 存在確認を省くと、存在しない ID に対して 200 {"comments":[]} を返してしまい、
+// クライアントは「スレッドはあるがコメントが無い」と誤認する。
+func TestListComments_ThreadNotFound(t *testing.T) {
+	env := newTestEnv(t)
+
+	rec := env.do(t, http.MethodGet, "/threads/999/comments", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if code := decodeError(t, rec).Error.Code; code != oapigen.NOTFOUND {
+		t.Errorf("code = %q, want NOT_FOUND", code)
+	}
+}
+
+// 論理削除されたスレッドの中身は読めてはいけない。
+// threads は soft delete なので行自体は残っており、
+// 存在確認を怠ると「削除したはずの内容が API から見える」状態になる。
+func TestListComments_SoftDeletedThreadIsHidden(t *testing.T) {
+	env := newTestEnv(t)
+	// スレッド 2 が論理削除された状況を再現する。
+	env.threads.summaries = env.threads.summaries[1:]
+
+	rec := env.do(t, http.MethodGet, "/threads/2/comments", "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (削除済みスレッドの中身が読める)", rec.Code)
+	}
+}
+
 // 親スレッドが存在しない場合、リポジトリ層が外部キー違反を
 // apperr.ErrNotFound に翻訳し、ハンドラが 404 にする。
 func TestCreateComment_ParentThreadMissing(t *testing.T) {
@@ -509,6 +551,21 @@ func TestCORS(t *testing.T) {
 
 		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 			t.Errorf("Access-Control-Allow-Origin = %q, want 空 (未許可オリジン)", got)
+		}
+		// 許可ヘッダが無い応答にも Vary は必要。
+		// これが無いと共有キャッシュがオリジン非依存として保存し、
+		// 許可オリジンからのリクエストにも使い回してしまう。
+		if got := rec.Header().Get("Vary"); !strings.Contains(got, "Origin") {
+			t.Errorf("Vary = %q, want Origin を含む (未許可オリジンでも必要)", got)
+		}
+	})
+
+	t.Run("Origin ヘッダが無くても Vary は付く", func(t *testing.T) {
+		env := newTestEnv(t)
+
+		rec := env.do(t, http.MethodGet, "/threads", "")
+		if got := rec.Header().Get("Vary"); !strings.Contains(got, "Origin") {
+			t.Errorf("Vary = %q, want Origin を含む", got)
 		}
 	})
 

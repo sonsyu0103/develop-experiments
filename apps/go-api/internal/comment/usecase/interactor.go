@@ -3,8 +3,10 @@ package usecase
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	"develop-experiments/apps/go-api/internal/apperr"
 	"develop-experiments/apps/go-api/internal/comment/domain/model"
 	"develop-experiments/apps/go-api/internal/comment/domain/repository"
 	"develop-experiments/apps/go-api/internal/pagination"
@@ -27,18 +29,36 @@ type CommentListResult struct {
 
 // CommentInteractor は「コメントを取得・投稿する」ユースケースを担当します。
 type CommentInteractor struct {
-	repo repository.CommentRepository
+	repo    repository.CommentRepository
+	threads repository.ThreadExistenceChecker
 }
 
 // NewCommentInteractor はリポジトリを注入してインタラクターを生成します。
-func NewCommentInteractor(repo repository.CommentRepository) *CommentInteractor {
-	return &CommentInteractor{repo: repo}
+func NewCommentInteractor(
+	repo repository.CommentRepository,
+	threads repository.ThreadExistenceChecker,
+) *CommentInteractor {
+	return &CommentInteractor{repo: repo, threads: threads}
 }
 
 // FetchComments は 1 スレッドのコメントを新しい順に取得します。
+// スレッドが存在しない、または論理削除済みの場合は apperr.ErrNotFound を返します。
+//
+// 存在確認を挟まないと、存在しないスレッドに対して
+// 「コメント 0 件」という誤った 200 を返してしまいます。
+// また論理削除済みスレッドの中身が読めてしまい、
+// 「削除したはずのものが API から見える」状態になります。
 func (i *CommentInteractor) FetchComments(
 	ctx context.Context, threadID int64, page pagination.Page,
 ) (CommentListResult, error) {
+	ok, err := i.threads.Exists(ctx, threadID)
+	if err != nil {
+		return CommentListResult{}, err
+	}
+	if !ok {
+		return CommentListResult{}, fmt.Errorf("スレッド %d: %w", threadID, apperr.ErrNotFound)
+	}
+
 	comments, err := i.repo.ListByThreadID(ctx, threadID, page)
 	if err != nil {
 		return CommentListResult{}, err
@@ -59,8 +79,11 @@ func (i *CommentInteractor) FetchComments(
 }
 
 // PostComment はコメントを投稿します。
-// 親スレッドが存在しない場合は apperr.ErrNotFound を返します
-// (外部キー違反をリポジトリ層が翻訳します)。
+// 親スレッドが存在しない、または論理削除済みの場合は apperr.ErrNotFound を返します。
+//
+// ここで事前に存在確認をしないのは、確認と挿入の間にスレッドが
+// 削除される競合を避けるためです。判定は INSERT ... WHERE EXISTS で
+// SQL 側に寄せてあります。
 func (i *CommentInteractor) PostComment(
 	ctx context.Context, threadID int64, authorName, body string,
 ) (CommentDTO, error) {

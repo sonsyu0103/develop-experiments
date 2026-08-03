@@ -25,6 +25,11 @@ type Config struct {
 	// AllowedOrigins は CORS で許可するオリジンの一覧です。
 	AllowedOrigins []string
 	// Debug は開発モードかどうかです。gin のモード切り替えに使います。
+	//
+	// ENV=development のときだけ true になります。
+	// 未設定なら false (本番扱い) です。設定を忘れた環境が
+	// 気づかないうちにデバッグモードで動くほうが危険なため、
+	// 安全側に倒しています。
 	Debug bool
 }
 
@@ -36,11 +41,14 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("config: DATABASE_URL は必須です")
 	}
 
-	maxConns, err := int32Env("DB_MAX_CONNS", 20)
+	// 接続プールの上限は 1 以上でなければ意味をなさない。
+	maxConns, err := int32Env("DB_MAX_CONNS", 20, 1)
 	if err != nil {
 		return nil, err
 	}
-	minConns, err := int32Env("DB_MIN_CONNS", 2)
+	// 下限の 0 は「アイドル接続を事前に張らない」という正当な設定
+	// (pgxpool の既定値でもある) なので許可する。
+	minConns, err := int32Env("DB_MIN_CONNS", 2, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +56,8 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("config: DB_MIN_CONNS (%d) が DB_MAX_CONNS (%d) を超えています", minConns, maxConns)
 	}
 
-	shutdownSec, err := intEnv("SHUTDOWN_TIMEOUT_SECONDS", 10)
+	// 0 は「猶予を設けず即座に終了する」という正当な設定なので許可する。
+	shutdownSec, err := intEnv("SHUTDOWN_TIMEOUT_SECONDS", 10, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +69,7 @@ func Load() (*Config, error) {
 		MinConns:        minConns,
 		ShutdownTimeout: time.Duration(shutdownSec) * time.Second,
 		AllowedOrigins:  csvEnv("CORS_ALLOWED_ORIGINS", []string{"http://localhost:3000"}),
-		Debug:           stringEnv("ENV", "development") == "development",
+		Debug:           strings.EqualFold(os.Getenv("ENV"), "development"),
 	}, nil
 }
 
@@ -91,16 +100,16 @@ func stringEnv(key, fallback string) string {
 	return fallback
 }
 
-func intEnv(key string, fallback int) (int, error) {
-	v, err := parseIntEnv(key, int64(fallback), 64)
+func intEnv(key string, fallback, minimum int) (int, error) {
+	v, err := parseIntEnv(key, int64(fallback), int64(minimum), 64)
 	return int(v), err
 }
 
 // int32Env は int32 に収まることを保証して読み取ります。
 // pgxpool の設定値が int32 なので、ここで範囲を確定させておくと
 // 呼び出し側で範囲外を気にする必要がなくなります。
-func int32Env(key string, fallback int32) (int32, error) {
-	v, err := parseIntEnv(key, int64(fallback), 32)
+func int32Env(key string, fallback, minimum int32) (int32, error) {
+	v, err := parseIntEnv(key, int64(fallback), int64(minimum), 32)
 	if err != nil {
 		return 0, err
 	}
@@ -112,9 +121,9 @@ func int32Env(key string, fallback int32) (int32, error) {
 	return int32(v), nil
 }
 
-// parseIntEnv は環境変数を正の整数として読み取ります。
+// parseIntEnv は環境変数を整数として読み取り、minimum 以上であることを確認します。
 // bitSize は strconv.ParseInt に渡す値で、これにより桁あふれを防ぎます。
-func parseIntEnv(key string, fallback int64, bitSize int) (int64, error) {
+func parseIntEnv(key string, fallback, minimum int64, bitSize int) (int64, error) {
 	raw := os.Getenv(key)
 	if raw == "" {
 		return fallback, nil
@@ -123,8 +132,8 @@ func parseIntEnv(key string, fallback int64, bitSize int) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("config: %s は %d ビット整数である必要があります: %w", key, bitSize, err)
 	}
-	if v <= 0 {
-		return 0, fmt.Errorf("config: %s は正の整数である必要があります (got %d)", key, v)
+	if v < minimum {
+		return 0, fmt.Errorf("config: %s は %d 以上である必要があります (got %d)", key, minimum, v)
 	}
 	return v, nil
 }

@@ -20,6 +20,9 @@ async function getThreads(): Promise<ThreadList> {
   return (await res.json()) as ThreadList;
 }
 
+// Server Component なので、日時の整形はコンテナのタイムゾーンで行われる。
+// compose で TZ を指定していない環境では UTC になり、9 時間ずれる。
+// 実行環境に依存させないよう timeZone を明示する。
 function ThreadCard({ thread }: { thread: Thread }) {
   return (
     <li style={{ margin: '1rem 0', padding: '1rem', border: '1px dashed #00f' }}>
@@ -27,7 +30,9 @@ function ThreadCard({ thread }: { thread: Thread }) {
       <p style={{ color: '#55f', margin: 0 }}>
         コメント数: {thread.commentCount}
         <span style={{ marginLeft: '1rem', opacity: 0.7 }}>
-          {new Date(thread.createdAt).toLocaleString('ja-JP')}
+          {new Date(thread.createdAt).toLocaleString('ja-JP', {
+            timeZone: 'Asia/Tokyo',
+          })}
         </span>
       </p>
     </li>
