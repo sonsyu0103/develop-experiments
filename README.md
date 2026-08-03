@@ -53,7 +53,9 @@ make clean   # 停止 + データ削除
 ```bash
 make tools             # sqlc / oapi-codegen / golangci-lint を導入
 make generate          # 仕様書と SQL から生成物をすべて作り直す
-make check             # CI と同じ検証 (lint + test + 生成物のドリフト検出)
+make check             # 静的検査 + ユニットテスト + 生成物のドリフト検出 (DB 不要)
+make smoke             # 実 DB を立てて API を起動し、HTTP 越しに疎通を検証
+make check-all         # check + smoke
 ```
 
 ### コード生成の流れ
@@ -202,6 +204,19 @@ EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM comments WHERE thread_id = 1;
 ```
 
 100ms を超えたクエリは実行計画つきで `docker compose logs postgres` に出る。
+
+## テストの層
+
+| 層 | 対象 | DB | コマンド |
+| --- | --- | --- | --- |
+| ユニット | ドメイン / ユースケース / HTTP ハンドラ | フェイク | `make test` |
+| スモーク | API 全体を HTTP 越しに | **実 DB** | `make smoke` |
+
+ユニットテストはフェイクのリポジトリで動くため、
+**SQL が実際に意図どおり動くかは検証できない**。
+論理削除の除外、キーセットページネーションの遷移、
+仕様書によるリクエスト検証といった「DB とアプリの前提が噛み合っているか」は
+スモークテスト (40 項目) で確認している。CI の Migration Check でも実行される。
 
 ## ロードマップ
 

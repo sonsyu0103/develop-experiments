@@ -96,6 +96,20 @@ generate: sqlc openapi ## 生成物をすべて作り直す
 test: ## Go のテストを実行する (race detector + カバレッジ)
 	cd $(GO_API_DIR) && go test -race -cover ./...
 
+.PHONY: smoke
+smoke: ## 実 DB に対して API を起動し、HTTP 越しに疎通を検証する
+	# ユニットテストはフェイクのリポジトリで動くため、
+	# 「SQL が意図どおり動くか」は検証できない。その穴を埋める。
+	@$(MAKE) --no-print-directory up
+	@$(MAKE) --no-print-directory seed
+	@echo "API の起動を待っています..."
+	@for i in $$(seq 1 30); do \
+		curl -sf -o /dev/null http://localhost:8080/healthz && break || sleep 2; \
+	done
+	BASE_URL=http://localhost:8080 \
+	SQL_EXEC="docker compose exec -T postgres psql -U app -d bbs -X -q -c" \
+	python3 .github/scripts/smoke-test.py
+
 .PHONY: bench
 bench: ## ベンチマークを実行する
 	cd $(GO_API_DIR) && go test -bench=. -benchmem -run='^$$' ./...
@@ -123,4 +137,7 @@ tools: ## 開発ツール (sqlc / golangci-lint) をインストールする
 	go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@$(OAPI_CODEGEN_VERSION)
 
 .PHONY: check
-check: lint test verify-generated ## CI と同じ検証をローカルで一通り実行する
+check: lint test verify-generated ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+
+.PHONY: check-all
+check-all: check smoke ## check に加えて実 DB での疎通確認まで行う

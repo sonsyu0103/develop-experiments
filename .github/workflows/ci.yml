@@ -203,6 +203,42 @@ jobs:
       - name: Verify partition pruning is effective
         run: bash .github/scripts/verify-partition-pruning.sh
 
+      # ユニットテストはフェイクのリポジトリで動くため、
+      # SQL が実際に意図どおり動くかは CI のこの段階でしか検証できない。
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: apps/go-api/go.sum
+
+      - name: Start API server
+        working-directory: ./apps/go-api
+        env:
+          DATABASE_URL: postgres://app:password@localhost:5432/bbs?sslmode=disable
+          ADDR: ":8080"
+        run: |
+          go build -o /tmp/api ./cmd/api
+          /tmp/api > /tmp/api.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://localhost:8080/healthz && exit 0
+            sleep 1
+          done
+          echo "::error::API が起動しませんでした"
+          cat /tmp/api.log
+          exit 1
+
+      - name: Run smoke test against the real database
+        env:
+          BASE_URL: http://localhost:8080
+          SQL_EXEC: psql -h localhost -U app -d bbs -X -q -c
+          PGPASSWORD: password
+        run: python3 .github/scripts/smoke-test.py
+
+      - name: Dump API log on failure
+        if: failure()
+        run: cat /tmp/api.log || true
+
       - name: Roll back migrations
         run: |
           migrate -path apps/go-api/db/migrations \
