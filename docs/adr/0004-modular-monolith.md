@@ -94,8 +94,12 @@ type CommentInteractor struct {
 
 | ルール | 対象 | 禁止するもの |
 | --- | --- | --- |
-| `thread-module` | `internal/thread/**` | `comment` モジュール、`httpapi`、`infrastructure`、`pgx`、`gin` |
-| `comment-module` | `internal/comment/**` | `thread` モジュール、`httpapi`、`infrastructure`、`pgx`、`gin` |
+| `thread-module` | `internal/thread/**` (テスト以外) | `comment` モジュール、`httpapi`、`infrastructure`、`pgx`、`gin` |
+| `comment-module` | `internal/comment/**` (テスト以外) | `thread` モジュール、`httpapi`、`infrastructure`、`pgx`、`gin` |
+| `thread-module-test` | `internal/thread/**` | `comment` モジュール、`httpapi`、`gin` |
+| `comment-module-test` | `internal/comment/**` | `thread` モジュール、`httpapi`、`gin` |
+| `httpapi-layer` | `internal/httpapi/**` (テスト以外) | 各モジュールの `domain`、`infrastructure`、`pgx` |
+| `httpapi-test` | `internal/httpapi/**` | `infrastructure`、`pgx` |
 | `domain-layer` | `internal/*/domain/**` | 各モジュールの `usecase` |
 
 `pgx` と `gin` を禁止対象に含めているのは、依存方向の違反が
@@ -106,21 +110,79 @@ type CommentInteractor struct {
 どこからでも import を許している。いずれもドメイン知識を持たず、
 どのモジュールにも属さない。
 
+### HTTP 層を別ルールにしている理由
+
+`httpapi` がドメインモデルを直接 import できると、内部表現がそのまま
+JSON に晒される崩れ方を防げない。これは `api/openapi.yaml` を単一の正とする
+[ADR 0002](0002-openapi-direction.md) の前提と衝突する。
+ハンドラは `usecase` の DTO を受け取り、`oapigen` の生成型へ詰め替える。
+
+`infrastructure` と `pgx` も禁止している。現在 `httpapi` は永続化層を
+`Pinger` インターフェース (`internal/httpapi/server.go`) で受けており、
+DB ドライバの型を一切知らない。この状態を維持する。
+
+### テストコードの扱い
+
+テストにも同じルールを適用すると、実 DB を使う統合テストを `usecase` 層に
+置けなくなる。Phase 2 (SERIALIZABLE + リトライ) では直列化失敗
+(SQLSTATE 40001) を扱うが、これはフェイクでは再現できず実 DB が要る。
+
+そのため **テストでは `infrastructure` と `pgx` を許し、モジュール境界
+(相手モジュール) と HTTP 層は本体と同じく閉じたまま**にしている。
+「テストなら何でも import してよい」にはしない。それでは境界が実質消える。
+
+`httpapi` のテストだけは `domain` を許している。ハンドラのテストは
+フェイクのリポジトリを組むためにドメインの型を必要とし、ここを縛ると
+テストのために本番コードを歪めることになるため。永続化層への直接依存は
+テストであっても禁止のまま。
+
+#### 落とし穴: `files` は AND ではなく OR
+
+depguard の `files` に複数パターンを並べると **OR** で評価される。
+そのため「モジュール配下 かつ テストファイル」を 1 ルールで表現できない。
+
+```yaml
+# 誤り: 「全テストファイル」にマッチしてしまう
+files:
+  - "**/internal/thread/**"
+  - "$test"
+```
+
+代わりに、本体用ルールに `"!$test"` を付けて非テストに限定し、
+緩和用ルールはモジュール配下すべてを対象に書いている。
+非テストのファイルには両方のルールが適用され、本体用の deny の方が広いため、
+結果として「テストにだけ緩和が効く」形になる。
+
+緩和用ルールを thread 用と comment 用に分けているのは、1 つにまとめると
+deny に両モジュールを並べることになり、自モジュールへの参照まで
+禁止されてしまうため (thread のテストが `thread/domain/model` を使えない)。
+
 ### 検証
 
 現在のコードは `0 issues` で通る。
 
-さらに、ルールが実際に発火することを意図的な違反 4 件で確認した
+さらに、**落ちること**と**通ること**の両方を意図的なプローブ 7 件で確認した
 (いずれも検証後に削除済み)。
 
-| 入れた違反 | 発火したルール |
-| --- | --- |
-| `comment/usecase` → `thread/domain/model` | `comment-module` |
-| `thread/domain/model` → `pgx/v5/pgtype` | `thread-module` |
-| `thread/usecase` → `infrastructure/postgres` | `thread-module` |
-| ダミーの `*/domain/**` → `thread/usecase` | `domain-layer` |
+| # | 入れたコード | 期待 | 結果 |
+| --- | --- | --- | --- |
+| A | 本体 `comment/usecase` → `thread/domain/model` | 落ちる | `comment-module` |
+| B | 本体 `thread/domain/model` → `pgx/v5/pgtype` | 落ちる | `thread-module` |
+| C | 本体 `thread/usecase` → `infrastructure/postgres` | 落ちる | `thread-module` |
+| D | **テスト** `thread/usecase` → `infrastructure/postgres` | **通る** | 検出なし |
+| E | **テスト** `comment/usecase` → `thread/domain/model` | 落ちる | `comment-module-test` |
+| F | 本体 `httpapi` → `thread/domain/model` | 落ちる | `httpapi-layer` |
+| G | **テスト** `httpapi` → `infrastructure/postgres` | 落ちる | `httpapi-test` |
 
-`domain-layer` だけダミーのパッケージで検証したのは、
+D が「通ること」の確認であるのが要点。緩和が効いていなければ Phase 2 で
+統合テストが書けず、そのとき設定を雑に緩める圧力がかかる。
+
+なお E は、緩和用ルールを 1 つにまとめていた初版では**検出できていなかった**。
+「相手モジュールは閉じたまま」と書きながら deny に入れ忘れており、
+プローブを置いて初めて気づいた。設定だけを読んで正しさを判断していたら
+見逃していた欠陥である。
+
+`domain-layer` (前回の検証) だけダミーのパッケージで確認したのは、
 現在の `usecase` が `domain` を import しているため、
 実コードで `domain` → `usecase` を書くと depguard より先に
 循環 import のコンパイルエラーになるから。
@@ -146,12 +208,19 @@ type CommentInteractor struct {
   (例: 「必要な操作だけのインターフェースを自モジュール側に定義して
   cmd/api で実装を注入する」)
 - 新しい機能モジュールを足すときは、`.golangci.yml` にルールを
-  1 つ追加する必要がある。忘れると新モジュールだけ無検査になる
+  **2 つ** (本体用と緩和用) 追加する必要がある。
+  忘れると新モジュールだけ無検査になる
 
 ### 引き受けるコスト
 
-- モジュールを増やすたびにルールを増やす手作業が残る
-  (`files` を `**/internal/*/domain/**` のように総称で書けるのは
-  レイヤ方向だけで、モジュール間の対称な禁止は列挙が必要)
+- モジュールを増やすたびにルールが 2 つ増える。
+  `files` を `**/internal/*/domain/**` のように総称で書けるのはレイヤ方向だけで、
+  モジュール間の対称な禁止は列挙するしかない。
+  現在 7 ルールで、モジュールが 3 つになれば 9 になる。
+  この数え方が破綻するようなら、`go-arch-lint` (選択肢 C) を再検討する
+- 緩和用ルールは非テストのファイルにも適用される。
+  本体用ルールの deny がそれを包含している前提で成り立っており、
+  本体用から deny を減らすと緩和用の穴がそのまま開く。
+  片方だけを編集しないこと
 - import 以外の流出は検出できない。
   型の流出を防ぐのは引き続きレビューの仕事

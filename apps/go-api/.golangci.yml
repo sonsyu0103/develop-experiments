@@ -35,10 +35,11 @@ linters:
   settings:
     depguard:
       rules:
-        # thread モジュールの内側から外を見ない
+        # thread モジュールの内側から外を見ない (本体のコード)
         thread-module:
           files:
             - "**/internal/thread/**"
+            - "!$test"
           deny:
             - pkg: develop-experiments/apps/go-api/internal/comment
               desc: >-
@@ -59,6 +60,7 @@ linters:
         comment-module:
           files:
             - "**/internal/comment/**"
+            - "!$test"
           deny:
             - pkg: develop-experiments/apps/go-api/internal/thread
               desc: >-
@@ -86,6 +88,78 @@ linters:
               desc: 依存方向の違反。domain は usecase を知らない
             - pkg: develop-experiments/apps/go-api/internal/comment/usecase
               desc: 依存方向の違反。domain は usecase を知らない
+
+        # モジュール内のテストコードへの緩和。
+        #
+        # files の複数パターンは AND ではなく OR で評価されるため、
+        # 「モジュール配下 かつ テスト」は 1 ルールでは表現できない。
+        # 代わりに、モジュール配下すべてに効く緩いルールとして書く。
+        # 非テストのファイルには上の thread-module / comment-module も同時に適用され、
+        # そちらの deny の方が広いので、実質「テストにだけ緩和が効く」形になる。
+        #
+        # 実 DB を使う統合テストを usecase 層に置けるよう infrastructure と pgx は許すが、
+        # モジュール境界 (相手モジュール) と HTTP 層は本体と同じく閉じたままにする。
+        # 「テストなら何でも import してよい」にすると境界が実質消える。
+        #
+        # thread 用と comment 用に分けているのは、1 ルールにまとめると
+        # deny に両モジュールを並べることになり、自モジュールの参照まで
+        # 禁止されてしまうため (thread のテストが thread/domain/model を使えない)。
+        thread-module-test:
+          files:
+            - "**/internal/thread/**"
+          deny:
+            - pkg: develop-experiments/apps/go-api/internal/comment
+              desc: モジュール境界の違反。テストであっても相手モジュールは直接参照しない
+            - pkg: develop-experiments/apps/go-api/internal/httpapi
+              desc: 依存方向の違反。テストであっても内側から HTTP 層は見えない
+            - pkg: github.com/gin-gonic/gin
+              desc: Web フレームワークの漏れ。モジュール内のテストに gin は要らない
+
+        comment-module-test:
+          files:
+            - "**/internal/comment/**"
+          deny:
+            - pkg: develop-experiments/apps/go-api/internal/thread
+              desc: モジュール境界の違反。テストであっても相手モジュールは直接参照しない
+            - pkg: develop-experiments/apps/go-api/internal/httpapi
+              desc: 依存方向の違反。テストであっても内側から HTTP 層は見えない
+            - pkg: github.com/gin-gonic/gin
+              desc: Web フレームワークの漏れ。モジュール内のテストに gin は要らない
+
+        # HTTP 層はユースケースだけを見る。
+        # ドメインモデルを直接 JSON に晒すと、内部表現が API 契約に漏れる
+        # (api/openapi.yaml を単一の正とする ADR 0002 の前提が崩れる)
+        httpapi-layer:
+          files:
+            - "**/internal/httpapi/**"
+            - "!$test"
+          deny:
+            - pkg: develop-experiments/apps/go-api/internal/thread/domain
+              desc: >-
+                ドメインモデルへの直接参照。usecase の DTO を経由し、
+                oapigen の生成型へ詰め替える
+            - pkg: develop-experiments/apps/go-api/internal/comment/domain
+              desc: >-
+                ドメインモデルへの直接参照。usecase の DTO を経由し、
+                oapigen の生成型へ詰め替える
+            - pkg: develop-experiments/apps/go-api/internal/infrastructure
+              desc: 依存方向の違反。永続化層に触れず、必要なら Pinger のような口を切る
+            - pkg: github.com/jackc/pgx
+              desc: DB ドライバの漏れ。HTTP 層は永続化の実装を知らない
+
+        # HTTP 層のテストへの緩和 (module-test と同じ理由で別ルールにしている)。
+        #
+        # ハンドラのテストはフェイクのリポジトリを組むためにドメインの型を必要とする。
+        # ここを縛るとテストのために本番コードを歪めることになるので domain は許す。
+        # 一方で永続化層への直接依存は、テストであっても入口を開けない
+        httpapi-test:
+          files:
+            - "**/internal/httpapi/**"
+          deny:
+            - pkg: develop-experiments/apps/go-api/internal/infrastructure
+              desc: 依存方向の違反。テストであっても HTTP 層から永続化層は見えない
+            - pkg: github.com/jackc/pgx
+              desc: DB ドライバの漏れ。フェイクのリポジトリで代替する
 
     errcheck:
       # 型アサーションの失敗も検査する
