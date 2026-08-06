@@ -1,0 +1,380 @@
+# ADR 0010: ログを Fluent Bit で S3 に集約し、Athena で検索する
+
+- ステータス: **採用 (実装前)**
+- 日付: 2026-08-05
+
+## 背景
+
+現状、Go API は `log/slog` の JSON ハンドラで stdout に出力している
+(`cmd/api/main.go` の `setupLogger`)。
+[インフラ構成](../infrastructure.md) の初版では、これを
+CloudWatch Logs に流すだけの想定にしていた。
+
+CloudWatch Logs には次の性質がある。
+
+- 取り込み課金が高い。長期保管するほど効く
+- 横断的な集計 (「直列化失敗が多いスレッド上位 10 件」など) を
+  Logs Insights で書けるが、SQL ではない独自構文になる
+- 保管したログを他の分析基盤から読みにくい
+
+**構造化ログを既に JSON で出している以上、
+S3 に置いて SQL で読めるようにするほうが素直**になる。
+
+## 決定 1: FireLens (Fluent Bit) で S3 へ。CloudWatch は短期だけ併用する
+
+ECS では **FireLens** がサイドカーとして Fluent Bit を動かし、
+アプリコンテナの stdout をルーティングする。
+タスク定義でログドライバに `awsfirelens` を指定する。
+
+```
+go-api コンテナ ──stdout──▶ FireLens サイドカー ──┬──▶ S3 (長期・分析)
+                          (aws-for-fluent-bit)  └──▶ CloudWatch Logs (短期・調査)
+```
+
+### CloudWatch を完全に捨てない理由
+
+コスト削減だけを見れば S3 に一本化したくなるが、
+**両者は用途が違う**ので片方では埋まらない穴がある。
+
+| | CloudWatch Logs | S3 + Athena |
+| --- | --- | --- |
+| 反映までの時間 | ほぼ即時 | **バッファぶん遅れる (数分)** |
+| 障害時のリアルタイム追跡 | Live Tail が使える | 向かない |
+| メトリクスとアラーム | メトリクスフィルタで直結 | 別途仕組みが要る |
+| 横断的な集計 | 独自構文。長期間は高い | **SQL。安い** |
+| 長期保管 | 高い | **安い** |
+
+**障害対応中に「数分待たないとログが見えない」のは致命的**になる。
+一方で、90 日前のデータを横断集計するのに CloudWatch を使うのも筋が悪い。
+
+したがって:
+
+- **CloudWatch Logs は保持期間を短く (7 日)** して、リアルタイム調査とアラーム用に残す
+- **S3 が長期保管と分析の正**
+
+Fluent Bit は複数の `[OUTPUT]` に同じログをルーティングできるので、
+これは設定で両立する。
+
+## 決定 2: Hive 形式でパーティションを切り、partition projection を使う
+
+**これを外すと Athena は破産する。**
+Athena はスキャンしたバイト数で課金されるため、
+パーティションがないクエリは毎回全期間を読む。
+
+### S3 のキー設計
+
+```
+s3://<bucket>/logs/service=go-api/dt=2026-08-05/hour=14/<uuid>.json.gz
+```
+
+Fluent Bit の `s3_key_format` で指定する。
+
+```ini
+[OUTPUT]
+    Name             s3
+    Match            *
+    bucket           ${LOG_BUCKET}
+    region           ap-northeast-1
+    compression      gzip
+    use_put_object   On
+    total_file_size  50M
+    upload_timeout   5m
+    s3_key_format    /logs/service=go-api/dt=%Y-%m-%d/hour=%H/$UUID.json.gz
+```
+
+### partition projection を使う
+
+Hive 形式のキーにしておくと、Athena の **partition projection** が使える。
+
+```sql
+TBLPROPERTIES (
+  'projection.enabled'      = 'true',
+  'projection.dt.type'      = 'date',
+  'projection.dt.format'    = 'yyyy-MM-dd',
+  'projection.dt.range'     = '2026-08-01,NOW',
+  'projection.hour.type'    = 'integer',
+  'projection.hour.range'   = '0,23',
+  'projection.hour.digits'  = '2',
+  'storage.location.template' =
+    's3://<bucket>/logs/service=go-api/dt=${dt}/hour=${hour}/'
+)
+```
+
+これにより **`MSCK REPAIR TABLE` も Glue Crawler も不要**になる。
+パーティションの登録という運用作業が丸ごと消える。
+
+Crawler を回す方式だと、実行の失敗に気づかないまま
+「昨日のログだけ検索できない」が起きる。
+projection は S3 のキーの規則性だけに依存するので、この失敗モードがない。
+
+### 罠: パーティションの時刻は「アプリの出力時刻」ではない
+
+`%Y-%m-%d/%H` は **Fluent Bit がフラッシュした時刻 (UTC)** で決まる。
+バッファリングのぶん、アプリがログを出した時刻とはズレる。
+
+つまり **`hour=14` のパーティションに 13:58 のログが混ざる**。
+時刻で絞り込むときは、パーティションを前後 1 つ広めに取ったうえで、
+レコード内の `time` フィールドで絞る。
+
+```sql
+WHERE dt = '2026-08-05'
+  AND hour IN ('13', '14')            -- パーティション (スキャン範囲の限定)
+  AND time BETWEEN ... AND ...        -- レコードの実時刻 (正確な絞り込み)
+```
+
+パーティションキーは**課金を減らすための道具**であって、
+正確な時刻の絞り込みには使えない。
+
+## 決定 3: 初手は JSON + gzip。Parquet は測ってから
+
+Athena の課金効率だけを見れば Parquet (列指向) が明確に有利で、
+必要な列しか読まないぶんスキャン量が大きく減る。
+
+しかし初手から Parquet にはしない。
+
+- Fluent Bit の S3 出力から直接 Parquet を書けるかは
+  ビルド構成に依存し、`aws-for-fluent-bit` の標準イメージで
+  使えるとは限らない。**確認せずに前提にはできない**
+- 変換を挟む構成 (Glue ETL / Athena CTAS) は、
+  パイプラインにコンポーネントを 1 つ増やす
+
+したがって:
+
+1. **まず JSON + gzip で S3 に着地させ、Athena から直接読む**
+2. スキャン量が課金として無視できなくなったら、
+   日次の CTAS で Parquet の分析用テーブルを作る二段構えにする
+
+[ADR 0009](0009-scaling-strategy.md) の
+「測ってから入れる」と同じ判断基準になる。
+
+## 決定 4: アプリ側のログを Athena 前提の形にする
+
+**ここが実際の作業量になる。** Fluent Bit の設定より、こちらが本体。
+
+### 4-1. リクエスト ID を入れる (現状ない)
+
+Athena で 1 リクエストの一連の処理を串刺しにするには相関 ID が要る。
+現在の `requestLogger` は method / path / status / latency しか出しておらず、
+**同時刻の別リクエストと区別できない**。
+
+- ミドルウェアで UUID を生成 (受信ヘッダ `X-Request-Id` があれば尊重)
+- `context.Context` に載せ、以降のログにすべて含める
+- レスポンスヘッダにも返す (利用者から問い合わせが来たときに引ける)
+
+`slog` では、ハンドラをラップして context から自動的に
+`request_id` を付与する形にすると、各所で渡し忘れが起きない。
+
+### 4-2. 共通フィールドを固定する
+
+Athena はスキーマオンリードなので、フィールドが揺れるとクエリが書きにくい。
+全ログに必ず含める最小集合を決める。
+
+| フィールド | 例 | 用途 |
+| --- | --- | --- |
+| `time` | RFC3339 (UTC) | 正確な時刻の絞り込み |
+| `level` | `INFO` / `ERROR` | |
+| `msg` | `http_request` | **イベント名として扱う** (自由文にしない) |
+| `service` | `go-api` | |
+| `version` | git の短縮ハッシュ | デプロイ間の比較 |
+| `request_id` | UUID | 相関 |
+| `user_id` | `12345` / 未ログインは省略 | [ADR 0005](0005-authentication.md) |
+
+`msg` を自由文にすると、集計のたびに `LIKE` を書くことになる。
+**固定の識別子とし、可変の情報は別フィールドに出す。**
+
+### 4-3. ログレベルの使い分けを定義する
+
+レベルの基準が人によってぶれると、`level` で絞り込む意味がなくなる。
+
+| レベル | 基準 | このシステムでの例 |
+| --- | --- | --- |
+| **ERROR** | **サーバの処理が途中で終わった** | 500 応答、リトライ上限に達した直列化失敗、パニック、画像の再エンコード失敗 |
+| **WARN** | **インフラ層で起きた異常** (処理自体は続行・回復した) | S3 への PUT 失敗後の再試行、SES の一時エラー、DB 接続の張り直し、閲覧数フラッシュの部分失敗 |
+| **INFO** | **後から調べるための情報** | `http_request`、ログイン / ログアウト、投稿・削除、モデレーション操作 |
+| **DEBUG** | **処理の流れ** | 発行したクエリ、リトライの各試行、キャッシュの当たり外れ |
+
+現在の `requestLogger` は「ステータス 500 以上で ERROR、それ以外は INFO」で、
+この基準と既に整合している。
+
+#### ERROR はアラートの閾値と直結する
+
+**ERROR = 人が対応する必要がある**、という意味を持たせる。
+CloudWatch のアラームはこのレベルを起点に組む
+([インフラ構成](../infrastructure.md) の「ログとメトリクスの分担」)。
+
+したがって、**人が対応しなくてよいものを ERROR にしない**ことが重要になる。
+
+#### 特に: リトライして成功した直列化失敗は ERROR ではない
+
+Phase 2 では直列化失敗 (SQLSTATE 40001) をリトライで吸収する。
+**リトライして最終的に成功したなら、処理は完了している**ため ERROR ではない。
+
+| 状況 | レベル |
+| --- | --- |
+| 直列化失敗 → リトライ → 成功 | `DEBUG` (各試行) + `INFO` (結果) |
+| 直列化失敗 → リトライ上限 → 失敗 | **`ERROR`** |
+
+ここを取り違えると、**正常に機能しているリトライでアラートが鳴り続ける**。
+Phase 2 の設計が正しく動いているほど 40001 は発生するので、
+発生そのものを異常として扱ってはいけない。
+
+40001 の**発生率**は ERROR ではなくメトリクスとして観測する
+([ADR 0006](0006-view-count-and-popularity.md) / [ADR 0009](0009-scaling-strategy.md))。
+
+#### DEBUG は本番で出さない
+
+`setupLogger` は既に `ENV=development` のときだけ `LevelDebug` にしている。
+本番で DEBUG を出すと、[決定 6](#決定-6-s3-のライフサイクルを最初から設定する) の
+保管コストと、[4-5](#4-5-ログに出さないものを先に決める) の
+機密情報の露出リスクが同時に上がる。
+
+### 4-4. `latency` の単位を決める
+
+現在の `slog.Duration` は JSON ハンドラでは**ナノ秒の整数**になる。
+間違いではないが、Athena で毎回 `/ 1e6` を書くことになる。
+
+`latency_ms`(数値) として出す。単位をフィールド名に含めておくと、
+後から読む人が桁を取り違えない。
+
+### 4-5. ログに出さないものを先に決める
+
+[ADR 0005](0005-authentication.md) で認証が入り、
+[ADR 0008](0008-contact-and-mail.md) で問い合わせ内容を受け取るようになる。
+
+**S3 に長期保管する以上、一度出したものは事実上消せない。**
+出さないものを先に決める。
+
+| 出さない | 理由 |
+| --- | --- |
+| セッション ID / Cookie ヘッダ | 漏れるとなりすましが可能。ログの閲覧権限が認証情報の閲覧権限になってしまう |
+| メールアドレス / `google_sub` | 個人データ。識別は内部の `user_id` で足りる |
+| 問い合わせの本文・氏名 | 個人データ。DB にあるものをログに複製しない |
+| 画像のバイト列・Authorization ヘッダ | |
+| クエリパラメータの丸ごと出力 | 将来の追加パラメータが自動的に漏れる |
+
+IP アドレスはレート制限 ([ADR 0008](0008-contact-and-mail.md)) の
+調査に要るため出すが、**保持期間で管理する** (決定 6)。
+
+### 4-6. 業務イベントを構造化ログとして出す
+
+これが Phase 4 と直結する。
+
+```json
+{"msg":"serialization_failure","thread_id":42,"attempt":3,"request_id":"..."}
+{"msg":"view_count_flushed","threads":128,"increments":4096,"duration_ms":12}
+{"msg":"contact_mail_failed","contact_id":77,"attempt":2,"error":"..."}
+```
+
+これらを出しておくと、**Athena で SQL のまま分析できる**。
+
+```sql
+-- 直列化失敗が集中しているスレッド上位 10 件
+SELECT thread_id, count(*) AS failures, max(attempt) AS max_retry
+FROM go_api_logs
+WHERE dt = '2026-08-05' AND msg = 'serialization_failure'
+GROUP BY thread_id
+ORDER BY failures DESC
+LIMIT 10;
+```
+
+[ADR 0009](0009-scaling-strategy.md) で「測るべきは平均 RPS ではなく
+単一スレッドへの集中度」と書いたが、
+**この集計を行う場所がまさにここになる**。
+ログ基盤は運用のためだけでなく、Phase 4 のベンチマークの分析基盤になる。
+
+## 決定 5: ログのロストを許容する
+
+Fluent Bit のバッファは既定でメモリ上にある。
+タスクが停止すると、未送信のログは失われる。
+
+- FireLens のサイドカーはアプリコンテナより後に停止する必要がある。
+  タスク定義の `dependsOn` と `stopTimeout` で制御する
+- `storage.type filesystem` でファイルバッファに逃がせるが、
+  Fargate のストレージはエフェメラルなので、タスク消滅時には同じく失われる
+
+したがって **ログは at-most-once であり、欠落しうる**。
+
+[ADR 0006](0006-view-count-and-popularity.md) で閲覧数のロストを
+許容したのと同じ判断になる。
+**課金・監査に使う数値をログの件数から数えない。**
+それが必要になったら、DB に書く。
+
+## 決定 6: S3 のライフサイクルを最初から設定する
+
+「あとで考える」にすると、コストが単調増加する。
+
+| 対象 | 設定 |
+| --- | --- |
+| ログ本体 | 90 日で Glacier Instant Retrieval、400 日で削除 |
+| 未完了のマルチパートアップロード | 7 日で中止 |
+| **Athena のクエリ結果** | 30 日で削除 |
+
+2 行目を忘れると、中断したアップロードの断片が
+一覧に出ないまま課金され続ける。
+
+3 行目は見落としやすい。**Athena はクエリのたびに結果を S3 に書く**ため、
+放置すると別のバケットが静かに膨らむ。
+
+## ローカルでの再現
+
+[ADR 0007](0007-image-storage.md) で MinIO を `compose.yaml` に追加するため、
+**同じ経路をローカルで再現できる**。
+
+```
+go-api (stdout) ──▶ fluent-bit ──▶ MinIO (S3 互換)
+                                      │
+                                      ▼
+                                  DuckDB で SQL
+```
+
+Athena そのものの代替にはならないが、
+DuckDB は S3 上の JSON / Parquet を SQL で直接読めるため、
+**クエリとパーティション設計をローカルで検証できる**。
+
+`compose.yaml` に `fluent-bit` を追加する。
+本番との差分は出力先のエンドポイントだけになる。
+
+## 罠: FireLens は JSON ログを文字列として包む
+
+`awsfirelens` ログドライバは、コンテナの各出力行を
+**`log` キーの文字列**として Fluent Bit に渡す。
+
+そのままだと S3 に着地するレコードはこうなる。
+
+```json
+{"log": "{\"time\":\"...\",\"level\":\"INFO\",\"msg\":\"http_request\"}", "container_id": "..."}
+```
+
+**JSON が二重にネストされ、Athena からは 1 本の文字列にしか見えない。**
+`json_extract` を毎回書くことになり、パーティション以外の絞り込みが遅くなる。
+
+パーサフィルタを入れて展開する。
+
+```ini
+[FILTER]
+    Name         parser
+    Match        *
+    Key_Name     log
+    Parser       json
+    Reserve_Data On
+```
+
+`Reserve_Data On` は、FireLens が付けるコンテナメタデータ
+(`container_id` / `ecs_task_arn` など) を残すために要る。
+これを落とすと、どのタスクが出したログか分からなくなる。
+
+## 引き受けるコスト
+
+- **アプリ側の変更が要る。** リクエスト ID の付与と伝播、
+  共通フィールドの固定、`latency` の単位変更。
+  Fluent Bit を置くだけでは Athena で使えるログにならない
+- **サイドカーが 1 つ増える。** タスクあたりのメモリと CPU を消費し、
+  停止順序の制御という新しい失敗モードが増える
+- **ログのスキーマが実質的に契約になる。**
+  フィールド名を変えると、過去データと新データで
+  クエリを分ける必要が出る。安易に改名しない
+- **二重の出力先を持つ。** CloudWatch と S3 の両方に課金される。
+  CloudWatch の保持を短くすることで抑えるが、ゼロにはならない
+- **Athena のコストは書いたクエリ次第で青天井になる。**
+  パーティションを指定し忘れた 1 本のクエリが全期間を読む。
+  ワークグループにデータスキャン量の上限を設定しておく
