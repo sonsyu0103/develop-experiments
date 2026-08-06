@@ -238,7 +238,8 @@ CREATE INDEX images_reclaimable_idx
 ## モジュール構成
 
 [ADR 0004](0004-modular-monolith.md) に従い `internal/image` を追加する。
-**`.golangci.yml` に depguard ルールを 2 つ追加する。**
+**2 枚の arch ファイルにコンポーネントと依存を宣言する**
+([ADR 0017](0017-arch-lint-and-depguard.md))。
 
 ストレージは `domain/repository` のインターフェースとして定義し、
 実装を `infrastructure/objectstorage` に置く。

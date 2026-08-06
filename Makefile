@@ -11,6 +11,7 @@ MIGRATE_URL := postgres://app:password@postgres:5432/bbs?sslmode=disable
 GOLANGCI_LINT_VERSION := v2.12.2
 SQLC_VERSION          := v1.31.1
 OAPI_CODEGEN_VERSION  := v2.8.0
+GO_ARCH_LINT_VERSION  := v1.17.0
 
 .PHONY: help
 help: ## このヘルプを表示する
@@ -115,10 +116,23 @@ bench: ## ベンチマークを実行する
 	cd $(GO_API_DIR) && go test -bench=. -benchmem -run='^$$' ./...
 
 .PHONY: lint
-lint: ## Go / TypeScript の静的解析を実行する
+lint: arch ## Go / TypeScript の静的解析を実行する
 	cd $(GO_API_DIR) && golangci-lint run ./...
 	cd $(NEXT_DIR) && npx tsc --noEmit
 	cd $(NEXT_DIR) && npm run lint
+
+.PHONY: arch
+arch: ## モジュール境界とレイヤの依存方向を検査する
+	# 本体用とテスト用の 2 枚を両方通す必要がある。
+	# 本体コードには両方が適用され、テストファイルには緩和版だけが効く。
+	cd $(GO_API_DIR) && go-arch-lint check
+	cd $(GO_API_DIR) && go-arch-lint check --arch-file .go-arch-lint.tests.yml
+
+.PHONY: arch-probe
+arch-probe: ## 境界検査そのものが機能しているかをプローブで実測する
+	# 「落ちるはずのものが通る」状態を検出する。
+	# 設定を読んだだけでは正しさを判断できないため CI で回す
+	.github/scripts/arch-probe.sh
 
 .PHONY: verify-generated
 verify-generated: generate ## 生成物がコミット済みの内容と一致するか検査する
@@ -131,13 +145,14 @@ verify-generated: generate ## 生成物がコミット済みの内容と一致�
 		    exit 1)
 
 .PHONY: tools
-tools: ## 開発ツール (sqlc / golangci-lint) をインストールする
+tools: ## 開発ツール (sqlc / golangci-lint / go-arch-lint) をインストールする
 	go install github.com/sqlc-dev/sqlc/cmd/sqlc@$(SQLC_VERSION)
 	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 	go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@$(OAPI_CODEGEN_VERSION)
+	go install github.com/fe3dback/go-arch-lint@$(GO_ARCH_LINT_VERSION)
 
 .PHONY: check
-check: lint test verify-generated ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test verify-generated arch-probe ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
 check-all: check smoke ## check に加えて実 DB での疎通確認まで行う

@@ -59,8 +59,10 @@ make clean   # 停止 + データ削除
 ## 開発
 
 ```bash
-make tools             # sqlc / oapi-codegen / golangci-lint を導入
+make tools             # sqlc / oapi-codegen / golangci-lint / go-arch-lint を導入
 make generate          # 仕様書と SQL から生成物をすべて作り直す
+make arch              # モジュール境界とレイヤの依存方向を検査する
+make arch-probe        # 境界検査そのものが機能しているかをプローブで実測する
 make check             # 静的検査 + ユニットテスト + 生成物のドリフト検出 (DB 不要)
 make smoke             # 実 DB を立てて API を起動し、HTTP 越しに疎通を検証
 make check-all         # check + smoke
@@ -144,10 +146,24 @@ Phase 5 以降で追加する。体系は [ADR 0013](docs/adr/0013-http-defense.
 モジュール間は相手を直接 import せず、
 必要な操作だけのインターフェースを利用側が定義して結線する。
 
-この向きは規約でしかないため、`depguard` で CI から検査している。
-境界を越える import はビルドではなく `make lint` で落ちる。
+この向きは規約でしかないため、`go-arch-lint` で CI から検査している。
+境界を越える import はビルドではなく `make arch` で落ちる。
 
-詳細は [ADR 0004](docs/adr/0004-modular-monolith.md)。
+**許可リスト方式**であり、arch ファイルに書かなかった依存はすべて禁止される。
+どのコンポーネントにも属さないパッケージも違反になるため、
+**モジュールを足して宣言を忘れると、無検査ではなく CI が落ちる。**
+
+```
+apps/go-api/.go-arch-lint.yml        本体コード用 (_test.go は対象外)
+apps/go-api/.go-arch-lint.tests.yml  テストの緩和を含む版
+```
+
+検査そのものが機能していることは、意図的な違反を置く
+16 件のプローブ (`make arch-probe`) で毎回確かめている。
+**「落ちるはずのものが通る」状態は、設定を読んでも気づけない。**
+
+詳細は [ADR 0004](docs/adr/0004-modular-monolith.md) と
+[ADR 0017](docs/adr/0017-arch-lint-and-depguard.md)。
 
 ### コメント数の集計に goroutine を使っていない
 
@@ -337,6 +353,7 @@ api/openapi.yaml を書く
 | [ADR 0014](docs/adr/0014-author-resolution.md) | 投稿者情報の解決 —— N+1 とモジュール境界の両立 |
 | [ADR 0015](docs/adr/0015-idempotency.md) | 冪等性 —— クライアント側のリトライを扱う |
 | [ADR 0016](docs/adr/0016-schema-and-indexes.md) | スキーマの集約とインデックス設計 |
+| [ADR 0017](docs/adr/0017-arch-lint-and-depguard.md) | モジュール境界の検査を go-arch-lint に移し、depguard を外す |
 | [インフラ構成](docs/infrastructure.md) | AWS 理想構成 (実際にはデプロイしない) |
 
 未決事項は [ADR 0003](docs/adr/0003-open-questions.md) に一覧化している。

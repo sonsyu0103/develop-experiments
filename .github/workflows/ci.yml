@@ -20,6 +20,7 @@ env:
   GOLANGCI_LINT_VERSION: v2.12.2
   SQLC_VERSION: v1.31.1
   OAPI_CODEGEN_VERSION: v2.8.0
+  GO_ARCH_LINT_VERSION: v1.17.0
 
 jobs:
   # --------------------------------------------------
@@ -55,6 +56,24 @@ jobs:
           export GOTOOLCHAIN=auto
           go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${{ env.GOLANGCI_LINT_VERSION }}
           golangci-lint run ./...
+
+      # モジュール境界とレイヤの依存方向は golangci-lint ではなく
+      # go-arch-lint で検査する (許可リスト方式)。
+      # 経緯は docs/adr/0017-arch-lint-and-depguard.md
+      - name: Run go-arch-lint
+        run: |
+          export GOTOOLCHAIN=auto
+          go install github.com/fe3dback/go-arch-lint@${{ env.GO_ARCH_LINT_VERSION }}
+          go-arch-lint check
+          go-arch-lint check --arch-file .go-arch-lint.tests.yml
+
+      # 「落ちるはずのものが通る」状態を検出する。
+      # 設定を読んだだけでは検査の正しさを判断できないため、
+      # 意図的な違反を置いて実測する
+      - name: Verify architecture probes
+        # このジョブの既定は apps/go-api なので、明示的にリポジトリ直下へ戻す
+        working-directory: ${{ github.workspace }}
+        run: .github/scripts/arch-probe.sh
 
       - name: Run Vulnerability Check (govulncheck)
         # 脆弱性データベースは新しいほうが良いので、ここだけは latest を使う
