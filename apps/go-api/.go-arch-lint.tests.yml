@@ -1,0 +1,133 @@
+# テストコードへの緩和を含む版。.go-arch-lint.yml との差は deps だけ。
+#
+# 「テストファイルだけを対象にする」ことはできない
+# (excludeFiles は Go の正規表現 = RE2 で、否定先読みが無い) ため、
+# このファイルは本体コードにも適用される。本体には厳しい方
+# (.go-arch-lint.yml) も同時に適用されるので、実質「テストにだけ緩和が効く」
+# 形になる。depguard の 本体用 / 緩和用 の対と同じ構造。
+#
+# **片方だけを編集しないこと。** 本体用から許可を減らしても、
+# こちらに残っていればテストからは通ってしまう。
+# 設計の背景は docs/adr/0017-arch-lint-and-depguard.md
+version: 3
+workdir: .
+
+allow:
+  deepScan: false
+
+vendors:
+  gin:
+    in: github.com/gin-gonic/gin
+  pgx:
+    in: github.com/jackc/pgx/**
+  openapi:
+    in:
+      - github.com/getkin/kin-openapi/**
+      - github.com/oapi-codegen/**
+  errgroup:
+    in: golang.org/x/sync/**
+
+components:
+  main:
+    in: cmd/api
+
+  shared-apperr:
+    in: internal/apperr
+  shared-pagination:
+    in: internal/pagination
+  shared-config:
+    in: internal/config
+
+  thread-model:
+    in: internal/thread/domain/model
+  thread-repository:
+    in: internal/thread/domain/repository
+  thread-usecase:
+    in: internal/thread/usecase
+
+  comment-model:
+    in: internal/comment/domain/model
+  comment-repository:
+    in: internal/comment/domain/repository
+  comment-usecase:
+    in: internal/comment/usecase
+
+  httpapi:
+    in: internal/httpapi
+  httpapi-oapigen:
+    in: internal/httpapi/oapigen
+
+  postgres:
+    in: internal/infrastructure/postgres
+  postgres-sqlcgen:
+    in: internal/infrastructure/postgres/sqlcgen
+
+commonComponents:
+  - shared-apperr
+  - shared-pagination
+
+deps:
+  main:
+    anyProjectDeps: true
+    canUse:
+      - gin
+
+  thread-repository:
+    mayDependOn:
+      - thread-model
+  thread-usecase:
+    canUse:
+      # N+1 比較実装 (interactor_nplus1.go) が errgroup を使う
+      - errgroup
+    mayDependOn:
+      - thread-model
+      - thread-repository
+      # 緩和: 実 DB を使う統合テストを usecase 層に置けるようにする。
+      # 直列化失敗 (SQLSTATE 40001) はフェイクでは再現できない (Phase 2)
+      - postgres
+
+  comment-repository:
+    mayDependOn:
+      - comment-model
+  comment-usecase:
+    mayDependOn:
+      - comment-model
+      - comment-repository
+      # 緩和: 同上
+      - postgres
+
+  httpapi:
+    canUse:
+      - gin
+      - openapi
+    mayDependOn:
+      - thread-usecase
+      - comment-usecase
+      - httpapi-oapigen
+      # 緩和: ハンドラのテストはフェイクのリポジトリを組むため
+      # ドメインの型を必要とする。ここを縛るとテストのために本番コードが歪む。
+      # 一方 postgres は許していない —— テストでも永続化層には触らせない
+      - thread-model
+      - thread-repository
+      - comment-model
+      - comment-repository
+
+  postgres:
+    canUse:
+      - pgx
+    mayDependOn:
+      - thread-model
+      - thread-repository
+      - comment-model
+      - comment-repository
+      - postgres-sqlcgen
+      - shared-config
+
+  # 生成物。import は生成器が決めるので、必要なベンダだけ許可する
+  httpapi-oapigen:
+    canUse:
+      - gin
+      - openapi
+  postgres-sqlcgen:
+    canUse:
+      - pgx

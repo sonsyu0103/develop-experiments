@@ -214,7 +214,8 @@ SMTP 実装と SES 実装を差し替えられるようにする。
 ## モジュール構成
 
 `internal/contact` を追加する。
-**`.golangci.yml` に depguard ルールを 2 つ追加する。**
+**2 枚の arch ファイルにコンポーネントと依存を宣言する**
+([ADR 0017](0017-arch-lint-and-depguard.md))。
 
 ## 引き受けるコスト
 

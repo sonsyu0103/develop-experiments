@@ -1,0 +1,131 @@
+# モジュール境界とレイヤの依存方向を「許可リスト」で宣言する。
+# ここに書かなかった依存はすべて禁止され、どのコンポーネントにも属さない
+# パッケージも通知になる (書き忘れが禁止側に倒れる)。
+#
+# このファイルは本体コードだけを見る。テストコードには緩和があるため
+# .go-arch-lint.tests.yml が別に存在する。両方を通す必要がある。
+# 設計の背景は docs/adr/0017-arch-lint-and-depguard.md
+version: 3
+workdir: .
+
+allow:
+  # deepScan (AST による DI 解析) は使わない。
+  # cmd/api での結線を「注入元コンポーネント -> 注入先コンポーネント」の
+  # 依存として数えるため、通すには usecase -> infrastructure を
+  # 宣言する必要がある。守りたい向きの逆であり、宣言した瞬間に
+  # 本体コードからの import まで許可されてしまう
+  deepScan: false
+
+# 本体用のため、テストファイルは対象外にする
+excludeFiles:
+  - "_test\\.go$"
+
+vendors:
+  gin:
+    in: github.com/gin-gonic/gin
+  pgx:
+    in: github.com/jackc/pgx/**
+  openapi:
+    in:
+      - github.com/getkin/kin-openapi/**
+      - github.com/oapi-codegen/**
+  errgroup:
+    in: golang.org/x/sync/**
+
+components:
+  main:
+    in: cmd/api
+
+  shared-apperr:
+    in: internal/apperr
+  shared-pagination:
+    in: internal/pagination
+  shared-config:
+    in: internal/config
+
+  thread-model:
+    in: internal/thread/domain/model
+  thread-repository:
+    in: internal/thread/domain/repository
+  thread-usecase:
+    in: internal/thread/usecase
+
+  comment-model:
+    in: internal/comment/domain/model
+  comment-repository:
+    in: internal/comment/domain/repository
+  comment-usecase:
+    in: internal/comment/usecase
+
+  httpapi:
+    in: internal/httpapi
+  httpapi-oapigen:
+    in: internal/httpapi/oapigen
+
+  postgres:
+    in: internal/infrastructure/postgres
+  postgres-sqlcgen:
+    in: internal/infrastructure/postgres/sqlcgen
+
+# どのモジュールにも属さない下地。どこからでも import してよい
+commonComponents:
+  - shared-apperr
+  - shared-pagination
+
+deps:
+  # 結線だけを行うため、すべてを知ってよい唯一の場所
+  main:
+    anyProjectDeps: true
+    canUse:
+      - gin
+
+  thread-repository:
+    mayDependOn:
+      - thread-model
+  thread-usecase:
+    canUse:
+      # N+1 比較実装 (interactor_nplus1.go) が errgroup を使う
+      - errgroup
+    mayDependOn:
+      - thread-model
+      - thread-repository
+
+  comment-repository:
+    mayDependOn:
+      - comment-model
+  comment-usecase:
+    mayDependOn:
+      - comment-model
+      - comment-repository
+
+  # HTTP 層は usecase の DTO だけを見る。
+  # domain を直接見ると内部表現がそのまま JSON に出る (ADR 0002 の前提が崩れる)
+  httpapi:
+    canUse:
+      - gin
+      - openapi
+    mayDependOn:
+      - thread-usecase
+      - comment-usecase
+      - httpapi-oapigen
+
+  # アダプタは外側なので、内側 (domain) を知ってよい
+  postgres:
+    canUse:
+      - pgx
+    mayDependOn:
+      - thread-model
+      - thread-repository
+      - comment-model
+      - comment-repository
+      - postgres-sqlcgen
+      - shared-config
+
+  # 生成物。import は生成器が決めるので、必要なベンダだけ許可する
+  httpapi-oapigen:
+    canUse:
+      - gin
+      - openapi
+  postgres-sqlcgen:
+    canUse:
+      - pgx
