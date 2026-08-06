@@ -3,6 +3,13 @@
 Go (Gin) + PostgreSQL + Next.js による掲示板アプリケーション。
 並行処理・排他制御・集計クエリの設計と、その**実測**を主題としている。
 
+認証・画像投稿・検索といった実用的な機能も揃えるが、
+これらは主題を薄める方向ではなく、**主題に新しい題材を持ち込む形**で入れている。
+たとえば閲覧数の計上は、そのまま
+「同一行への書き込み集中をどう捌くか」という並行制御の問題になり
+([ADR 0006](docs/adr/0006-view-count-and-popularity.md))、
+その分析はログ基盤の上で行う ([ADR 0010](docs/adr/0010-log-pipeline.md))。
+
 ## 構成
 
 ```
@@ -28,6 +35,7 @@ Go (Gin) + PostgreSQL + Next.js による掲示板アプリケーション。
 │   └── next-app/                Next.js (App Router / RSC)
 ├── docs/
 │   ├── adr/                     設計判断の記録
+│   ├── infrastructure.md        AWS 理想構成 (実際にはデプロイしない)
 │   └── postgres-ssi.md          SSI (直列化スナップショット分離) の解説
 └── compose.yaml
 ```
@@ -121,6 +129,9 @@ CI の `generated-ci` ジョブが再生成して差分を検査するため、
 | `METHOD_NOT_ALLOWED` | 405 | パスは存在するがそのメソッドは未定義 |
 | `CONFLICT` | 409 | 同時更新の競合。再試行可能 |
 | `INTERNAL` | 500 | サーバ内部エラー |
+
+認証・権限・レート制限・サイズ超過のコード (401 / 403 / 413 / 429) は
+Phase 5 以降で追加する。体系は [ADR 0013](docs/adr/0013-http-defense.md)。
 
 ## 設計上の判断
 
@@ -236,9 +247,96 @@ EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM comments WHERE thread_id = 1;
 | --- | --- | --- |
 | Phase 0 | PostgreSQL / マイグレーション / sqlc の基盤構築 | 完了 |
 | Phase 1 | OpenAPI → Go スタブ / TypeScript 型の自動生成 | 完了 (`make generate`) |
-| Phase 2 | コメント投稿の並行制御強化 (SSI + リトライ、悲観ロック版との比較) | 未着手 |
-| Phase 3 | Next.js のスレッド一覧・詳細画面 | 一覧のみ実装 |
-| Phase 4 | ベンチマーク (N+1 vs 単一クエリ、パーティションの損益分岐点) | 未着手 |
+| Phase 2 | コメント投稿の並行制御強化 (SSI + リトライ、悲観ロック版との比較、冪等キー) | 未着手 |
+| Phase 3 | Next.js の画面 (一覧・詳細・マイページ・各種フォーム) | 一覧のみ実装 |
+| Phase 4 | ベンチマーク (N+1 vs 単一クエリ、パーティションの損益分岐点、スケール限界の測定) | 未着手 |
+| Phase 5 | 認証 (Google OIDC) とマイページ | 設計完了 |
+| Phase 6 | 画像投稿 (コメント添付 / プロフィール / スレッドアイコン) | 設計完了 |
+| Phase 7 | 人気スレッド一覧 (閲覧数) | 設計完了 |
+| Phase 8 | 問い合わせフォームとメール送信 | 設計完了 |
+| Phase 9 | ログ基盤 (Fluent Bit → S3 → Athena) | 設計完了 |
+| Phase 10 | モデレーション (ロール・通報・管理画面) | 設計完了 |
+| Phase 11 | スレッド検索 (`pg_trgm`) | 設計完了 |
+
+### 着手順
+
+**Phase 番号は識別子であって着手順ではない。** 手戻りが少ない順に進める。
+
+0. **カーソルを不透明トークンに変える** —— 既存 API の破壊的変更なので最初に済ませる。
+   人気順はカーソルが `(view_count, id)` の複合キーになり、
+   現在の `*int64` では表せない
+   ([ADR 0006](docs/adr/0006-view-count-and-popularity.md))。
+   **後回しにするほど、直すクライアントのコードが増える**
+1. **Phase 5 (認証) + Phase 9 の前半 + Phase 10 の前半** —— `author_id` と
+   `users.role` がスキーマに入るため先に置く。
+   Phase 2 を先にやると、トランザクションとリトライを組んだ後にカラムが増え、
+   テストとリトライ経路を書き直すことになる。
+   ログのリクエスト ID と共通フィールドの整備も、
+   同じミドルウェア層を触るのでここで済ませる
+2. **Phase 2 (並行制御)** —— 主題。スキーマが固まってから作り込む
+3. **Phase 6 (画像投稿)** —— 認証が前提になる (匿名は画像を投稿できない)
+4. **Phase 10 の後半 (通報・管理画面)** —— 削除の対象が出揃ってから。
+   画像の実削除は回収バッチに相乗りする
+   ([ADR 0011](docs/adr/0011-moderation.md))
+5. **Phase 11 (検索)** —— 他と依存がない。Phase 4 の測定対象に含めるため、
+   ベンチマークより前に置く
+6. **Phase 9 の後半 → Phase 7 (人気一覧) + Phase 4 (ベンチマーク)** —— 合流させる。
+   閲覧数の設計がそのままベンチマークの題材になり
+   ([ADR 0006](docs/adr/0006-view-count-and-popularity.md))、
+   その分析はログ基盤の上で行う
+   ([ADR 0010](docs/adr/0010-log-pipeline.md))
+7. **Phase 8 (問い合わせ)** —— 他と依存がない
+
+### 各段階の進め方
+
+どの段階も **`api/openapi.yaml` を書くところから始まる。**
+スキーマが単一の正であり ([ADR 0002](docs/adr/0002-openapi-direction.md))、
+Go のスタブと TypeScript の型はそこから生成されるため、
+ハンドラや画面を先に書くと生成物と食い違う。
+
+```
+api/openapi.yaml を書く
+  → make generate (Go スタブ / TS 型)
+  → db/migrations と db/query を書く → make generate (sqlc)
+  → ドメイン / ユースケース / ハンドラ
+  → Next.js の画面
+  → make check
+```
+
+**Phase 1 が「完了」なのは生成の仕組みが動いていることを指す。**
+スキーマの中身は各段階で増え続ける。
+
+**Phase 9 (ログ基盤) と Phase 10 (モデレーション) は 2 つに割れる。**
+
+| | 前半 (Phase 5 と同時) | 後半 |
+| --- | --- | --- |
+| Phase 9 | リクエスト ID の付与と伝播、共通フィールドの固定 | Fluent Bit と Athena の経路 |
+| Phase 10 | `users.role` と権限判定 | 通報・管理画面 |
+
+どちらも**前半はスキーマとミドルウェアに触る**ため、
+後からやると同じ場所を二度触ることになる。
+後半は依存する機能 (削除対象の画像、分析すべきログ) が揃ってからでよい。
+
+**Phase 3 (フロント) は独立した段階ではなく、各段階の最後の工程になる。**
+ログイン導線、マイページ、画像アップロード、問い合わせフォーム、
+人気順の切り替えが、それぞれの段階で増えていく。
+
+### 設計ドキュメント
+
+| | |
+| --- | --- |
+| [ADR 0005](docs/adr/0005-authentication.md) | 認証を Go API 側に置き、匿名投稿と共存させる |
+| [ADR 0006](docs/adr/0006-view-count-and-popularity.md) | 閲覧数の計上を主トランザクションから分離する |
+| [ADR 0007](docs/adr/0007-image-storage.md) | 画像はアップロード時に再エンコードし、API を経由させる |
+| [ADR 0008](docs/adr/0008-contact-and-mail.md) | 問い合わせは DB に保存し、メール送信は非同期にする |
+| [ADR 0009](docs/adr/0009-scaling-strategy.md) | スケール戦略 —— 何を今決め、何を後回しにするか |
+| [ADR 0010](docs/adr/0010-log-pipeline.md) | ログを Fluent Bit で S3 に集約し、Athena で検索する |
+| [ADR 0011](docs/adr/0011-moderation.md) | モデレーション —— ロール・削除権限・通報 |
+| [ADR 0012](docs/adr/0012-search.md) | スレッド検索は `pg_trgm` から始める |
+| [ADR 0013](docs/adr/0013-http-defense.md) | HTTP 層の防御とエラーコード体系 |
+| [ADR 0014](docs/adr/0014-author-resolution.md) | 投稿者情報の解決 —— N+1 とモジュール境界の両立 |
+| [ADR 0015](docs/adr/0015-idempotency.md) | 冪等性 —— クライアント側のリトライを扱う |
+| [インフラ構成](docs/infrastructure.md) | AWS 理想構成 (実際にはデプロイしない) |
 
 未決事項は [ADR 0003](docs/adr/0003-open-questions.md) に一覧化している。
 
