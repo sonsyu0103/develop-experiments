@@ -336,6 +336,7 @@ api/openapi.yaml を書く
 | [ADR 0013](docs/adr/0013-http-defense.md) | HTTP 層の防御とエラーコード体系 |
 | [ADR 0014](docs/adr/0014-author-resolution.md) | 投稿者情報の解決 —— N+1 とモジュール境界の両立 |
 | [ADR 0015](docs/adr/0015-idempotency.md) | 冪等性 —— クライアント側のリトライを扱う |
+| [ADR 0016](docs/adr/0016-schema-and-indexes.md) | スキーマの集約とインデックス設計 |
 | [インフラ構成](docs/infrastructure.md) | AWS 理想構成 (実際にはデプロイしない) |
 
 未決事項は [ADR 0003](docs/adr/0003-open-questions.md) に一覧化している。
