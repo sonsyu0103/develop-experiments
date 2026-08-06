@@ -51,19 +51,34 @@ jobs:
           git diff --exit-code -- go.mod go.sum \
             || (echo "go.mod / go.sum が最新ではありません。'go mod tidy' を実行してコミットしてください。"; exit 1)
 
-      - name: Run golangci-lint
+      # ツールはバージョンを固定しているので、ビルド済みのバイナリを
+      # そのまま再利用できる。キーに @latest のものを含めてはいけない
+      # (govulncheck は毎回入れ直す。下のステップを参照)
+      - name: Cache Go tools
+        id: cache-go-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: gotools-${{ runner.os }}-${{ runner.arch }}-golangci${{ env.GOLANGCI_LINT_VERSION }}-archlint${{ env.GO_ARCH_LINT_VERSION }}
+
+      # Go のバージョンはキーに含めていない。ここで作るのは実行可能な
+      # バイナリであり、Go を上げても動くため。上げるたびに作り直すと
+      # キャッシュの意味が薄れる
+      - name: Install Go tools
+        if: steps.cache-go-tools.outputs.cache-hit != 'true'
         run: |
           export GOTOOLCHAIN=auto
           go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${{ env.GOLANGCI_LINT_VERSION }}
-          golangci-lint run ./...
+          go install github.com/fe3dback/go-arch-lint@${{ env.GO_ARCH_LINT_VERSION }}
+
+      - name: Run golangci-lint
+        run: golangci-lint run ./...
 
       # モジュール境界とレイヤの依存方向は golangci-lint ではなく
       # go-arch-lint で検査する (許可リスト方式)。
       # 経緯は docs/adr/0017-arch-lint-and-depguard.md
       - name: Run go-arch-lint
         run: |
-          export GOTOOLCHAIN=auto
-          go install github.com/fe3dback/go-arch-lint@${{ env.GO_ARCH_LINT_VERSION }}
           go-arch-lint check
           go-arch-lint check --arch-file .go-arch-lint.tests.yml
 
@@ -76,7 +91,10 @@ jobs:
         run: .github/scripts/arch-probe.sh
 
       - name: Run Vulnerability Check (govulncheck)
-        # 脆弱性データベースは新しいほうが良いので、ここだけは latest を使う
+        # 脆弱性データベースは新しいほうが良いので、ここだけは latest を使う。
+        # そのためキャッシュの対象にせず、毎回入れ直す。
+        # ~/go/bin がキャッシュから復元されていても、この go install が
+        # 上書きするので古いバイナリが残ることはない
         run: |
           export GOTOOLCHAIN=auto
           go install golang.org/x/vuln/cmd/govulncheck@latest
@@ -144,7 +162,18 @@ jobs:
           cache: npm
           cache-dependency-path: apps/next-app/package-lock.json
 
+      # 生成器はバージョンを固定しているので、ビルド済みのバイナリを再利用する。
+      # このジョブの実作業 (再生成 + 差分検査) は合計 1 秒であり、
+      # キャッシュが無いと 90 秒かけてビルドしたツールで 1 秒の仕事をすることになる
+      - name: Cache code generators
+        id: cache-generators
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: generators-${{ runner.os }}-${{ runner.arch }}-sqlc${{ env.SQLC_VERSION }}-oapi${{ env.OAPI_CODEGEN_VERSION }}
+
       - name: Install code generators
+        if: steps.cache-generators.outputs.cache-hit != 'true'
         run: |
           export GOTOOLCHAIN=auto
           go install github.com/sqlc-dev/sqlc/cmd/sqlc@${{ env.SQLC_VERSION }}
