@@ -5,6 +5,14 @@ out/
 build/
 *.tsbuildinfo
 
+# Next が実行モードに応じて書き換えるため、コミットすると差分が延々と出る。
+#   next dev   → import "./.next/dev/types/routes.d.ts"
+#   next build → import "./.next/types/routes.d.ts"
+# Next 公式はコミットを推奨しているが、ここだけ外す。
+# next-env.d.ts と .next の両方が無い状態 (CI のクリーンチェックアウト相当) でも
+# `npx tsc --noEmit` が通ることを実測して確認済み。
+next-env.d.ts
+
 # Go のバイナリやノイズを遮断
 bin/
 dist/
