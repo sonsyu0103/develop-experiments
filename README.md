@@ -43,9 +43,17 @@ Go (Gin) + PostgreSQL + Next.js による掲示板アプリケーション。
 ## 起動
 
 ```bash
-make up      # PostgreSQL 起動 → マイグレーション適用 → API と Web を起動
-make seed    # 開発用データを投入
+make up-seeded  # 起動 + 開発用データの投入 (初回はこれ 1 つでよい)
 ```
+
+```bash
+make up      # PostgreSQL 起動 → マイグレーション適用 → API と Web を起動
+make seed    # 開発用データを投入 (スレッド 5 件 + コメント 16 件)
+```
+
+シードは `make up` に含めていない。
+`db/seed/seed.sql` は `TRUNCATE` から始まるため、起動のたびに走らせると
+**手で入れたデータが毎回消える**。投入は明示的な操作にしてある。
 
 - API: http://localhost:8080
 - Web: http://localhost:3000

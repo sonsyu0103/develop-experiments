@@ -26,6 +26,12 @@ help: ## このヘルプを表示する
 up: ## 全サービスを起動する (マイグレーションも自動実行)
 	docker compose up -d --build
 
+.PHONY: up-seeded
+up-seeded: up ## 起動したうえでシードデータまで投入する (既存データは消える)
+	# up と分けているのは、seed.sql が TRUNCATE から始まるため。
+	# make up にまとめると、起動のたびに手入力のデータが消える。
+	@$(MAKE) --no-print-directory seed
+
 .PHONY: down
 down: ## 全サービスを停止する (データは残る)
 	docker compose down
@@ -63,11 +69,11 @@ endif
 
 .PHONY: seed
 seed: ## 開発用のシードデータを投入する (既存データは消える)
-	# ON_ERROR_STOP=1 が無いと、途中の失敗で psql が続行し、
-	# BEGIN/COMMIT の中なので COMMIT が ROLLBACK に化けたうえで
-	# 終了コード 0 を返す。「成功したのに空のまま」を防ぐ。
-	docker compose exec -T postgres psql -U app -d bbs -v ON_ERROR_STOP=1 \
-		< $(GO_API_DIR)/db/seed/seed.sql
+	# compose の seed サービスとして定義してある。
+	# psql の起動条件 (ON_ERROR_STOP、マイグレーション完了待ち) を
+	# compose.yaml とこことで二重に持たないため、run に寄せている。
+	# 未起動なら postgres と migrate は depends_on 経由で立ち上がる。
+	docker compose run --rm seed
 
 # ---------------------------------------------------------------------------
 # コード生成
@@ -102,6 +108,12 @@ smoke: ## 実 DB に対して API を起動し、HTTP 越しに疎通を検証�
 	# ユニットテストはフェイクのリポジトリで動くため、
 	# 「SQL が意図どおり動くか」は検証できない。その穴を埋める。
 	@$(MAKE) --no-print-directory up
+	# up は「イメージが変わらなければコンテナを作り直さない」。
+	# dev の go-api はソースを volume マウントしていてイメージが変わらず、
+	# go run は起動時にしかコンパイルしないため、既に動いていると
+	# 古いバイナリのまま残る。生成物を作り直した直後や
+	# ブランチを切り替えた直後に、古いコードを検証してしまう。
+	docker compose restart go-api
 	@$(MAKE) --no-print-directory seed
 	@echo "API の起動を待っています..."
 	@for i in $$(seq 1 30); do \
