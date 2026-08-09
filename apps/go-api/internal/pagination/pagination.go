@@ -7,7 +7,8 @@
 // id は単調増加なので「id < cursor」で辿れば、索引だけで一定コストになります。
 //
 // カーソルは API では不透明トークン (base64url + JSON) として扱い、
-// 内部表現である id を直接は晒しません。理由は ADR 0006 を参照してください。
+// 内部表現である id を直接は晒しません。形式と検証の決定は ADR 0018、
+// そもそも不透明にした理由は ADR 0006 を参照してください。
 // 人気順では並び順のキーが (view_count, id) の複合キーになるため、
 // 「カーソル = id」を公開したままでは並び順を増やすたびに API が壊れます。
 package pagination
@@ -64,11 +65,18 @@ func NewCursor(id int64) Cursor {
 // 署名は付けていません。改竄されても読めるのは「公開済みの一覧の別の位置」
 // でしかなく、権限の昇格にはつながらないためです。
 // トークンの目的は秘匿ではなく、内部表現を API の契約から切り離すことです。
-func (c Cursor) Encode() string {
-	// Cursor は json.Marshal が失敗しうる型 (chan, func, 循環参照) を
-	// 含まないため、ここでエラーは発生しません。
-	b, _ := json.Marshal(c)
-	return tokenEncoding.EncodeToString(b)
+//
+// 現在の Cursor は json.Marshal が失敗しうる型 (chan, func, 循環参照) を
+// 含まないため、エラーは発生しません。それでも返しているのは、
+// このパッケージが「並び順を足すときにフィールドを増やす」前提で作られており、
+// 握りつぶすと将来 Encode が空文字を返して
+// "nextCursor": "" がクライアントへ流れるためです。
+func (c Cursor) Encode() (string, error) {
+	b, err := json.Marshal(c)
+	if err != nil {
+		return "", fmt.Errorf("カーソルの符号化に失敗しました: %w", err)
+	}
+	return tokenEncoding.EncodeToString(b), nil
 }
 
 // DecodeCursor は不透明トークンをカーソルへ戻します。
@@ -115,6 +123,12 @@ type Page struct {
 // NewPage はページ指定を検証して組み立てます。
 // token が nil または空文字の場合は先頭ページになります。
 // size が 0 以下の場合は DefaultSize を使います。
+//
+// 空文字を受け付けるのは、クライアントが「トークンが無ければ空文字」として
+// ?cursor= を組み立てることがあるためです。
+// 仕様書の pattern も空文字を許す形にしてあり、
+// 「省略」と「空文字」はどちらも先頭ページになります。
+// 片方だけを 400 にすると、初回ロードだけが失敗する形になります。
 func NewPage(token *string, size int32) (Page, error) {
 	if size <= 0 {
 		size = DefaultSize
@@ -153,10 +167,13 @@ func (p Page) CursorID() *int64 {
 // 空ページを 1 回引く程度のコストなので、ここでは単純さを優先しています。
 //
 // 次ページがない場合は nil を返します。
-func NextToken(lastID int64, returned int, size int32) *string {
+func NextToken(lastID int64, returned int, size int32) (*string, error) {
 	if returned == 0 || returned != int(size) {
-		return nil
+		return nil, nil
 	}
-	t := NewCursor(lastID).Encode()
-	return &t
+	t, err := NewCursor(lastID).Encode()
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }

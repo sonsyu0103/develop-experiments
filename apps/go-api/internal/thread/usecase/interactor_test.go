@@ -18,7 +18,10 @@ func mustPage(t *testing.T, cursorID *int64, size int32) pagination.Page {
 
 	var token *string
 	if cursorID != nil {
-		s := pagination.NewCursor(*cursorID).Encode()
+		s, err := pagination.NewCursor(*cursorID).Encode()
+		if err != nil {
+			t.Fatalf("カーソルの符号化が失敗した: %v", err)
+		}
 		token = &s
 	}
 

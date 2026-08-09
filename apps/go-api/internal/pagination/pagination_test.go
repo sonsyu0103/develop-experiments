@@ -11,8 +11,18 @@ import (
 
 func ptr[T any](v T) *T { return &v }
 
+// mustEncode は符号化に成功することを前提に、トークンを組み立てます。
+func mustEncode(t *testing.T, c Cursor) string {
+	t.Helper()
+	s, err := c.Encode()
+	if err != nil {
+		t.Fatalf("Encode が失敗した (%+v): %v", c, err)
+	}
+	return s
+}
+
 // token は id を指すトークンを組み立てるテスト用の補助関数です。
-func token(id int64) string { return NewCursor(id).Encode() }
+func token(t *testing.T, id int64) string { return mustEncode(t, NewCursor(id)) }
 
 func TestNewPage(t *testing.T) {
 	t.Parallel()
@@ -30,7 +40,7 @@ func TestNewPage(t *testing.T) {
 		{name: "明示指定", token: nil, size: 50, wantSize: 50},
 		{name: "上限ちょうどは通る", token: nil, size: MaxSize, wantSize: MaxSize},
 		{
-			name: "カーソルつき", token: ptr(token(100)), size: 10,
+			name: "カーソルつき", token: ptr(token(t, 100)), size: 10,
 			wantSize: 10, wantCursor: ptr(int64(100)),
 		},
 		{name: "空文字は先頭ページ扱い", token: ptr(""), size: 10, wantSize: 10},
@@ -38,12 +48,12 @@ func TestNewPage(t *testing.T) {
 		{name: "上限超過は拒否", token: nil, size: MaxSize + 1, wantErr: true},
 		{name: "base64 として壊れたトークンは拒否", token: ptr("!!!!"), size: 10, wantErr: true},
 		{name: "JSON として壊れたトークンは拒否", token: ptr(encodeRaw("{")), size: 10, wantErr: true},
-		{name: "id が 0 のトークンは拒否", token: ptr(token(0)), size: 10, wantErr: true},
-		{name: "id が負のトークンは拒否", token: ptr(token(-1)), size: 10, wantErr: true},
+		{name: "id が 0 のトークンは拒否", token: ptr(token(t, 0)), size: 10, wantErr: true},
+		{name: "id が負のトークンは拒否", token: ptr(token(t, -1)), size: 10, wantErr: true},
 		{
 			name: "版が違うトークンは拒否",
 			// 将来 cursorVersion を上げたとき、古いトークンが素通りしないこと。
-			token: ptr(Cursor{Version: cursorVersion + 1, ID: 100}.Encode()), size: 10, wantErr: true,
+			token: ptr(mustEncode(t, Cursor{Version: cursorVersion + 1, ID: 100})), size: 10, wantErr: true,
 		},
 		{
 			name:  "長すぎるトークンは復号する前に拒否",
@@ -88,7 +98,7 @@ func TestCursorRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	for _, id := range []int64{1, 42, 1 << 62} {
-		c, err := DecodeCursor(NewCursor(id).Encode())
+		c, err := DecodeCursor(token(t, id))
 		if err != nil {
 			t.Fatalf("id=%d: 復号に失敗した: %v", id, err)
 		}
@@ -103,7 +113,7 @@ func TestCursorRoundTrip(t *testing.T) {
 func TestEncodeIsNotPlainID(t *testing.T) {
 	t.Parallel()
 
-	got := NewCursor(42).Encode()
+	got := token(t, 42)
 	if got == "42" {
 		t.Fatalf("カーソルが id を素のまま公開している: %q", got)
 	}
@@ -131,7 +141,10 @@ func TestNextToken(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := NextToken(tt.lastID, tt.returned, tt.size)
+			got, err := NextToken(tt.lastID, tt.returned, tt.size)
+			if err != nil {
+				t.Fatalf("NextToken が失敗した: %v", err)
+			}
 
 			if tt.wantNil {
 				if got != nil {

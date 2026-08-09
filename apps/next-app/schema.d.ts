@@ -253,12 +253,12 @@ export interface components {
         /**
          * @description 次ページの取得位置を表す不透明トークン。
          *     直前のレスポンスの `nextCursor` をそのまま渡します。
-         *     省略すると先頭ページになります。
+         *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
          *
          *     中身はサーバ側の実装詳細なので、
          *     **クライアントは解釈も生成も改変もしないでください。**
          *     並び順を追加してもこの型は変わりません
-         *     (docs/adr/0006-view-count-and-popularity.md)。
+         *     (docs/adr/0018-opaque-cursor.md)。
          */
         Cursor: string;
         /**
@@ -328,12 +328,12 @@ export interface operations {
                 /**
                  * @description 次ページの取得位置を表す不透明トークン。
                  *     直前のレスポンスの `nextCursor` をそのまま渡します。
-                 *     省略すると先頭ページになります。
+                 *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
                  *
                  *     中身はサーバ側の実装詳細なので、
                  *     **クライアントは解釈も生成も改変もしないでください。**
                  *     並び順を追加してもこの型は変わりません
-                 *     (docs/adr/0006-view-count-and-popularity.md)。
+                 *     (docs/adr/0018-opaque-cursor.md)。
                  */
                 cursor?: components["parameters"]["Cursor"];
                 /**
@@ -419,12 +419,12 @@ export interface operations {
                 /**
                  * @description 次ページの取得位置を表す不透明トークン。
                  *     直前のレスポンスの `nextCursor` をそのまま渡します。
-                 *     省略すると先頭ページになります。
+                 *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
                  *
                  *     中身はサーバ側の実装詳細なので、
                  *     **クライアントは解釈も生成も改変もしないでください。**
                  *     並び順を追加してもこの型は変わりません
-                 *     (docs/adr/0006-view-count-and-popularity.md)。
+                 *     (docs/adr/0018-opaque-cursor.md)。
                  */
                 cursor?: components["parameters"]["Cursor"];
                 /**

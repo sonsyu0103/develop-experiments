@@ -23,7 +23,7 @@ type ThreadDTO struct {
 //
 // カーソルは不透明トークン (文字列) です。id をそのまま返さないのは、
 // 並び順を追加したときにカーソルの中身が変わっても
-// API の契約を壊さないためです (ADR 0006)。
+// API の契約を壊さないためです (形式は ADR 0018)。
 type ThreadListResult struct {
 	Threads    []ThreadDTO `json:"threads"`
 	NextCursor *string     `json:"nextCursor"`
@@ -54,7 +54,7 @@ func (i *ThreadInteractor) FetchThreadList(ctx context.Context, page pagination.
 	if err != nil {
 		return ThreadListResult{}, err
 	}
-	return buildListResult(summaries, page.Size), nil
+	return buildListResult(summaries, page.Size)
 }
 
 // FetchThread は 1 件のスレッドをコメント数つきで取得します。
@@ -93,7 +93,7 @@ func toDTO(s model.Summary) ThreadDTO {
 
 // buildListResult は取得結果を DTO に詰め替え、次ページ用のカーソルを決めます。
 // 次ページの有無の判定は pagination.NextToken にまとめてあります。
-func buildListResult(summaries []model.Summary, size int32) ThreadListResult {
+func buildListResult(summaries []model.Summary, size int32) (ThreadListResult, error) {
 	dtos := make([]ThreadDTO, 0, len(summaries))
 	for _, s := range summaries {
 		dtos = append(dtos, toDTO(s))
@@ -104,8 +104,10 @@ func buildListResult(summaries []model.Summary, size int32) ThreadListResult {
 		lastID = dtos[len(dtos)-1].ID
 	}
 
-	return ThreadListResult{
-		Threads:    dtos,
-		NextCursor: pagination.NextToken(lastID, len(dtos), size),
+	next, err := pagination.NextToken(lastID, len(dtos), size)
+	if err != nil {
+		return ThreadListResult{}, err
 	}
+
+	return ThreadListResult{Threads: dtos, NextCursor: next}, nil
 }

@@ -22,7 +22,7 @@ type CommentDTO struct {
 }
 
 // CommentListResult はコメント一覧と、次ページ取得用のカーソルです。
-// カーソルは不透明トークン (文字列) です。理由は ADR 0006 を参照してください。
+// カーソルは不透明トークン (文字列) です。形式は ADR 0018 を参照してください。
 type CommentListResult struct {
 	Comments   []CommentDTO `json:"comments"`
 	NextCursor *string      `json:"nextCursor"`
@@ -81,10 +81,12 @@ func (i *CommentInteractor) FetchComments(
 		lastID = dtos[len(dtos)-1].ID
 	}
 
-	return CommentListResult{
-		Comments:   dtos,
-		NextCursor: pagination.NextToken(lastID, len(dtos), page.Size),
-	}, nil
+	next, err := pagination.NextToken(lastID, len(dtos), page.Size)
+	if err != nil {
+		return CommentListResult{}, err
+	}
+
+	return CommentListResult{Comments: dtos, NextCursor: next}, nil
 }
 
 // PostComment はコメントを投稿します。

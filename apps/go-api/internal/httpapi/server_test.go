@@ -381,9 +381,35 @@ func TestListThreads_MalformedCursorIsBadRequest(t *testing.T) {
 func TestListThreads_ValidCursorIsAccepted(t *testing.T) {
 	env := newTestEnv(t)
 
-	rec := env.do(t, http.MethodGet, "/threads?cursor="+pagination.NewCursor(2).Encode(), "")
+	token, err := pagination.NewCursor(2).Encode()
+	if err != nil {
+		t.Fatalf("カーソルの符号化が失敗した: %v", err)
+	}
+
+	rec := env.do(t, http.MethodGet, "/threads?cursor="+token, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// 空の cursor は「省略」と同じく先頭ページになる。
+//
+// 仕様書の pattern が空文字を弾く形になっていると、クライアントが素直に
+// 「トークンが無ければ空文字」として ?cursor= を組み立てたときに、
+// 初回ロードだけが 400 になる。
+// pagination 側は空文字を先頭ページとして扱うので、
+// 仕様書とハンドラのどちらか片方だけを直すとここがずれる。
+func TestListThreads_EmptyCursorIsFirstPage(t *testing.T) {
+	env := newTestEnv(t)
+
+	rec := env.do(t, http.MethodGet, "/threads?cursor=", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	got := decodeJSON[oapigen.ThreadList](t, rec)
+	if len(got.Threads) != 2 {
+		t.Errorf("件数 = %d, want 2 (先頭ページと同じ結果)", len(got.Threads))
 	}
 }
 

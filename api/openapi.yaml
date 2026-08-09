@@ -231,17 +231,19 @@ components:
       description: |
         次ページの取得位置を表す不透明トークン。
         直前のレスポンスの `nextCursor` をそのまま渡します。
-        省略すると先頭ページになります。
+        省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
 
         中身はサーバ側の実装詳細なので、
         **クライアントは解釈も生成も改変もしないでください。**
         並び順を追加してもこの型は変わりません
-        (docs/adr/0006-view-count-and-popularity.md)。
+        (docs/adr/0018-opaque-cursor.md)。
       schema:
         type: string
         # base64url (パディングなし) なので、この文字集合に収まる。
+        # 空文字を許すのは、クライアントが ?cursor=${nextCursor ?? ''} と
+        # 組み立てたときに初回ロードだけ 400 になるのを避けるため。
         # 長さの上限がないと、巨大な文字列を復号させられる。
-        pattern: '^[A-Za-z0-9_-]+$'
+        pattern: '^[A-Za-z0-9_-]*$'
         maxLength: 256
         example: eyJ2IjoxLCJpZCI6NDJ9
 
