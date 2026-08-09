@@ -37,7 +37,27 @@ CREATE TABLE users (
     -- Google のプロフィール画像 URL。初期値であり、後から差し替えうる。
     avatar_url   TEXT,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- 退会。行は消さない (ADR 0005: アカウント削除は投稿の匿名化であり、
+    -- users を DELETE すると外部キーで失敗する)。
+    --
+    -- この列が無いと、退会したのと同じ Google アカウントで再ログインしたときに
+    -- upsert が同じ行に当たり、email / display_name が入り直して
+    -- 同一の users.id が復活する。スキーマ側に判定の手掛かりを持たせる。
+    --
+    -- 【未決】再ログインを「拒否する」のか「復帰させる」のかは Phase 5 で決める。
+    -- google_sub の UNIQUE は全体に効いたままなので、
+    -- 「別人として作り直す」だけはこのスキーマでは選べない
+    -- (選ぶなら UNIQUE を部分索引に変える必要がある)。
+    deleted_at   TIMESTAMPTZ,
+
+    -- 匿名投稿の author_name は 1〜50 文字に制限されている (000001)。
+    -- ログイン済みの表示名だけ無制限だと、一覧の表示が非対称になる。
+    --
+    -- 上限を 50 に揃えないのは、この値が Google から来る外部入力であるため。
+    -- 揃えると、長い表示名の利用者がログインできなくなる (INSERT が落ちる)。
+    -- アプリ側で切り詰めたうえで、DB は暴走を止める上限として 100 を持つ。
+    CONSTRAINT users_display_name_length CHECK (char_length(display_name) BETWEEN 1 AND 100)
 );
 
 -- email には索引を張らない。照合に使わないため。
@@ -86,24 +106,34 @@ CREATE INDEX sessions_expires_at_idx ON sessions (expires_at);
 ALTER TABLE threads  ADD COLUMN author_id BIGINT REFERENCES users (id);
 ALTER TABLE comments ADD COLUMN author_id BIGINT REFERENCES users (id);
 
--- マイページ (自分の投稿一覧) 用。既存の索引と同じく deleted_at で絞る。
+-- 絞り込みを deleted_at ではなく author_id IS NOT NULL にしている。
+-- 既存の索引 (threads_alive_id_desc_idx など) とは流儀が違うので理由を残す。
 --
--- 【注意】この部分インデックスは外部キーの整合性確認には使われない。
--- 確認は WHERE author_id = $1 の形で走り、論理削除済みの行も対象になるため、
--- deleted_at IS NULL で絞った索引からは条件を導けない。
--- それを承知でこの形にしている ——
--- ADR 0005 が「アカウント削除は匿名化であり users の行は消さない」と
--- 決めているため、users からの DELETE は運用上発生しない。
--- 詳細は docs/adr/0016-schema-and-indexes.md の
--- 「部分インデックスは外部キーの走査には使えない」を参照。
-CREATE INDEX threads_alive_author_id_desc_idx
+-- 1. B-tree は NULL を格納する。ログイン必須ではない設計 (ADR 0005 決定 2) では
+--    author_id IS NULL の匿名投稿が多数派になるため、deleted_at で絞っただけでは
+--    生存行のほぼ全件が索引に載る。
+--    実測 (コメント 50,000 件・匿名 90%、8 パーティション合計。
+--    どちらも空の索引を作ってから行を入れた、実際の経路と同じ条件):
+--        WHERE deleted_at IS NULL     2856 kB
+--        WHERE author_id IS NOT NULL   352 kB   (約 1/8)
+--
+-- 2. author_id = $1 は strict な演算子なので author_id IS NOT NULL が導ける。
+--    そのため外部キーの整合性確認と、アカウント削除時の匿名化
+--    (UPDATE ... SET author_id = NULL WHERE author_id = $1) にも使える。
+--    deleted_at で絞ると、論理削除済みの行が索引から漏れるためどちらにも使えない。
+--    実測: deleted_at 版だけを置いて enable_seqscan = off にしても、
+--    8 パーティションすべてが Seq Scan になる (索引が候補にすら入らない)。
+--
+-- マイページ (自分の投稿一覧) では deleted_at IS NULL が Filter に回るが、
+-- 対象は 1 ユーザーの投稿だけなので影響は小さい。
+CREATE INDEX threads_author_id_desc_idx
     ON threads (author_id, id DESC)
-    WHERE deleted_at IS NULL;
+    WHERE author_id IS NOT NULL;
 
 -- comments 側は partition pruning が効かない。
 -- author_id には thread_id が含まれないため、8 パーティションすべてを走る。
 -- 各パーティションでの索引スキャンなので致命的ではないが、
 -- スレッド内のコメント一覧とはコストが桁で違う。Phase 4 の測定対象。
-CREATE INDEX comments_alive_author_id_desc_idx
+CREATE INDEX comments_author_id_desc_idx
     ON comments (author_id, id DESC)
-    WHERE deleted_at IS NULL;
+    WHERE author_id IS NOT NULL;

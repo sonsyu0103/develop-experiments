@@ -223,6 +223,11 @@ CREATE TABLE users (
 );
 ```
 
+> **実装時に 2 列を足した** ([ADR 0016](0016-schema-and-indexes.md) を参照)。
+> `deleted_at TIMESTAMPTZ` (退会の表現。無いと再ログインで同じ `users.id` が復活する) と、
+> `display_name` の長さ CHECK (匿名の `author_name` は 1〜50 文字なのに
+> ログイン済みだけ無制限だった)。
+
 **内部 ID (`id`) は API に出さない。** 外部キーとしてのみ使う。
 API とフロントが扱うのは `public_id` だけになる。
 
