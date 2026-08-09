@@ -122,9 +122,13 @@ status, page1, _ = call("GET", "/threads?size=2")
 if status == 200:
     ids1 = [t["id"] for t in page1["threads"]]
     check("1 ページ目が [5, 4]", ids1 == [5, 4], f"ids={ids1}")
-    check("nextCursor が 4", page1["nextCursor"] == 4, f"got={page1['nextCursor']}")
+    # カーソルは不透明トークン。中身 (id=4) を素で返していないことも見る。
+    token = page1["nextCursor"]
+    check("nextCursor が文字列トークン", isinstance(token, str), f"got={token!r}")
+    check("nextCursor が id を素で公開していない", token != "4" and token != 4,
+          f"got={token!r}")
 
-    status, page2, _ = call("GET", f"/threads?size=2&cursor={page1['nextCursor']}")
+    status, page2, _ = call("GET", f"/threads?size=2&cursor={token}")
     ids2 = [t["id"] for t in page2["threads"]]
     check("2 ページ目が [3, 2]", ids2 == [3, 2], f"ids={ids2}")
     check("ページ間で重複しない", not set(ids1) & set(ids2))
@@ -154,8 +158,11 @@ for label, method, path, body in [
     ("threadId が非数値", "GET", "/threads/abc", None),
     ("size が上限超過", "GET", "/threads?size=101", None),
     ("size が 0", "GET", "/threads?size=0", None),
-    ("cursor が 0", "GET", "/threads?cursor=0", None),
-    ("cursor が非数値", "GET", "/threads?cursor=xyz", None),
+    # 前 2 つは仕様書 (pattern / maxLength) が、
+    # 最後の 1 つはハンドラ側の復号が弾く。
+    ("cursor に使えない文字", "GET", "/threads?cursor=abc.def", None),
+    ("cursor が長すぎる", "GET", "/threads?cursor=" + "A" * 257, None),
+    ("cursor が復号できない", "GET", "/threads?cursor=notAToken", None),
     ("title が空", "POST", "/threads", '{"title":""}'),
     ("title 未指定", "POST", "/threads", "{}"),
     ("title が型違い", "POST", "/threads", '{"title":123}'),

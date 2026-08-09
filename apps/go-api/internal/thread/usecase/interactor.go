@@ -20,9 +20,13 @@ type ThreadDTO struct {
 
 // ThreadListResult はスレッド一覧と、次ページ取得用のカーソルです。
 // NextCursor が nil の場合は、それ以上ページがないことを意味します。
+//
+// カーソルは不透明トークン (文字列) です。id をそのまま返さないのは、
+// 並び順を追加したときにカーソルの中身が変わっても
+// API の契約を壊さないためです (ADR 0006)。
 type ThreadListResult struct {
 	Threads    []ThreadDTO `json:"threads"`
-	NextCursor *int64      `json:"nextCursor"`
+	NextCursor *string     `json:"nextCursor"`
 }
 
 // ThreadInteractor は「スレッドを取得・作成する」ユースケースを担当します。
@@ -88,22 +92,20 @@ func toDTO(s model.Summary) ThreadDTO {
 }
 
 // buildListResult は取得結果を DTO に詰め替え、次ページ用のカーソルを決めます。
-//
-// 「size 件ちょうど返ってきたら次ページがあるかもしれない」という判断なので、
-// 最終ページがちょうど size 件だった場合、次ページが空になることがあります。
-// 厳密にするには size+1 件取得して 1 件捨てる必要がありますが、
-// 空ページを 1 回引く程度のコストなので、ここでは単純さを優先しています。
+// 次ページの有無の判定は pagination.NextToken にまとめてあります。
 func buildListResult(summaries []model.Summary, size int32) ThreadListResult {
 	dtos := make([]ThreadDTO, 0, len(summaries))
 	for _, s := range summaries {
 		dtos = append(dtos, toDTO(s))
 	}
 
-	var next *int64
-	if len(dtos) > 0 && len(dtos) == int(size) {
-		last := dtos[len(dtos)-1].ID
-		next = &last
+	var lastID int64
+	if len(dtos) > 0 {
+		lastID = dtos[len(dtos)-1].ID
 	}
 
-	return ThreadListResult{Threads: dtos, NextCursor: next}
+	return ThreadListResult{
+		Threads:    dtos,
+		NextCursor: pagination.NextToken(lastID, len(dtos), size),
+	}
 }

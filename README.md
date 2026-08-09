@@ -113,6 +113,9 @@ CI の `generated-ci` ジョブが再生成して差分を検査するため、
 | POST | `/threads/{threadId}/comments` | コメント投稿 |
 
 一覧系はキーセットページネーション (`?cursor=&size=`、既定 20 件 / 上限 100 件)。
+`cursor` は不透明トークンで、レスポンスの `nextCursor` をそのまま渡す。
+中身は実装詳細なので、クライアントは解釈も生成もしない
+([ADR 0018](docs/adr/0018-opaque-cursor.md))。
 完全な仕様は [`api/openapi.yaml`](api/openapi.yaml) を参照。
 このファイルが唯一の正であり、Go と TypeScript の型はここから生成される。
 
@@ -198,6 +201,11 @@ DB 側の負荷も N 倍になる。
 
 `id` は単調増加なので `WHERE id < cursor` で索引だけを辿れる。
 
+ただし API に出るのは `id` ではなく不透明トークンである。
+人気順を足すと境界が `(view_count, id)` の複合キーになるため、
+`id` をそのまま公開したままだと並び順を増やすたびに API が壊れる
+([ADR 0018](docs/adr/0018-opaque-cursor.md))。
+
 ### パーティショニングは「必要だから」入れたのではない
 
 `comments` は `thread_id` による HASH パーティション (8 分割) だが、
@@ -278,11 +286,10 @@ EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM comments WHERE thread_id = 1;
 
 **Phase 番号は識別子であって着手順ではない。** 手戻りが少ない順に進める。
 
-0. **カーソルを不透明トークンに変える** —— 既存 API の破壊的変更なので最初に済ませる。
+0. ~~**カーソルを不透明トークンに変える**~~ —— **完了**。
    人気順はカーソルが `(view_count, id)` の複合キーになり、
-   現在の `*int64` では表せない
-   ([ADR 0006](docs/adr/0006-view-count-and-popularity.md))。
-   **後回しにするほど、直すクライアントのコードが増える**
+   `*int64` では表せないため、公開前に済ませた
+   ([ADR 0018](docs/adr/0018-opaque-cursor.md))
 1. **Phase 5 (認証) + Phase 9 の前半 + Phase 10 の前半** —— `author_id` と
    `users.role` がスキーマに入るため先に置く。
    Phase 2 を先にやると、トランザクションとリトライを組んだ後にカラムが増え、
@@ -354,6 +361,7 @@ api/openapi.yaml を書く
 | [ADR 0015](docs/adr/0015-idempotency.md) | 冪等性 —— クライアント側のリトライを扱う |
 | [ADR 0016](docs/adr/0016-schema-and-indexes.md) | スキーマの集約とインデックス設計 |
 | [ADR 0017](docs/adr/0017-arch-lint-and-depguard.md) | モジュール境界の検査を go-arch-lint に移し、depguard を外す |
+| [ADR 0018](docs/adr/0018-opaque-cursor.md) | カーソルを不透明トークン (base64url + JSON) にする |
 | [インフラ構成](docs/infrastructure.md) | AWS 理想構成 (実際にはデプロイしない) |
 
 未決事項は [ADR 0003](docs/adr/0003-open-questions.md) に一覧化している。

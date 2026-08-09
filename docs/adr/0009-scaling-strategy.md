@@ -207,7 +207,7 @@ RDS Proxy、リードレプリカ、Redis、CloudFront、オートスケーリ�
 | 項目 | 状態 |
 | --- | --- |
 | 読み書きの経路分離 | **決定 1 で今やる** |
-| カーソルの表現 | 不透明トークンに変更済み ([ADR 0006](0006-view-count-and-popularity.md))。公開前なので今が最後の機会 |
+| カーソルの表現 | **対応済み** ([ADR 0018](0018-opaque-cursor.md))。公開前に不透明トークンへ変更した |
 | セッションストアの抽象化 | [ADR 0005](0005-authentication.md) で対処済み |
 | ID の型 (`BIGINT` 連番) | **未決** ([ADR 0003](0003-open-questions.md) #11) |
 | `comments` のパーティション数 (8) | **未決** ([ADR 0003](0003-open-questions.md) #12) |

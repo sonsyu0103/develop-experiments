@@ -46,7 +46,7 @@ var (
 func (f *fakeRepo) summaries(page pagination.Page) []model.Summary {
 	out := make([]model.Summary, 0, len(f.threads))
 	for _, t := range f.threads {
-		if page.Cursor != nil && t.ID >= *page.Cursor {
+		if cursorID := page.CursorID(); cursorID != nil && t.ID >= *cursorID {
 			continue
 		}
 		out = append(out, model.Summary{Thread: t, CommentCount: f.counts[t.ID]})
@@ -96,7 +96,7 @@ func (f *fakeRepo) ListThreadsOnly(_ context.Context, page pagination.Page) ([]m
 	}
 	out := make([]model.Thread, 0, len(f.threads))
 	for _, t := range f.threads {
-		if page.Cursor != nil && t.ID >= *page.Cursor {
+		if cursorID := page.CursorID(); cursorID != nil && t.ID >= *cursorID {
 			continue
 		}
 		out = append(out, t)
