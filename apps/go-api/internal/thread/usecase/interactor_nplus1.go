@@ -85,5 +85,5 @@ func (i *NPlusOneInteractor) FetchThreadListNPlusOne(
 		return ThreadListResult{}, err
 	}
 
-	return buildListResult(summaries, page.Size), nil
+	return buildListResult(summaries, page.Size)
 }

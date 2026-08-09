@@ -11,13 +11,41 @@ import (
 	"develop-experiments/apps/go-api/internal/thread/domain/model"
 )
 
-func mustPage(t *testing.T, cursor *int64, size int32) pagination.Page {
+// mustPage は「この id より小さい行を size 件」というページ指定を組み立てます。
+// カーソルは API 上は不透明トークンなので、テストからも id を直接は渡せません。
+func mustPage(t *testing.T, cursorID *int64, size int32) pagination.Page {
 	t.Helper()
-	p, err := pagination.NewPage(cursor, size)
+
+	var token *string
+	if cursorID != nil {
+		s, err := pagination.NewCursor(*cursorID).Encode()
+		if err != nil {
+			t.Fatalf("カーソルの符号化が失敗した: %v", err)
+		}
+		token = &s
+	}
+
+	p, err := pagination.NewPage(token, size)
 	if err != nil {
 		t.Fatalf("pagination.NewPage が失敗した: %v", err)
 	}
 	return p
+}
+
+// wantNextCursor は次ページ用トークンが指す id を検査します。
+func wantNextCursor(t *testing.T, token *string, wantID int64) {
+	t.Helper()
+
+	if token == nil {
+		t.Fatalf("NextCursor = nil, want id=%d を指すトークン", wantID)
+	}
+	c, err := pagination.DecodeCursor(*token)
+	if err != nil {
+		t.Fatalf("NextCursor が復号できない (%q): %v", *token, err)
+	}
+	if c.ID != wantID {
+		t.Errorf("NextCursor が指す ID = %d, want %d", c.ID, wantID)
+	}
 }
 
 func TestThreadInteractor_FetchThreadList(t *testing.T) {
@@ -43,9 +71,7 @@ func TestThreadInteractor_FetchThreadList(t *testing.T) {
 		t.Errorf("CommentCount = %d, want 15", got.Threads[0].CommentCount)
 	}
 	// size ちょうど返ったので、次ページのカーソルが立つ。
-	if got.NextCursor == nil || *got.NextCursor != 3 {
-		t.Errorf("NextCursor = %v, want 3", got.NextCursor)
-	}
+	wantNextCursor(t, got.NextCursor, 3)
 
 	// 集計に N+1 を使っていないことの確認。
 	// 本命の経路では CountComments が一度も呼ばれてはいけない。

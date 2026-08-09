@@ -26,6 +26,9 @@ info:
     OFFSET を使わないのは、深いページほど線形に遅くなることと、
     ページ送り中の挿入で行の重複・取りこぼしが起きるためです。
 
+    カーソルは不透明トークンです。中身は実装詳細なので、
+    クライアントは `nextCursor` をそのまま `cursor` に渡してください。
+
 servers:
   - url: http://localhost:8080
     description: ローカル開発環境
@@ -225,11 +228,24 @@ components:
       name: cursor
       in: query
       required: false
-      description: この ID より小さい行を取得します。省略すると先頭ページ。
+      description: |
+        次ページの取得位置を表す不透明トークン。
+        直前のレスポンスの `nextCursor` をそのまま渡します。
+        省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
+
+        中身はサーバ側の実装詳細なので、
+        **クライアントは解釈も生成も改変もしないでください。**
+        並び順を追加してもこの型は変わりません
+        (docs/adr/0018-opaque-cursor.md)。
       schema:
-        type: integer
-        format: int64
-        minimum: 1
+        type: string
+        # base64url (パディングなし) なので、この文字集合に収まる。
+        # 空文字を許すのは、クライアントが ?cursor=${nextCursor ?? ''} と
+        # 組み立てたときに初回ロードだけ 400 になるのを避けるため。
+        # 長さの上限がないと、巨大な文字列を復号させられる。
+        pattern: '^[A-Za-z0-9_-]*$'
+        maxLength: 256
+        example: eyJ2IjoxLCJpZCI6NDJ9
 
     Size:
       name: size
@@ -347,11 +363,12 @@ components:
           $ref: '#/components/schemas/NextCursor'
 
     NextCursor:
-      type: integer
-      format: int64
+      type: string
       nullable: true
-      description: 次ページ取得用のカーソル。これ以上ページがない場合は null。
-      example: 42
+      description: |
+        次ページ取得用の不透明トークン。これ以上ページがない場合は null。
+        `cursor` パラメータへそのまま渡してください。
+      example: eyJ2IjoxLCJpZCI6NDJ9
 
     CreateThreadRequest:
       type: object

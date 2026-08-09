@@ -30,7 +30,7 @@ func NewThreadRepository(pool *pgxpool.Pool) *ThreadRepository {
 // ListSummaries はスレッドとコメント数の組を新しい順に取得します。
 func (r *ThreadRepository) ListSummaries(ctx context.Context, page pagination.Page) ([]model.Summary, error) {
 	rows, err := r.q.ListThreadsWithCommentCount(ctx, sqlcgen.ListThreadsWithCommentCountParams{
-		CursorID: page.Cursor,
+		CursorID: page.CursorID(),
 		PageSize: page.Size,
 	})
 	if err != nil {
@@ -81,7 +81,7 @@ func (r *ThreadRepository) Exists(ctx context.Context, id int64) (bool, error) {
 // ListThreadsOnly はコメント数を含めずにスレッドだけを取得します (ベンチマーク用)。
 func (r *ThreadRepository) ListThreadsOnly(ctx context.Context, page pagination.Page) ([]model.Thread, error) {
 	rows, err := r.q.ListThreadIDs(ctx, sqlcgen.ListThreadIDsParams{
-		CursorID: page.Cursor,
+		CursorID: page.CursorID(),
 		PageSize: page.Size,
 	})
 	if err != nil {

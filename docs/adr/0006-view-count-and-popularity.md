@@ -185,6 +185,11 @@ CREATE INDEX threads_alive_popular_idx
 これは既存の新着順 API の互換性を壊す変更になる。
 まだ公開前なので、この段階で直しておく。
 
+> **実装済み (2026-08-09)。** トークンの形式・検証・失効の扱いは
+> [ADR 0018](0018-opaque-cursor.md) で確定させた。
+> `Page.Cursor` は `*pagination.Cursor` になり、
+> 人気順で `view_count` を足しても API の型は変わらない。
+
 ### 重複カウントは簡易な抑制に留める
 
 同一ユーザーの連打をすべて弾こうとすると、

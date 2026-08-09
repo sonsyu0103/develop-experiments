@@ -10,11 +10,14 @@ import (
 // toPage は仕様書から生成されたクエリパラメータを、
 // ドメイン層のページ指定へ変換します。
 //
-// 型の解析 (文字列 → int64 / int32) と、仕様書に書いた範囲制約
-// (minimum / maximum) の検証は、それぞれ生成コードと
+// 型の解析 (文字列 → int32) と、仕様書に書いた制約
+// (minimum / maximum / pattern / maxLength) の検証は、それぞれ生成コードと
 // 仕様検証ミドルウェアが済ませています。
 // ここでは「省略時の既定値」の適用と、最終的な整合性の確認だけを行います。
-func toPage(cursor *int64, size *int32) (pagination.Page, error) {
+//
+// cursor は不透明トークンなので、中身の復号と検証は pagination 側で行います。
+// HTTP 層はトークンの形式を知りません。
+func toPage(cursor *string, size *int32) (pagination.Page, error) {
 	var s int32
 	if size != nil {
 		s = *size

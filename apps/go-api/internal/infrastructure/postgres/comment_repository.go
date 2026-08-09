@@ -31,7 +31,7 @@ func (r *CommentRepository) ListByThreadID(
 ) ([]model.Comment, error) {
 	rows, err := r.q.ListCommentsByThreadID(ctx, sqlcgen.ListCommentsByThreadIDParams{
 		ThreadID: threadID,
-		CursorID: page.Cursor,
+		CursorID: page.CursorID(),
 		PageSize: page.Size,
 	})
 	if err != nil {

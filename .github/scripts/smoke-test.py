@@ -122,12 +122,46 @@ status, page1, _ = call("GET", "/threads?size=2")
 if status == 200:
     ids1 = [t["id"] for t in page1["threads"]]
     check("1 ページ目が [5, 4]", ids1 == [5, 4], f"ids={ids1}")
-    check("nextCursor が 4", page1["nextCursor"] == 4, f"got={page1['nextCursor']}")
+    # カーソルは不透明トークン。中身 (id=4) を素で返していないことも見る。
+    token = page1["nextCursor"]
+    check("nextCursor が文字列トークン", isinstance(token, str), f"got={token!r}")
+    check("nextCursor が id を素で公開していない", token != "4" and token != 4,
+          f"got={token!r}")
 
-    status, page2, _ = call("GET", f"/threads?size=2&cursor={page1['nextCursor']}")
+    status, page2, _ = call("GET", f"/threads?size=2&cursor={token}")
     ids2 = [t["id"] for t in page2["threads"]]
     check("2 ページ目が [3, 2]", ids2 == [3, 2], f"ids={ids2}")
     check("ページ間で重複しない", not set(ids1) & set(ids2))
+
+    # クライアントが ?cursor=${nextCursor ?? ''} と組み立てても
+    # 初回ロードが 400 にならないこと。
+    status, empty_cursor, _ = call("GET", "/threads?size=2&cursor=")
+    check("空の cursor は先頭ページと同じ",
+          status == 200 and [t["id"] for t in empty_cursor["threads"]] == ids1,
+          f"status={status}")
+
+# コメント側は経路が別 (別 usecase・別クエリ・パーティション越し) なので、
+# スレッド一覧が通っていてもここが通っている保証にはならない。
+status, all_comments, _ = call("GET", "/threads/2/comments")
+if status == 200:
+    total = len(all_comments["comments"])
+    check("スレッド 2 のコメントが 3 件以上ある (ページ送りの前提)", total >= 3, f"got={total}")
+
+    status, cpage1, _ = call("GET", "/threads/2/comments?size=2")
+    cids1 = [c["id"] for c in cpage1["comments"]]
+    check("コメント 1 ページ目が 2 件", len(cids1) == 2, f"ids={cids1}")
+    check("コメントも新しい順 (ID 降順)", cids1 == sorted(cids1, reverse=True), f"ids={cids1}")
+
+    ctoken = cpage1["nextCursor"]
+    check("コメントの nextCursor が不透明トークン",
+          isinstance(ctoken, str) and ctoken != str(cids1[-1]), f"got={ctoken!r}")
+
+    status, cpage2, _ = call("GET", f"/threads/2/comments?size=2&cursor={ctoken}")
+    cids2 = [c["id"] for c in cpage2["comments"]]
+    # カーソルが「最後に返した行」ではなく先頭を指していると、ここで重複が出る。
+    check("コメント 2 ページ目は 1 ページ目より小さい ID だけを返す",
+          cids2 and max(cids2) < min(cids1), f"1: {cids1}, 2: {cids2}")
+    check("コメントのページ間で重複しない", not set(cids1) & set(cids2))
 
 section("単体取得とコメント")
 check_status("GET /threads/1", "GET", "/threads/1", 200)
@@ -154,8 +188,11 @@ for label, method, path, body in [
     ("threadId が非数値", "GET", "/threads/abc", None),
     ("size が上限超過", "GET", "/threads?size=101", None),
     ("size が 0", "GET", "/threads?size=0", None),
-    ("cursor が 0", "GET", "/threads?cursor=0", None),
-    ("cursor が非数値", "GET", "/threads?cursor=xyz", None),
+    # 前 2 つは仕様書 (pattern / maxLength) が、
+    # 最後の 1 つはハンドラ側の復号が弾く。
+    ("cursor に使えない文字", "GET", "/threads?cursor=abc.def", None),
+    ("cursor が長すぎる", "GET", "/threads?cursor=" + "A" * 257, None),
+    ("cursor が復号できない", "GET", "/threads?cursor=notAToken", None),
     ("title が空", "POST", "/threads", '{"title":""}'),
     ("title 未指定", "POST", "/threads", "{}"),
     ("title が型違い", "POST", "/threads", '{"title":123}'),

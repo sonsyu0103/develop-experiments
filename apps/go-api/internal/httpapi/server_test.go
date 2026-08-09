@@ -320,8 +320,13 @@ func TestSpecValidation_RejectsInvalidRequests(t *testing.T) {
 		{"size が上限超過 (maximum: 100 違反)", http.MethodGet, "/threads?size=101", ""},
 		{"size が 0 (minimum: 1 違反)", http.MethodGet, "/threads?size=0", ""},
 		{"size が非数値", http.MethodGet, "/threads?size=abc", ""},
-		{"cursor が 0 (minimum: 1 違反)", http.MethodGet, "/threads?cursor=0", ""},
-		{"cursor が非数値", http.MethodGet, "/threads?cursor=xyz", ""},
+		// cursor は不透明トークン (base64url) なので、
+		// 仕様書で強制できるのは文字集合と長さまで。
+		// 「復号できるか」はミドルウェアではなくハンドラ側の判定になる
+		// (TestListThreads_MalformedCursorIsBadRequest)。
+		{"cursor に使えない文字 (pattern 違反)", http.MethodGet, "/threads?cursor=abc.def", ""},
+		{"cursor が長すぎる (maxLength: 256 違反)", http.MethodGet,
+			"/threads?cursor=" + strings.Repeat("A", 257), ""},
 
 		// リクエストボディ (requestBody の schema)
 		{"title が空 (minLength: 1 違反)", http.MethodPost, "/threads", `{"title":""}`},
@@ -350,6 +355,61 @@ func TestSpecValidation_RejectsInvalidRequests(t *testing.T) {
 				t.Errorf("code = %q, want INVALID_ARGUMENT", code)
 			}
 		})
+	}
+}
+
+// 文字集合と長さは満たすが復号できないカーソルは、400 になる。
+//
+// 仕様書に書けるのは「base64url の文字集合に収まっていること」までなので、
+// ここは検証ミドルウェアを通り抜けてハンドラに届く。
+// 素通りさせると、壊れたトークンが先頭ページ扱いになり、
+// クライアントは「ページ送りしたのに 1 ページ目が返る」無限ループに入る。
+func TestListThreads_MalformedCursorIsBadRequest(t *testing.T) {
+	env := newTestEnv(t)
+
+	rec := env.do(t, http.MethodGet, "/threads?cursor=notAToken", "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if code := decodeError(t, rec).Error.Code; code != oapigen.INVALIDARGUMENT {
+		t.Errorf("code = %q, want INVALID_ARGUMENT", code)
+	}
+}
+
+// 正しく発行したトークンは受け付ける。
+// 上の 400 系だけだと「常に弾いている」実装でもテストが通ってしまう。
+func TestListThreads_ValidCursorIsAccepted(t *testing.T) {
+	env := newTestEnv(t)
+
+	token, err := pagination.NewCursor(2).Encode()
+	if err != nil {
+		t.Fatalf("カーソルの符号化が失敗した: %v", err)
+	}
+
+	rec := env.do(t, http.MethodGet, "/threads?cursor="+token, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// 空の cursor は「省略」と同じく先頭ページになる。
+//
+// 仕様書の pattern が空文字を弾く形になっていると、クライアントが素直に
+// 「トークンが無ければ空文字」として ?cursor= を組み立てたときに、
+// 初回ロードだけが 400 になる。
+// pagination 側は空文字を先頭ページとして扱うので、
+// 仕様書とハンドラのどちらか片方だけを直すとここがずれる。
+func TestListThreads_EmptyCursorIsFirstPage(t *testing.T) {
+	env := newTestEnv(t)
+
+	rec := env.do(t, http.MethodGet, "/threads?cursor=", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	got := decodeJSON[oapigen.ThreadList](t, rec)
+	if len(got.Threads) != 2 {
+		t.Errorf("件数 = %d, want 2 (先頭ページと同じ結果)", len(got.Threads))
 	}
 }
 

@@ -181,11 +181,11 @@ export interface components {
             nextCursor: components["schemas"]["NextCursor"];
         };
         /**
-         * Format: int64
-         * @description 次ページ取得用のカーソル。これ以上ページがない場合は null。
-         * @example 42
+         * @description 次ページ取得用の不透明トークン。これ以上ページがない場合は null。
+         *     `cursor` パラメータへそのまま渡してください。
+         * @example eyJ2IjoxLCJpZCI6NDJ9
          */
-        NextCursor: number | null;
+        NextCursor: string | null;
         CreateThreadRequest: {
             /**
              * @description DB 側の CHECK 制約 threads_title_length と同じ上限です
@@ -250,8 +250,17 @@ export interface components {
     parameters: {
         /** @description スレッド ID */
         ThreadId: number;
-        /** @description この ID より小さい行を取得します。省略すると先頭ページ。 */
-        Cursor: number;
+        /**
+         * @description 次ページの取得位置を表す不透明トークン。
+         *     直前のレスポンスの `nextCursor` をそのまま渡します。
+         *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
+         *
+         *     中身はサーバ側の実装詳細なので、
+         *     **クライアントは解釈も生成も改変もしないでください。**
+         *     並び順を追加してもこの型は変わりません
+         *     (docs/adr/0018-opaque-cursor.md)。
+         */
+        Cursor: string;
         /**
          * @description 取得件数。省略時は 20。
          *     上限を設けないと、1 リクエストで全件走査させられてしまいます。
@@ -316,7 +325,16 @@ export interface operations {
     listThreads: {
         parameters: {
             query?: {
-                /** @description この ID より小さい行を取得します。省略すると先頭ページ。 */
+                /**
+                 * @description 次ページの取得位置を表す不透明トークン。
+                 *     直前のレスポンスの `nextCursor` をそのまま渡します。
+                 *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
+                 *
+                 *     中身はサーバ側の実装詳細なので、
+                 *     **クライアントは解釈も生成も改変もしないでください。**
+                 *     並び順を追加してもこの型は変わりません
+                 *     (docs/adr/0018-opaque-cursor.md)。
+                 */
                 cursor?: components["parameters"]["Cursor"];
                 /**
                  * @description 取得件数。省略時は 20。
@@ -398,7 +416,16 @@ export interface operations {
     listComments: {
         parameters: {
             query?: {
-                /** @description この ID より小さい行を取得します。省略すると先頭ページ。 */
+                /**
+                 * @description 次ページの取得位置を表す不透明トークン。
+                 *     直前のレスポンスの `nextCursor` をそのまま渡します。
+                 *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
+                 *
+                 *     中身はサーバ側の実装詳細なので、
+                 *     **クライアントは解釈も生成も改変もしないでください。**
+                 *     並び順を追加してもこの型は変わりません
+                 *     (docs/adr/0018-opaque-cursor.md)。
+                 */
                 cursor?: components["parameters"]["Cursor"];
                 /**
                  * @description 取得件数。省略時は 20。
