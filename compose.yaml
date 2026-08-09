@@ -57,6 +57,36 @@ services:
         condition: service_healthy
     restart: on-failure
 
+  # 開発用のシードデータを投入して終了する使い捨てコンテナ。
+  #
+  # profiles が付いているので、通常の docker compose up では起動しない。
+  # seed.sql は先頭で TRUNCATE するため、既定で走らせると
+  # 「起動しただけで手入力のデータが消える」ことになる。
+  #
+  #   docker compose --profile seed up -d   起動と同時に投入する
+  #   docker compose run --rm seed          起動済みの環境に投入し直す (make seed)
+  seed:
+    image: postgres:17-alpine
+    profiles:
+      - seed
+    volumes:
+      - ./apps/go-api/db/seed:/seed:ro
+    # ON_ERROR_STOP=1 が無いと、途中の失敗で psql が続行し、
+    # BEGIN/COMMIT の中なので COMMIT が ROLLBACK に化けたうえで
+    # 終了コード 0 を返す。「成功したのに空のまま」を防ぐ。
+    command:
+      - psql
+      - postgres://app:password@postgres:5432/bbs
+      - -v
+      - ON_ERROR_STOP=1
+      - -f
+      - /seed/seed.sql
+    depends_on:
+      # テーブルが出来る前に流しても失敗する。
+      # postgres の healthy 待ちは migrate 側が済ませている。
+      migrate:
+        condition: service_completed_successfully
+
   go-api:
     build:
       context: ./apps/go-api
