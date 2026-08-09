@@ -108,6 +108,12 @@ smoke: ## 実 DB に対して API を起動し、HTTP 越しに疎通を検証�
 	# ユニットテストはフェイクのリポジトリで動くため、
 	# 「SQL が意図どおり動くか」は検証できない。その穴を埋める。
 	@$(MAKE) --no-print-directory up
+	# up は「イメージが変わらなければコンテナを作り直さない」。
+	# dev の go-api はソースを volume マウントしていてイメージが変わらず、
+	# go run は起動時にしかコンパイルしないため、既に動いていると
+	# 古いバイナリのまま残る。生成物を作り直した直後や
+	# ブランチを切り替えた直後に、古いコードを検証してしまう。
+	docker compose restart go-api
 	@$(MAKE) --no-print-directory seed
 	@echo "API の起動を待っています..."
 	@for i in $$(seq 1 30); do \
