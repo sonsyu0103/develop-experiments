@@ -76,7 +76,10 @@ services:
     # 終了コード 0 を返す。「成功したのに空のまま」を防ぐ。
     command:
       - psql
-      - postgres://app:password@postgres:5432/bbs
+      # sslmode=disable は migrate / go-api と揃えている。
+      # 省くと libpq の既定 (prefer) になり、postgres 側で SSL を
+      # 有効にした日に、このサービスだけ挙動が分岐する。
+      - postgres://app:password@postgres:5432/bbs?sslmode=disable
       - -v
       - ON_ERROR_STOP=1
       - -f
