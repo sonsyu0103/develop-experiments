@@ -23,6 +23,11 @@ sql:
           # pgtype.Timestamptz をドメイン層に漏らさず time.Time で受ける
           - db_type: "timestamptz"
             go_type: "time.Time"
+          # 既定では pgtype.UUID になる。バイト配列 + Valid フラグの構造体で、
+          # 文字列化にも比較にも一手かかるため google/uuid.UUID で受ける。
+          # 生成は Go 側で行う (PostgreSQL 17 に uuidv7() が無い。ADR 0003 未決 #11)
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
           - db_type: "timestamptz"
             nullable: true
             go_type:
