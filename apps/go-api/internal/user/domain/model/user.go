@@ -37,6 +37,27 @@ type User struct {
 	DeletedAt   *time.Time
 }
 
+// Author は投稿一覧で投稿者を表示するための、最小限の情報です。
+//
+// GoogleSub も Email も持ちません。この値の行き先は
+// **他人にも見える投稿一覧**であり、余分な列を運ぶと、
+// 詰め替えを 1 つ間違えただけで読み手に渡ります
+// (docs/adr/0014-author-resolution.md)。
+type Author struct {
+	ID          int64
+	PublicID    uuid.UUID
+	DisplayName string
+	AvatarURL   *string
+	// DeletedAt は退会済みかの判定に使います。
+	// 投稿は匿名化されるまで残るため、表示側で扱いを変える必要があります。
+	DeletedAt *time.Time
+}
+
+// IsDeleted は退会済みかを返します。
+func (a *Author) IsDeleted() bool {
+	return a.DeletedAt != nil
+}
+
 // SessionOwner はセッション検証で必要になる範囲の利用者情報です。
 //
 // GoogleSub を含めていません。あれは IdP との照合にだけ使う値であり、

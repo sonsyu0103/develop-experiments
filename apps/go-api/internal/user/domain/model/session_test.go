@@ -12,7 +12,7 @@ func TestNewSession(t *testing.T) {
 
 	now := time.Unix(1_700_000_000, 0).UTC()
 
-	s, err := NewSession(42, now, time.Hour)
+	s, _, err := NewSession(42, now, time.Hour)
 	if err != nil {
 		t.Fatalf("NewSession が失敗した: %v", err)
 	}
@@ -30,7 +30,7 @@ func TestNewSession_DefaultTTL(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0).UTC()
 
 	for _, ttl := range []time.Duration{0, -time.Hour} {
-		s, err := NewSession(1, now, ttl)
+		s, _, err := NewSession(1, now, ttl)
 		if err != nil {
 			t.Fatalf("NewSession が失敗した: %v", err)
 		}
@@ -44,7 +44,7 @@ func TestNewSession_RejectsInvalidUserID(t *testing.T) {
 	t.Parallel()
 
 	for _, id := range []int64{0, -1} {
-		if _, err := NewSession(id, time.Now(), time.Hour); err == nil {
+		if _, _, err := NewSession(id, time.Now(), time.Hour); err == nil {
 			t.Errorf("user_id = %d が通ってしまった", id)
 		}
 	}
@@ -52,35 +52,77 @@ func TestNewSession_RejectsInvalidUserID(t *testing.T) {
 
 // セッション ID は「推測できないこと」がこのエンティティの性質そのものです。
 // 連番や固定値に退行すると、総当たりで他人になれます。
-func TestNewSession_IDIsRandomAndURLSafe(t *testing.T) {
+func TestNewSession_TokenIsRandomAndURLSafe(t *testing.T) {
 	t.Parallel()
 
 	now := time.Now()
 	seen := make(map[string]bool, 500)
 
 	for range 500 {
-		s, err := NewSession(1, now, time.Hour)
+		_, token, err := NewSession(1, now, time.Hour)
 		if err != nil {
 			t.Fatalf("NewSession が失敗した: %v", err)
 		}
 
-		if seen[s.ID] {
-			t.Fatalf("セッション ID が重複した: %s", s.ID)
+		if seen[string(token)] {
+			t.Fatalf("セッショントークンが重複した: %s", token)
 		}
-		seen[s.ID] = true
+		seen[string(token)] = true
 
 		// Cookie に載せるので URL 安全な文字だけ。
-		if strings.ContainsAny(s.ID, "=+/") {
-			t.Fatalf("URL 安全でない文字が含まれている: %q", s.ID)
+		if strings.ContainsAny(string(token), "=+/") {
+			t.Fatalf("URL 安全でない文字が含まれている: %q", token)
 		}
 
-		raw, err := base64.RawURLEncoding.DecodeString(s.ID)
+		raw, err := base64.RawURLEncoding.DecodeString(string(token))
 		if err != nil {
-			t.Fatalf("base64url として復号できない (%q): %v", s.ID, err)
+			t.Fatalf("base64url として復号できない (%q): %v", token, err)
 		}
-		if len(raw) != sessionIDBytes {
-			t.Fatalf("乱数が %d バイト, want %d", len(raw), sessionIDBytes)
+		if len(raw) != sessionTokenBytes {
+			t.Fatalf("乱数が %d バイト, want %d", len(raw), sessionTokenBytes)
 		}
+	}
+}
+
+// **保存する値と Cookie に入れる値が別であること。**
+//
+// ここが同じに戻ると、DB を読めるだけの穴 (無関係なクエリの SQL インジェクション、
+// バックアップの流出、調査用のダンプ) がそのまま全利用者へのなりすましになる。
+func TestNewSession_StoresHashNotToken(t *testing.T) {
+	t.Parallel()
+
+	s, token, err := NewSession(1, time.Now(), time.Hour)
+	if err != nil {
+		t.Fatalf("NewSession が失敗した: %v", err)
+	}
+
+	if s.ID == string(token) {
+		t.Fatal("保存される ID が生のトークンと同じになっている")
+	}
+	if s.ID != token.Hash() {
+		t.Errorf("ID = %q, want トークンのハッシュ %q", s.ID, token.Hash())
+	}
+	// SHA-256 の 16 進表現は 64 文字。
+	if len(s.ID) != 64 {
+		t.Errorf("ID の長さ = %d, want 64 (SHA-256 の hex)", len(s.ID))
+	}
+	// 生のトークンが ID に含まれていないこと (前方一致などの取り違え防止)。
+	if strings.Contains(s.ID, string(token)) {
+		t.Error("ID に生のトークンが含まれている")
+	}
+}
+
+func TestSessionToken_HashIsStable(t *testing.T) {
+	t.Parallel()
+
+	const token = SessionToken("abc")
+
+	first, second := token.Hash(), token.Hash()
+	if first != second {
+		t.Fatalf("同じトークンから違うハッシュが出た: %q と %q", first, second)
+	}
+	if other := SessionToken("abd").Hash(); other == first {
+		t.Fatal("違うトークンから同じハッシュが出た")
 	}
 }
 
@@ -88,7 +130,7 @@ func TestSession_IsExpired(t *testing.T) {
 	t.Parallel()
 
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s, err := NewSession(1, now, time.Hour)
+	s, _, err := NewSession(1, now, time.Hour)
 	if err != nil {
 		t.Fatalf("NewSession が失敗した: %v", err)
 	}

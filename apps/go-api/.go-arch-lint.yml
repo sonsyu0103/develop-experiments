@@ -105,8 +105,6 @@ deps:
       - comment-model
       - comment-repository
 
-  # HTTP 層は usecase の DTO だけを見る。
-  # domain を直接見ると内部表現がそのまま JSON に出る (ADR 0002 の前提が崩れる)
   # user モジュール。public_id (UUID v7) の採番をドメイン側で行うため uuid を許可する
   user-model:
     canUse:
@@ -117,6 +115,8 @@ deps:
     mayDependOn:
       - user-model
 
+  # HTTP 層は usecase の DTO だけを見る。
+  # domain を直接見ると内部表現がそのまま JSON に出る (ADR 0002 の前提が崩れる)
   httpapi:
     canUse:
       - gin

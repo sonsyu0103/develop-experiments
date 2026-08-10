@@ -69,6 +69,24 @@ type Querier interface {
 	// API から来る識別子は public_id だけ (ADR 0003 未決 #11 の決定)。
 	// 内部 ID を URL に出すとユーザーを列挙できるため。
 	GetUserByPublicID(ctx context.Context, publicID uuid.UUID) (User, error)
+	// 投稿者の一括解決。
+	//
+	// 一覧に載ったコメントの author_id を集めて 1 回で引く。
+	// コメント 1 件ごとに users を引くと N+1 になり、
+	// スレッド一覧のコメント数集計で避けたのと同じ問題が投稿者表示で再発する
+	// (db/query/threads.sql の冒頭コメントを参照)。
+	//
+	// 【表示に要る列だけを選ぶ】
+	// google_sub と email を返さない。この経路の行き先は「他人にも見える投稿一覧」であり、
+	// 全列を返すと、DTO の詰め替えを 1 つ間違えただけで
+	// 投稿者のメールアドレスが読み手に渡る。
+	// ADR 0014 の Author も PublicID / DisplayName / AvatarURL しか持たない。
+	//
+	// 退会済みも返す。投稿は匿名化されるまで残るため、
+	// 「退会済みなので表示を変える」の判断は呼び出し側が行う。
+	//
+	// 主キー索引で完結する (ADR 0016 の users の索引一覧)。
+	ListAuthorsByIDs(ctx context.Context, ids []int64) ([]ListAuthorsByIDsRow, error)
 	// thread_id を等値で指定しているため、HASH パーティションの pruning が効き、
 	// 8 分割中 1 パーティションだけを走査する。
 	//
@@ -121,15 +139,6 @@ type Querier interface {
 	// ページネーションは OFFSET ではなくキーセット (cursor) 方式。
 	// OFFSET は「読み飛ばす行を実際に読む」ため、深いページほど線形に遅くなる。
 	ListThreadsWithCommentCount(ctx context.Context, arg ListThreadsWithCommentCountParams) ([]ListThreadsWithCommentCountRow, error)
-	// 投稿者の一括解決。
-	//
-	// 一覧に載ったコメントの author_id を集めて 1 回で引く。
-	// コメント 1 件ごとに users を引くと N+1 になり、
-	// スレッド一覧のコメント数集計で避けたのと同じ問題が投稿者表示で再発する
-	// (db/query/threads.sql の冒頭コメントを参照)。
-	//
-	// 主キー索引で完結する (ADR 0016 の users の索引一覧)。
-	ListUsersByIDs(ctx context.Context, ids []int64) ([]User, error)
 	// スレッド行に行ロックを取る。Phase 2 の排他制御で、
 	// 「コメント投稿と同時にスレッドの集計列を更新する」ようなケースに使う。
 	//
