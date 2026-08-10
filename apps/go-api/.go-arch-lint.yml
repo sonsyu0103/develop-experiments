@@ -31,6 +31,8 @@ vendors:
       - github.com/oapi-codegen/**
   errgroup:
     in: golang.org/x/sync/**
+  uuid:
+    in: github.com/google/uuid
 
 components:
   main:
@@ -56,6 +58,11 @@ components:
     in: internal/comment/domain/repository
   comment-usecase:
     in: internal/comment/usecase
+
+  user-model:
+    in: internal/user/domain/model
+  user-repository:
+    in: internal/user/domain/repository
 
   httpapi:
     in: internal/httpapi
@@ -100,6 +107,16 @@ deps:
 
   # HTTP 層は usecase の DTO だけを見る。
   # domain を直接見ると内部表現がそのまま JSON に出る (ADR 0002 の前提が崩れる)
+  # user モジュール。public_id (UUID v7) の採番をドメイン側で行うため uuid を許可する
+  user-model:
+    canUse:
+      - uuid
+  user-repository:
+    canUse:
+      - uuid
+    mayDependOn:
+      - user-model
+
   httpapi:
     canUse:
       - gin
@@ -113,11 +130,14 @@ deps:
   postgres:
     canUse:
       - pgx
+      - uuid
     mayDependOn:
       - thread-model
       - thread-repository
       - comment-model
       - comment-repository
+      - user-model
+      - user-repository
       - postgres-sqlcgen
       - shared-config
 
@@ -129,3 +149,4 @@ deps:
   postgres-sqlcgen:
     canUse:
       - pgx
+      - uuid

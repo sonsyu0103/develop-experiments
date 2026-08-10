@@ -3,3 +3,28 @@
 //   sqlc v1.31.1
 
 package sqlcgen
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Session struct {
+	ID        string
+	UserID    int64
+	ExpiresAt time.Time
+	CreatedAt time.Time
+}
+
+type User struct {
+	ID          int64
+	PublicID    uuid.UUID
+	GoogleSub   string
+	Email       string
+	DisplayName string
+	AvatarUrl   *string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	DeletedAt   *time.Time
+}

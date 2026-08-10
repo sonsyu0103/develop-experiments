@@ -6,6 +6,8 @@ package sqlcgen
 
 import (
 	"context"
+
+	"github.com/google/uuid"
 )
 
 type Querier interface {
@@ -22,11 +24,51 @@ type Querier interface {
 	// INSERT ... SELECT ... WHERE EXISTS なら 1 文で完結し、競合しない。
 	// 挿入されなかった場合は 0 行が返るため、pgx.ErrNoRows として検出できる。
 	CreateComment(ctx context.Context, arg CreateCommentParams) (CreateCommentRow, error)
+	// セッション ID は Go 側で生成した暗号論的乱数を渡す。
+	// DB 側で採番しないのは、連番や推測可能な値になると
+	// 総当たりで他人のセッションを引けてしまうため。
+	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
 	// RETURNING により INSERT と採番値の取得が 1 往復で完結する。
 	// MySQL では LAST_INSERT_ID() を別クエリで叩く必要がある。
 	CreateThread(ctx context.Context, title string) (CreateThreadRow, error)
+	// 期限切れの削除。定期処理から呼ぶ (ADR 0003 未決 #9: どのプロセスで動かすかは未決)。
+	//
+	// 一度に消す件数を制限しているのは、放置後に大量の行がたまった場合でも
+	// 1 トランザクションを短く保つため。長時間のロックと WAL の急増を避ける。
+	// 呼び出し側は「0 行になるまで繰り返す」形で使う。
+	//
+	// sessions (expires_at) の索引で引く。
+	DeleteExpiredSessions(ctx context.Context, maxRows int32) (int64, error)
+	// ログアウト。0 行なら「既に無い」なので、呼び出し側で 404 にするかは任意。
+	DeleteSession(ctx context.Context, id string) (int64, error)
+	// 「全端末からログアウト」。パスワード変更に相当する操作や、
+	// 権限剥奪の直後に呼ぶ。sessions (user_id) の索引で引く。
+	DeleteSessionsByUserID(ctx context.Context, userID int64) (int64, error)
+	// セッションの検証。**毎リクエスト通る、最も高頻度の経路**になる。
+	//
+	// 【なぜ JOIN するか】
+	// セッションを引いてから users を引くと、認証つきリクエストのたびに
+	// DB へ 2 往復する。ここは 1 往復に畳む。
+	//
+	// comments 側で LEFT JOIN を避けた理由 (db/query/comments.sql) はここには当たらない。
+	// sessions.user_id は NOT NULL かつ外部キーなので INNER JOIN になり、
+	// 列が NULL になりうる状況が生じないため、sqlc の NULL 推論の問題は起きない。
+	//
+	// 【期限切れと退会をここで弾く】
+	// expires_at の判定を SQL 側に置く。アプリ側で比較すると、
+	// 判定を書き忘れた経路が「期限切れでも通る」穴になる。
+	// 退会済み (users.deleted_at) も同じ理由でここに含める。
+	//
+	// 期限切れの行は定期処理が消すが、消える前に引かれても通してはいけない。
+	// 掃除は容量のための処理であり、認可の判定に使うものではない。
+	GetLiveSessionWithUser(ctx context.Context, id string) (GetLiveSessionWithUserRow, error)
 	// 一覧と同じ理由で、JOIN + GROUP BY ではなく相関サブクエリで数える。
 	GetThreadWithCommentCount(ctx context.Context, id int64) (GetThreadWithCommentCountRow, error)
+	// 内部 ID での取得。外部キーからの解決に使う。
+	GetUserByID(ctx context.Context, id int64) (User, error)
+	// API から来る識別子は public_id だけ (ADR 0003 未決 #11 の決定)。
+	// 内部 ID を URL に出すとユーザーを列挙できるため。
+	GetUserByPublicID(ctx context.Context, publicID uuid.UUID) (User, error)
 	// thread_id を等値で指定しているため、HASH パーティションの pruning が効き、
 	// 8 分割中 1 パーティションだけを走査する。
 	//
@@ -79,6 +121,15 @@ type Querier interface {
 	// ページネーションは OFFSET ではなくキーセット (cursor) 方式。
 	// OFFSET は「読み飛ばす行を実際に読む」ため、深いページほど線形に遅くなる。
 	ListThreadsWithCommentCount(ctx context.Context, arg ListThreadsWithCommentCountParams) ([]ListThreadsWithCommentCountRow, error)
+	// 投稿者の一括解決。
+	//
+	// 一覧に載ったコメントの author_id を集めて 1 回で引く。
+	// コメント 1 件ごとに users を引くと N+1 になり、
+	// スレッド一覧のコメント数集計で避けたのと同じ問題が投稿者表示で再発する
+	// (db/query/threads.sql の冒頭コメントを参照)。
+	//
+	// 主キー索引で完結する (ADR 0016 の users の索引一覧)。
+	ListUsersByIDs(ctx context.Context, ids []int64) ([]User, error)
 	// スレッド行に行ロックを取る。Phase 2 の排他制御で、
 	// 「コメント投稿と同時にスレッドの集計列を更新する」ようなケースに使う。
 	//
@@ -90,6 +141,27 @@ type Querier interface {
 	// 削除 API を公開するかは未決 (docs/adr/0003-open-questions.md 項目 7)。
 	SoftDeleteComment(ctx context.Context, arg SoftDeleteCommentParams) (int64, error)
 	ThreadExists(ctx context.Context, id int64) (bool, error)
+	// ログイン時に呼ぶ。google_sub で照合し、無ければ作る。
+	//
+	// 【なぜ upsert か】
+	// 「SELECT して無ければ INSERT」だと、同じ利用者が同時に 2 回ログインしたときに
+	// 両方が「無い」と判定して INSERT が衝突する。1 文に閉じれば競合しない。
+	//
+	// 【public_id を更新しない】
+	// ON CONFLICT 側の SET に public_id を含めていない。
+	// 既存の利用者がログインし直すたびに公開 ID が変わると、
+	// 配布済みのマイページ URL が壊れる。採番は INSERT の 1 回きり。
+	//
+	// 【退会済みの行には当たらない】
+	// WHERE users.deleted_at IS NULL を付けているため、退会済みの行に
+	// 衝突した場合は DO UPDATE が実行されず、0 行が返る (pgx.ErrNoRows)。
+	//
+	// これが無いと、退会したのと同じ Google アカウントで再ログインしたときに
+	// email / display_name が入り直して同一の users.id が黙って復活する。
+	// 「復活させる」か「拒否する」かは未決なので、
+	// ここでは安全側 (呼び出し側に判断させる) に倒している。
+	// 決めたら ADR に記録すること (docs/adr/0005-authentication.md)。
+	UpsertUser(ctx context.Context, arg UpsertUserParams) (User, error)
 }
 
 var _ Querier = (*Queries)(nil)
