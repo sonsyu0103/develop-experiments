@@ -13,7 +13,24 @@ var (
 	// ErrInvalidArgument は入力値が不正であることを表します (HTTP 400)。
 	ErrInvalidArgument = errors.New("入力が不正です")
 
+	// ErrUnauthenticated は未ログイン、またはセッションが無効なことを表します
+	// (HTTP 401)。
+	//
+	// 「誰か分からない」状態であり、ログインすれば解決します。
+	// 「誰かは分かるが権限がない」(403) とは分けてください
+	// —— フロントは 401 でログイン画面へ遷移します
+	// (docs/adr/0013-http-defense.md)。
+	ErrUnauthenticated = errors.New("認証が必要です")
+
 	// ErrConflict は同時更新などで競合が起きたことを表します (HTTP 409)。
 	// SERIALIZABLE 分離レベルで直列化失敗が起きた場合などに使います。
 	ErrConflict = errors.New("競合が発生しました")
+
+	// ErrUnavailable は依存する外部要素の設定や疎通が無く、
+	// その経路だけが使えないことを表します (HTTP 503)。
+	//
+	// 認証プロバイダの設定が入っていない場合に使います。
+	// 設定が無くても API 自体は起動します —— 掲示板の閲覧と匿名投稿は
+	// 認証に依存しないため、全体を落とすほうが害が大きいからです。
+	ErrUnavailable = errors.New("この機能は現在利用できません")
 )

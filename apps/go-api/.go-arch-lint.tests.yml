@@ -28,6 +28,11 @@ vendors:
     in: golang.org/x/sync/**
   uuid:
     in: github.com/google/uuid
+  oidc:
+    in:
+      - github.com/coreos/go-oidc/**
+      - golang.org/x/oauth2
+      - golang.org/x/oauth2/**
 
 components:
   main:
@@ -58,6 +63,8 @@ components:
     in: internal/user/domain/model
   user-repository:
     in: internal/user/domain/repository
+  user-usecase:
+    in: internal/user/usecase
 
   httpapi:
     in: internal/httpapi
@@ -66,6 +73,8 @@ components:
 
   postgres:
     in: internal/infrastructure/postgres
+  oidc-provider:
+    in: internal/infrastructure/oidc
   postgres-sqlcgen:
     in: internal/infrastructure/postgres/sqlcgen
 
@@ -112,15 +121,36 @@ deps:
       - uuid
     mayDependOn:
       - user-model
+  # 認証のユースケース。OIDC プロバイダはインターフェースの背後に置くので、
+  # ここから go-oidc / oauth2 は見えない (テストでフェイクに差し替えるため)
+  user-usecase:
+    canUse:
+      - uuid
+    mayDependOn:
+      - user-model
+      - user-repository
+
+  # 外側のアダプタ。usecase が定義した Provider を実装する
+  oidc-provider:
+    canUse:
+      - oidc
+    mayDependOn:
+      - user-usecase
+      - shared-config
 
   httpapi:
     canUse:
       - gin
       - openapi
+      # 緩和: フェイクの user-repository を組むために必要 (本体用では許可しない)
+      - uuid
     mayDependOn:
       - thread-usecase
       - comment-usecase
+      - user-usecase
+      - user-model
       - httpapi-oapigen
+      - shared-config
       # 緩和: ハンドラのテストはフェイクのリポジトリを組むため
       # ドメインの型を必要とする。ここを縛るとテストのために本番コードが歪む。
       # 一方 postgres は許していない —— テストでも永続化層には触らせない
@@ -128,6 +158,10 @@ deps:
       - thread-repository
       - comment-model
       - comment-repository
+      # 認証のテストも同じ理由でフェイクを組む。
+      # user-repository のインターフェースを満たす必要があり、
+      # その署名に uuid.UUID が出てくるため vendors も要る。
+      - user-repository
 
   postgres:
     canUse:

@@ -4,6 +4,7 @@ import (
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
+	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
 )
 
 // ユースケース層の DTO を、仕様書から生成されたワイヤ型へ変換します。
@@ -30,6 +31,19 @@ func toWireThreadList(r threadusecase.ThreadListResult) oapigen.ThreadList {
 	return oapigen.ThreadList{
 		Threads:    threads,
 		NextCursor: r.NextCursor,
+	}
+}
+
+// toWireMe はログイン中の利用者をワイヤ型へ変換します。
+//
+// 内部 ID を含めないことは仕様書側でも保証されています
+// (Me スキーマに id が無いため、書こうとしてもコンパイルが通りません)。
+func toWireMe(d userusecase.MeDTO) oapigen.Me {
+	return oapigen.Me{
+		PublicId:    d.PublicID,
+		DisplayName: d.DisplayName,
+		Email:       d.Email,
+		AvatarUrl:   d.AvatarURL,
 	}
 }
 

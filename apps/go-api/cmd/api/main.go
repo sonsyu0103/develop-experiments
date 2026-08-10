@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,8 +17,10 @@ import (
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi"
+	oidcprovider "develop-experiments/apps/go-api/internal/infrastructure/oidc"
 	"develop-experiments/apps/go-api/internal/infrastructure/postgres"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
+	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
 )
 
 func main() {
@@ -53,10 +56,34 @@ func run() error {
 	// スレッドのリポジトリは、コメント側の親スレッド存在確認にも使い回す。
 	threadRepo := postgres.NewThreadRepository(pool)
 
+	// 認証は設定が揃っているときだけ有効にする。
+	//
+	// 揃っていなくても API は起動する。掲示板の閲覧と匿名投稿は認証に依存せず、
+	// 設定漏れで全体が落ちるほうが害が大きい (config.AuthConfig を参照)。
+	// 無効なときは認証エンドポイントだけが 503 を返す。
+	var authInteractor *userusecase.AuthInteractor
+	if cfg.Auth.Enabled() {
+		provider, providerErr := oidcprovider.NewGoogle(ctx, cfg.Auth)
+		if providerErr != nil {
+			return fmt.Errorf("OIDC プロバイダの初期化に失敗しました: %w", providerErr)
+		}
+		authInteractor = userusecase.NewAuthInteractor(
+			postgres.NewUserRepository(pool),
+			postgres.NewSessionRepository(pool),
+			provider,
+			nil,
+		)
+		slog.Info("認証を有効にしました")
+	} else {
+		slog.Warn("認証の設定が無いため、/auth と /me は 503 を返します")
+	}
+
 	server := httpapi.NewServer(
 		threadusecase.NewThreadInteractor(threadRepo),
 		commentusecase.NewCommentInteractor(postgres.NewCommentRepository(pool), threadRepo),
 		pool,
+		authInteractor,
+		cfg.Auth,
 	)
 
 	router, err := httpapi.NewRouter(httpapi.Deps{

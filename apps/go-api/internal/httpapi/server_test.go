@@ -18,6 +18,7 @@ import (
 	commentmodel "develop-experiments/apps/go-api/internal/comment/domain/model"
 	commentrepo "develop-experiments/apps/go-api/internal/comment/domain/repository"
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
+	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
 	"develop-experiments/apps/go-api/internal/pagination"
 	threadmodel "develop-experiments/apps/go-api/internal/thread/domain/model"
@@ -142,6 +143,8 @@ func newTestEnv(t *testing.T) *testEnv {
 			threadusecase.NewThreadInteractor(threads),
 			commentusecase.NewCommentInteractor(comments, threads),
 			pinger,
+			nil,
+			config.AuthConfig{},
 		),
 		AllowedOrigins: []string{"http://localhost:3000"},
 	})
