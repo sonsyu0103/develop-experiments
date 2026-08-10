@@ -103,6 +103,34 @@ generate: sqlc openapi ## 生成物をすべて作り直す
 test: ## Go のテストを実行する (race detector + カバレッジ)
 	cd $(GO_API_DIR) && go test -race -cover ./...
 
+# カバレッジの下限。下回ると cover が落ちる。
+#
+# 上げるときは「テストを足した結果として上がった」ときだけにすること。
+# 数字を満たすためにテストを書き始めると、
+# 「通るが何も守らないテスト」が量産される。
+# 目安は 90%。到達したら COVER_MIN を上げてラチェットにする。
+COVER_MIN := 83
+
+.PHONY: cover
+cover: ## 手書きロジックのカバレッジを測り、下限を下回ったら落とす
+	# 【計測対象を絞る理由】
+	#   oapigen / sqlcgen : 生成コード。テストを書く対象ではない
+	#   infrastructure/   : 実 DB と実 IdP が要る。フェイクで測っても意味が無い
+	#                       (SQL が意図どおり動くかは make smoke が見る)
+	#   cmd/              : 起動と結線。ここは smoke が実質のカバーになる
+	#
+	# 全体で率を出すと、生成コードのために意味のないテストを書く圧力が生まれる。
+	#
+	# 【-coverpkg を使う理由】
+	# 既定の -cover は「そのパッケージ自身のテスト」しか数えない。
+	# httpapi のテストが usecase を通しても usecase には計上されないため、
+	# 実態より低く出る。
+	@cd $(GO_API_DIR) && 		pkgs=$$(go list ./internal/... | grep -vE 'oapigen|sqlcgen|/infrastructure/' | paste -sd, -) && 		go test -coverpkg="$$pkgs" -coverprofile=/tmp/cover.out $$(echo "$$pkgs" | tr ',' ' ') > /dev/null && 		total=$$(go tool cover -func=/tmp/cover.out | tail -1 | grep -oE '[0-9]+\.[0-9]+') && 		echo "手書きロジックのカバレッジ: $$total% (下限 $(COVER_MIN)%)" && 		awk -v t="$$total" -v m="$(COVER_MIN)" 'BEGIN { if (t+0 < m+0) { print "下限を下回りました"; exit 1 } }'
+
+.PHONY: cover-html
+cover-html: cover ## カバレッジをブラウザで開く (どこが通っていないかを見る)
+	cd $(GO_API_DIR) && go tool cover -html=/tmp/cover.out
+
 .PHONY: smoke
 smoke: ## 実 DB に対して API を起動し、HTTP 越しに疎通を検証する
 	# ユニットテストはフェイクのリポジトリで動くため、
@@ -164,7 +192,7 @@ tools: ## 開発ツール (sqlc / golangci-lint / go-arch-lint) をインスト�
 	go install github.com/fe3dback/go-arch-lint@$(GO_ARCH_LINT_VERSION)
 
 .PHONY: check
-check: lint test verify-generated arch-probe ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test cover verify-generated arch-probe ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
 check-all: check smoke ## check に加えて実 DB での疎通確認まで行う
