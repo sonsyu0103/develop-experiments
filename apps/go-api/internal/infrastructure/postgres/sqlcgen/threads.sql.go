@@ -8,6 +8,8 @@ package sqlcgen
 import (
 	"context"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const countCommentsByThreadID = `-- name: CountCommentsByThreadID :one
@@ -25,23 +27,60 @@ func (q *Queries) CountCommentsByThreadID(ctx context.Context, threadID int64) (
 }
 
 const createThread = `-- name: CreateThread :one
-INSERT INTO threads (title)
-VALUES ($1)
-RETURNING id, title, created_at
+WITH inserted AS (
+    INSERT INTO threads (title, author_id)
+    VALUES ($1, $2)
+    RETURNING id, title, created_at, author_id
+)
+SELECT
+    i.id,
+    i.title,
+    i.created_at,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at
+FROM inserted i
+LEFT JOIN users u ON u.id = i.author_id
 `
 
+type CreateThreadParams struct {
+	Title    string
+	AuthorID *int64
+}
+
 type CreateThreadRow struct {
-	ID        int64
-	Title     string
-	CreatedAt time.Time
+	ID                int64
+	Title             string
+	CreatedAt         time.Time
+	AuthorPublicID    pgtype.UUID
+	AuthorDisplayName *string
+	AuthorAvatarUrl   *string
+	AuthorDeletedAt   *time.Time
 }
 
 // RETURNING により INSERT と採番値の取得が 1 往復で完結する。
 // MySQL では LAST_INSERT_ID() を別クエリで叩く必要がある。
-func (q *Queries) CreateThread(ctx context.Context, title string) (CreateThreadRow, error) {
-	row := q.db.QueryRow(ctx, createThread, title)
+//
+// 【なぜ CTE で LEFT JOIN まで済ませるか】
+// RETURNING は挿入した行しか返せず、users を結合できない。
+// 投稿直後のレスポンスにも投稿者を載せる必要があるため、
+// ここで引かないと「作成時だけ author が null」という不整合になる。
+// 呼び出し側で組み立てる手もあるが、一覧・詳細と組み立て方が 2 通りになる。
+//
+// author_id は NULL 許容。NULL が匿名を意味する (ADR 0005 決定 2)。
+func (q *Queries) CreateThread(ctx context.Context, arg CreateThreadParams) (CreateThreadRow, error) {
+	row := q.db.QueryRow(ctx, createThread, arg.Title, arg.AuthorID)
 	var i CreateThreadRow
-	err := row.Scan(&i.ID, &i.Title, &i.CreatedAt)
+	err := row.Scan(
+		&i.ID,
+		&i.Title,
+		&i.CreatedAt,
+		&i.AuthorPublicID,
+		&i.AuthorDisplayName,
+		&i.AuthorAvatarUrl,
+		&i.AuthorDeletedAt,
+	)
 	return i, err
 }
 
@@ -55,17 +94,26 @@ SELECT
         FROM comments c
         WHERE c.thread_id = t.id
           AND c.deleted_at IS NULL
-    )::bigint AS comment_count
+    )::bigint AS comment_count,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at
 FROM threads t
+LEFT JOIN users u ON u.id = t.author_id
 WHERE t.id = $1
   AND t.deleted_at IS NULL
 `
 
 type GetThreadWithCommentCountRow struct {
-	ID           int64
-	Title        string
-	CreatedAt    time.Time
-	CommentCount int64
+	ID                int64
+	Title             string
+	CreatedAt         time.Time
+	CommentCount      int64
+	AuthorPublicID    pgtype.UUID
+	AuthorDisplayName *string
+	AuthorAvatarUrl   *string
+	AuthorDeletedAt   *time.Time
 }
 
 // 一覧と同じ理由で、JOIN + GROUP BY ではなく相関サブクエリで数える。
@@ -77,6 +125,10 @@ func (q *Queries) GetThreadWithCommentCount(ctx context.Context, id int64) (GetT
 		&i.Title,
 		&i.CreatedAt,
 		&i.CommentCount,
+		&i.AuthorPublicID,
+		&i.AuthorDisplayName,
+		&i.AuthorAvatarUrl,
+		&i.AuthorDeletedAt,
 	)
 	return i, err
 }
@@ -128,7 +180,7 @@ func (q *Queries) ListThreadIDs(ctx context.Context, arg ListThreadIDsParams) ([
 
 const listThreadsWithCommentCount = `-- name: ListThreadsWithCommentCount :many
 WITH page AS (
-    SELECT id, title, created_at
+    SELECT id, title, created_at, author_id
     FROM threads
     WHERE deleted_at IS NULL
       AND ($1::bigint IS NULL OR id < $1::bigint)
@@ -144,8 +196,13 @@ SELECT
         FROM comments c
         WHERE c.thread_id = p.id
           AND c.deleted_at IS NULL
-    )::bigint AS comment_count
+    )::bigint AS comment_count,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at
 FROM page p
+LEFT JOIN users u ON u.id = p.author_id
 ORDER BY p.id DESC
 `
 
@@ -155,10 +212,14 @@ type ListThreadsWithCommentCountParams struct {
 }
 
 type ListThreadsWithCommentCountRow struct {
-	ID           int64
-	Title        string
-	CreatedAt    time.Time
-	CommentCount int64
+	ID                int64
+	Title             string
+	CreatedAt         time.Time
+	CommentCount      int64
+	AuthorPublicID    pgtype.UUID
+	AuthorDisplayName *string
+	AuthorAvatarUrl   *string
+	AuthorDeletedAt   *time.Time
 }
 
 // スレッド一覧 + コメント数を「1 往復」で取得する。
@@ -178,11 +239,18 @@ type ListThreadsWithCommentCountRow struct {
 // 2,005 スレッド / 200,016 コメントでの実測 (EXPLAIN ANALYZE、各 3 回):
 //
 //	LEFT JOIN + GROUP BY : 5.84 - 7.43 ms / shared buffers 2,054
-//	この実装             : 1.04 - 1.11 ms / shared buffers    59
+//	相関サブクエリ       : 1.04 - 1.11 ms / shared buffers    59
 //
 // 約 5.5 倍速く、バッファ読み取りは 35 分の 1。結果は完全に一致する
 // (両者を FULL JOIN して差分 0 件を確認済み)。
 // どちらも DB への往復は 1 回なので、N+1 実装との対比は変わらない。
+//
+// 【重要】**この測定は LEFT JOIN users を足す前のもの。**
+// 投稿者の解決を加えた現在の形では測り直していない
+// (Phase 4 のデータセットが要る。開発環境は 7 スレッド / users 0 件で、
+// この規模では何を測っても意味が無い)。
+// 上の数値を「投稿者の解決を含めたコスト」として読まないこと。
+// Phase 4 で測り直し、この節を更新する。
 //
 // 【注意】この差は Index Only Scan が効くことに依存する。
 // バルク INSERT 直後は visibility map が未整備で Heap Fetches が発生し、
@@ -192,6 +260,16 @@ type ListThreadsWithCommentCountRow struct {
 //
 // ページネーションは OFFSET ではなくキーセット (cursor) 方式。
 // OFFSET は「読み飛ばす行を実際に読む」ため、深いページほど線形に遅くなる。
+//
+// 【投稿者は LEFT JOIN で解決する】
+// ADR 0014 の選択肢 A。コメント数の集約とは事情が違い、
+// users.id は主キーなので 1:1 の参照になる。
+//
+// **LEFT であることが必須。** INNER にすると author_id IS NULL の
+// 匿名投稿が一覧から丸ごと消える (ADR 0005 決定 2)。
+//
+// JOIN は page で 20 件に絞ったあとに掛ける。
+// 内側の CTE に混ぜると、絞り込む前の全行に対して結合が走る。
 func (q *Queries) ListThreadsWithCommentCount(ctx context.Context, arg ListThreadsWithCommentCountParams) ([]ListThreadsWithCommentCountRow, error) {
 	rows, err := q.db.Query(ctx, listThreadsWithCommentCount, arg.CursorID, arg.PageSize)
 	if err != nil {
@@ -206,6 +284,10 @@ func (q *Queries) ListThreadsWithCommentCount(ctx context.Context, arg ListThrea
 			&i.Title,
 			&i.CreatedAt,
 			&i.CommentCount,
+			&i.AuthorPublicID,
+			&i.AuthorDisplayName,
+			&i.AuthorAvatarUrl,
+			&i.AuthorDeletedAt,
 		); err != nil {
 			return nil, err
 		}

@@ -23,6 +23,11 @@ type Querier interface {
 	// 確認と挿入の間に削除される競合 (TOCTOU) を許してしまう。
 	// INSERT ... SELECT ... WHERE EXISTS なら 1 文で完結し、競合しない。
 	// 挿入されなかった場合は 0 行が返るため、pgx.ErrNoRows として検出できる。
+	//
+	// 投稿者の解決も 1 往復に含める。RETURNING は挿入行しか返せないので
+	// CTE で包んで LEFT JOIN する (threads.sql の CreateThread と同じ理由)。
+	// 親スレッドが無ければ inserted が 0 行になり、外側も 0 行になるため、
+	// pgx.ErrNoRows での検出はそのまま効く。
 	CreateComment(ctx context.Context, arg CreateCommentParams) (CreateCommentRow, error)
 	// セッション ID は Go 側で生成した暗号論的乱数を渡す。
 	// DB 側で採番しないのは、連番や推測可能な値になると
@@ -30,7 +35,15 @@ type Querier interface {
 	CreateSession(ctx context.Context, arg CreateSessionParams) (Session, error)
 	// RETURNING により INSERT と採番値の取得が 1 往復で完結する。
 	// MySQL では LAST_INSERT_ID() を別クエリで叩く必要がある。
-	CreateThread(ctx context.Context, title string) (CreateThreadRow, error)
+	//
+	// 【なぜ CTE で LEFT JOIN まで済ませるか】
+	// RETURNING は挿入した行しか返せず、users を結合できない。
+	// 投稿直後のレスポンスにも投稿者を載せる必要があるため、
+	// ここで引かないと「作成時だけ author が null」という不整合になる。
+	// 呼び出し側で組み立てる手もあるが、一覧・詳細と組み立て方が 2 通りになる。
+	//
+	// author_id は NULL 許容。NULL が匿名を意味する (ADR 0005 決定 2)。
+	CreateThread(ctx context.Context, arg CreateThreadParams) (CreateThreadRow, error)
 	// 期限切れの削除。定期処理から呼ぶ (ADR 0003 未決 #9: どのプロセスで動かすかは未決)。
 	//
 	// 一度に消す件数を制限しているのは、放置後に大量の行がたまった場合でも
@@ -101,6 +114,14 @@ type Querier interface {
 	// 往復 1 回を節約するために実行時エラーの危険を持ち込むのは割に合わないため、
 	// 存在確認は呼び出し側 (CommentInteractor) の別クエリに分けている。
 	// どちらも主キー / 部分インデックスで完結する軽いクエリである。
+	//
+	// 【投稿者は LEFT JOIN で解決する (ADR 0014 の選択肢 A)】
+	// **LEFT であることが必須。** INNER にすると匿名コメントが消える。
+	//
+	// ADR 0014 は「コメント一覧では選択肢 B (一括取得) が勝つ可能性がある」と
+	// 書いている。同じ人が連投すると、同じ投稿者の情報が最大 100 行ぶん
+	// 重複して転送されるため。初手は A で揃え、B (ListAuthorsByIDs) との
+	// 比較は Phase 4 のベンチマークで行う。
 	ListCommentsByThreadID(ctx context.Context, arg ListCommentsByThreadIDParams) ([]ListCommentsByThreadIDRow, error)
 	// -----------------------------------------------------------------------------
 	// 以下 2 つは Phase 4 のベンチマーク専用 (N+1 実装の再現用)。
@@ -124,11 +145,18 @@ type Querier interface {
 	// 2,005 スレッド / 200,016 コメントでの実測 (EXPLAIN ANALYZE、各 3 回):
 	//
 	//   LEFT JOIN + GROUP BY : 5.84 - 7.43 ms / shared buffers 2,054
-	//   この実装             : 1.04 - 1.11 ms / shared buffers    59
+	//   相関サブクエリ       : 1.04 - 1.11 ms / shared buffers    59
 	//
 	// 約 5.5 倍速く、バッファ読み取りは 35 分の 1。結果は完全に一致する
 	// (両者を FULL JOIN して差分 0 件を確認済み)。
 	// どちらも DB への往復は 1 回なので、N+1 実装との対比は変わらない。
+	//
+	// 【重要】**この測定は LEFT JOIN users を足す前のもの。**
+	// 投稿者の解決を加えた現在の形では測り直していない
+	// (Phase 4 のデータセットが要る。開発環境は 7 スレッド / users 0 件で、
+	// この規模では何を測っても意味が無い)。
+	// 上の数値を「投稿者の解決を含めたコスト」として読まないこと。
+	// Phase 4 で測り直し、この節を更新する。
 	//
 	// 【注意】この差は Index Only Scan が効くことに依存する。
 	// バルク INSERT 直後は visibility map が未整備で Heap Fetches が発生し、
@@ -138,6 +166,16 @@ type Querier interface {
 	//
 	// ページネーションは OFFSET ではなくキーセット (cursor) 方式。
 	// OFFSET は「読み飛ばす行を実際に読む」ため、深いページほど線形に遅くなる。
+	//
+	// 【投稿者は LEFT JOIN で解決する】
+	// ADR 0014 の選択肢 A。コメント数の集約とは事情が違い、
+	// users.id は主キーなので 1:1 の参照になる。
+	//
+	// **LEFT であることが必須。** INNER にすると author_id IS NULL の
+	// 匿名投稿が一覧から丸ごと消える (ADR 0005 決定 2)。
+	//
+	// JOIN は page で 20 件に絞ったあとに掛ける。
+	// 内側の CTE に混ぜると、絞り込む前の全行に対して結合が走る。
 	ListThreadsWithCommentCount(ctx context.Context, arg ListThreadsWithCommentCountParams) ([]ListThreadsWithCommentCountRow, error)
 	// スレッド行に行ロックを取る。Phase 2 の排他制御で、
 	// 「コメント投稿と同時にスレッドの集計列を更新する」ようなケースに使う。

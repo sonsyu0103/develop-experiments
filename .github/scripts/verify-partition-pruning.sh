@@ -108,4 +108,62 @@ if [ "$actual" -ne "$EXPECTED_PARTITIONS" ]; then
 fi
 
 echo ""
+echo "=============================================================="
+echo "4. アプリが実際に発行するクエリで pruning が効くか"
+echo "=============================================================="
+#
+# 1 と 2 は合成クエリ (SELECT * FROM comments WHERE thread_id = 1) を使う。
+# **それだけでは、アプリが実際に流すクエリの検査になっていない。**
+#
+# 実際に踏んだ: ListCommentsByThreadID を CTE + LEFT JOIN users に書き換えたとき、
+# 1 と 2 は緑のままだった。書き換えで pruning が壊れても気づけない状態だった。
+#
+# クエリは手で写さず、**sqlc の生成物から取り出す**。
+# 写すと、db/query を直したときにこちらだけ古くなる
+# (この検査が「昔のクエリは pruning できる」としか言わなくなる)。
+readonly SQLC_FILE="apps/go-api/internal/infrastructure/postgres/sqlcgen/comments.sql.go"
+readonly QUERY_CONST="listCommentsByThreadID"
+
+cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
+
+if [ ! -f "$SQLC_FILE" ]; then
+  echo "::error::${SQLC_FILE} がありません。'make generate' を実行してください"
+  exit 1
+fi
+
+list_query="$(awk -v c="const ${QUERY_CONST} = \`" '
+  index($0, c) == 1 { flag = 1; next }
+  /^`$/ { flag = 0 }
+  flag { print }
+' "$SQLC_FILE")"
+
+if [ -z "$list_query" ]; then
+  echo "::error::${SQLC_FILE} から ${QUERY_CONST} を取り出せませんでした。" \
+       "sqlc の出力形式が変わった可能性があります"
+  exit 1
+fi
+
+# PREPARE してから EXPLAIN する。プレースホルダを含むクエリを
+# そのまま EXPLAIN できないため。初回の EXECUTE はカスタムプランになるので、
+# 実引数にもとづく pruning が実行計画に現れる。
+plan_real="$(psql_query "
+  PREPARE probe_list(bigint, bigint, int) AS ${list_query};
+  EXPLAIN (COSTS OFF) EXECUTE probe_list(1, NULL, 20);
+")"
+echo "$plan_real"
+
+scanned_real="$(printf '%s' "$plan_real" | count_scanned_partitions)"
+echo ""
+echo "走査対象パーティション数: ${scanned_real} / ${EXPECTED_PARTITIONS}"
+
+if [ "$scanned_real" -ne 1 ]; then
+  echo "::error::アプリのクエリで partition pruning が効いていません" \
+       "(走査数=${scanned_real}, 期待=1)。" \
+       "db/query/comments.sql の書き換えで thread_id の等値条件が" \
+       "効かなくなっていないか確認してください"
+  exit 1
+fi
+echo "OK: アプリのクエリでも 1 パーティションのみを走査している"
+
+echo ""
 echo "すべての検証に成功しました。"

@@ -259,6 +259,88 @@ else:
     section("論理削除されたスレッドの扱い")
     print("  \033[33mSKIP\033[0m SQL_EXEC が未設定のためスキップ")
 
+if SQL_EXEC:
+    section("投稿者の紐付け (ADR 0005 決定 2 / ADR 0014)")
+
+    # 認証は資格情報が無いので使えない。HTTP でログインできないため、
+    # 投稿者つきの行は SQL で作る。**検証したいのは LEFT JOIN と CTE が
+    # 実 DB で意図どおり動くか**であり、そこは HTTP 越しに読める。
+    # **投入も try の中に入れる。** 外に置くと、投入が失敗した時点で
+    # finally に到達せず 900001 の行が残る。しかも check() の FAIL ではなく
+    # トレースバックでスモーク全体が異常終了するため、
+    # 「何件中何件が失敗したか」の集計にも乗らない。
+    try:
+        sql("""
+            INSERT INTO users (id, public_id, google_sub, email, display_name, avatar_url)
+            VALUES (900001, '01920000-0000-7000-8000-000000900001'::uuid,
+                    'smoke-sub-1', 'smoke@example.com', 'スモークの人',
+                    'https://example.com/a.png')
+            ON CONFLICT (google_sub) DO NOTHING;
+        """)
+        sql("""
+            INSERT INTO threads (id, title, author_id)
+            VALUES (900001, 'スモーク: 投稿者つきスレッド', 900001)
+            ON CONFLICT (id) DO UPDATE SET deleted_at = NULL, author_id = 900001;
+        """)
+        sql("""
+            INSERT INTO comments (thread_id, author_name, body, author_id)
+            VALUES (900001, '名無しさん', 'スモーク: 投稿者つきコメント', 900001)
+            ON CONFLICT DO NOTHING;
+        """)
+
+        status, payload, _ = call("GET", "/threads/900001")
+        author = payload.get("author")
+        check("詳細で投稿者が解決される", author is not None, f"payload={payload}")
+        if author:
+            check("表示名が users から引かれる",
+                  author["displayName"] == "スモークの人", f"author={author}")
+            check("公開 ID が返る (内部 ID ではない)",
+                  author.get("publicId", "").startswith("01920000"), f"author={author}")
+            check("在籍中は withdrawn=false", author["withdrawn"] is False, f"author={author}")
+        # 内部 ID (users.id) を漏らさないこと。
+        # author に id が生えたり、authorId がそのまま出ていないかを見る。
+        check("投稿者の内部 ID が応答に含まれない",
+              "authorId" not in json.dumps(payload) and (author is None or "id" not in author),
+              f"payload={payload}")
+
+        # 添字で取り出す前に形を確かめる。
+        # エラー応答や 0 件のときに KeyError で飛ぶと、
+        # FAIL として記録されないまま全体が止まる。
+        status, payload, _ = call("GET", "/threads/900001/comments")
+        comments = payload.get("comments") or []
+        c = comments[0] if comments else None
+        check("コメントでも投稿者が解決される",
+              c is not None and c.get("author") is not None
+              and c["author"]["displayName"] == "スモークの人",
+              f"payload={payload}")
+
+        # 匿名投稿が LEFT JOIN で消えないこと。
+        # INNER にすると、ここで一覧から丸ごと落ちる。
+        status, payload, _ = call("GET", "/threads")
+        anon = [t for t in payload["threads"] if t["author"] is None]
+        check("匿名スレッドが一覧から消えない (LEFT であること)",
+              len(anon) > 0, f"threads={[t['id'] for t in payload['threads']]}")
+
+        # 退会させると表示が差し替わる。
+        sql("UPDATE users SET deleted_at = now() WHERE id = 900001;")
+        status, payload, _ = call("GET", "/threads/900001")
+        author = payload.get("author")
+        check("退会後は表示名が差し替わる",
+              author is not None and author["displayName"] == "退会したユーザー",
+              f"author={author}")
+        check("退会後は公開 ID を返さない",
+              author is not None and author.get("publicId") is None, f"author={author}")
+        check("退会後もアバターを返さない",
+              author is not None and author.get("avatarUrl") is None, f"author={author}")
+        check("退会しても投稿自体は残る", status == 200, f"status={status}")
+    finally:
+        sql("DELETE FROM comments WHERE thread_id = 900001;")
+        sql("DELETE FROM threads WHERE id = 900001;")
+        sql("DELETE FROM users WHERE id = 900001;")
+else:
+    section("投稿者の紐付け")
+    print("  \033[33mSKIP\033[0m SQL_EXEC が未設定のためスキップ")
+
 # ---------------------------------------------------------------------------
 
 print()

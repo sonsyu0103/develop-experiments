@@ -8,30 +8,55 @@ package sqlcgen
 import (
 	"context"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const createComment = `-- name: CreateComment :one
-INSERT INTO comments (thread_id, author_name, body)
-SELECT $1, $2, $3
-WHERE EXISTS (
-    SELECT 1 FROM threads
-    WHERE id = $1 AND deleted_at IS NULL
+WITH inserted AS (
+    INSERT INTO comments (thread_id, author_name, body, author_id)
+    SELECT
+        $1,
+        $2,
+        $3,
+        $4
+    WHERE EXISTS (
+        SELECT 1 FROM threads
+        WHERE id = $1 AND deleted_at IS NULL
+    )
+    RETURNING id, thread_id, author_name, body, created_at, author_id
 )
-RETURNING id, thread_id, author_name, body, created_at
+SELECT
+    i.id,
+    i.thread_id,
+    i.author_name,
+    i.body,
+    i.created_at,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at
+FROM inserted i
+LEFT JOIN users u ON u.id = i.author_id
 `
 
 type CreateCommentParams struct {
 	ThreadID   int64
 	AuthorName string
 	Body       string
+	AuthorID   *int64
 }
 
 type CreateCommentRow struct {
-	ID         int64
-	ThreadID   int64
-	AuthorName string
-	Body       string
-	CreatedAt  time.Time
+	ID                int64
+	ThreadID          int64
+	AuthorName        string
+	Body              string
+	CreatedAt         time.Time
+	AuthorPublicID    pgtype.UUID
+	AuthorDisplayName *string
+	AuthorAvatarUrl   *string
+	AuthorDeletedAt   *time.Time
 }
 
 // 親スレッドが「生存している」場合にだけ挿入する。
@@ -45,8 +70,18 @@ type CreateCommentRow struct {
 // 確認と挿入の間に削除される競合 (TOCTOU) を許してしまう。
 // INSERT ... SELECT ... WHERE EXISTS なら 1 文で完結し、競合しない。
 // 挿入されなかった場合は 0 行が返るため、pgx.ErrNoRows として検出できる。
+//
+// 投稿者の解決も 1 往復に含める。RETURNING は挿入行しか返せないので
+// CTE で包んで LEFT JOIN する (threads.sql の CreateThread と同じ理由)。
+// 親スレッドが無ければ inserted が 0 行になり、外側も 0 行になるため、
+// pgx.ErrNoRows での検出はそのまま効く。
 func (q *Queries) CreateComment(ctx context.Context, arg CreateCommentParams) (CreateCommentRow, error) {
-	row := q.db.QueryRow(ctx, createComment, arg.ThreadID, arg.AuthorName, arg.Body)
+	row := q.db.QueryRow(ctx, createComment,
+		arg.ThreadID,
+		arg.AuthorName,
+		arg.Body,
+		arg.AuthorID,
+	)
 	var i CreateCommentRow
 	err := row.Scan(
 		&i.ID,
@@ -54,23 +89,37 @@ func (q *Queries) CreateComment(ctx context.Context, arg CreateCommentParams) (C
 		&i.AuthorName,
 		&i.Body,
 		&i.CreatedAt,
+		&i.AuthorPublicID,
+		&i.AuthorDisplayName,
+		&i.AuthorAvatarUrl,
+		&i.AuthorDeletedAt,
 	)
 	return i, err
 }
 
 const listCommentsByThreadID = `-- name: ListCommentsByThreadID :many
+WITH page AS (
+    SELECT id, thread_id, author_name, body, created_at, author_id
+    FROM comments
+    WHERE thread_id = $1
+      AND deleted_at IS NULL
+      AND ($2::bigint IS NULL OR id < $2::bigint)
+    ORDER BY id DESC
+    LIMIT $3
+)
 SELECT
-    id,
-    thread_id,
-    author_name,
-    body,
-    created_at
-FROM comments
-WHERE thread_id = $1
-  AND deleted_at IS NULL
-  AND ($2::bigint IS NULL OR id < $2::bigint)
-ORDER BY id DESC
-LIMIT $3
+    p.id,
+    p.thread_id,
+    p.author_name,
+    p.body,
+    p.created_at,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at
+FROM page p
+LEFT JOIN users u ON u.id = p.author_id
+ORDER BY p.id DESC
 `
 
 type ListCommentsByThreadIDParams struct {
@@ -80,11 +129,15 @@ type ListCommentsByThreadIDParams struct {
 }
 
 type ListCommentsByThreadIDRow struct {
-	ID         int64
-	ThreadID   int64
-	AuthorName string
-	Body       string
-	CreatedAt  time.Time
+	ID                int64
+	ThreadID          int64
+	AuthorName        string
+	Body              string
+	CreatedAt         time.Time
+	AuthorPublicID    pgtype.UUID
+	AuthorDisplayName *string
+	AuthorAvatarUrl   *string
+	AuthorDeletedAt   *time.Time
 }
 
 // thread_id を等値で指定しているため、HASH パーティションの pruning が効き、
@@ -101,6 +154,14 @@ type ListCommentsByThreadIDRow struct {
 // 往復 1 回を節約するために実行時エラーの危険を持ち込むのは割に合わないため、
 // 存在確認は呼び出し側 (CommentInteractor) の別クエリに分けている。
 // どちらも主キー / 部分インデックスで完結する軽いクエリである。
+//
+// 【投稿者は LEFT JOIN で解決する (ADR 0014 の選択肢 A)】
+// **LEFT であることが必須。** INNER にすると匿名コメントが消える。
+//
+// ADR 0014 は「コメント一覧では選択肢 B (一括取得) が勝つ可能性がある」と
+// 書いている。同じ人が連投すると、同じ投稿者の情報が最大 100 行ぶん
+// 重複して転送されるため。初手は A で揃え、B (ListAuthorsByIDs) との
+// 比較は Phase 4 のベンチマークで行う。
 func (q *Queries) ListCommentsByThreadID(ctx context.Context, arg ListCommentsByThreadIDParams) ([]ListCommentsByThreadIDRow, error) {
 	rows, err := q.db.Query(ctx, listCommentsByThreadID, arg.ThreadID, arg.CursorID, arg.PageSize)
 	if err != nil {
@@ -116,6 +177,10 @@ func (q *Queries) ListCommentsByThreadID(ctx context.Context, arg ListCommentsBy
 			&i.AuthorName,
 			&i.Body,
 			&i.CreatedAt,
+			&i.AuthorPublicID,
+			&i.AuthorDisplayName,
+			&i.AuthorAvatarUrl,
+			&i.AuthorDeletedAt,
 		); err != nil {
 			return nil, err
 		}

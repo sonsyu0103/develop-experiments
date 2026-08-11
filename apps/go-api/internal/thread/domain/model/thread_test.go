@@ -56,7 +56,7 @@ func TestNewThread(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := NewThread(tt.title)
+			got, err := NewThread(tt.title, nil)
 
 			if tt.wantErr != nil {
 				if !errors.Is(err, tt.wantErr) {
@@ -86,7 +86,7 @@ func TestReconstruct(t *testing.T) {
 	t.Parallel()
 
 	createdAt := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
-	got := Reconstruct(42, "復元されたスレッド", createdAt)
+	got := Reconstruct(42, "復元されたスレッド", nil, createdAt)
 
 	if got.ID != 42 {
 		t.Errorf("ID = %d, want 42", got.ID)
@@ -104,8 +104,31 @@ func TestReconstruct(t *testing.T) {
 func TestReconstruct_SkipsValidation(t *testing.T) {
 	t.Parallel()
 
-	got := Reconstruct(1, "", time.Now())
+	got := Reconstruct(1, "", nil, time.Now())
 	if got.Title != "" {
 		t.Errorf("Title = %q, want 空文字 (復元時は検証しない)", got.Title)
+	}
+}
+
+// 投稿者の紐付け。nil が匿名を意味する (ADR 0005 決定 2)。
+func TestNewThread_AuthorID(t *testing.T) {
+	t.Parallel()
+
+	authorID := int64(42)
+
+	withAuthor, err := NewThread("ログインして立てたスレッド", &authorID)
+	if err != nil {
+		t.Fatalf("NewThread が失敗した: %v", err)
+	}
+	if withAuthor.AuthorID == nil || *withAuthor.AuthorID != authorID {
+		t.Errorf("AuthorID = %v, want %d", withAuthor.AuthorID, authorID)
+	}
+
+	anonymous, err := NewThread("匿名で立てたスレッド", nil)
+	if err != nil {
+		t.Fatalf("NewThread が失敗した: %v", err)
+	}
+	if anonymous.AuthorID != nil {
+		t.Errorf("AuthorID = %v, want nil (匿名)", *anonymous.AuthorID)
 	}
 }

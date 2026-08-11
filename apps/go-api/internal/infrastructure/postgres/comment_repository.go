@@ -41,7 +41,10 @@ func (r *CommentRepository) ListByThreadID(
 	comments := make([]model.Comment, 0, len(rows))
 	for _, row := range rows {
 		comments = append(comments, *model.Reconstruct(
-			row.ID, row.ThreadID, row.AuthorName, row.Body, row.CreatedAt,
+			row.ID, row.ThreadID, row.AuthorName,
+			toCommentAuthor(row.AuthorPublicID, row.AuthorDisplayName,
+				row.AuthorAvatarUrl, row.AuthorDeletedAt),
+			row.Body, row.CreatedAt,
 		))
 	}
 	return comments, nil
@@ -58,12 +61,19 @@ func (r *CommentRepository) Create(ctx context.Context, comment *model.Comment) 
 		ThreadID:   comment.ThreadID,
 		AuthorName: comment.AuthorName,
 		Body:       comment.Body,
+		AuthorID:   comment.AuthorID,
 	})
 	if err != nil {
 		return nil, translateError("CommentRepository.Create", err)
 	}
 
-	return model.Reconstruct(row.ID, row.ThreadID, row.AuthorName, row.Body, row.CreatedAt), nil
+	created := model.Reconstruct(row.ID, row.ThreadID, row.AuthorName,
+		toCommentAuthor(row.AuthorPublicID, row.AuthorDisplayName,
+			row.AuthorAvatarUrl, row.AuthorDeletedAt),
+		row.Body, row.CreatedAt)
+	// 書いた内容を戻り値に反映させる (thread_repository.go と同じ理由)。
+	created.AuthorID = comment.AuthorID
+	return created, nil
 }
 
 // SoftDelete はコメントを論理削除します。

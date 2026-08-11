@@ -5,17 +5,31 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
+
 	"develop-experiments/apps/go-api/internal/pagination"
 	"develop-experiments/apps/go-api/internal/thread/domain/model"
 	"develop-experiments/apps/go-api/internal/thread/domain/repository"
 )
 
+// AuthorDTO はフロントエンドに返す投稿者のデータ構造です。
+// 内部 ID (users.id) は含めません。
+type AuthorDTO struct {
+	// PublicID は退会済みでは nil になります。
+	PublicID    *uuid.UUID `json:"publicId"`
+	DisplayName string     `json:"displayName"`
+	AvatarURL   *string    `json:"avatarUrl"`
+	Withdrawn   bool       `json:"withdrawn"`
+}
+
 // ThreadDTO はフロントエンドに返すスレッドのデータ構造です。
 type ThreadDTO struct {
-	ID           int64     `json:"id"`
-	Title        string    `json:"title"`
-	CommentCount int64     `json:"commentCount"`
-	CreatedAt    time.Time `json:"createdAt"`
+	ID           int64  `json:"id"`
+	Title        string `json:"title"`
+	CommentCount int64  `json:"commentCount"`
+	// Author は匿名投稿では nil になります。
+	Author    *AuthorDTO `json:"author"`
+	CreatedAt time.Time  `json:"createdAt"`
 }
 
 // ThreadListResult はスレッド一覧と、次ページ取得用のカーソルです。
@@ -68,8 +82,10 @@ func (i *ThreadInteractor) FetchThread(ctx context.Context, id int64) (ThreadDTO
 }
 
 // CreateThread は新しいスレッドを作成します。
-func (i *ThreadInteractor) CreateThread(ctx context.Context, title string) (ThreadDTO, error) {
-	thread, err := model.NewThread(title)
+func (i *ThreadInteractor) CreateThread(
+	ctx context.Context, title string, authorID *int64,
+) (ThreadDTO, error) {
+	thread, err := model.NewThread(title, authorID)
 	if err != nil {
 		return ThreadDTO{}, err
 	}
@@ -87,7 +103,24 @@ func toDTO(s model.Summary) ThreadDTO {
 		ID:           s.ID,
 		Title:        s.Title,
 		CommentCount: s.CommentCount,
+		Author:       toAuthorDTO(s.Author),
 		CreatedAt:    s.CreatedAt,
+	}
+}
+
+// toAuthorDTO は投稿者を詰め替えます。匿名投稿では nil のまま返します。
+//
+// 退会済みの表示の差し替えはドメイン側 (model.NewAuthor) で済んでいます。
+// ここで判定を足すと、同じ規則が 2 か所に散ります。
+func toAuthorDTO(a *model.Author) *AuthorDTO {
+	if a == nil {
+		return nil
+	}
+	return &AuthorDTO{
+		PublicID:    a.PublicID,
+		DisplayName: a.DisplayName,
+		AvatarURL:   a.AvatarURL,
+		Withdrawn:   a.Withdrawn,
 	}
 }
 

@@ -88,6 +88,11 @@ deps:
     canUse:
       - gin
 
+  # Author が投稿者の公開 ID (public_id) を持つため uuid を許可する。
+  # 内部 ID は運ばない (docs/adr/0014-author-resolution.md)
+  thread-model:
+    canUse:
+      - uuid
   thread-repository:
     mayDependOn:
       - thread-model
@@ -95,6 +100,8 @@ deps:
     canUse:
       # N+1 比較実装 (interactor_nplus1.go) が errgroup を使う
       - errgroup
+      # AuthorDTO が公開 ID を持つ
+      - uuid
     mayDependOn:
       - thread-model
       - thread-repository
@@ -102,10 +109,16 @@ deps:
       # 直列化失敗 (SQLSTATE 40001) はフェイクでは再現できない (Phase 2)
       - postgres
 
+  comment-model:
+    canUse:
+      - uuid
   comment-repository:
     mayDependOn:
       - comment-model
   comment-usecase:
+    canUse:
+      # AuthorDTO が公開 ID を持つ
+      - uuid
     mayDependOn:
       - comment-model
       - comment-repository

@@ -84,7 +84,7 @@ func TestNewComment(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := NewComment(tt.threadID, tt.authorName, tt.body)
+			got, err := NewComment(tt.threadID, tt.authorName, tt.body, nil)
 
 			if tt.wantErr {
 				if !errors.Is(err, apperr.ErrInvalidArgument) {
@@ -110,5 +110,49 @@ func TestNewComment(t *testing.T) {
 				t.Errorf("ID = %d, want 0 (永続化前なので未採番)", got.ID)
 			}
 		})
+	}
+}
+
+// **ログイン中はリクエストの投稿者名を捨てる。**
+//
+// 保存してしまうと「投稿時点の表示名」が残り、
+// 表示名を変えても過去の投稿に反映されなくなる。
+// ADR 0014 は即時反映を選んでいるので、表示に使うのは users 側の表示名になる。
+//
+// 捨てないと、他人の名前を騙った投稿をログイン状態で作れてしまう
+// (表示側が author_name を優先した場合)。
+func TestNewComment_LoggedInDiscardsAuthorName(t *testing.T) {
+	t.Parallel()
+
+	authorID := int64(42)
+
+	got, err := NewComment(1, "別人を名乗る", "本文", &authorID)
+	if err != nil {
+		t.Fatalf("NewComment が失敗した: %v", err)
+	}
+
+	if got.AuthorName != DefaultAuthorName {
+		t.Errorf("AuthorName = %q, want %q (ログイン中は捨てる)", got.AuthorName, DefaultAuthorName)
+	}
+	if got.AuthorID == nil || *got.AuthorID != authorID {
+		t.Errorf("AuthorID = %v, want %d", got.AuthorID, authorID)
+	}
+}
+
+// 匿名投稿では従来どおり投稿者名が残る。
+// ログイン側だけを見ると「常に捨てる」実装でも通ってしまう。
+func TestNewComment_AnonymousKeepsAuthorName(t *testing.T) {
+	t.Parallel()
+
+	got, err := NewComment(1, "ホシノ", "本文", nil)
+	if err != nil {
+		t.Fatalf("NewComment が失敗した: %v", err)
+	}
+
+	if got.AuthorName != "ホシノ" {
+		t.Errorf("AuthorName = %q, want ホシノ", got.AuthorName)
+	}
+	if got.AuthorID != nil {
+		t.Errorf("AuthorID = %v, want nil (匿名)", *got.AuthorID)
 	}
 }

@@ -33,7 +33,13 @@ PG="$PKG/internal/infrastructure/postgres"
 TUC="$PKG/internal/thread/usecase"
 PGX="github.com/jackc/pgx/v5/pgtype"
 GIN="github.com/gin-gonic/gin"
-UUID="github.com/google/uuid"
+# O / P の「宣言していないライブラリ」。
+# 以前は uuid を使っていたが、投稿者の公開 ID を運ぶために
+# thread-usecase が uuid を宣言した時点でプローブが無効化された
+# (期待 fail のはずが pass になり、arch-probe が検出した)。
+# 宣言済みのベンダを使うと同じことが起きるため、
+# **usecase 層が絶対に触らないもの**を選ぶ。oauth2 は認証アダプタ専用。
+OAUTH2="golang.org/x/oauth2"
 
 # id | 置くファイル | package 名 | import する先 | 期待 | 説明
 #
@@ -54,8 +60,8 @@ PROBES=(
 "L|internal/thread/usecase/zz_probe_test.go|usecase|$GIN|fail|テスト thread/usecase -> gin (テストでも不可)"
 "M|internal/user/usecase/zz_probe.go|usecase|$CMODEL|fail|設定を更新せずに足した新モジュール -> 他モジュール"
 "N|internal/user/usecase/zz_probe.go|usecase|$PG|fail|設定を更新せずに足した新モジュール -> infrastructure"
-"O|internal/thread/usecase/zz_probe.go|usecase|$UUID|fail|宣言していないライブラリを本体で使う"
-"P|internal/thread/usecase/zz_probe_test.go|usecase|$UUID|fail|宣言していないライブラリをテストで使う"
+"O|internal/thread/usecase/zz_probe.go|usecase|$OAUTH2|fail|宣言していないライブラリを本体で使う"
+"P|internal/thread/usecase/zz_probe_test.go|usecase|$OAUTH2|fail|宣言していないライブラリをテストで使う"
 )
 
 CREATED=""

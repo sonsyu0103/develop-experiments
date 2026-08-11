@@ -40,7 +40,10 @@ func (r *ThreadRepository) ListSummaries(ctx context.Context, page pagination.Pa
 	summaries := make([]model.Summary, 0, len(rows))
 	for _, row := range rows {
 		summaries = append(summaries, model.Summary{
-			Thread:       *model.Reconstruct(row.ID, row.Title, row.CreatedAt),
+			Thread: *model.Reconstruct(row.ID, row.Title,
+				toThreadAuthor(row.AuthorPublicID, row.AuthorDisplayName,
+					row.AuthorAvatarUrl, row.AuthorDeletedAt),
+				row.CreatedAt),
 			CommentCount: row.CommentCount,
 		})
 	}
@@ -55,18 +58,33 @@ func (r *ThreadRepository) FindSummaryByID(ctx context.Context, id int64) (*mode
 	}
 
 	return &model.Summary{
-		Thread:       *model.Reconstruct(row.ID, row.Title, row.CreatedAt),
+		Thread: *model.Reconstruct(row.ID, row.Title,
+			toThreadAuthor(row.AuthorPublicID, row.AuthorDisplayName,
+				row.AuthorAvatarUrl, row.AuthorDeletedAt),
+			row.CreatedAt),
 		CommentCount: row.CommentCount,
 	}, nil
 }
 
 // Create はスレッドを保存し、採番済みの値を返します。
 func (r *ThreadRepository) Create(ctx context.Context, thread *model.Thread) (*model.Thread, error) {
-	row, err := r.q.CreateThread(ctx, thread.Title)
+	row, err := r.q.CreateThread(ctx, sqlcgen.CreateThreadParams{
+		Title:    thread.Title,
+		AuthorID: thread.AuthorID,
+	})
 	if err != nil {
 		return nil, translateError("ThreadRepository.Create", err)
 	}
-	return model.Reconstruct(row.ID, row.Title, row.CreatedAt), nil
+	created := model.Reconstruct(row.ID, row.Title,
+		toThreadAuthor(row.AuthorPublicID, row.AuthorDisplayName,
+			row.AuthorAvatarUrl, row.AuthorDeletedAt),
+		row.CreatedAt)
+	// 書き込み経路の戻り値は、書いた内容を反映させる。
+	// Reconstruct は読み出し用で AuthorID を持たないため、ここで補う。
+	// 補わないと「ログインして作ったのに AuthorID が nil」になり、
+	// 戻り値で紐付けを判定するコードが将来書かれたときに静かに壊れる。
+	created.AuthorID = thread.AuthorID
+	return created, nil
 }
 
 // Exists はスレッドが存在するかを返します。
@@ -90,7 +108,8 @@ func (r *ThreadRepository) ListThreadsOnly(ctx context.Context, page pagination.
 
 	threads := make([]model.Thread, 0, len(rows))
 	for _, row := range rows {
-		threads = append(threads, *model.Reconstruct(row.ID, row.Title, row.CreatedAt))
+		// ベンチマーク専用の経路。投稿者は引かないので nil のままにする。
+		threads = append(threads, *model.Reconstruct(row.ID, row.Title, nil, row.CreatedAt))
 	}
 	return threads, nil
 }

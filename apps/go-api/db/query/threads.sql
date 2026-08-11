@@ -16,11 +16,18 @@
 -- 2,005 スレッド / 200,016 コメントでの実測 (EXPLAIN ANALYZE、各 3 回):
 --
 --   LEFT JOIN + GROUP BY : 5.84 - 7.43 ms / shared buffers 2,054
---   この実装             : 1.04 - 1.11 ms / shared buffers    59
+--   相関サブクエリ       : 1.04 - 1.11 ms / shared buffers    59
 --
 -- 約 5.5 倍速く、バッファ読み取りは 35 分の 1。結果は完全に一致する
 -- (両者を FULL JOIN して差分 0 件を確認済み)。
 -- どちらも DB への往復は 1 回なので、N+1 実装との対比は変わらない。
+--
+-- 【重要】**この測定は LEFT JOIN users を足す前のもの。**
+-- 投稿者の解決を加えた現在の形では測り直していない
+-- (Phase 4 のデータセットが要る。開発環境は 7 スレッド / users 0 件で、
+-- この規模では何を測っても意味が無い)。
+-- 上の数値を「投稿者の解決を含めたコスト」として読まないこと。
+-- Phase 4 で測り直し、この節を更新する。
 --
 -- 【注意】この差は Index Only Scan が効くことに依存する。
 -- バルク INSERT 直後は visibility map が未整備で Heap Fetches が発生し、
@@ -30,8 +37,18 @@
 --
 -- ページネーションは OFFSET ではなくキーセット (cursor) 方式。
 -- OFFSET は「読み飛ばす行を実際に読む」ため、深いページほど線形に遅くなる。
+--
+-- 【投稿者は LEFT JOIN で解決する】
+-- ADR 0014 の選択肢 A。コメント数の集約とは事情が違い、
+-- users.id は主キーなので 1:1 の参照になる。
+--
+-- **LEFT であることが必須。** INNER にすると author_id IS NULL の
+-- 匿名投稿が一覧から丸ごと消える (ADR 0005 決定 2)。
+--
+-- JOIN は page で 20 件に絞ったあとに掛ける。
+-- 内側の CTE に混ぜると、絞り込む前の全行に対して結合が走る。
 WITH page AS (
-    SELECT id, title, created_at
+    SELECT id, title, created_at, author_id
     FROM threads
     WHERE deleted_at IS NULL
       AND (sqlc.narg('cursor_id')::bigint IS NULL OR id < sqlc.narg('cursor_id')::bigint)
@@ -47,8 +64,13 @@ SELECT
         FROM comments c
         WHERE c.thread_id = p.id
           AND c.deleted_at IS NULL
-    )::bigint AS comment_count
+    )::bigint AS comment_count,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at
 FROM page p
+LEFT JOIN users u ON u.id = p.author_id
 ORDER BY p.id DESC;
 
 -- name: GetThreadWithCommentCount :one
@@ -62,17 +84,42 @@ SELECT
         FROM comments c
         WHERE c.thread_id = t.id
           AND c.deleted_at IS NULL
-    )::bigint AS comment_count
+    )::bigint AS comment_count,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at
 FROM threads t
+LEFT JOIN users u ON u.id = t.author_id
 WHERE t.id = sqlc.arg('id')
   AND t.deleted_at IS NULL;
 
 -- name: CreateThread :one
 -- RETURNING により INSERT と採番値の取得が 1 往復で完結する。
 -- MySQL では LAST_INSERT_ID() を別クエリで叩く必要がある。
-INSERT INTO threads (title)
-VALUES (sqlc.arg('title'))
-RETURNING id, title, created_at;
+--
+-- 【なぜ CTE で LEFT JOIN まで済ませるか】
+-- RETURNING は挿入した行しか返せず、users を結合できない。
+-- 投稿直後のレスポンスにも投稿者を載せる必要があるため、
+-- ここで引かないと「作成時だけ author が null」という不整合になる。
+-- 呼び出し側で組み立てる手もあるが、一覧・詳細と組み立て方が 2 通りになる。
+--
+-- author_id は NULL 許容。NULL が匿名を意味する (ADR 0005 決定 2)。
+WITH inserted AS (
+    INSERT INTO threads (title, author_id)
+    VALUES (sqlc.arg('title'), sqlc.narg('author_id'))
+    RETURNING id, title, created_at, author_id
+)
+SELECT
+    i.id,
+    i.title,
+    i.created_at,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at
+FROM inserted i
+LEFT JOIN users u ON u.id = i.author_id;
 
 -- name: ThreadExists :one
 SELECT EXISTS (

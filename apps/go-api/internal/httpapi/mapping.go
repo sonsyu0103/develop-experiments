@@ -15,10 +15,20 @@ import (
 // 仕様からフィールドを消すと、この関数がコンパイルエラーになります。
 
 func toWireThread(d threadusecase.ThreadDTO) oapigen.Thread {
+	var author *oapigen.Author
+	if d.Author != nil {
+		author = &oapigen.Author{
+			PublicId:    d.Author.PublicID,
+			DisplayName: d.Author.DisplayName,
+			AvatarUrl:   d.Author.AvatarURL,
+			Withdrawn:   d.Author.Withdrawn,
+		}
+	}
 	return oapigen.Thread{
 		Id:           d.ID,
 		Title:        d.Title,
 		CommentCount: d.CommentCount,
+		Author:       author,
 		CreatedAt:    d.CreatedAt,
 	}
 }
@@ -48,10 +58,20 @@ func toWireMe(d userusecase.MeDTO) oapigen.Me {
 }
 
 func toWireComment(d commentusecase.CommentDTO) oapigen.Comment {
+	var author *oapigen.Author
+	if d.Author != nil {
+		author = &oapigen.Author{
+			PublicId:    d.Author.PublicID,
+			DisplayName: d.Author.DisplayName,
+			AvatarUrl:   d.Author.AvatarURL,
+			Withdrawn:   d.Author.Withdrawn,
+		}
+	}
 	return oapigen.Comment{
 		Id:         d.ID,
 		ThreadId:   d.ThreadID,
 		AuthorName: d.AuthorName,
+		Author:     author,
 		Body:       d.Body,
 		CreatedAt:  d.CreatedAt,
 	}

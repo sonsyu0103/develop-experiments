@@ -178,7 +178,7 @@ func TestThreadInteractor_CreateThread(t *testing.T) {
 	repo := newFakeRepo(0)
 	uc := NewThreadInteractor(repo)
 
-	got, err := uc.CreateThread(context.Background(), "  新しいスレッド  ")
+	got, err := uc.CreateThread(context.Background(), "  新しいスレッド  ", nil)
 	if err != nil {
 		t.Fatalf("CreateThread が失敗した: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestThreadInteractor_CreateThread_ValidationStopsBeforeRepository(t *testin
 
 	for name, title := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := uc.CreateThread(context.Background(), title)
+			_, err := uc.CreateThread(context.Background(), title, nil)
 			if !errors.Is(err, apperr.ErrInvalidArgument) {
 				t.Errorf("err = %v, want apperr.ErrInvalidArgument", err)
 			}

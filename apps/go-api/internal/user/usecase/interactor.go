@@ -32,6 +32,17 @@ type MeDTO struct {
 	AvatarURL   *string   `json:"avatarUrl"`
 }
 
+// PrincipalDTO は認証済みリクエストの主体です。
+//
+// **UserID は内部 ID (users.id) です。API には出しません。**
+// 投稿者の紐付け (threads.author_id / comments.author_id) に必要なので、
+// Me とは分けて持ちます。Me に混ぜると、投稿一覧の詰め替えを 1 つ間違えた
+// だけで内部 ID が外に出ます (docs/adr/0003-open-questions.md 未決 #11)。
+type PrincipalDTO struct {
+	UserID int64
+	Me     MeDTO
+}
+
 // LoginResult はログイン成功時に、ハンドラが Cookie を組み立てるための値です。
 type LoginResult struct {
 	Token     model.SessionToken
@@ -162,7 +173,9 @@ func (i *AuthInteractor) CompleteLogin(
 //
 // **毎リクエスト通る経路**です。期限切れと退会の判定は SQL 側にあり、
 // ここでは再判定しません (判定を 2 か所に置くと片方だけ直したときに食い違うため)。
-func (i *AuthInteractor) Authenticate(ctx context.Context, token model.SessionToken) (*MeDTO, error) {
+func (i *AuthInteractor) Authenticate(
+	ctx context.Context, token model.SessionToken,
+) (*PrincipalDTO, error) {
 	if token == "" {
 		return nil, fmt.Errorf("セッションがありません: %w", apperr.ErrUnauthenticated)
 	}
@@ -177,11 +190,14 @@ func (i *AuthInteractor) Authenticate(ctx context.Context, token model.SessionTo
 		return nil, err
 	}
 
-	return &MeDTO{
-		PublicID:    auth.Owner.PublicID,
-		DisplayName: auth.Owner.DisplayName,
-		Email:       auth.Owner.Email,
-		AvatarURL:   auth.Owner.AvatarURL,
+	return &PrincipalDTO{
+		UserID: auth.Owner.ID,
+		Me: MeDTO{
+			PublicID:    auth.Owner.PublicID,
+			DisplayName: auth.Owner.DisplayName,
+			Email:       auth.Owner.Email,
+			AvatarURL:   auth.Owner.AvatarURL,
+		},
 	}, nil
 }
 

@@ -41,9 +41,25 @@ type principalKey struct{}
 
 // principalFromContext は認証済み利用者を取り出します。
 // 未ログインの場合は nil を返します。
-func principalFromContext(ctx context.Context) *userusecase.MeDTO {
-	me, _ := ctx.Value(principalKey{}).(*userusecase.MeDTO)
-	return me
+func principalFromContext(ctx context.Context) *userusecase.PrincipalDTO {
+	p, _ := ctx.Value(principalKey{}).(*userusecase.PrincipalDTO)
+	return p
+}
+
+// authorIDFromContext は投稿に紐付ける投稿者の内部 ID を返します。
+//
+// **未ログインでは nil**。それが匿名投稿を意味します
+// (docs/adr/0005-authentication.md 決定 2)。
+// 投稿系のエンドポイントは仕様書に security を宣言していないため、
+// ここが nil でも 401 にはなりません。
+func authorIDFromContext(ctx context.Context) *int64 {
+	p := principalFromContext(ctx)
+	if p == nil {
+		return nil
+	}
+	// コンテキストに載せた値を共有しないよう、複製してから返す。
+	id := p.UserID
+	return &id
 }
 
 // resolveSession は Cookie からセッションを解決し、コンテキストに載せます。
@@ -71,7 +87,7 @@ func (s *Server) resolveSession() gin.HandlerFunc {
 			return
 		}
 
-		me, err := s.auth.Authenticate(c.Request.Context(), usermodel.SessionToken(raw))
+		principal, err := s.auth.Authenticate(c.Request.Context(), usermodel.SessionToken(raw))
 		if err != nil {
 			// 無効なセッションは「未ログイン」として扱い、ここでは弾かない。
 			// security を宣言したエンドポイントだけが 401 になる。
@@ -92,7 +108,7 @@ func (s *Server) resolveSession() gin.HandlerFunc {
 			return
 		}
 
-		ctx := context.WithValue(c.Request.Context(), principalKey{}, me)
+		ctx := context.WithValue(c.Request.Context(), principalKey{}, principal)
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}

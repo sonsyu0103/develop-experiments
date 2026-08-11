@@ -246,6 +246,7 @@ export interface components {
              * @example 7
              */
             commentCount: number;
+            author: components["schemas"]["Author"];
             /**
              * Format: date-time
              * @example 2026-08-02T12:00:00Z
@@ -263,8 +264,16 @@ export interface components {
              * @example 1
              */
             threadId: number;
-            /** @example 名無しさん */
+            /**
+             * @description 匿名投稿の表示名。省略時は「名無しさん」になります。
+             *
+             *     **`author` があるときは、そちらを表示してください。**
+             *     ログイン中の投稿ではこの欄は既定値のまま保存されます
+             *     (表示名の変更を過去の投稿にも反映させるため。ADR 0014)。
+             * @example 名無しさん
+             */
             authorName: string;
+            author: components["schemas"]["Author"];
             /** @example ふぁ〜、眠いよ〜 */
             body: string;
             /**
@@ -295,6 +304,45 @@ export interface components {
             title: string;
         };
         /**
+         * @description 投稿者。**匿名投稿では `null` になります**
+         *     (docs/adr/0005-authentication.md 決定 2)。
+         *
+         *     内部 ID (`users.id`) は含めません。`Me` と同じ理由です。
+         *
+         *     退会した利用者の投稿は、投稿そのものは残したまま表示だけ差し替えます。
+         *     このとき `publicId` を返しません —— フロントが `withdrawn` の分岐を
+         *     落としても、退会した人のマイページへ辿れないようにするためです。
+         */
+        Author: {
+            /**
+             * Format: uuid
+             * @description 公開用の識別子 (UUID v7)。
+             *
+             *     **退会済みの場合はフィールドごと省略されます** (null ではありません)。
+             *     required に入れていないため、生成される型は省略可能になります
+             * @example 0192f0a0-0000-7000-8000-000000000001
+             */
+            publicId?: string;
+            /**
+             * @description 退会済みの場合は「退会したユーザー」に置き換わります
+             * @example ホシノ
+             */
+            displayName: string;
+            /**
+             * @description アバター画像の URL。
+             *
+             *     **未設定または退会済みの場合はフィールドごと省略されます**
+             *     (`Me.avatarUrl` と同じ挙動)。null が入って返ることはありません
+             * @example https://lh3.googleusercontent.com/a/xxxx
+             */
+            avatarUrl?: string | null;
+            /**
+             * @description 退会済みか
+             * @example false
+             */
+            withdrawn: boolean;
+        } | null;
+        /**
          * @description ログイン中の利用者。
          *
          *     **内部 ID (`users.id`) は含めません。** マイページの URL が連番だと
@@ -320,7 +368,12 @@ export interface components {
         };
         CreateCommentRequest: {
             /**
-             * @description 省略時は「名無しさん」になります
+             * @description 匿名投稿の表示名。省略時は「名無しさん」になります。
+             *
+             *     **ログイン中は無視されます。** 表示名は `users` 側から解決するため、
+             *     送っても保存されず、レスポンスの `authorName` は既定値のままになります
+             *     (表示名の変更を過去の投稿にも反映させるため。ADR 0014)。
+             *     エラーにはしません
              * @example ホシノ
              */
             authorName?: string;

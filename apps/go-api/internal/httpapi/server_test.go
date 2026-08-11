@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"develop-experiments/apps/go-api/internal/apperr"
 	commentmodel "develop-experiments/apps/go-api/internal/comment/domain/model"
@@ -38,6 +39,9 @@ func TestMain(m *testing.M) {
 type fakeThreadRepo struct {
 	summaries []threadmodel.Summary
 	err       error
+	// created は Create に渡された値です。
+	// 「投稿者が実際に紐付いたか」は、返り値ではなく渡された値で見ます。
+	created *threadmodel.Thread
 }
 
 var _ threadrepo.ThreadRepository = (*fakeThreadRepo)(nil)
@@ -65,8 +69,22 @@ func (f *fakeThreadRepo) Create(_ context.Context, th *threadmodel.Thread) (*thr
 	if f.err != nil {
 		return nil, f.err
 	}
-	return threadmodel.Reconstruct(99, th.Title, time.Unix(0, 0).UTC()), nil
+	f.created = th
+	// 実装では LEFT JOIN users が投稿者を解決する。
+	// フェイクでも同じ形にしないと、作成レスポンスの詰め替えを検証できない。
+	return threadmodel.Reconstruct(99, th.Title, fakeAuthorFor(th.AuthorID), time.Unix(0, 0).UTC()), nil
 }
+
+// fakeAuthorFor は author_id から投稿者を解決する DB 側の振る舞いを真似ます。
+func fakeAuthorFor(authorID *int64) *threadmodel.Author {
+	if authorID == nil {
+		return nil
+	}
+	return threadmodel.NewAuthor(fakeAuthorPublicID, "ホシノ", nil, nil)
+}
+
+// fakeAuthorPublicID はフェイクが返す投稿者の公開 ID です。
+var fakeAuthorPublicID = uuid.MustParse("01920000-0000-7000-8000-000000000001")
 
 // Exists は summaries に含まれるスレッドだけを「生存している」とみなす。
 // 論理削除されたスレッドは summaries から除かれる想定。
@@ -85,6 +103,8 @@ func (f *fakeThreadRepo) Exists(_ context.Context, id int64) (bool, error) {
 type fakeCommentRepo struct {
 	comments []commentmodel.Comment
 	err      error
+	// created は Create に渡された値です。
+	created *commentmodel.Comment
 }
 
 var _ commentrepo.CommentRepository = (*fakeCommentRepo)(nil)
@@ -102,7 +122,13 @@ func (f *fakeCommentRepo) Create(_ context.Context, c *commentmodel.Comment) (*c
 	if f.err != nil {
 		return nil, f.err
 	}
-	return commentmodel.Reconstruct(7, c.ThreadID, c.AuthorName, c.Body, time.Unix(0, 0).UTC()), nil
+	f.created = c
+
+	var author *commentmodel.Author
+	if c.AuthorID != nil {
+		author = commentmodel.NewAuthor(fakeAuthorPublicID, "ホシノ", nil, nil)
+	}
+	return commentmodel.Reconstruct(7, c.ThreadID, c.AuthorName, author, c.Body, time.Unix(0, 0).UTC()), nil
 }
 
 func (f *fakeCommentRepo) SoftDelete(context.Context, int64, int64) error { return f.err }
@@ -127,13 +153,13 @@ func newTestEnv(t *testing.T) *testEnv {
 
 	threads := &fakeThreadRepo{
 		summaries: []threadmodel.Summary{
-			{Thread: *threadmodel.Reconstruct(2, "2 番目のスレッド", time.Unix(2, 0).UTC()), CommentCount: 5},
-			{Thread: *threadmodel.Reconstruct(1, "1 番目のスレッド", time.Unix(1, 0).UTC()), CommentCount: 0},
+			{Thread: *threadmodel.Reconstruct(2, "2 番目のスレッド", nil, time.Unix(2, 0).UTC()), CommentCount: 5},
+			{Thread: *threadmodel.Reconstruct(1, "1 番目のスレッド", nil, time.Unix(1, 0).UTC()), CommentCount: 0},
 		},
 	}
 	comments := &fakeCommentRepo{
 		comments: []commentmodel.Comment{
-			*commentmodel.Reconstruct(10, 2, "ホシノ", "ふぁ〜", time.Unix(3, 0).UTC()),
+			*commentmodel.Reconstruct(10, 2, "ホシノ", nil, "ふぁ〜", time.Unix(3, 0).UTC()),
 		},
 	}
 	pinger := &fakePinger{}
@@ -662,4 +688,63 @@ func TestCORS(t *testing.T) {
 			t.Errorf("Access-Control-Allow-Methods = %q, want POST を含む", got)
 		}
 	})
+}
+
+// **退会した投稿者は、一覧で公開 ID が出ない。**
+//
+// 表示名の差し替えはドメイン層 (model.NewAuthor) の責務だが、
+// 詰め替えが 1 段でも増えると落としやすい。API の出力側で固定しておく。
+func TestListThreads_WithdrawnAuthor(t *testing.T) {
+	env := newTestEnv(t)
+
+	deletedAt := time.Unix(1_700_000_000, 0).UTC()
+	avatar := "https://example.com/a.png"
+	active := threadmodel.NewAuthor(fakeAuthorPublicID, "ホシノ", &avatar, nil)
+	withdrawn := threadmodel.NewAuthor(fakeAuthorPublicID, "やめた人", &avatar, &deletedAt)
+
+	env.threads.summaries = []threadmodel.Summary{
+		{Thread: *threadmodel.Reconstruct(3, "退会者のスレッド", withdrawn, time.Unix(3, 0).UTC())},
+		{Thread: *threadmodel.Reconstruct(2, "在籍者のスレッド", active, time.Unix(2, 0).UTC())},
+		{Thread: *threadmodel.Reconstruct(1, "匿名のスレッド", nil, time.Unix(1, 0).UTC())},
+	}
+
+	rec := env.do(t, http.MethodGet, "/threads", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	got := decodeJSON[oapigen.ThreadList](t, rec)
+	if len(got.Threads) != 3 {
+		t.Fatalf("threads = %d 件, want 3", len(got.Threads))
+	}
+
+	// 退会者。
+	if a := got.Threads[0].Author; a == nil {
+		t.Error("退会者の author が null になっている (匿名と区別できない)")
+	} else {
+		if !a.Withdrawn {
+			t.Error("withdrawn = false, want true")
+		}
+		if a.DisplayName != threadmodel.WithdrawnDisplayName {
+			t.Errorf("displayName = %q, want %q", a.DisplayName, threadmodel.WithdrawnDisplayName)
+		}
+		if a.PublicId != nil {
+			t.Errorf("publicId = %v, want null (退会者の識別子は返さない)", *a.PublicId)
+		}
+		if a.AvatarUrl != nil {
+			t.Errorf("avatarUrl = %q, want null", *a.AvatarUrl)
+		}
+	}
+
+	// 在籍者。退会側だけを見ると「常に伏せる」実装でも通る。
+	if a := got.Threads[1].Author; a == nil {
+		t.Error("在籍者の author が null になっている")
+	} else if a.PublicId == nil || *a.PublicId != fakeAuthorPublicID {
+		t.Errorf("publicId = %v, want %v", a.PublicId, fakeAuthorPublicID)
+	}
+
+	// 匿名投稿。**LEFT ではなく INNER で結合すると、ここが一覧から消える。**
+	if got.Threads[2].Author != nil {
+		t.Errorf("匿名スレッドに author が付いている: %+v", *got.Threads[2].Author)
+	}
 }
