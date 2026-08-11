@@ -22,6 +22,11 @@ type Thread struct {
 	// AuthorID は投稿者の内部 ID です。**nil が匿名を意味します**
 	// (docs/adr/0005-authentication.md 決定 2)。
 	// 書き込み時に使う値で、API には出しません。
+	//
+	// **読み出し経路では埋まりません。** 一覧・詳細のクエリは author_id を
+	// 選ばず、代わりに JOIN 済みの Author を返すためです。
+	// 「匿名かどうか」の判定に読み出し側でこれを使わないでください
+	// (常に nil に見えます)。判定は Author が nil かどうかで行います。
 	AuthorID *int64
 	// Author は表示用の投稿者情報です。読み出し時に解決されます。
 	// 匿名投稿では nil になります。

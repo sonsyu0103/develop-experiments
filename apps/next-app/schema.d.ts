@@ -316,7 +316,10 @@ export interface components {
         Author: {
             /**
              * Format: uuid
-             * @description 公開用の識別子 (UUID v7)。**退会済みの場合は返しません**
+             * @description 公開用の識別子 (UUID v7)。
+             *
+             *     **退会済みの場合はフィールドごと省略されます** (null ではありません)。
+             *     required に入れていないため、生成される型は省略可能になります
              * @example 0192f0a0-0000-7000-8000-000000000001
              */
             publicId?: string;
@@ -326,7 +329,10 @@ export interface components {
              */
             displayName: string;
             /**
-             * @description 退会済みの場合は null になります
+             * @description アバター画像の URL。
+             *
+             *     **未設定または退会済みの場合はフィールドごと省略されます**
+             *     (`Me.avatarUrl` と同じ挙動)。null が入って返ることはありません
              * @example https://lh3.googleusercontent.com/a/xxxx
              */
             avatarUrl?: string | null;
@@ -362,7 +368,12 @@ export interface components {
         };
         CreateCommentRequest: {
             /**
-             * @description 省略時は「名無しさん」になります
+             * @description 匿名投稿の表示名。省略時は「名無しさん」になります。
+             *
+             *     **ログイン中は無視されます。** 表示名は `users` 側から解決するため、
+             *     送っても保存されず、レスポンスの `authorName` は既定値のままになります
+             *     (表示名の変更を過去の投稿にも反映させるため。ADR 0014)。
+             *     エラーにはしません
              * @example ホシノ
              */
             authorName?: string;

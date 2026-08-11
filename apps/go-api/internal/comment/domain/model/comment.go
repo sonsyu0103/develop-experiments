@@ -30,6 +30,9 @@ type Comment struct {
 	AuthorName string
 	// AuthorID は投稿者の内部 ID です。**nil が匿名を意味します**。
 	// 書き込み時に使う値で、API には出しません。
+	//
+	// **読み出し経路では埋まりません** (thread 側と同じ理由)。
+	// 匿名かどうかの判定は Author が nil かどうかで行います。
 	AuthorID *int64
 	// Author は表示用の投稿者情報です。匿名投稿では nil になります。
 	Author    *Author

@@ -239,11 +239,18 @@ type ListThreadsWithCommentCountRow struct {
 // 2,005 スレッド / 200,016 コメントでの実測 (EXPLAIN ANALYZE、各 3 回):
 //
 //	LEFT JOIN + GROUP BY : 5.84 - 7.43 ms / shared buffers 2,054
-//	この実装             : 1.04 - 1.11 ms / shared buffers    59
+//	相関サブクエリ       : 1.04 - 1.11 ms / shared buffers    59
 //
 // 約 5.5 倍速く、バッファ読み取りは 35 分の 1。結果は完全に一致する
 // (両者を FULL JOIN して差分 0 件を確認済み)。
 // どちらも DB への往復は 1 回なので、N+1 実装との対比は変わらない。
+//
+// 【重要】**この測定は LEFT JOIN users を足す前のもの。**
+// 投稿者の解決を加えた現在の形では測り直していない
+// (Phase 4 のデータセットが要る。開発環境は 7 スレッド / users 0 件で、
+// この規模では何を測っても意味が無い)。
+// 上の数値を「投稿者の解決を含めたコスト」として読まないこと。
+// Phase 4 で測り直し、この節を更新する。
 //
 // 【注意】この差は Index Only Scan が効くことに依存する。
 // バルク INSERT 直後は visibility map が未整備で Heap Fetches が発生し、

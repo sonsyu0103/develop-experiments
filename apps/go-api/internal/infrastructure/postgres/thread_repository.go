@@ -75,10 +75,16 @@ func (r *ThreadRepository) Create(ctx context.Context, thread *model.Thread) (*m
 	if err != nil {
 		return nil, translateError("ThreadRepository.Create", err)
 	}
-	return model.Reconstruct(row.ID, row.Title,
+	created := model.Reconstruct(row.ID, row.Title,
 		toThreadAuthor(row.AuthorPublicID, row.AuthorDisplayName,
 			row.AuthorAvatarUrl, row.AuthorDeletedAt),
-		row.CreatedAt), nil
+		row.CreatedAt)
+	// 書き込み経路の戻り値は、書いた内容を反映させる。
+	// Reconstruct は読み出し用で AuthorID を持たないため、ここで補う。
+	// 補わないと「ログインして作ったのに AuthorID が nil」になり、
+	// 戻り値で紐付けを判定するコードが将来書かれたときに静かに壊れる。
+	created.AuthorID = thread.AuthorID
+	return created, nil
 }
 
 // Exists はスレッドが存在するかを返します。

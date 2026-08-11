@@ -67,10 +67,13 @@ func (r *CommentRepository) Create(ctx context.Context, comment *model.Comment) 
 		return nil, translateError("CommentRepository.Create", err)
 	}
 
-	return model.Reconstruct(row.ID, row.ThreadID, row.AuthorName,
+	created := model.Reconstruct(row.ID, row.ThreadID, row.AuthorName,
 		toCommentAuthor(row.AuthorPublicID, row.AuthorDisplayName,
 			row.AuthorAvatarUrl, row.AuthorDeletedAt),
-		row.Body, row.CreatedAt), nil
+		row.Body, row.CreatedAt)
+	// 書いた内容を戻り値に反映させる (thread_repository.go と同じ理由)。
+	created.AuthorID = comment.AuthorID
+	return created, nil
 }
 
 // SoftDelete はコメントを論理削除します。

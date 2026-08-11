@@ -265,24 +265,29 @@ if SQL_EXEC:
     # 認証は資格情報が無いので使えない。HTTP でログインできないため、
     # 投稿者つきの行は SQL で作る。**検証したいのは LEFT JOIN と CTE が
     # 実 DB で意図どおり動くか**であり、そこは HTTP 越しに読める。
-    sql("""
-        INSERT INTO users (id, public_id, google_sub, email, display_name, avatar_url)
-        VALUES (900001, '01920000-0000-7000-8000-000000900001'::uuid,
-                'smoke-sub-1', 'smoke@example.com', 'スモークの人',
-                'https://example.com/a.png')
-        ON CONFLICT (google_sub) DO NOTHING;
-    """)
-    sql("""
-        INSERT INTO threads (id, title, author_id)
-        VALUES (900001, 'スモーク: 投稿者つきスレッド', 900001)
-        ON CONFLICT (id) DO UPDATE SET deleted_at = NULL, author_id = 900001;
-    """)
-    sql("""
-        INSERT INTO comments (thread_id, author_name, body, author_id)
-        VALUES (900001, '名無しさん', 'スモーク: 投稿者つきコメント', 900001)
-        ON CONFLICT DO NOTHING;
-    """)
+    # **投入も try の中に入れる。** 外に置くと、投入が失敗した時点で
+    # finally に到達せず 900001 の行が残る。しかも check() の FAIL ではなく
+    # トレースバックでスモーク全体が異常終了するため、
+    # 「何件中何件が失敗したか」の集計にも乗らない。
     try:
+        sql("""
+            INSERT INTO users (id, public_id, google_sub, email, display_name, avatar_url)
+            VALUES (900001, '01920000-0000-7000-8000-000000900001'::uuid,
+                    'smoke-sub-1', 'smoke@example.com', 'スモークの人',
+                    'https://example.com/a.png')
+            ON CONFLICT (google_sub) DO NOTHING;
+        """)
+        sql("""
+            INSERT INTO threads (id, title, author_id)
+            VALUES (900001, 'スモーク: 投稿者つきスレッド', 900001)
+            ON CONFLICT (id) DO UPDATE SET deleted_at = NULL, author_id = 900001;
+        """)
+        sql("""
+            INSERT INTO comments (thread_id, author_name, body, author_id)
+            VALUES (900001, '名無しさん', 'スモーク: 投稿者つきコメント', 900001)
+            ON CONFLICT DO NOTHING;
+        """)
+
         status, payload, _ = call("GET", "/threads/900001")
         author = payload.get("author")
         check("詳細で投稿者が解決される", author is not None, f"payload={payload}")
@@ -298,11 +303,16 @@ if SQL_EXEC:
               "authorId" not in json.dumps(payload) and (author is None or "id" not in author),
               f"payload={payload}")
 
+        # 添字で取り出す前に形を確かめる。
+        # エラー応答や 0 件のときに KeyError で飛ぶと、
+        # FAIL として記録されないまま全体が止まる。
         status, payload, _ = call("GET", "/threads/900001/comments")
-        c = payload["comments"][0]
+        comments = payload.get("comments") or []
+        c = comments[0] if comments else None
         check("コメントでも投稿者が解決される",
-              c["author"] is not None and c["author"]["displayName"] == "スモークの人",
-              f"comment={c}")
+              c is not None and c.get("author") is not None
+              and c["author"]["displayName"] == "スモークの人",
+              f"payload={payload}")
 
         # 匿名投稿が LEFT JOIN で消えないこと。
         # INNER にすると、ここで一覧から丸ごと落ちる。
