@@ -340,7 +340,8 @@ func NewRouter(deps Deps) (*gin.Engine, error) {
 	spec.Servers = nil
 
 	r := gin.New()
-	r.Use(gin.Recovery(), requestLogger(), cors(deps.AllowedOrigins))
+	// 並びの意味は middlewares のコメントを参照。
+	r.Use(middlewares(deps.AllowedOrigins)...)
 
 	// セッションの解決は仕様検証より前に置く。
 	// AuthenticationFunc がここで載せた結果を見るため、順序が逆だと

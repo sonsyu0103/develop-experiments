@@ -45,6 +45,40 @@ failures: list[str] = []
 checks = 0
 
 
+def _decode(raw: bytes):
+    """本文を JSON として読む。読めなければ None を返す。
+
+    **例外にしない。** リダイレクトの本文は HTML なので、
+    json.loads がそのまま落ちるとスモーク全体がトレースバックで止まり、
+    check() の集計にも乗らない (何件中何件失敗したかが分からなくなる)。
+    """
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """リダイレクトを追跡しないためのハンドラ。
+
+    **既定の urllib は 302 を自動で追いかける。** API のスモークでは
+    「何番を返したか」を見たいので、追われると検査にならない。
+
+    実害もある。認証を設定した環境では /auth/google が
+    accounts.google.com へリダイレクトするため、
+    **スモークが外部へ実際に接続していた**。CI から意図しない
+    外向き通信が出るし、Google 側の応答に結果が左右される。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirect)
+
+
 def call(method: str, path: str, body: str | None = None):
     """API を叩き、(ステータス, JSON, ヘッダ) を返す。"""
     req = urllib.request.Request(BASE_URL + path, method=method)
@@ -53,15 +87,19 @@ def call(method: str, path: str, body: str | None = None):
         req.add_header("Content-Type", "application/json")
         data = body.encode()
     try:
-        with urllib.request.urlopen(req, data, timeout=10) as res:
+        with _opener.open(req, data, timeout=10) as res:
             raw = res.read()
-            return res.status, (json.loads(raw) if raw else None), dict(res.headers)
+            # **dict() にしない。** Set-Cookie のように同名で複数回
+            # 現れるヘッダが 1 本に潰れ、「3 つ発行したのに 1 つしか見えない」
+            # という形で検査が嘘をつく (実際に踏んだ)。
+            # Message のまま返せば get_all() で全部取れる。
+            return res.status, _decode(raw), res.headers
     except urllib.error.HTTPError as e:
         raw = e.read()
         try:
-            return e.code, json.loads(raw), dict(e.headers)
+            return e.code, _decode(raw), e.headers
         except json.JSONDecodeError:
-            return e.code, raw.decode(errors="replace")[:200], dict(e.headers)
+            return e.code, raw.decode(errors="replace")[:200], e.headers
 
 
 def sql(statement: str) -> None:
@@ -204,12 +242,30 @@ for label, method, path, body in [
 
 check_status("上限ちょうどの size は通る", "GET", "/threads?size=100", 200)
 
-section("認証 (資格情報が無い状態での振る舞い)")
-# CI とローカルの既定では GOOGLE_CLIENT_ID / SECRET を置いていない。
-# その状態で「認証だけが使えない」ことを確認する。
-# 全体が落ちる設計だと、ここで掲示板の検証がすべて巻き添えになる。
-check_status("認証が未設定なら /auth/google は 503", "GET", "/auth/google", 503,
-             want_code="UNAVAILABLE")
+section("認証")
+# **資格情報の有無で期待が変わるので、まず状態を判定する。**
+# CI は置いていないので 503、手元に .env を置くと 302 になる。
+# 決め打ちにすると、資格情報を入れた環境でスモークが落ちる (実際に踏んだ)。
+auth_status, auth_payload, auth_headers = call("GET", "/auth/google")
+
+if auth_status == 503:
+    # 認証だけが使えない状態。全体が落ちる設計だと、
+    # ここで掲示板の検証がすべて巻き添えになる。
+    code = (auth_payload or {}).get("error", {}).get("code")
+    check("認証が未設定なら /auth/google は 503 UNAVAILABLE",
+          code == "UNAVAILABLE", f"status={auth_status} code={code}")
+else:
+    # 資格情報が入っている。Google の認可エンドポイントへ送ること。
+    location = auth_headers.get("Location", "")
+    check("認証が設定済みなら /auth/google は 302",
+          auth_status == 302, f"status={auth_status}")
+    check("リダイレクト先が Google の認可エンドポイント",
+          location.startswith("https://accounts.google.com/"), f"Location={location[:80]}")
+    # state / nonce / PKCE を持ち回るための Cookie が発行されること。
+    cookies = auth_headers.get_all("Set-Cookie") or []
+    joined = " | ".join(cookies)
+    for name in ("oauth_state", "oauth_nonce", "oauth_verifier"):
+        check(f"{name} が発行される", name in joined, f"Set-Cookie={joined[:200]}")
 
 # 仕様書の security 宣言が 401 として強制されること。
 # gin-middleware は security 違反を 400 に丸めるため、

@@ -49,6 +49,10 @@ components:
     in: internal/pagination
   shared-config:
     in: internal/config
+  # 構造化ログの共通フィールドと相関 ID (docs/adr/0010-log-pipeline.md 決定 4)。
+  # どの層からもログを出すため、下地として扱う
+  shared-logging:
+    in: internal/logging
 
   thread-model:
     in: internal/thread/domain/model
@@ -87,6 +91,7 @@ components:
 commonComponents:
   - shared-apperr
   - shared-pagination
+  - shared-logging
 
 deps:
   # 結線だけを行うため、すべてを知ってよい唯一の場所
@@ -159,6 +164,8 @@ deps:
     canUse:
       - gin
       - openapi
+      # リクエスト ID の採番 (ADR 0010 の 4-1)
+      - uuid
     mayDependOn:
       - thread-usecase
       - comment-usecase

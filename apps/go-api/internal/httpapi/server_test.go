@@ -1,10 +1,12 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +23,7 @@ import (
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
+	"develop-experiments/apps/go-api/internal/logging"
 	"develop-experiments/apps/go-api/internal/pagination"
 	threadmodel "develop-experiments/apps/go-api/internal/thread/domain/model"
 	threadrepo "develop-experiments/apps/go-api/internal/thread/domain/repository"
@@ -635,6 +638,18 @@ func TestCORS(t *testing.T) {
 		if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
 			t.Errorf("Access-Control-Allow-Credentials = %q, want true", got)
 		}
+		// **返すだけでは JavaScript から読めない。**
+		// Expose-Headers に挙げないと、fetch の res.headers から消える。
+		// 「問い合わせが来たら request_id で引く」には、
+		// まず利用者側が値を知れる必要がある。
+		if got := rec.Header().Get("Access-Control-Expose-Headers"); !strings.Contains(got, requestIDHeader) {
+			t.Errorf("Access-Control-Expose-Headers = %q, want %s を含む", got, requestIDHeader)
+		}
+		// 送る側にも許す。無いと preflight で弾かれ、
+		// 「フロントが採番済みの ID を渡す」経路が成立しない。
+		if got := rec.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, requestIDHeader) {
+			t.Errorf("Access-Control-Allow-Headers = %q, want %s を含む", got, requestIDHeader)
+		}
 	})
 
 	t.Run("未許可オリジンにはヘッダを返さない", func(t *testing.T) {
@@ -746,5 +761,195 @@ func TestListThreads_WithdrawnAuthor(t *testing.T) {
 	// 匿名投稿。**LEFT ではなく INNER で結合すると、ここが一覧から消える。**
 	if got.Threads[2].Author != nil {
 		t.Errorf("匿名スレッドに author が付いている: %+v", *got.Threads[2].Author)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// リクエスト ID (ADR 0010 の 4-1)
+// ---------------------------------------------------------------------------
+
+// 相関 ID が採番され、レスポンスヘッダにも返ること。
+// 利用者から問い合わせが来たときに、この値でログを引く。
+func TestRequestID_GeneratedAndReturned(t *testing.T) {
+	env := newTestEnv(t)
+
+	rec := env.do(t, http.MethodGet, "/threads", "")
+
+	got := rec.Header().Get(requestIDHeader)
+	if got == "" {
+		t.Fatal("X-Request-Id が返っていない")
+	}
+	if _, err := uuid.Parse(got); err != nil {
+		t.Errorf("X-Request-Id = %q, UUID として読めない: %v", got, err)
+	}
+}
+
+// 受信したヘッダを尊重する。ALB やフロントが採番済みの場合に前後をつなぐため。
+func TestRequestID_HonorsIncomingHeader(t *testing.T) {
+	env := newTestEnv(t)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/threads", nil)
+	req.Header.Set(requestIDHeader, "01J8ZC5N9K2QX7V3MTB4RSAHDF")
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get(requestIDHeader); got != "01J8ZC5N9K2QX7V3MTB4RSAHDF" {
+		t.Errorf("X-Request-Id = %q, want 受信した値", got)
+	}
+}
+
+// **受け取った値をそのまま信じない。**
+//
+// ログは S3 に長期保管され Athena から検索される。
+// 改行や制御文字を通すと偽のログ行を作られる (ログインジェクション)。
+// 長大な値は保管コストにも効く。
+func TestRequestID_RejectsUntrustedValues(t *testing.T) {
+	tests := map[string]string{
+		"改行を含む":      "abc\ndef",
+		"空白を含む":      "abc def",
+		"引用符を含む":     `abc"def`,
+		"長すぎる":       strings.Repeat("a", 65),
+		"空":          "",
+		"JSON らしきもの": `{"level":"ERROR"}`,
+	}
+
+	for name, value := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := newTestEnv(t)
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/threads", nil)
+			// ヘッダ値に制御文字を直接入れると net/http が弾くため、
+			// 検証したいのは「ミドルウェアが値を採用しないこと」に絞る。
+			req.Header[requestIDHeader] = []string{value}
+			rec := httptest.NewRecorder()
+			env.router.ServeHTTP(rec, req)
+
+			got := rec.Header().Get(requestIDHeader)
+			if got == value {
+				t.Errorf("信用できない値をそのまま採用した: %q", got)
+			}
+			if _, err := uuid.Parse(got); err != nil {
+				t.Errorf("採番し直されていない: %q", got)
+			}
+		})
+	}
+}
+
+// **相関 ID が実際にログへ届くこと。**
+//
+// ヘッダを返すだけでは意味が無い。ログに乗って初めて Athena で串刺しにできる。
+// ミドルウェアがコンテキストに載せ忘れても、ヘッダの検査だけでは通ってしまう。
+func TestRequestID_ReachesTheLog(t *testing.T) {
+	env := newTestEnv(t)
+
+	// 既定ロガーを差し替えて出力を捕まえる。
+	var buf bytes.Buffer
+	original := slog.Default()
+	slog.SetDefault(slog.New(logging.NewHandler(&buf, false)))
+	t.Cleanup(func() { slog.SetDefault(original) })
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/threads", nil)
+	req.Header.Set(requestIDHeader, "01J8ZC5N9K2QX7V3MTB4RSAHDF")
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("ログを JSON として読めない: %v (raw=%s)", err, buf.String())
+	}
+
+	if got["msg"] != "http_request" {
+		t.Errorf("msg = %v, want http_request (イベント名として固定する)", got["msg"])
+	}
+	if got["request_id"] != "01J8ZC5N9K2QX7V3MTB4RSAHDF" {
+		t.Errorf("ログの request_id = %v, want 受信した値", got["request_id"])
+	}
+	// レスポンスヘッダと同じ値であること。突き合わせられないと問い合わせに使えない。
+	if got["request_id"] != rec.Header().Get(requestIDHeader) {
+		t.Errorf("ログとヘッダで request_id が違う: log=%v header=%q",
+			got["request_id"], rec.Header().Get(requestIDHeader))
+	}
+	// 単位をフィールド名に含めた数値であること (ADR 0010 の 4-4)。
+	if _, ok := got["latency_ms"].(float64); !ok {
+		t.Errorf("latency_ms が数値で出ていない: %v", got["latency_ms"])
+	}
+	// クエリ文字列を丸ごと出さないこと (ADR 0010 の 4-5)。
+	if got["path"] != "/threads" {
+		t.Errorf("path = %v, want /threads", got["path"])
+	}
+}
+
+// **パニックしても構造化ログが残ること。**
+//
+// gin.Recovery を requestLogger より外側に置いていたときは、
+// パニックが c.Next() を巻き戻して抜けるため http_request が 1 行も出ず、
+// gin が stderr へ平文を書くだけだった (status=500 / ログ空 を実測)。
+//
+// ADR 0010 の 4-3 はパニックを ERROR に分類し、
+// CloudWatch のアラームはこのレベルを起点に組むと決めている。
+// **最もアラートが要る事象でだけ ERROR が立たない**状態になっていた。
+func TestPanic_IsLoggedAsError(t *testing.T) {
+	var buf bytes.Buffer
+	original := slog.Default()
+	slog.SetDefault(slog.New(logging.NewHandler(&buf, false)))
+	t.Cleanup(func() { slog.SetDefault(original) })
+
+	// 仕様書から生成されるルータにはパニックする経路が無いため、
+	// ミドルウェアの並びだけを本番と共有して確かめる。
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middlewares([]string{"http://localhost:3000"})...)
+	r.GET("/zz-panic", func(*gin.Context) { panic("わざと落とす") })
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/zz-panic", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	// 500 でも本文は JSON。gin.Recovery の既定は空ボディで、API の約束から外れる。
+	if code := decodeError(t, rec).Error.Code; code != oapigen.INTERNAL {
+		t.Errorf("code = %q, want INTERNAL", code)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if buf.Len() == 0 {
+		t.Fatal("パニックしたのにログが 1 行も出ていない")
+	}
+
+	var sawPanic, sawRequest bool
+	for _, line := range lines {
+		var got map[string]any
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Fatalf("ログを JSON として読めない: %v (raw=%s)", err, line)
+		}
+		if got["request_id"] == nil {
+			t.Errorf("相関 ID が付いていない: %s", line)
+		}
+		switch got["msg"] {
+		case "panic":
+			sawPanic = true
+			if got["level"] != "ERROR" {
+				t.Errorf("panic の level = %v, want ERROR", got["level"])
+			}
+			if got["stack"] == nil {
+				t.Error("スタックが出ていない")
+			}
+		case "http_request":
+			sawRequest = true
+			if got["level"] != "ERROR" {
+				t.Errorf("http_request の level = %v, want ERROR (status 500)", got["level"])
+			}
+			if got["status"] != float64(500) {
+				t.Errorf("status = %v, want 500", got["status"])
+			}
+		}
+	}
+	if !sawPanic {
+		t.Error("panic のログが出ていない")
+	}
+	if !sawRequest {
+		t.Error("http_request のログが出ていない (パニックで巻き戻されている)")
 	}
 }

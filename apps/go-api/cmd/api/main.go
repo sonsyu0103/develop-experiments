@@ -19,6 +19,7 @@ import (
 	"develop-experiments/apps/go-api/internal/httpapi"
 	oidcprovider "develop-experiments/apps/go-api/internal/infrastructure/oidc"
 	"develop-experiments/apps/go-api/internal/infrastructure/postgres"
+	"develop-experiments/apps/go-api/internal/logging"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
 )
@@ -36,7 +37,7 @@ func run() error {
 		return err
 	}
 
-	setupLogger(cfg.Debug)
+	logging.Setup(cfg.Debug)
 	if cfg.Debug {
 		gin.SetMode(gin.DebugMode)
 	} else {
@@ -130,20 +131,4 @@ func run() error {
 		slog.Info("シャットダウンが完了しました")
 		return nil
 	}
-}
-
-// setupLogger は slog のデフォルトロガーを設定します。
-// 本番は JSON、開発は人間が読みやすいテキスト形式にします。
-func setupLogger(debug bool) {
-	level := slog.LevelInfo
-	var handler slog.Handler
-
-	if debug {
-		level = slog.LevelDebug
-		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level})
-	} else {
-		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})
-	}
-
-	slog.SetDefault(slog.New(handler))
 }
