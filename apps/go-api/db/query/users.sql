@@ -1,3 +1,15 @@
+-- =============================================================================
+-- 【列の順番をテーブルと揃えること】
+--
+-- role は ALTER TABLE ADD COLUMN で足したため、**テーブルでは末尾**にある。
+-- SELECT / RETURNING の並びをテーブルと一致させると、sqlc は
+-- 共通の行型 (sqlcgen.User) を再利用する。
+--
+-- ずらすとクエリごとに別の行型 (GetUserByIDRow / UpsertUserRow ...) が生成され、
+-- ドメインへの詰め替えが 1 か所から 4 か所に増える。
+-- 実際に一度そうなった (role を created_at の前に置いていた)。
+-- =============================================================================
+
 -- name: UpsertUser :one
 -- ログイン時に呼ぶ。google_sub で照合し、無ければ作る。
 --
@@ -35,13 +47,17 @@ SET email        = EXCLUDED.email,
     -- 実測: 2 回目のログインで消えることを確認済み。
     -- public_id を守っているのと同じ理由で、こちらも上書きさせない。
     avatar_url   = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
+    -- **role は絶対に更新しない。** INSERT 側の列にも含めていない。
+    -- クライアント由来の値がロールに触れる経路を 1 か所でも作ると、
+    -- そこが権限昇格の入口になる (ADR 0011 決定 1「権限昇格を作り込まない」)。
+    -- 新規は DEFAULT 'user'、既存はログインしても変わらない。
     updated_at   = now()
 WHERE users.deleted_at IS NULL
-RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at;
+RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role;
 
 -- name: GetUserByID :one
 -- 内部 ID での取得。外部キーからの解決に使う。
-SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at
+SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role
 FROM users
 WHERE id = sqlc.arg('id')
   AND deleted_at IS NULL;
@@ -49,7 +65,7 @@ WHERE id = sqlc.arg('id')
 -- name: GetUserByPublicID :one
 -- API から来る識別子は public_id だけ (ADR 0003 未決 #11 の決定)。
 -- 内部 ID を URL に出すとユーザーを列挙できるため。
-SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at
+SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role
 FROM users
 WHERE public_id = sqlc.arg('public_id')
   AND deleted_at IS NULL;
@@ -75,3 +91,25 @@ WHERE public_id = sqlc.arg('public_id')
 SELECT id, public_id, display_name, avatar_url, deleted_at
 FROM users
 WHERE id = ANY(sqlc.arg('ids')::bigint[]);
+
+-- name: PromoteToAdmin :one
+-- 最初の管理者を作る唯一の経路 (ADR 0011 決定 1「最初の管理者をどう作るか」)。
+--
+-- **UI からは作れない。** 「最初の 1 人」を作る機能は、そのまま
+-- 「誰でも管理者になれる」機能になりうるため。
+-- 環境変数 BOOTSTRAP_ADMIN_GOOGLE_SUB に一致する利用者がログインしたときだけ、
+-- アプリがこれを呼ぶ。
+--
+-- google_sub で指定するのは、内部 ID も public_id も
+-- 「先に一度ログインしてもらわないと分からない」ため。
+-- Google の sub なら、アカウントが決まった時点で確定する。
+--
+-- 既に admin なら更新しない (role <> 'admin')。
+-- 毎ログインで UPDATE を撃つと、更新日時だけが動いて監査の邪魔になる。
+-- 該当が無ければ 0 行が返るので、呼び出し側は「昇格したか」を判定できる。
+UPDATE users
+SET role = 'admin', updated_at = now()
+WHERE google_sub = sqlc.arg('google_sub')
+  AND deleted_at IS NULL
+  AND role <> 'admin'
+RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role;

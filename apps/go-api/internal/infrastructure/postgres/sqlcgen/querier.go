@@ -184,10 +184,36 @@ type Querier interface {
 	// 悲観ロック版と楽観 (SSI) 版を比較実装して、
 	// スループット差を計測できるようにするために両方用意している。
 	LockThreadForUpdate(ctx context.Context, id int64) (int64, error)
+	// 最初の管理者を作る唯一の経路 (ADR 0011 決定 1「最初の管理者をどう作るか」)。
+	//
+	// **UI からは作れない。** 「最初の 1 人」を作る機能は、そのまま
+	// 「誰でも管理者になれる」機能になりうるため。
+	// 環境変数 BOOTSTRAP_ADMIN_GOOGLE_SUB に一致する利用者がログインしたときだけ、
+	// アプリがこれを呼ぶ。
+	//
+	// google_sub で指定するのは、内部 ID も public_id も
+	// 「先に一度ログインしてもらわないと分からない」ため。
+	// Google の sub なら、アカウントが決まった時点で確定する。
+	//
+	// 既に admin なら更新しない (role <> 'admin')。
+	// 毎ログインで UPDATE を撃つと、更新日時だけが動いて監査の邪魔になる。
+	// 該当が無ければ 0 行が返るので、呼び出し側は「昇格したか」を判定できる。
+	PromoteToAdmin(ctx context.Context, googleSub string) (User, error)
 	// 現時点で HTTP エンドポイントからは呼ばれていない。
 	// 削除 API を公開するかは未決 (docs/adr/0003-open-questions.md 項目 7)。
 	SoftDeleteComment(ctx context.Context, arg SoftDeleteCommentParams) (int64, error)
 	ThreadExists(ctx context.Context, id int64) (bool, error)
+	// =============================================================================
+	// 【列の順番をテーブルと揃えること】
+	//
+	// role は ALTER TABLE ADD COLUMN で足したため、**テーブルでは末尾**にある。
+	// SELECT / RETURNING の並びをテーブルと一致させると、sqlc は
+	// 共通の行型 (sqlcgen.User) を再利用する。
+	//
+	// ずらすとクエリごとに別の行型 (GetUserByIDRow / UpsertUserRow ...) が生成され、
+	// ドメインへの詰め替えが 1 か所から 4 か所に増える。
+	// 実際に一度そうなった (role を created_at の前に置いていた)。
+	// =============================================================================
 	// ログイン時に呼ぶ。google_sub で照合し、無ければ作る。
 	//
 	// 【なぜ upsert か】

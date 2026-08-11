@@ -32,9 +32,13 @@ type User struct {
 	Email       string
 	DisplayName string
 	AvatarURL   *string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	DeletedAt   *time.Time
+	// Role は権限です。**新規登録では常に RoleUser** になります
+	// (DB 側の DEFAULT)。クライアントから来た値をここに入れる経路は
+	// 作りません (docs/adr/0011-moderation.md 決定 1)。
+	Role      Role
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	DeletedAt *time.Time
 }
 
 // Author は投稿一覧で投稿者を表示するための、最小限の情報です。
@@ -68,6 +72,9 @@ type SessionOwner struct {
 	Email       string
 	DisplayName string
 	AvatarURL   *string
+	// Role は権限判定に使います。毎リクエストの経路で必要になるため、
+	// セッションの検証と同じクエリで引いています (db/query/sessions.sql)。
+	Role Role
 }
 
 // NewUser は永続化前の新しい利用者を組み立てます。
@@ -118,7 +125,7 @@ func NewUser(googleSub, email, displayName string, avatarURL *string) (*User, er
 // 保存済みのデータが対象なので、検証は行いません。
 func Reconstruct(
 	id int64, publicID uuid.UUID, googleSub, email, displayName string,
-	avatarURL *string, createdAt, updatedAt time.Time, deletedAt *time.Time,
+	avatarURL *string, role Role, createdAt, updatedAt time.Time, deletedAt *time.Time,
 ) *User {
 	return &User{
 		ID:          id,
@@ -127,6 +134,7 @@ func Reconstruct(
 		Email:       email,
 		DisplayName: displayName,
 		AvatarURL:   avatarURL,
+		Role:        role,
 		CreatedAt:   createdAt,
 		UpdatedAt:   updatedAt,
 		DeletedAt:   deletedAt,

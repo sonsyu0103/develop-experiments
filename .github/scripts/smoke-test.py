@@ -25,6 +25,7 @@
 # ローカルで動かないスクリプトは結局使われなくなる。
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -79,9 +80,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_NoRedirect)
 
 
-def call(method: str, path: str, body: str | None = None):
+def call(method: str, path: str, body: str | None = None,
+         headers: dict[str, str] | None = None):
     """API を叩き、(ステータス, JSON, ヘッダ) を返す。"""
     req = urllib.request.Request(BASE_URL + path, method=method)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
     data = None
     if body is not None:
         req.add_header("Content-Type", "application/json")
@@ -395,6 +399,68 @@ if SQL_EXEC:
         sql("DELETE FROM users WHERE id = 900001;")
 else:
     section("投稿者の紐付け")
+    print("  \033[33mSKIP\033[0m SQL_EXEC が未設定のためスキップ")
+
+if SQL_EXEC:
+    section("権限 (ADR 0011 決定 1)")
+
+    # 認証を通さずにロールの読み出し経路を確かめる。
+    # セッションは ID がトークンの SHA-256 なので、こちらで計算して挿入する
+    # (生のトークンは DB に保存しない設計。docs/adr/0005-authentication.md)。
+    probe_token = "smoke-role-probe-token"
+    probe_hash = hashlib.sha256(probe_token.encode()).hexdigest()
+
+    try:
+        sql("""
+            INSERT INTO users (id, public_id, google_sub, email, display_name)
+            VALUES (900002, '01920000-0000-7000-8000-000000900002'::uuid,
+                    'smoke-sub-2', 'smoke-role@example.com', 'ロール検証')
+            ON CONFLICT (google_sub) DO NOTHING;
+        """)
+        sql(f"""
+            INSERT INTO sessions (id, user_id, expires_at)
+            VALUES ('{probe_hash}', 900002, now() + interval '1 hour')
+            ON CONFLICT (id) DO NOTHING;
+        """)
+        cookie = {"Cookie": f"session={probe_token}"}
+
+        status, payload, _ = call("GET", "/me", headers=cookie)
+        check("ログイン中は /me に role が載る",
+              status == 200 and (payload or {}).get("role") == "user",
+              f"status={status} payload={payload}")
+
+        # **昇格が読み出し側に反映されること。**
+        # ここが繋がっていないと、権限を変えても API から見えない。
+        sql("UPDATE users SET role = 'moderator' WHERE id = 900002;")
+        _, payload, _ = call("GET", "/me", headers=cookie)
+        check("ロールを変えると /me に反映される",
+              (payload or {}).get("role") == "moderator", f"payload={payload}")
+
+        # **他人のロールは投稿一覧に出さない。**
+        # 誰がモデレーターかを晒す必要がない (Author に role は無い)。
+        sql("""
+            INSERT INTO threads (id, title, author_id)
+            VALUES (900002, 'スモーク: モデレーターの投稿', 900002)
+            ON CONFLICT (id) DO UPDATE SET deleted_at = NULL, author_id = 900002;
+        """)
+        _, payload, _ = call("GET", "/threads/900002")
+        author = (payload or {}).get("author") or {}
+        check("投稿一覧の author に role を含めない",
+              "role" not in author, f"author={author}")
+
+        # DB 側の CHECK 制約が効いていること。
+        # アプリと DB のどちらか片方だけ値を増やすと、ここで気づける。
+        try:
+            sql("UPDATE users SET role = 'superadmin' WHERE id = 900002;")
+            check("不正なロールを DB が拒否する", False, "CHECK 制約が効いていない")
+        except subprocess.CalledProcessError:
+            check("不正なロールを DB が拒否する", True)
+    finally:
+        sql("DELETE FROM threads WHERE id = 900002;")
+        sql("DELETE FROM sessions WHERE user_id = 900002;")
+        sql("DELETE FROM users WHERE id = 900002;")
+else:
+    section("権限")
     print("  \033[33mSKIP\033[0m SQL_EXEC が未設定のためスキップ")
 
 # ---------------------------------------------------------------------------

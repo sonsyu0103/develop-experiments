@@ -99,7 +99,11 @@ SELECT
     u.public_id,
     u.email,
     u.display_name,
-    u.avatar_url
+    u.avatar_url,
+    -- 権限判定は毎リクエスト必要になる (ADR 0011 決定 1)。
+    -- ここで一緒に引かないと、削除やモデレーションのたびに
+    -- users をもう一度引くことになり、1 往復に畳んだ意味が薄れる。
+    u.role
 FROM sessions s
 JOIN users u ON u.id = s.user_id
 WHERE s.id = $1
@@ -116,6 +120,7 @@ type GetLiveSessionWithUserRow struct {
 	Email       string
 	DisplayName string
 	AvatarUrl   *string
+	Role        string
 }
 
 // セッションの検証。**毎リクエスト通る、最も高頻度の経路**になる。
@@ -147,6 +152,7 @@ func (q *Queries) GetLiveSessionWithUser(ctx context.Context, id string) (GetLiv
 		&i.Email,
 		&i.DisplayName,
 		&i.AvatarUrl,
+		&i.Role,
 	)
 	return i, err
 }

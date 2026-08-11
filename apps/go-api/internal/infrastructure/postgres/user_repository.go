@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -93,9 +94,37 @@ func (r *UserRepository) ListAuthorsByIDs(ctx context.Context, ids []int64) ([]m
 	return authors, nil
 }
 
+// PromoteToAdmin は google_sub で指定した利用者を admin にします。
+//
+// 0 行なら「既に admin」か「該当が居ない」のどちらかで、
+// どちらも異常ではないため false を返します
+// (環境変数に未ログインの sub を書いておく運用が成り立つ)。
+func (r *UserRepository) PromoteToAdmin(ctx context.Context, googleSub string) (bool, error) {
+	_, err := r.q.PromoteToAdmin(ctx, googleSub)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, translateError("UserRepository.PromoteToAdmin", err)
+	}
+	return true, nil
+}
+
 func toUserModel(row sqlcgen.User) *model.User {
+	// ロールが読めない値なら、そこで止める。
+	// 既定値へ丸めると「一般利用者として静かに動く」か
+	// 「管理者として静かに動く」形になり、どちらも気づけない。
+	role, err := model.ParseRole(row.Role)
+	if err != nil {
+		// 呼び出し側がエラーを返せない位置なので、
+		// 一般利用者へ倒したうえで記録に残す。
+		// DB の CHECK 制約があるため、到達するのは制約を外したときだけ。
+		slog.Error("ロールを解釈できません",
+			slog.Int64("user_id", row.ID), slog.String("role", row.Role))
+		role = model.RoleUser
+	}
 	return model.Reconstruct(
 		row.ID, row.PublicID, row.GoogleSub, row.Email, row.DisplayName,
-		row.AvatarUrl, row.CreatedAt, row.UpdatedAt, row.DeletedAt,
+		row.AvatarUrl, role, row.CreatedAt, row.UpdatedAt, row.DeletedAt,
 	)
 }

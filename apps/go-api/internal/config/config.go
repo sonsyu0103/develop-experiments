@@ -61,6 +61,16 @@ type AuthConfig struct {
 	// FrontendURL はログイン完了後に戻す先です。RedirectURL と同じ理由で
 	// 既定値を持たせません。
 	FrontendURL string
+	// BootstrapAdminGoogleSub は最初の管理者にする Google の sub です。
+	//
+	// **UI から管理者を作れないようにするための設定**です
+	// (docs/adr/0011-moderation.md 決定 1)。
+	// 「最初の 1 人」を作る機能は、そのまま
+	// 「誰でも管理者になれる」機能になりえます。
+	//
+	// 未設定なら誰も昇格しません。認証の有効・無効とは独立です
+	// (Enabled() の判定には含めません)。
+	BootstrapAdminGoogleSub string
 	// SecureCookie は Cookie に Secure 属性を付けるかどうかです。
 	//
 	// localhost は HTTP なので開発時は付けられません。
@@ -121,6 +131,8 @@ func Load() (*Config, error) {
 			// compose.yaml と apps/go-api/.env.example が明示的に渡す。
 			RedirectURL: os.Getenv("AUTH_REDIRECT_URL"),
 			FrontendURL: os.Getenv("AUTH_FRONTEND_URL"),
+			// シークレットではないが、他の認証設定と同じ経路で渡す。
+			BootstrapAdminGoogleSub: os.Getenv("BOOTSTRAP_ADMIN_GOOGLE_SUB"),
 			// 開発時だけ Secure を外す。未設定の環境は本番扱いで付ける。
 			SecureCookie: !debug,
 		},

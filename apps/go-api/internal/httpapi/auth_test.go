@@ -49,8 +49,11 @@ func (f *fakeProvider) Exchange(context.Context, string, string, string) (*useru
 }
 
 type fakeUserRepo struct {
-	user *usermodel.User
-	err  error
+	user          *usermodel.User
+	err           error
+	promotedSubs  []string
+	promoteResult bool
+	promoteErr    error
 }
 
 var _ userrepo.UserRepository = (*fakeUserRepo)(nil)
@@ -67,6 +70,14 @@ func (f *fakeUserRepo) FindByID(context.Context, int64) (*usermodel.User, error)
 func (f *fakeUserRepo) FindByPublicID(context.Context, uuid.UUID) (*usermodel.User, error) {
 	return f.user, f.err
 }
+
+// promoted は PromoteToAdmin が呼ばれた回数です。
+// 「昇格させた」ことを返り値ではなく呼び出しの有無で見るため。
+func (f *fakeUserRepo) PromoteToAdmin(_ context.Context, googleSub string) (bool, error) {
+	f.promotedSubs = append(f.promotedSubs, googleSub)
+	return f.promoteResult, f.promoteErr
+}
+
 func (f *fakeUserRepo) ListAuthorsByIDs(context.Context, []int64) ([]usermodel.Author, error) {
 	return nil, f.err
 }
@@ -138,7 +149,7 @@ func newAuthEnv(t *testing.T, authEnabled bool) *authEnv {
 	var auth *userusecase.AuthInteractor
 	if authEnabled {
 		user := usermodel.Reconstruct(1, publicID, "sub-1", "h@example.com", "ホシノ",
-			nil, time.Unix(0, 0).UTC(), time.Unix(0, 0).UTC(), nil)
+			nil, usermodel.RoleUser, time.Unix(0, 0).UTC(), time.Unix(0, 0).UTC(), nil)
 		auth = userusecase.NewAuthInteractor(
 			&fakeUserRepo{user: user},
 			sessions,

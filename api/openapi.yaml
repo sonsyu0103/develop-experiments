@@ -606,9 +606,26 @@ components:
           description: 退会済みか
           example: false
 
+    Role:
+      type: string
+      enum: [user, moderator, admin]
+      description: |
+        利用者の権限 (docs/adr/0011-moderation.md 決定 1)。
+
+        3 段階に分けているのは、**投稿を消せる権限と、
+        権限を配れる権限を分離する**ためです。
+        モデレーターを増やしても、権限を配れる人間は増えません。
+
+        | | user | moderator | admin |
+        | --- | --- | --- | --- |
+        | 自分の投稿の削除 | ✅ | ✅ | ✅ |
+        | 他人・匿名の投稿の削除 | ❌ | ✅ | ✅ |
+        | ロールの変更 | ❌ | ❌ | ✅ |
+      example: user
+
     Me:
       type: object
-      required: [publicId, displayName, email]
+      required: [publicId, displayName, email, role]
       description: |
         ログイン中の利用者。
 
@@ -628,6 +645,15 @@ components:
           type: string
           description: 本人にだけ返します。投稿一覧には含まれません
           example: hoshino@example.com
+        role:
+          allOf:
+            - $ref: '#/components/schemas/Role'
+          description: |
+            **自分のロールだけ**返します。
+            フロントが管理用の導線を出し分けるために使います。
+
+            他人のロールは `Author` に含めません ——
+            誰がモデレーターかを一覧で晒す必要がないためです
         avatarUrl:
           type: string
           nullable: true

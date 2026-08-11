@@ -41,6 +41,17 @@ type UserRepository interface {
 	// API から来る識別子は常にこちらです。
 	FindByPublicID(ctx context.Context, publicID uuid.UUID) (*model.User, error)
 
+	// PromoteToAdmin は google_sub で指定した利用者を admin にします。
+	//
+	// **最初の管理者を作る唯一の経路**です (ADR 0011 決定 1)。
+	// UI から作れる形にすると、それがそのまま
+	// 「誰でも管理者になれる」機能になりえます。
+	//
+	// 既に admin の場合は何もせず、promoted が false になります。
+	// 該当する利用者が居ない場合も false です (エラーにしません ——
+	// 環境変数に未ログインの sub を書いておく運用が成り立つため)。
+	PromoteToAdmin(ctx context.Context, googleSub string) (promoted bool, err error)
+
 	// ListAuthorsByIDs は投稿者の表示に必要な情報だけをまとめて取得します。
 	//
 	// 【現時点で本番経路からは呼ばれていません】

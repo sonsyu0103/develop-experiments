@@ -49,7 +49,10 @@ type fakeUserRepo struct {
 	user *model.User
 	err  error
 
-	upserted *model.User
+	upserted      *model.User
+	promotedSubs  []string
+	promoteResult bool
+	promoteErr    error
 }
 
 var _ repository.UserRepository = (*fakeUserRepo)(nil)
@@ -65,6 +68,14 @@ func (f *fakeUserRepo) FindByID(context.Context, int64) (*model.User, error) { r
 func (f *fakeUserRepo) FindByPublicID(context.Context, uuid.UUID) (*model.User, error) {
 	return f.user, f.err
 }
+
+// promoted は PromoteToAdmin が呼ばれた回数です。
+// 「昇格させた」ことを返り値ではなく呼び出しの有無で見るため。
+func (f *fakeUserRepo) PromoteToAdmin(_ context.Context, googleSub string) (bool, error) {
+	f.promotedSubs = append(f.promotedSubs, googleSub)
+	return f.promoteResult, f.promoteErr
+}
+
 func (f *fakeUserRepo) ListAuthorsByIDs(context.Context, []int64) ([]model.Author, error) {
 	return nil, f.err
 }
@@ -115,7 +126,7 @@ var fixedNow = time.Unix(1_700_000_000, 0).UTC()
 func newTestUser() *model.User {
 	return model.Reconstruct(42,
 		uuid.MustParse("01920000-0000-7000-8000-000000000001"),
-		"sub-1", "h@example.com", "ホシノ", nil,
+		"sub-1", "h@example.com", "ホシノ", nil, model.RoleUser,
 		fixedNow, fixedNow, nil)
 }
 
@@ -414,5 +425,104 @@ func TestLogout(t *testing.T) {
 	}
 	if len(sessions.deleted) != 1 || sessions.deleted[0] != "token-1" {
 		t.Errorf("削除されたトークン = %v", sessions.deleted)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 最初の管理者 (ADR 0011 決定 1)
+// ---------------------------------------------------------------------------
+
+// **設定した sub の利用者だけが昇格すること。**
+func TestCompleteLogin_PromotesBootstrapAdmin(t *testing.T) {
+	t.Parallel()
+
+	users := &fakeUserRepo{user: newTestUser(), promoteResult: true}
+	uc := newInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: validClaims()}).
+		WithBootstrapAdmin("sub-1")
+
+	if _, err := uc.CompleteLogin(context.Background(), "code", "verifier", "nonce"); err != nil {
+		t.Fatalf("CompleteLogin が失敗した: %v", err)
+	}
+
+	if len(users.promotedSubs) != 1 || users.promotedSubs[0] != "sub-1" {
+		t.Errorf("昇格した sub = %v, want [sub-1]", users.promotedSubs)
+	}
+}
+
+// **別人は昇格しない。** ここが緩むと、設定を書いた時点で全員が管理者になる。
+func TestCompleteLogin_DoesNotPromoteOthers(t *testing.T) {
+	t.Parallel()
+
+	users := &fakeUserRepo{user: newTestUser()}
+	uc := newInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: validClaims()}).
+		WithBootstrapAdmin("だれか別の sub")
+
+	if _, err := uc.CompleteLogin(context.Background(), "code", "verifier", "nonce"); err != nil {
+		t.Fatalf("CompleteLogin が失敗した: %v", err)
+	}
+
+	if len(users.promotedSubs) != 0 {
+		t.Errorf("別人が昇格された: %v", users.promotedSubs)
+	}
+}
+
+// 未設定なら誰も昇格しない。
+func TestCompleteLogin_NoBootstrapAdminConfigured(t *testing.T) {
+	t.Parallel()
+
+	users := &fakeUserRepo{user: newTestUser()}
+	uc := newInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: validClaims()})
+
+	if _, err := uc.CompleteLogin(context.Background(), "code", "verifier", "nonce"); err != nil {
+		t.Fatalf("CompleteLogin が失敗した: %v", err)
+	}
+
+	if len(users.promotedSubs) != 0 {
+		t.Errorf("未設定なのに昇格が走った: %v", users.promotedSubs)
+	}
+}
+
+// **昇格に失敗してもログインは通ること。**
+//
+// ここで失敗を返すと「管理者にしたい人だけログインできない」ことになる。
+// 昇格は運用の都合であって、認証の成否ではない。
+func TestCompleteLogin_PromotionFailureDoesNotBlockLogin(t *testing.T) {
+	t.Parallel()
+
+	users := &fakeUserRepo{user: newTestUser(), promoteErr: errors.New("DB が落ちている")}
+	uc := newInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: validClaims()}).
+		WithBootstrapAdmin("sub-1")
+
+	got, err := uc.CompleteLogin(context.Background(), "code", "verifier", "nonce")
+	if err != nil {
+		t.Fatalf("昇格の失敗でログインまで落ちた: %v", err)
+	}
+	if got.Token == "" {
+		t.Error("セッションが発行されていない")
+	}
+}
+
+// ロールがセッションの検証結果から運ばれること。
+// 毎リクエストの権限判定がここに依存する。
+func TestAuthenticate_CarriesRole(t *testing.T) {
+	t.Parallel()
+
+	const token = model.SessionToken("t")
+	owner := model.SessionOwner{
+		ID: 42, PublicID: uuid.MustParse("01920000-0000-7000-8000-000000000001"),
+		Email: "h@example.com", DisplayName: "ホシノ", Role: model.RoleModerator,
+	}
+	uc := newInteractor(&fakeUserRepo{}, &fakeSessionRepo{liveToken: token, owner: owner}, &fakeProvider{})
+
+	got, err := uc.Authenticate(context.Background(), token)
+	if err != nil {
+		t.Fatalf("Authenticate が失敗した: %v", err)
+	}
+	if got.Role != model.RoleModerator {
+		t.Errorf("Role = %q, want moderator", got.Role)
+	}
+	// 自分のロールは Me にも載る (フロントが導線を出し分けるため)。
+	if got.Me.Role != model.RoleModerator {
+		t.Errorf("Me.Role = %q, want moderator", got.Me.Role)
 	}
 }

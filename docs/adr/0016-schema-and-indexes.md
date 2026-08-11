@@ -378,15 +378,22 @@ Phase 4 の測定対象に加える。
 | 番号 | 内容 | Phase |
 | --- | --- | --- |
 | `000002` | `users` / `sessions`、`threads`・`comments` への `author_id` | 5 |
-| `000003` | `users.role` / `reports` / `moderation_actions` | 10 前半 |
-| `000004` | `idempotency_keys` | 2 |
-| `000005` | `images`、添付列 3 つ | 6 |
-| `000006` | `threads.view_count` と人気順索引 | 7 |
-| `000007` | `pg_trgm` の索引 | 11 |
-| `000008` | `contact_messages` | 8 |
+| `000003` | `users.role` (+ 部分索引) | 10 前半 |
+| `000004` | `reports` / `moderation_actions` | 10 後半 |
+| `000005` | `idempotency_keys` | 2 |
+| `000006` | `images`、添付列 3 つ | 6 |
+| `000007` | `threads.view_count` と人気順索引 | 7 |
+| `000008` | `pg_trgm` の索引 | 11 |
+| `000009` | `contact_messages` | 8 |
 
 使わないテーブルを先に作ると、
 **「設計したが実装していない」がスキーマに残る**。
+
+> **初版は `000003` に `reports` と `moderation_actions` を入れていた。**
+> しかし [README](../../README.md) の着手順は Phase 10 を
+> 前半 (`role` と権限判定) と後半 (通報・管理画面) に割っており、
+> 通報は後半になる。上の原則に自分で反していたので、
+> `000004` へ分けた (以降の番号もずらしている)。
 
 ### 既存テーブルへの `ALTER` は安全
 

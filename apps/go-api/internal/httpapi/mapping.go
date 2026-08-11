@@ -54,6 +54,9 @@ func toWireMe(d userusecase.MeDTO) oapigen.Me {
 		DisplayName: d.DisplayName,
 		Email:       d.Email,
 		AvatarUrl:   d.AvatarURL,
+		// ドメインの Role と仕様書の enum は同じ 3 値。
+		// 増やすときは DB の CHECK 制約も含めて 3 か所を揃えること。
+		Role: oapigen.Role(d.Role),
 	}
 }
 

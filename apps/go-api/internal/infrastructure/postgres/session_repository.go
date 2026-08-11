@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -46,6 +47,16 @@ func (r *SessionRepository) FindLive(ctx context.Context, token model.SessionTok
 		return nil, translateError("SessionRepository.FindLive", err)
 	}
 
+	// ロールが読めない値なら一般利用者へ倒し、記録に残す。
+	// **昇格側へ倒さない。** 読めない値を管理者として扱うと、
+	// 制約を外した瞬間に権限が広がる。
+	role, err := model.ParseRole(row.Role)
+	if err != nil {
+		slog.ErrorContext(ctx, "ロールを解釈できません",
+			slog.Int64("owner_id", row.UserID), slog.String("role", row.Role))
+		role = model.RoleUser
+	}
+
 	return &model.AuthenticatedSession{
 		Session: *model.ReconstructSession(row.ID, row.UserID, row.ExpiresAt, row.CreatedAt),
 		Owner: model.SessionOwner{
@@ -54,6 +65,7 @@ func (r *SessionRepository) FindLive(ctx context.Context, token model.SessionTok
 			Email:       row.Email,
 			DisplayName: row.DisplayName,
 			AvatarURL:   row.AvatarUrl,
+			Role:        role,
 		},
 	}, nil
 }
