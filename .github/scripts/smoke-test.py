@@ -106,10 +106,16 @@ def call(method: str, path: str, body: str | None = None,
             return e.code, raw.decode(errors="replace")[:200], e.headers
 
 
-def sql(statement: str) -> None:
-    """SQL を 1 文実行する。SQL_EXEC 未設定なら何もしない。"""
+def sql(statement: str, quiet: bool = False) -> None:
+    """SQL を 1 文実行する。SQL_EXEC 未設定なら何もしない。
+
+    quiet=True は「失敗を期待する」呼び出し用。標準エラーも捨てる。
+    **期待どおりの拒否で ERROR 行がログに出ると、
+    本物の異常と見分けが付かなくなる** (赤い行を無視する癖がつく)。
+    """
     subprocess.run(shlex.split(SQL_EXEC) + [statement], check=True,
-                   stdout=subprocess.DEVNULL)
+                   stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL if quiet else None)
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
@@ -251,6 +257,8 @@ section("認証")
 # CI は置いていないので 503、手元に .env を置くと 302 になる。
 # 決め打ちにすると、資格情報を入れた環境でスモークが落ちる (実際に踏んだ)。
 auth_status, auth_payload, auth_headers = call("GET", "/auth/google")
+# 資格情報が入っているか。セッションを要する検査はこれで分岐する。
+auth_enabled = auth_status != 503
 
 if auth_status == 503:
     # 認証だけが使えない状態。全体が落ちる設計だと、
@@ -424,17 +432,24 @@ if SQL_EXEC:
         """)
         cookie = {"Cookie": f"session={probe_token}"}
 
-        status, payload, _ = call("GET", "/me", headers=cookie)
-        check("ログイン中は /me に role が載る",
-              status == 200 and (payload or {}).get("role") == "user",
-              f"status={status} payload={payload}")
+        # **セッションを要する検査は、認証が設定されている環境でだけ行う。**
+        # 資格情報が無いと auth が nil になり、ミドルウェアが
+        # セッションを解決しないため /me は必ず 401 になる。
+        # ここを決め打ちにすると CI (資格情報なし) で落ちる —— 実際に落とした。
+        if auth_enabled:
+            status, payload, _ = call("GET", "/me", headers=cookie)
+            check("ログイン中は /me に role が載る",
+                  status == 200 and (payload or {}).get("role") == "user",
+                  f"status={status} payload={payload}")
 
-        # **昇格が読み出し側に反映されること。**
-        # ここが繋がっていないと、権限を変えても API から見えない。
-        sql("UPDATE users SET role = 'moderator' WHERE id = 900002;")
-        _, payload, _ = call("GET", "/me", headers=cookie)
-        check("ロールを変えると /me に反映される",
-              (payload or {}).get("role") == "moderator", f"payload={payload}")
+            # **昇格が読み出し側に反映されること。**
+            # ここが繋がっていないと、権限を変えても API から見えない。
+            sql("UPDATE users SET role = 'moderator' WHERE id = 900002;")
+            _, payload, _ = call("GET", "/me", headers=cookie)
+            check("ロールを変えると /me に反映される",
+                  (payload or {}).get("role") == "moderator", f"payload={payload}")
+        else:
+            print("  \033[33mSKIP\033[0m /me の検査 (認証が未設定のためセッションを解決できない)")
 
         # **他人のロールは投稿一覧に出さない。**
         # 誰がモデレーターかを晒す必要がない (Author に role は無い)。
@@ -451,7 +466,7 @@ if SQL_EXEC:
         # DB 側の CHECK 制約が効いていること。
         # アプリと DB のどちらか片方だけ値を増やすと、ここで気づける。
         try:
-            sql("UPDATE users SET role = 'superadmin' WHERE id = 900002;")
+            sql("UPDATE users SET role = 'superadmin' WHERE id = 900002;", quiet=True)
             check("不正なロールを DB が拒否する", False, "CHECK 制約が効いていない")
         except subprocess.CalledProcessError:
             check("不正なロールを DB が拒否する", True)
