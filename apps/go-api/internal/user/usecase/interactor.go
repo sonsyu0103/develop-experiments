@@ -196,7 +196,23 @@ func (i *AuthInteractor) CompleteLogin(
 // ここで失敗を返すと「管理者にしたい人だけログインできない」ことになります。
 // 記録は残すので、あとから気づけます。
 func (i *AuthInteractor) promoteBootstrapAdmin(ctx context.Context, googleSub string) {
-	if i.bootstrapAdminSub == "" || i.bootstrapAdminSub != googleSub {
+	if i.bootstrapAdminSub == "" {
+		return
+	}
+	if i.bootstrapAdminSub != googleSub {
+		// **無言で戻らない。** 起動時には bootstrap_admin=true と出るので、
+		// 運用者には「効いている」と見える。設定値に打ち間違いや
+		// 余分な空白があると、管理者にしたい人が何度ログインしても
+		// 昇格せず、手がかりがどこにも残らない。
+		// PromoteToAdmin は role に書く唯一の経路なので、
+		// その環境には管理者が永久に存在しないことになる。
+		//
+		// sub 自体はログに出さない (個人を特定する識別子のため)。
+		// 長さだけ出せば、空白混入や切り詰めは判別できる。
+		slog.WarnContext(ctx, "bootstrap_admin_sub_mismatch",
+			slog.Int("configured_len", len(i.bootstrapAdminSub)),
+			slog.Int("received_len", len(googleSub)),
+		)
 		return
 	}
 

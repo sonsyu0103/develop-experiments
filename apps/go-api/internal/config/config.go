@@ -132,7 +132,10 @@ func Load() (*Config, error) {
 			RedirectURL: os.Getenv("AUTH_REDIRECT_URL"),
 			FrontendURL: os.Getenv("AUTH_FRONTEND_URL"),
 			// シークレットではないが、他の認証設定と同じ経路で渡す。
-			BootstrapAdminGoogleSub: os.Getenv("BOOTSTRAP_ADMIN_GOOGLE_SUB"),
+			// TrimSpace するのは、.env から貼り付けたときの
+			// 末尾空白や改行で一致しなくなるのを避けるため。
+			// 一致しなければ昇格が起きず、しかも気づきにくい。
+			BootstrapAdminGoogleSub: strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_GOOGLE_SUB")),
 			// 開発時だけ Secure を外す。未設定の環境は本番扱いで付ける。
 			SecureCookie: !debug,
 		},

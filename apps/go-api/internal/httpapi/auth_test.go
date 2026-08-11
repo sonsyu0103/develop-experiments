@@ -143,6 +143,10 @@ func newAuthEnv(t *testing.T, authEnabled bool) *authEnv {
 		liveToken: token,
 		owner: usermodel.SessionOwner{
 			ID: 1, PublicID: publicID, Email: "h@example.com", DisplayName: "ホシノ",
+			// **空のままにしない。** role は required かつ enum なので、
+			// "" を返すと仕様違反のペイロードになる。
+			// kin-openapi はリクエストしか検証しないので、誰も気づかない。
+			Role: usermodel.RoleUser,
 		},
 	}
 
@@ -292,6 +296,11 @@ func TestAuth_ValidCookieReturnsMe(t *testing.T) {
 	got := decodeJSON[oapigen.Me](t, rec)
 	if got.DisplayName != "ホシノ" {
 		t.Errorf("DisplayName = %q", got.DisplayName)
+	}
+	// 自分のロールは返す (フロントが管理用の導線を出し分けるため)。
+	// 空文字は仕様書の enum に無いので、そのまま返してはいけない。
+	if got.Role != oapigen.User {
+		t.Errorf("role = %q, want user", got.Role)
 	}
 	// 内部 ID (users.id = 1) が漏れていないこと。
 	if strings.Contains(rec.Body.String(), `"id"`) {

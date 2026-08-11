@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shlex
 import subprocess
 import sys
@@ -113,6 +114,14 @@ def sql(statement: str, quiet: bool = False) -> None:
     **期待どおりの拒否で ERROR 行がログに出ると、
     本物の異常と見分けが付かなくなる** (赤い行を無視する癖がつく)。
     """
+    # **ガードが本体に無いまま docstring だけが「何もしない」と書いていた。**
+    # 空だと shlex.split("") が [] になり、SQL 文字列を
+    # プログラムとして exec しようとして FileNotFoundError で落ちる。
+    # 呼び出しがすべて if SQL_EXEC: の下にある間は表に出ないが、
+    # 外で 1 度呼ばれた瞬間に、check() の集計に乗らない形で全体が止まる。
+    if not SQL_EXEC:
+        return
+
     subprocess.run(shlex.split(SQL_EXEC) + [statement], check=True,
                    stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL if quiet else None)
@@ -415,7 +424,10 @@ if SQL_EXEC:
     # 認証を通さずにロールの読み出し経路を確かめる。
     # セッションは ID がトークンの SHA-256 なので、こちらで計算して挿入する
     # (生のトークンは DB に保存しない設計。docs/adr/0005-authentication.md)。
-    probe_token = "smoke-role-probe-token"
+    # **トークンは実行ごとに作る。** 固定値をコミットすると、
+    # 検査の間だけとはいえ「公開された有効なセッション」が存在することになる。
+    # 前回の実行が後片付け前に落ちた場合に、古い行へ衝突する事故も避けられる。
+    probe_token = "smoke-role-" + secrets.token_hex(16)
     probe_hash = hashlib.sha256(probe_token.encode()).hexdigest()
 
     try:
@@ -427,8 +439,7 @@ if SQL_EXEC:
         """)
         sql(f"""
             INSERT INTO sessions (id, user_id, expires_at)
-            VALUES ('{probe_hash}', 900002, now() + interval '1 hour')
-            ON CONFLICT (id) DO NOTHING;
+            VALUES ('{probe_hash}', 900002, now() + interval '5 minutes');
         """)
         cookie = {"Cookie": f"session={probe_token}"}
 
@@ -459,9 +470,16 @@ if SQL_EXEC:
             ON CONFLICT (id) DO UPDATE SET deleted_at = NULL, author_id = 900002;
         """)
         _, payload, _ = call("GET", "/threads/900002")
-        author = (payload or {}).get("author") or {}
+        author = (payload or {}).get("author")
+        # **先に「投稿者が解決できていること」を確かめる。**
+        # 空の辞書へ倒すと、404 などで author が無いときに
+        # "role" not in {} が真になり、素通しで OK になる。
+        # この検査が唯一守ろうとしている「role が Author に漏れる」を、
+        # フィクスチャが壊れているときに限って見逃すことになる。
+        check("モデレーターの投稿で author が解決される",
+              author is not None, f"payload={payload}")
         check("投稿一覧の author に role を含めない",
-              "role" not in author, f"author={author}")
+              author is not None and "role" not in author, f"author={author}")
 
         # DB 側の CHECK 制約が効いていること。
         # アプリと DB のどちらか片方だけ値を増やすと、ここで気づける。

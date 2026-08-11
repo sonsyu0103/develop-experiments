@@ -26,6 +26,14 @@ const (
 	RoleAdmin Role = "admin"
 )
 
+// AllRoles は定義済みのロールをすべて並べたものです。
+//
+// **定数を足したらここにも足してください。** ParseRole はこれを見るため、
+// 登録し忘れた定数は「知らない値」として弾かれます。
+// 3 か所 (この定数群 / DB の CHECK 制約 / 仕様書の enum) が
+// 揃っていることは role_test.go が実際にファイルを読んで検査します。
+var AllRoles = []Role{RoleUser, RoleModerator, RoleAdmin}
+
 // ParseRole は永続化層から読み出した文字列を Role にします。
 //
 // **知らない値はエラーにします。** 既定値へ丸めると、
@@ -33,12 +41,12 @@ const (
 // 逆に「管理者として静かに動く」形になります。
 // どちらも気づけないので、読めない時点で止めます。
 func ParseRole(s string) (Role, error) {
-	switch r := Role(s); r {
-	case RoleUser, RoleModerator, RoleAdmin:
-		return r, nil
-	default:
-		return "", fmt.Errorf("不正なロールです (%q): %w", s, apperr.ErrInvalidArgument)
+	for _, r := range AllRoles {
+		if Role(s) == r {
+			return r, nil
+		}
 	}
+	return "", fmt.Errorf("不正なロールです (%q): %w", s, apperr.ErrInvalidArgument)
 }
 
 // CanModerate は他人・匿名の投稿を削除できるかを返します。
