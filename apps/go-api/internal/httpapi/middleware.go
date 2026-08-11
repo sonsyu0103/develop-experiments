@@ -15,7 +15,7 @@ import (
 // コメント投稿のようにブラウザから直接叩く経路では必要になります。
 //
 // ワイルドカード (*) を使わず許可リスト方式にしているのは、
-// 将来 Cookie 認証を入れたときに Access-Control-Allow-Credentials と
+// Cookie 認証で必要な Access-Control-Allow-Credentials と
 // 併用できるようにするためです (* との併用はブラウザが拒否します)。
 func cors(allowedOrigins []string) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -35,6 +35,11 @@ func cors(allowedOrigins []string) gin.HandlerFunc {
 			h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 			h.Set("Access-Control-Allow-Headers", "Content-Type")
 			h.Set("Access-Control-Max-Age", "600")
+			// セッションは Cookie で運ぶ (ADR 0005 決定 1)。
+			// これが無いと、ブラウザは credentials 付きの要求に対する
+			// 応答を JavaScript へ渡さない。Cookie は送られるので
+			// サーバ側のログは正常に見え、フロントだけが失敗する。
+			h.Set("Access-Control-Allow-Credentials", "true")
 		}
 
 		if c.Request.Method == http.MethodOptions {

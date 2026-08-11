@@ -204,6 +204,25 @@ for label, method, path, body in [
 
 check_status("上限ちょうどの size は通る", "GET", "/threads?size=100", 200)
 
+section("認証 (資格情報が無い状態での振る舞い)")
+# CI とローカルの既定では GOOGLE_CLIENT_ID / SECRET を置いていない。
+# その状態で「認証だけが使えない」ことを確認する。
+# 全体が落ちる設計だと、ここで掲示板の検証がすべて巻き添えになる。
+check_status("認証が未設定なら /auth/google は 503", "GET", "/auth/google", 503,
+             want_code="UNAVAILABLE")
+
+# 仕様書の security 宣言が 401 として強制されること。
+# gin-middleware は security 違反を 400 に丸めるため、
+# respondSpecError で振り分け直していないとここが 400 になる。
+check_status("未ログインで /me は 401", "GET", "/me", 401, want_code="UNAUTHENTICATED")
+check_status("未ログインで POST /auth/logout は 401", "POST", "/auth/logout", 401,
+             want_code="UNAUTHENTICATED")
+
+# 匿名投稿は認証必須にならないこと (OpenAPI の security は「必須」しか書けないため、
+# 投稿系には宣言していない)。ここが 401 になると匿名投稿ができなくなる。
+status, _, _ = call("POST", "/threads", '{"title":"匿名でも書ける"}')
+check("匿名のスレッド作成は 401 にならない", status == 201, f"status={status}")
+
 section("ルーティング")
 check_status("仕様書に無いパスは 404", "GET", "/threads/1/likes", 404, want_code="NOT_FOUND")
 check_status("未定義メソッドは 405", "DELETE", "/threads/1", 405,

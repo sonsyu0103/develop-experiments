@@ -4,6 +4,107 @@
  */
 
 export interface paths {
+    "/auth/google": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Google へのログインを開始する
+         * @description Google の認可エンドポイントへリダイレクトします。
+         *
+         *     state / nonce / PKCE の code_verifier をサーバ側で生成し、
+         *     短命な Cookie に保存します。CSRF とトークン差し替えを防ぐため、
+         *     コールバックではこれらを必ず照合します。
+         */
+        get: operations["startGoogleLogin"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/google/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Google からのコールバックを受ける
+         * @description 認可コードをトークンへ交換し、ID トークンを検証してから
+         *     セッションを発行します。成功するとフロントエンドへリダイレクトし、
+         *     セッション ID を HttpOnly Cookie で返します。
+         *
+         *     退会済みの利用者が同じ Google アカウントで再ログインした場合は
+         *     401 になります。行を復活させるかは未決です
+         *     (docs/adr/0005-authentication.md)。
+         *
+         *     同意画面で拒否された場合、Google は code を付けずに
+         *     error だけを返します。この経路もフロントエンドへリダイレクトし、
+         *     API のエラー JSON をブラウザに直接見せません。
+         */
+        get: operations["googleLoginCallback"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * ログアウトする
+         * @description サーバ側のセッションを削除し、Cookie を破棄します。
+         *
+         *     セッションの実体を DB に持つため、ログアウトは即座に効きます。
+         *     ステートレスな JWT ではこれができません
+         *     (docs/adr/0005-authentication.md 決定 1)。
+         */
+        post: operations["logout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * ログイン中の利用者を取得する
+         * @description セッションが有効な場合にだけ 200 を返します。
+         *
+         *     内部 ID (`users.id`) は返しません。API が扱う識別子は `publicId` だけです
+         *     (docs/adr/0003-open-questions.md 未決 #11)。
+         */
+        get: operations["getMe"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -193,6 +294,30 @@ export interface components {
              */
             title: string;
         };
+        /**
+         * @description ログイン中の利用者。
+         *
+         *     **内部 ID (`users.id`) は含めません。** マイページの URL が連番だと
+         *     全ユーザーを列挙できるため、API が扱う識別子は `publicId` だけです
+         *     (docs/adr/0003-open-questions.md 未決 #11)。
+         */
+        Me: {
+            /**
+             * Format: uuid
+             * @description 公開用の識別子 (UUID v7)
+             * @example 0192f0a0-0000-7000-8000-000000000001
+             */
+            publicId: string;
+            /** @example ホシノ */
+            displayName: string;
+            /**
+             * @description 本人にだけ返します。投稿一覧には含まれません
+             * @example hoshino@example.com
+             */
+            email: string;
+            /** @example https://lh3.googleusercontent.com/a/xxxx */
+            avatarUrl?: string | null;
+        };
         CreateCommentRequest: {
             /**
              * @description 省略時は「名無しさん」になります
@@ -209,7 +334,7 @@ export interface components {
                  * @example NOT_FOUND
                  * @enum {string}
                  */
-                code: "INVALID_ARGUMENT" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "INTERNAL";
+                code: "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "UNAVAILABLE" | "INTERNAL";
                 /**
                  * @description 人間向けの説明。文言は予告なく変わるため分岐に使わないでください。
                  * @example 対象のリソースが見つかりません
@@ -230,6 +355,28 @@ export interface components {
         };
         /** @description 対象が存在しない */
         NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description 未ログイン、またはセッションが無効 */
+        Unauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /**
+         * @description 認証プロバイダの設定が入っていないため、この経路は利用できません。
+         *     設定が無くても API 自体は起動します
+         *     (掲示板の閲覧と匿名投稿は認証に依存しないため)。
+         */
+        ServiceUnavailable: {
             headers: {
                 [name: string]: unknown;
             };
@@ -273,6 +420,114 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    startGoogleLogin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Google の認可エンドポイントへリダイレクト */
+            302: {
+                headers: {
+                    /** @description accounts.google.com の認可 URL */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    googleLoginCallback: {
+        parameters: {
+            query: {
+                /**
+                 * @description 開始時に発行した state。Cookie の値と照合します。
+                 *     拒否された場合も Google はこれを返すため、必須にしています
+                 */
+                state: string;
+                /**
+                 * @description Google が発行した認可コード。
+                 *     **同意画面で拒否されたときは付きません** (代わりに error が付きます)。
+                 *     必須にすると、拒否した利用者に検証エラーの JSON が直接見えてしまいます
+                 */
+                code?: string;
+                /**
+                 * @description 拒否や設定不備のときに Google が返すエラー識別子
+                 *     (access_denied など)
+                 */
+                error?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description フロントエンドへリダイレクト */
+            302: {
+                headers: {
+                    Location?: string;
+                    /** @description セッション ID (HttpOnly) */
+                    "Set-Cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    logout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description ログアウトした */
+            204: {
+                headers: {
+                    /** @description 空値・有効期限切れの Cookie */
+                    "Set-Cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getMe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
     getHealthz: {
         parameters: {
             query?: never;

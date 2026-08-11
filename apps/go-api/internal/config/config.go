@@ -31,6 +31,48 @@ type Config struct {
 	// 気づかないうちにデバッグモードで動くほうが危険なため、
 	// 安全側に倒しています。
 	Debug bool
+	// Auth は Google OIDC の設定です。
+	Auth AuthConfig
+}
+
+// AuthConfig は Google OIDC による認証の設定です。
+//
+// **すべて任意です。** 揃っていない場合、API は起動しますが
+// 認証エンドポイントだけが 503 を返します。
+//
+// 必須にしない理由:
+//   - 掲示板の閲覧と匿名投稿は認証に依存しない。認証の設定が無いだけで
+//     API 全体が起動しないのは害のほうが大きい
+//   - CI の Migration Check は API サーバを起動してスモークテストを回す。
+//     必須にすると、Google の資格情報を CI に置くまで CI が落ちる
+type AuthConfig struct {
+	// GoogleClientID / GoogleClientSecret は Google Cloud で発行する資格情報です。
+	GoogleClientID     string
+	GoogleClientSecret string
+	// RedirectURL は Google からのコールバック先です。
+	// Google Cloud 側の「承認済みのリダイレクト URI」と一致している必要があります。
+	//
+	// **既定値を持たせません。** localhost を既定にすると、本番で
+	// AUTH_REDIRECT_URL を入れ忘れても Enabled() が true になり、
+	// Google に redirect_uri=http://localhost:8080/... を送って
+	// redirect_uri_mismatch で初めて気づくことになります。
+	// 未設定なら認証ごと無効 (503) にするほうが、原因が分かりやすくなります。
+	RedirectURL string
+	// FrontendURL はログイン完了後に戻す先です。RedirectURL と同じ理由で
+	// 既定値を持たせません。
+	FrontendURL string
+	// SecureCookie は Cookie に Secure 属性を付けるかどうかです。
+	//
+	// localhost は HTTP なので開発時は付けられません。
+	// ENV=development 以外では既定で true になります —— 設定を忘れた本番が
+	// Secure なしで動くほうが危険なため、安全側に倒しています。
+	SecureCookie bool
+}
+
+// Enabled は認証を有効にできるだけの設定が揃っているかを返します。
+func (a AuthConfig) Enabled() bool {
+	return a.GoogleClientID != "" && a.GoogleClientSecret != "" &&
+		a.RedirectURL != "" && a.FrontendURL != ""
 }
 
 // Load は環境変数から設定を読み取ります。
@@ -62,6 +104,8 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	debug := strings.EqualFold(os.Getenv("ENV"), "development")
+
 	return &Config{
 		Addr:            stringEnv("ADDR", ":8080"),
 		DatabaseURL:     dsn,
@@ -69,7 +113,17 @@ func Load() (*Config, error) {
 		MinConns:        minConns,
 		ShutdownTimeout: time.Duration(shutdownSec) * time.Second,
 		AllowedOrigins:  csvEnv("CORS_ALLOWED_ORIGINS", []string{"http://localhost:3000"}),
-		Debug:           strings.EqualFold(os.Getenv("ENV"), "development"),
+		Debug:           debug,
+		Auth: AuthConfig{
+			GoogleClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
+			GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
+			// 既定値を入れない (AuthConfig のコメントを参照)。
+			// compose.yaml と apps/go-api/.env.example が明示的に渡す。
+			RedirectURL: os.Getenv("AUTH_REDIRECT_URL"),
+			FrontendURL: os.Getenv("AUTH_FRONTEND_URL"),
+			// 開発時だけ Secure を外す。未設定の環境は本番扱いで付ける。
+			SecureCookie: !debug,
+		},
 	}, nil
 }
 

@@ -33,6 +33,11 @@ vendors:
     in: golang.org/x/sync/**
   uuid:
     in: github.com/google/uuid
+  oidc:
+    in:
+      - github.com/coreos/go-oidc/**
+      - golang.org/x/oauth2
+      - golang.org/x/oauth2/**
 
 components:
   main:
@@ -63,6 +68,8 @@ components:
     in: internal/user/domain/model
   user-repository:
     in: internal/user/domain/repository
+  user-usecase:
+    in: internal/user/usecase
 
   httpapi:
     in: internal/httpapi
@@ -71,6 +78,8 @@ components:
 
   postgres:
     in: internal/infrastructure/postgres
+  oidc-provider:
+    in: internal/infrastructure/oidc
   postgres-sqlcgen:
     in: internal/infrastructure/postgres/sqlcgen
 
@@ -114,6 +123,22 @@ deps:
       - uuid
     mayDependOn:
       - user-model
+  # 認証のユースケース。OIDC プロバイダはインターフェースの背後に置くので、
+  # ここから go-oidc / oauth2 は見えない (テストでフェイクに差し替えるため)
+  user-usecase:
+    canUse:
+      - uuid
+    mayDependOn:
+      - user-model
+      - user-repository
+
+  # 外側のアダプタ。usecase が定義した Provider を実装する
+  oidc-provider:
+    canUse:
+      - oidc
+    mayDependOn:
+      - user-usecase
+      - shared-config
 
   # HTTP 層は usecase の DTO だけを見る。
   # domain を直接見ると内部表現がそのまま JSON に出る (ADR 0002 の前提が崩れる)
@@ -124,7 +149,10 @@ deps:
     mayDependOn:
       - thread-usecase
       - comment-usecase
+      - user-usecase
+      - user-model
       - httpapi-oapigen
+      - shared-config
 
   # アダプタは外側なので、内側 (domain) を知ってよい
   postgres:

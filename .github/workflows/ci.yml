@@ -103,6 +103,16 @@ jobs:
       - name: Run Go Tests with Race Detector
         run: go test -v -race -cover ./...
 
+      # 手書きロジックのカバレッジが下限を割ったら落とす。
+      #
+      # 生成コード (oapigen / sqlcgen)、実 DB / 実 IdP に依存する
+      # infrastructure/、起動と結線だけの cmd/ は計測から外している。
+      # 全体で率を出すと、生成コードのために意味のないテストを書く圧力が生まれる。
+      # 対象と下限は Makefile の cover ターゲットを参照。
+      - name: Check test coverage of hand-written code
+        working-directory: .
+        run: make cover
+
   # --------------------------------------------------
   # Next.js Frontend Checks
   # --------------------------------------------------

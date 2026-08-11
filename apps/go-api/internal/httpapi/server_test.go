@@ -18,6 +18,7 @@ import (
 	commentmodel "develop-experiments/apps/go-api/internal/comment/domain/model"
 	commentrepo "develop-experiments/apps/go-api/internal/comment/domain/repository"
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
+	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
 	"develop-experiments/apps/go-api/internal/pagination"
 	threadmodel "develop-experiments/apps/go-api/internal/thread/domain/model"
@@ -142,6 +143,8 @@ func newTestEnv(t *testing.T) *testEnv {
 			threadusecase.NewThreadInteractor(threads),
 			commentusecase.NewCommentInteractor(comments, threads),
 			pinger,
+			nil,
+			config.AuthConfig{},
 		),
 		AllowedOrigins: []string{"http://localhost:3000"},
 	})
@@ -599,6 +602,13 @@ func TestCORS(t *testing.T) {
 		if got := rec.Header().Get("Vary"); !strings.Contains(got, "Origin") {
 			t.Errorf("Vary = %q, want Origin を含む", got)
 		}
+		// **セッションは Cookie で運ぶ (ADR 0005)。**
+		// これが無いと、ブラウザは credentials 付きの要求への応答を
+		// JavaScript に渡さない。Cookie 自体は送られるのでサーバ側は
+		// 正常に見え、フロントだけが失敗する。
+		if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+			t.Errorf("Access-Control-Allow-Credentials = %q, want true", got)
+		}
 	})
 
 	t.Run("未許可オリジンにはヘッダを返さない", func(t *testing.T) {
@@ -611,6 +621,11 @@ func TestCORS(t *testing.T) {
 
 		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 			t.Errorf("Access-Control-Allow-Origin = %q, want 空 (未許可オリジン)", got)
+		}
+		// Allow-Credentials だけが漏れると、許可オリジンの判定を
+		// 素通ししたときに Cookie 付きの要求が通る余地ができる。
+		if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+			t.Errorf("Access-Control-Allow-Credentials = %q, want 空 (未許可オリジン)", got)
 		}
 		// 許可ヘッダが無い応答にも Vary は必要。
 		// これが無いと共有キャッシュがオリジン非依存として保存し、

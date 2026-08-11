@@ -2,14 +2,21 @@ package httpapi
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 
+	"develop-experiments/apps/go-api/internal/apperr"
+
+	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/gin-gonic/gin"
 	ginmiddleware "github.com/oapi-codegen/gin-middleware"
 
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
+	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
+	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
+	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
 )
 
 // Pinger は DB への疎通確認を抽象化したものです。*pgxpool.Pool が満たします。
@@ -25,17 +32,24 @@ type Server struct {
 	threads  *threadusecase.ThreadInteractor
 	comments *commentusecase.CommentInteractor
 	db       Pinger
+	// auth は認証の設定が無い場合 nil になります。
+	// そのとき認証エンドポイントだけが 503 を返します。
+	auth    *userusecase.AuthInteractor
+	authCfg config.AuthConfig
 }
 
 var _ oapigen.ServerInterface = (*Server)(nil)
 
 // NewServer はハンドラ実装を生成します。
+// auth が nil の場合、認証エンドポイントは 503 を返します。
 func NewServer(
 	threads *threadusecase.ThreadInteractor,
 	comments *commentusecase.CommentInteractor,
 	db Pinger,
+	auth *userusecase.AuthInteractor,
+	authCfg config.AuthConfig,
 ) *Server {
-	return &Server{threads: threads, comments: comments, db: db}
+	return &Server{threads: threads, comments: comments, db: db, auth: auth, authCfg: authCfg}
 }
 
 // ---------------------------------------------------------------------------
@@ -62,6 +76,131 @@ func (s *Server) GetReadyz(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, oapigen.HealthStatus{Status: "ok"})
+}
+
+// ---------------------------------------------------------------------------
+// auth
+// ---------------------------------------------------------------------------
+
+// StartGoogleLogin は GET /auth/google を処理します。
+//
+// state / nonce / code_verifier を発行し、短命な Cookie に預けてから
+// Google の認可エンドポイントへリダイレクトします。
+func (s *Server) StartGoogleLogin(c *gin.Context) {
+	if err := s.requireAuthEnabled(); err != nil {
+		respondError(c, err)
+		return
+	}
+
+	req, err := s.auth.StartLogin()
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	s.setFlowCookie(c, stateCookieName, req.State)
+	s.setFlowCookie(c, nonceCookieName, req.Nonce)
+	s.setFlowCookie(c, verifierCookieName, req.CodeVerifier)
+
+	c.Redirect(http.StatusFound, req.AuthURL)
+}
+
+// GoogleLoginCallback は GET /auth/google/callback を処理します。
+func (s *Server) GoogleLoginCallback(c *gin.Context, params oapigen.GoogleLoginCallbackParams) {
+	if err := s.requireAuthEnabled(); err != nil {
+		respondError(c, err)
+		return
+	}
+
+	// Cookie を読むのはここだけ。読み終えたら**検査より先に**捨てる。
+	//
+	// defer にしてはいけない。defer が走るのはハンドラから戻るときで、
+	// その時点では c.Redirect / respondError がヘッダを書き出し済みのため
+	// Set-Cookie がレスポンスに載らない。
+	// 早期 return する経路 (ログイン CSRF の検知など) では
+	// そもそも defer の登録前に抜けてしまう。捨てたいのはむしろその経路。
+	wantState, _ := c.Cookie(stateCookieName)
+	nonce, _ := c.Cookie(nonceCookieName)
+	verifier, _ := c.Cookie(verifierCookieName)
+	s.clearFlowCookies(c)
+
+	// state の照合は HTTP 層の仕事。
+	// 一致を確認できなければ先へ進まない。これが無いと、攻撃者が用意した
+	// 認可コードを被害者のブラウザで交換させられる (ログイン CSRF)。
+	//
+	// 拒否された場合も Google は state を返すので、error の判定より先に置ける。
+	if wantState == "" || wantState != params.State {
+		respondError(c, fmt.Errorf("state が一致しません: %w", apperr.ErrUnauthenticated))
+		return
+	}
+
+	// 同意画面で拒否された場合。code は付かず error だけが返る。
+	// ここで 4xx の JSON を返すと、ブラウザにそれが直接表示されてしまう。
+	if params.Error != nil && *params.Error != "" {
+		c.Redirect(http.StatusFound, s.frontendURLWithError(*params.Error))
+		return
+	}
+
+	if params.Code == nil || *params.Code == "" {
+		respondError(c, fmt.Errorf("認可コードがありません: %w", apperr.ErrUnauthenticated))
+		return
+	}
+	if nonce == "" {
+		respondError(c, fmt.Errorf("nonce がありません: %w", apperr.ErrUnauthenticated))
+		return
+	}
+	if verifier == "" {
+		respondError(c, fmt.Errorf("code_verifier がありません: %w", apperr.ErrUnauthenticated))
+		return
+	}
+
+	result, err := s.auth.CompleteLogin(c.Request.Context(), *params.Code, verifier, nonce)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	// MaxAge はインタラクタが返す寿命をそのまま使う。
+	// ここで time.Until(ExpiresAt) を計算すると、インタラクタの時計と
+	// 壁時計がずれたときに負になり、発行と同時に失効する Cookie ができる。
+	s.setSessionCookie(c, result.Token, int(result.TTL.Seconds()))
+	c.Redirect(http.StatusFound, s.authCfg.FrontendURL)
+}
+
+// Logout は POST /auth/logout を処理します。
+func (s *Server) Logout(c *gin.Context) {
+	if err := s.requireAuthEnabled(); err != nil {
+		respondError(c, err)
+		return
+	}
+
+	// ここに到達している時点で、仕様書の security 要件は満たされている。
+	if raw, err := c.Cookie(sessionCookieName); err == nil && raw != "" {
+		if err := s.auth.Logout(c.Request.Context(), usermodel.SessionToken(raw)); err != nil {
+			respondError(c, err)
+			return
+		}
+	}
+
+	s.clearCookie(c, sessionCookieName)
+	c.Status(http.StatusNoContent)
+}
+
+// GetMe は GET /me を処理します。
+//
+// セッションの解決は resolveSession が済ませており、
+// 未ログインなら検証ミドルウェアが 401 で弾いています。
+// ここまで来た時点で principal は必ず存在します。
+func (s *Server) GetMe(c *gin.Context) {
+	me := principalFromContext(c.Request.Context())
+	if me == nil {
+		// 到達しない想定。security 宣言と resolveSession の
+		// どちらかが外れたときだけここに来る。
+		respondError(c, fmt.Errorf("セッションがありません: %w", apperr.ErrUnauthenticated))
+		return
+	}
+
+	c.JSON(http.StatusOK, toWireMe(*me))
 }
 
 // ---------------------------------------------------------------------------
@@ -200,12 +339,23 @@ func NewRouter(deps Deps) (*gin.Engine, error) {
 	r := gin.New()
 	r.Use(gin.Recovery(), requestLogger(), cors(deps.AllowedOrigins))
 
+	// セッションの解決は仕様検証より前に置く。
+	// AuthenticationFunc がここで載せた結果を見るため、順序が逆だと
+	// security を宣言したエンドポイントが常に 401 になる。
+	r.Use(deps.Server.resolveSession())
+
 	// 仕様書そのものをリクエスト検証に使う。
 	// minimum / maximum / maxLength / required といった制約が、
 	// ドキュメント上の飾りではなく実際に強制される。
 	r.Use(ginmiddleware.OapiRequestValidatorWithOptions(spec, &ginmiddleware.Options{
 		ErrorHandler: func(c *gin.Context, message string, status int) {
 			respondSpecError(c, status, message)
+		},
+		Options: openapi3filter.Options{
+			// security を宣言したオペレーションでは、これが未設定だと
+			// kin-openapi が ErrAuthenticationServiceMissing を返して
+			// リクエストを弾く。仕様書に security を書いた時点で結線は必須になる。
+			AuthenticationFunc: newAuthenticationFunc(),
 		},
 	}))
 
