@@ -30,6 +30,9 @@ type MeDTO struct {
 	DisplayName string    `json:"displayName"`
 	Email       string    `json:"email"`
 	AvatarURL   *string   `json:"avatarUrl"`
+	// Role は**自分のロールだけ**返します。フロントが管理用の導線を
+	// 出し分けるために要ります。他人のロールは Author に含めません。
+	Role model.Role `json:"role"`
 }
 
 // PrincipalDTO は認証済みリクエストの主体です。
@@ -40,7 +43,11 @@ type MeDTO struct {
 // だけで内部 ID が外に出ます (docs/adr/0003-open-questions.md 未決 #11)。
 type PrincipalDTO struct {
 	UserID int64
-	Me     MeDTO
+	// Role は権限判定に使います。**API には出しません** ——
+	// 出すのは Me だけで、他人のロールは投稿一覧に載せません
+	// (誰がモデレーターかを晒す必要がない)。
+	Role model.Role
+	Me   MeDTO
 }
 
 // LoginResult はログイン成功時に、ハンドラが Cookie を組み立てるための値です。
@@ -62,6 +69,18 @@ type AuthInteractor struct {
 	sessions repository.SessionRepository
 	provider Provider
 	now      Clock
+	// bootstrapAdminSub が空でなければ、その Google sub の利用者を
+	// ログイン時に admin へ昇格させます (ADR 0011 決定 1)。
+	bootstrapAdminSub string
+}
+
+// WithBootstrapAdmin は最初の管理者にする Google の sub を設定します。
+//
+// コンストラクタの引数にしないのは、**認証の主経路とは独立した運用設定**
+// だからです。引数に混ぜると、テストのたびにこの値を意識することになります。
+func (i *AuthInteractor) WithBootstrapAdmin(googleSub string) *AuthInteractor {
+	i.bootstrapAdminSub = googleSub
+	return i
 }
 
 // NewAuthInteractor は依存を注入してインタラクターを生成します。
@@ -152,6 +171,8 @@ func (i *AuthInteractor) CompleteLogin(
 		return nil, err
 	}
 
+	i.promoteBootstrapAdmin(ctx, claims.Subject)
+
 	now := i.now()
 	session, token, err := model.NewSession(saved.ID, now, model.DefaultSessionTTL)
 	if err != nil {
@@ -167,6 +188,45 @@ func (i *AuthInteractor) CompleteLogin(
 		// NewSession が既定値へ丸める場合があるので、引数ではなく結果から取る。
 		TTL: session.ExpiresAt.Sub(now),
 	}, nil
+}
+
+// promoteBootstrapAdmin は設定された Google sub の利用者を admin にします。
+//
+// **失敗してもログインは通します。** 昇格は運用の都合であり、
+// ここで失敗を返すと「管理者にしたい人だけログインできない」ことになります。
+// 記録は残すので、あとから気づけます。
+func (i *AuthInteractor) promoteBootstrapAdmin(ctx context.Context, googleSub string) {
+	if i.bootstrapAdminSub == "" {
+		return
+	}
+	if i.bootstrapAdminSub != googleSub {
+		// **無言で戻らない。** 起動時には bootstrap_admin=true と出るので、
+		// 運用者には「効いている」と見える。設定値に打ち間違いや
+		// 余分な空白があると、管理者にしたい人が何度ログインしても
+		// 昇格せず、手がかりがどこにも残らない。
+		// PromoteToAdmin は role に書く唯一の経路なので、
+		// その環境には管理者が永久に存在しないことになる。
+		//
+		// sub 自体はログに出さない (個人を特定する識別子のため)。
+		// 長さだけ出せば、空白混入や切り詰めは判別できる。
+		slog.WarnContext(ctx, "bootstrap_admin_sub_mismatch",
+			slog.Int("configured_len", len(i.bootstrapAdminSub)),
+			slog.Int("received_len", len(googleSub)),
+		)
+		return
+	}
+
+	promoted, err := i.users.PromoteToAdmin(ctx, googleSub)
+	if err != nil {
+		slog.ErrorContext(ctx, "最初の管理者への昇格に失敗しました",
+			slog.String("error", err.Error()))
+		return
+	}
+	if promoted {
+		// **必ず記録に残す。** 権限が動いた事実は、
+		// 監査記録 (ADR 0011 決定 3) が入るまでログだけが頼りになる。
+		slog.InfoContext(ctx, "bootstrap_admin_promoted")
+	}
 }
 
 // Authenticate はセッショントークンを検証し、持ち主を返します。
@@ -192,11 +252,13 @@ func (i *AuthInteractor) Authenticate(
 
 	return &PrincipalDTO{
 		UserID: auth.Owner.ID,
+		Role:   auth.Owner.Role,
 		Me: MeDTO{
 			PublicID:    auth.Owner.PublicID,
 			DisplayName: auth.Owner.DisplayName,
 			Email:       auth.Owner.Email,
 			AvatarURL:   auth.Owner.AvatarURL,
+			Role:        auth.Owner.Role,
 		},
 	}, nil
 }

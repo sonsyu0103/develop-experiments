@@ -343,6 +343,22 @@ export interface components {
             withdrawn: boolean;
         } | null;
         /**
+         * @description 利用者の権限 (docs/adr/0011-moderation.md 決定 1)。
+         *
+         *     3 段階に分けているのは、**投稿を消せる権限と、
+         *     権限を配れる権限を分離する**ためです。
+         *     モデレーターを増やしても、権限を配れる人間は増えません。
+         *
+         *     | | user | moderator | admin |
+         *     | --- | --- | --- | --- |
+         *     | 自分の投稿の削除 | ✅ | ✅ | ✅ |
+         *     | 他人・匿名の投稿の削除 | ❌ | ✅ | ✅ |
+         *     | ロールの変更 | ❌ | ❌ | ✅ |
+         * @example user
+         * @enum {string}
+         */
+        Role: "user" | "moderator" | "admin";
+        /**
          * @description ログイン中の利用者。
          *
          *     **内部 ID (`users.id`) は含めません。** マイページの URL が連番だと
@@ -363,6 +379,14 @@ export interface components {
              * @example hoshino@example.com
              */
             email: string;
+            /**
+             * @description **自分のロールだけ**返します。
+             *     フロントが管理用の導線を出し分けるために使います。
+             *
+             *     他人のロールは `Author` に含めません ——
+             *     誰がモデレーターかを一覧で晒す必要がないためです
+             */
+            role: components["schemas"]["Role"];
             /** @example https://lh3.googleusercontent.com/a/xxxx */
             avatarUrl?: string | null;
         };

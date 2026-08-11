@@ -73,8 +73,9 @@ func run() error {
 			postgres.NewSessionRepository(pool),
 			provider,
 			nil,
-		)
-		slog.Info("認証を有効にしました")
+		).WithBootstrapAdmin(cfg.Auth.BootstrapAdminGoogleSub)
+		slog.Info("認証を有効にしました",
+			slog.Bool("bootstrap_admin", cfg.Auth.BootstrapAdminGoogleSub != ""))
 	} else {
 		slog.Warn("認証の設定が無いため、/auth と /me は 503 を返します")
 	}

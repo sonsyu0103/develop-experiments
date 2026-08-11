@@ -113,6 +113,8 @@ services:
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       AUTH_REDIRECT_URL: http://localhost:8080/auth/google/callback
       AUTH_FRONTEND_URL: http://localhost:3000
+      # 最初の管理者。値はここに書かず .env から補間する (ADR 0011 決定 1)
+      BOOTSTRAP_ADMIN_GOOGLE_SUB: ${BOOTSTRAP_ADMIN_GOOGLE_SUB:-}
     depends_on:
       postgres:
         condition: service_healthy

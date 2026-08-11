@@ -49,8 +49,11 @@ func (f *fakeProvider) Exchange(context.Context, string, string, string) (*useru
 }
 
 type fakeUserRepo struct {
-	user *usermodel.User
-	err  error
+	user          *usermodel.User
+	err           error
+	promotedSubs  []string
+	promoteResult bool
+	promoteErr    error
 }
 
 var _ userrepo.UserRepository = (*fakeUserRepo)(nil)
@@ -67,6 +70,14 @@ func (f *fakeUserRepo) FindByID(context.Context, int64) (*usermodel.User, error)
 func (f *fakeUserRepo) FindByPublicID(context.Context, uuid.UUID) (*usermodel.User, error) {
 	return f.user, f.err
 }
+
+// promoted は PromoteToAdmin が呼ばれた回数です。
+// 「昇格させた」ことを返り値ではなく呼び出しの有無で見るため。
+func (f *fakeUserRepo) PromoteToAdmin(_ context.Context, googleSub string) (bool, error) {
+	f.promotedSubs = append(f.promotedSubs, googleSub)
+	return f.promoteResult, f.promoteErr
+}
+
 func (f *fakeUserRepo) ListAuthorsByIDs(context.Context, []int64) ([]usermodel.Author, error) {
 	return nil, f.err
 }
@@ -132,13 +143,17 @@ func newAuthEnv(t *testing.T, authEnabled bool) *authEnv {
 		liveToken: token,
 		owner: usermodel.SessionOwner{
 			ID: 1, PublicID: publicID, Email: "h@example.com", DisplayName: "ホシノ",
+			// **空のままにしない。** role は required かつ enum なので、
+			// "" を返すと仕様違反のペイロードになる。
+			// kin-openapi はリクエストしか検証しないので、誰も気づかない。
+			Role: usermodel.RoleUser,
 		},
 	}
 
 	var auth *userusecase.AuthInteractor
 	if authEnabled {
 		user := usermodel.Reconstruct(1, publicID, "sub-1", "h@example.com", "ホシノ",
-			nil, time.Unix(0, 0).UTC(), time.Unix(0, 0).UTC(), nil)
+			nil, usermodel.RoleUser, time.Unix(0, 0).UTC(), time.Unix(0, 0).UTC(), nil)
 		auth = userusecase.NewAuthInteractor(
 			&fakeUserRepo{user: user},
 			sessions,
@@ -281,6 +296,11 @@ func TestAuth_ValidCookieReturnsMe(t *testing.T) {
 	got := decodeJSON[oapigen.Me](t, rec)
 	if got.DisplayName != "ホシノ" {
 		t.Errorf("DisplayName = %q", got.DisplayName)
+	}
+	// 自分のロールは返す (フロントが管理用の導線を出し分けるため)。
+	// 空文字は仕様書の enum に無いので、そのまま返してはいけない。
+	if got.Role != oapigen.User {
+		t.Errorf("role = %q, want user", got.Role)
 	}
 	// 内部 ID (users.id = 1) が漏れていないこと。
 	if strings.Contains(rec.Body.String(), `"id"`) {

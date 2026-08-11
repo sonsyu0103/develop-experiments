@@ -25,8 +25,10 @@
 # ローカルで動かないスクリプトは結局使われなくなる。
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import secrets
 import shlex
 import subprocess
 import sys
@@ -79,9 +81,12 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_NoRedirect)
 
 
-def call(method: str, path: str, body: str | None = None):
+def call(method: str, path: str, body: str | None = None,
+         headers: dict[str, str] | None = None):
     """API を叩き、(ステータス, JSON, ヘッダ) を返す。"""
     req = urllib.request.Request(BASE_URL + path, method=method)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
     data = None
     if body is not None:
         req.add_header("Content-Type", "application/json")
@@ -102,10 +107,24 @@ def call(method: str, path: str, body: str | None = None):
             return e.code, raw.decode(errors="replace")[:200], e.headers
 
 
-def sql(statement: str) -> None:
-    """SQL を 1 文実行する。SQL_EXEC 未設定なら何もしない。"""
+def sql(statement: str, quiet: bool = False) -> None:
+    """SQL を 1 文実行する。SQL_EXEC 未設定なら何もしない。
+
+    quiet=True は「失敗を期待する」呼び出し用。標準エラーも捨てる。
+    **期待どおりの拒否で ERROR 行がログに出ると、
+    本物の異常と見分けが付かなくなる** (赤い行を無視する癖がつく)。
+    """
+    # **ガードが本体に無いまま docstring だけが「何もしない」と書いていた。**
+    # 空だと shlex.split("") が [] になり、SQL 文字列を
+    # プログラムとして exec しようとして FileNotFoundError で落ちる。
+    # 呼び出しがすべて if SQL_EXEC: の下にある間は表に出ないが、
+    # 外で 1 度呼ばれた瞬間に、check() の集計に乗らない形で全体が止まる。
+    if not SQL_EXEC:
+        return
+
     subprocess.run(shlex.split(SQL_EXEC) + [statement], check=True,
-                   stdout=subprocess.DEVNULL)
+                   stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL if quiet else None)
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
@@ -247,6 +266,8 @@ section("認証")
 # CI は置いていないので 503、手元に .env を置くと 302 になる。
 # 決め打ちにすると、資格情報を入れた環境でスモークが落ちる (実際に踏んだ)。
 auth_status, auth_payload, auth_headers = call("GET", "/auth/google")
+# 資格情報が入っているか。セッションを要する検査はこれで分岐する。
+auth_enabled = auth_status != 503
 
 if auth_status == 503:
     # 認証だけが使えない状態。全体が落ちる設計だと、
@@ -395,6 +416,84 @@ if SQL_EXEC:
         sql("DELETE FROM users WHERE id = 900001;")
 else:
     section("投稿者の紐付け")
+    print("  \033[33mSKIP\033[0m SQL_EXEC が未設定のためスキップ")
+
+if SQL_EXEC:
+    section("権限 (ADR 0011 決定 1)")
+
+    # 認証を通さずにロールの読み出し経路を確かめる。
+    # セッションは ID がトークンの SHA-256 なので、こちらで計算して挿入する
+    # (生のトークンは DB に保存しない設計。docs/adr/0005-authentication.md)。
+    # **トークンは実行ごとに作る。** 固定値をコミットすると、
+    # 検査の間だけとはいえ「公開された有効なセッション」が存在することになる。
+    # 前回の実行が後片付け前に落ちた場合に、古い行へ衝突する事故も避けられる。
+    probe_token = "smoke-role-" + secrets.token_hex(16)
+    probe_hash = hashlib.sha256(probe_token.encode()).hexdigest()
+
+    try:
+        sql("""
+            INSERT INTO users (id, public_id, google_sub, email, display_name)
+            VALUES (900002, '01920000-0000-7000-8000-000000900002'::uuid,
+                    'smoke-sub-2', 'smoke-role@example.com', 'ロール検証')
+            ON CONFLICT (google_sub) DO NOTHING;
+        """)
+        sql(f"""
+            INSERT INTO sessions (id, user_id, expires_at)
+            VALUES ('{probe_hash}', 900002, now() + interval '5 minutes');
+        """)
+        cookie = {"Cookie": f"session={probe_token}"}
+
+        # **セッションを要する検査は、認証が設定されている環境でだけ行う。**
+        # 資格情報が無いと auth が nil になり、ミドルウェアが
+        # セッションを解決しないため /me は必ず 401 になる。
+        # ここを決め打ちにすると CI (資格情報なし) で落ちる —— 実際に落とした。
+        if auth_enabled:
+            status, payload, _ = call("GET", "/me", headers=cookie)
+            check("ログイン中は /me に role が載る",
+                  status == 200 and (payload or {}).get("role") == "user",
+                  f"status={status} payload={payload}")
+
+            # **昇格が読み出し側に反映されること。**
+            # ここが繋がっていないと、権限を変えても API から見えない。
+            sql("UPDATE users SET role = 'moderator' WHERE id = 900002;")
+            _, payload, _ = call("GET", "/me", headers=cookie)
+            check("ロールを変えると /me に反映される",
+                  (payload or {}).get("role") == "moderator", f"payload={payload}")
+        else:
+            print("  \033[33mSKIP\033[0m /me の検査 (認証が未設定のためセッションを解決できない)")
+
+        # **他人のロールは投稿一覧に出さない。**
+        # 誰がモデレーターかを晒す必要がない (Author に role は無い)。
+        sql("""
+            INSERT INTO threads (id, title, author_id)
+            VALUES (900002, 'スモーク: モデレーターの投稿', 900002)
+            ON CONFLICT (id) DO UPDATE SET deleted_at = NULL, author_id = 900002;
+        """)
+        _, payload, _ = call("GET", "/threads/900002")
+        author = (payload or {}).get("author")
+        # **先に「投稿者が解決できていること」を確かめる。**
+        # 空の辞書へ倒すと、404 などで author が無いときに
+        # "role" not in {} が真になり、素通しで OK になる。
+        # この検査が唯一守ろうとしている「role が Author に漏れる」を、
+        # フィクスチャが壊れているときに限って見逃すことになる。
+        check("モデレーターの投稿で author が解決される",
+              author is not None, f"payload={payload}")
+        check("投稿一覧の author に role を含めない",
+              author is not None and "role" not in author, f"author={author}")
+
+        # DB 側の CHECK 制約が効いていること。
+        # アプリと DB のどちらか片方だけ値を増やすと、ここで気づける。
+        try:
+            sql("UPDATE users SET role = 'superadmin' WHERE id = 900002;", quiet=True)
+            check("不正なロールを DB が拒否する", False, "CHECK 制約が効いていない")
+        except subprocess.CalledProcessError:
+            check("不正なロールを DB が拒否する", True)
+    finally:
+        sql("DELETE FROM threads WHERE id = 900002;")
+        sql("DELETE FROM sessions WHERE user_id = 900002;")
+        sql("DELETE FROM users WHERE id = 900002;")
+else:
+    section("権限")
     print("  \033[33mSKIP\033[0m SQL_EXEC が未設定のためスキップ")
 
 # ---------------------------------------------------------------------------
