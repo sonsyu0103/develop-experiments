@@ -344,11 +344,16 @@ func TestAuthenticate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Authenticate が失敗した: %v", err)
 	}
-	if got.PublicID != owner.PublicID {
-		t.Errorf("PublicID = %v, want %v", got.PublicID, owner.PublicID)
+	if got.Me.PublicID != owner.PublicID {
+		t.Errorf("PublicID = %v, want %v", got.Me.PublicID, owner.PublicID)
 	}
-	if got.DisplayName != "ホシノ" {
-		t.Errorf("DisplayName = %q", got.DisplayName)
+	if got.Me.DisplayName != "ホシノ" {
+		t.Errorf("DisplayName = %q", got.Me.DisplayName)
+	}
+	// **内部 ID も返る。** 投稿者の紐付け (author_id) に要る値で、
+	// これが欠けると匿名投稿しかできなくなる。
+	if got.UserID != owner.ID {
+		t.Errorf("UserID = %d, want %d", got.UserID, owner.ID)
 	}
 }
 

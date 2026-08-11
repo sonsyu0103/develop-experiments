@@ -6,19 +6,35 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
+
 	"develop-experiments/apps/go-api/internal/apperr"
 	"develop-experiments/apps/go-api/internal/comment/domain/model"
 	"develop-experiments/apps/go-api/internal/comment/domain/repository"
 	"develop-experiments/apps/go-api/internal/pagination"
 )
 
+// AuthorDTO はフロントエンドに返す投稿者のデータ構造です。
+// 内部 ID (users.id) は含めません。
+type AuthorDTO struct {
+	// PublicID は退会済みでは nil になります。
+	PublicID    *uuid.UUID `json:"publicId"`
+	DisplayName string     `json:"displayName"`
+	AvatarURL   *string    `json:"avatarUrl"`
+	Withdrawn   bool       `json:"withdrawn"`
+}
+
 // CommentDTO はフロントエンドに返すコメントのデータ構造です。
 type CommentDTO struct {
-	ID         int64     `json:"id"`
-	ThreadID   int64     `json:"threadId"`
-	AuthorName string    `json:"authorName"`
-	Body       string    `json:"body"`
-	CreatedAt  time.Time `json:"createdAt"`
+	ID       int64 `json:"id"`
+	ThreadID int64 `json:"threadId"`
+	// AuthorName は匿名投稿の表示名です。
+	// Author があるときは、そちらを表示してください。
+	AuthorName string `json:"authorName"`
+	// Author は匿名投稿では nil になります。
+	Author    *AuthorDTO `json:"author"`
+	Body      string     `json:"body"`
+	CreatedAt time.Time  `json:"createdAt"`
 }
 
 // CommentListResult はコメント一覧と、次ページ取得用のカーソルです。
@@ -96,9 +112,9 @@ func (i *CommentInteractor) FetchComments(
 // 削除される競合を避けるためです。判定は INSERT ... WHERE EXISTS で
 // SQL 側に寄せてあります。
 func (i *CommentInteractor) PostComment(
-	ctx context.Context, threadID int64, authorName, body string,
+	ctx context.Context, threadID int64, authorName, body string, authorID *int64,
 ) (CommentDTO, error) {
-	comment, err := model.NewComment(threadID, authorName, body)
+	comment, err := model.NewComment(threadID, authorName, body, authorID)
 	if err != nil {
 		return CommentDTO{}, err
 	}
@@ -116,7 +132,23 @@ func toDTO(c model.Comment) CommentDTO {
 		ID:         c.ID,
 		ThreadID:   c.ThreadID,
 		AuthorName: c.AuthorName,
+		Author:     toAuthorDTO(c.Author),
 		Body:       c.Body,
 		CreatedAt:  c.CreatedAt,
+	}
+}
+
+// toAuthorDTO は投稿者を詰め替えます。匿名投稿では nil のまま返します。
+//
+// 退会済みの表示の差し替えはドメイン側 (model.NewAuthor) で済んでいます。
+func toAuthorDTO(a *model.Author) *AuthorDTO {
+	if a == nil {
+		return nil
+	}
+	return &AuthorDTO{
+		PublicID:    a.PublicID,
+		DisplayName: a.DisplayName,
+		AvatarURL:   a.AvatarURL,
+		Withdrawn:   a.Withdrawn,
 	}
 }

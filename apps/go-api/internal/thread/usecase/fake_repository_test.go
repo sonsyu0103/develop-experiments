@@ -78,7 +78,7 @@ func (f *fakeRepo) Create(_ context.Context, thread *model.Thread) (*model.Threa
 	defer f.createdThreadMux.Unlock()
 
 	f.createdThreads = append(f.createdThreads, thread.Title)
-	return model.Reconstruct(int64(len(f.createdThreads)), thread.Title, time.Unix(0, 0).UTC()), nil
+	return model.Reconstruct(int64(len(f.createdThreads)), thread.Title, thread.Author, time.Unix(0, 0).UTC()), nil
 }
 
 func (f *fakeRepo) Exists(_ context.Context, id int64) (bool, error) {
@@ -144,7 +144,7 @@ func newFakeRepo(n int) *fakeRepo {
 	counts := make(map[int64]int64, n)
 	for i := n; i >= 1; i-- {
 		id := int64(i)
-		threads = append(threads, *model.Reconstruct(id, fmt.Sprintf("スレッド %d", id), time.Unix(int64(i), 0).UTC()))
+		threads = append(threads, *model.Reconstruct(id, fmt.Sprintf("スレッド %d", id), nil, time.Unix(int64(i), 0).UTC()))
 		counts[id] = id * 3
 	}
 	return &fakeRepo{threads: threads, counts: counts}

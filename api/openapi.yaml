@@ -472,7 +472,7 @@ components:
 
     Thread:
       type: object
-      required: [id, title, commentCount, createdAt]
+      required: [id, title, commentCount, author, createdAt]
       properties:
         id:
           type: integer
@@ -486,6 +486,8 @@ components:
           format: int64
           description: 論理削除されていないコメントの件数
           example: 7
+        author:
+          $ref: '#/components/schemas/Author'
         createdAt:
           type: string
           format: date-time
@@ -493,7 +495,7 @@ components:
 
     Comment:
       type: object
-      required: [id, threadId, authorName, body, createdAt]
+      required: [id, threadId, authorName, author, body, createdAt]
       properties:
         id:
           type: integer
@@ -505,7 +507,15 @@ components:
           example: 1
         authorName:
           type: string
+          description: |
+            匿名投稿の表示名。省略時は「名無しさん」になります。
+
+            **`author` があるときは、そちらを表示してください。**
+            ログイン中の投稿ではこの欄は既定値のまま保存されます
+            (表示名の変更を過去の投稿にも反映させるため。ADR 0014)。
           example: 名無しさん
+        author:
+          $ref: '#/components/schemas/Author'
         body:
           type: string
           example: ふぁ〜、眠いよ〜
@@ -554,6 +564,39 @@ components:
           maxLength: 200
           description: DB 側の CHECK 制約 threads_title_length と同じ上限です
           example: 新しいスレッド
+
+    Author:
+      type: object
+      nullable: true
+      required: [displayName, withdrawn]
+      description: |
+        投稿者。**匿名投稿では `null` になります**
+        (docs/adr/0005-authentication.md 決定 2)。
+
+        内部 ID (`users.id`) は含めません。`Me` と同じ理由です。
+
+        退会した利用者の投稿は、投稿そのものは残したまま表示だけ差し替えます。
+        このとき `publicId` を返しません —— フロントが `withdrawn` の分岐を
+        落としても、退会した人のマイページへ辿れないようにするためです。
+      properties:
+        publicId:
+          type: string
+          format: uuid
+          description: 公開用の識別子 (UUID v7)。**退会済みの場合は返しません**
+          example: 0192f0a0-0000-7000-8000-000000000001
+        displayName:
+          type: string
+          description: 退会済みの場合は「退会したユーザー」に置き換わります
+          example: ホシノ
+        avatarUrl:
+          type: string
+          nullable: true
+          description: 退会済みの場合は null になります
+          example: https://lh3.googleusercontent.com/a/xxxx
+        withdrawn:
+          type: boolean
+          description: 退会済みか
+          example: false
 
     Me:
       type: object

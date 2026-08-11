@@ -13,9 +13,11 @@ import (
 	"github.com/google/uuid"
 
 	"develop-experiments/apps/go-api/internal/apperr"
+	commentmodel "develop-experiments/apps/go-api/internal/comment/domain/model"
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
+	threadmodel "develop-experiments/apps/go-api/internal/thread/domain/model"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
 	userrepo "develop-experiments/apps/go-api/internal/user/domain/repository"
@@ -113,6 +115,8 @@ func (f *fakeSessionRepo) DeleteExpired(context.Context, int32) (int64, error)  
 type authEnv struct {
 	router   *gin.Engine
 	sessions *fakeSessionRepo
+	threads  *fakeThreadRepo
+	comments *fakeCommentRepo
 	token    usermodel.SessionToken
 }
 
@@ -145,10 +149,18 @@ func newAuthEnv(t *testing.T, authEnabled bool) *authEnv {
 		)
 	}
 
+	// コメント投稿の親スレッド確認に使うので、生存しているスレッドを 1 件持たせる。
+	threads := &fakeThreadRepo{
+		summaries: []threadmodel.Summary{
+			{Thread: *threadmodel.Reconstruct(1, "スレッド", nil, time.Unix(1, 0).UTC())},
+		},
+	}
+	comments := &fakeCommentRepo{}
+
 	router, err := NewRouter(Deps{
 		Server: NewServer(
-			threadusecase.NewThreadInteractor(&fakeThreadRepo{}),
-			commentusecase.NewCommentInteractor(&fakeCommentRepo{}, &fakeThreadRepo{}),
+			threadusecase.NewThreadInteractor(threads),
+			commentusecase.NewCommentInteractor(comments, threads),
 			&fakePinger{},
 			auth,
 			config.AuthConfig{FrontendURL: "http://localhost:3000"},
@@ -159,7 +171,10 @@ func newAuthEnv(t *testing.T, authEnabled bool) *authEnv {
 		t.Fatalf("NewRouter が失敗した: %v", err)
 	}
 
-	return &authEnv{router: router, sessions: sessions, token: token}
+	return &authEnv{
+		router: router, sessions: sessions,
+		threads: threads, comments: comments, token: token,
+	}
 }
 
 func (e *authEnv) do(t *testing.T, method, path string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
@@ -529,5 +544,128 @@ func TestLogout_RequiresSession(t *testing.T) {
 	rec := env.do(t, http.MethodPost, "/auth/logout")
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 投稿者の紐付け (ADR 0005 決定 2 / ADR 0014)
+// ---------------------------------------------------------------------------
+
+func postJSON(t *testing.T, e *authEnv, path, body string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+
+	rec := httptest.NewRecorder()
+	e.router.ServeHTTP(rec, req)
+	return rec
+}
+
+// **ログイン中の投稿には投稿者が紐付く。**
+//
+// ここが繋がっていないと、ログインしていても全部が匿名投稿になる。
+// 返り値ではなくリポジトリが受け取った値を見ているのは、
+// 「詰め替えは正しいが author_id を渡していない」を検出するため。
+func TestCreateThread_AttachesAuthorWhenLoggedIn(t *testing.T) {
+	env := newAuthEnv(t, true)
+
+	rec := postJSON(t, env, "/threads", `{"title":"ログインして立てたスレッド"}`,
+		sessionCookie(env.token))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	if env.threads.created == nil {
+		t.Fatal("スレッドが保存されていない")
+	}
+	// fakeSessionRepo の owner.ID が 1。
+	if got := env.threads.created.AuthorID; got == nil || *got != 1 {
+		t.Errorf("AuthorID = %v, want 1", got)
+	}
+
+	got := decodeJSON[oapigen.Thread](t, rec)
+	if got.Author == nil {
+		t.Fatal("レスポンスに author が無い")
+	}
+	if got.Author.DisplayName != "ホシノ" {
+		t.Errorf("author.displayName = %q", got.Author.DisplayName)
+	}
+	if got.Author.Withdrawn {
+		t.Error("withdrawn = true, want false")
+	}
+}
+
+// **匿名投稿は匿名のまま。** author_id を勝手に埋めない。
+func TestCreateThread_AnonymousHasNoAuthor(t *testing.T) {
+	env := newAuthEnv(t, true)
+
+	rec := postJSON(t, env, "/threads", `{"title":"匿名で立てたスレッド"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	if env.threads.created == nil {
+		t.Fatal("スレッドが保存されていない")
+	}
+	if got := env.threads.created.AuthorID; got != nil {
+		t.Errorf("AuthorID = %d, want nil (匿名)", *got)
+	}
+	if got := decodeJSON[oapigen.Thread](t, rec); got.Author != nil {
+		t.Errorf("author = %+v, want null", *got.Author)
+	}
+}
+
+// コメントも同じ。あわせて、**ログイン中は authorName が捨てられる**ことを見る。
+//
+// 保存されると「投稿時点の表示名」が残り、表示名の変更が
+// 過去の投稿に反映されなくなる (ADR 0014 はそれを選んでいない)。
+func TestCreateComment_AttachesAuthorAndDiscardsAuthorName(t *testing.T) {
+	env := newAuthEnv(t, true)
+
+	rec := postJSON(t, env, "/threads/1/comments",
+		`{"authorName":"別人を名乗る","body":"ログインして書いたコメント"}`,
+		sessionCookie(env.token))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	if env.comments.created == nil {
+		t.Fatal("コメントが保存されていない")
+	}
+	if got := env.comments.created.AuthorID; got == nil || *got != 1 {
+		t.Errorf("AuthorID = %v, want 1", got)
+	}
+	if got := env.comments.created.AuthorName; got != commentmodel.DefaultAuthorName {
+		t.Errorf("AuthorName = %q, want %q (ログイン中は捨てる)", got, commentmodel.DefaultAuthorName)
+	}
+
+	got := decodeJSON[oapigen.Comment](t, rec)
+	if got.Author == nil || got.Author.DisplayName != "ホシノ" {
+		t.Errorf("author = %+v, want ホシノ", got.Author)
+	}
+}
+
+// 匿名のコメントは投稿者名がそのまま残り、author は null になる。
+func TestCreateComment_AnonymousKeepsAuthorName(t *testing.T) {
+	env := newAuthEnv(t, true)
+
+	rec := postJSON(t, env, "/threads/1/comments",
+		`{"authorName":"通りすがり","body":"匿名のコメント"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	if got := env.comments.created.AuthorName; got != "通りすがり" {
+		t.Errorf("AuthorName = %q, want 通りすがり", got)
+	}
+	if got := env.comments.created.AuthorID; got != nil {
+		t.Errorf("AuthorID = %d, want nil (匿名)", *got)
+	}
+	if got := decodeJSON[oapigen.Comment](t, rec); got.Author != nil {
+		t.Errorf("author = %+v, want null", *got.Author)
 	}
 }

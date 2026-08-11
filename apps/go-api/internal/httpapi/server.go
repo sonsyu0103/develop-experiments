@@ -192,15 +192,15 @@ func (s *Server) Logout(c *gin.Context) {
 // 未ログインなら検証ミドルウェアが 401 で弾いています。
 // ここまで来た時点で principal は必ず存在します。
 func (s *Server) GetMe(c *gin.Context) {
-	me := principalFromContext(c.Request.Context())
-	if me == nil {
+	p := principalFromContext(c.Request.Context())
+	if p == nil {
 		// 到達しない想定。security 宣言と resolveSession の
 		// どちらかが外れたときだけここに来る。
 		respondError(c, fmt.Errorf("セッションがありません: %w", apperr.ErrUnauthenticated))
 		return
 	}
 
-	c.JSON(http.StatusOK, toWireMe(*me))
+	c.JSON(http.StatusOK, toWireMe(p.Me))
 }
 
 // ---------------------------------------------------------------------------
@@ -232,7 +232,9 @@ func (s *Server) CreateThread(c *gin.Context) {
 		return
 	}
 
-	thread, err := s.threads.CreateThread(c.Request.Context(), req.Title)
+	// ログイン中なら投稿者を紐付ける。未ログインなら nil = 匿名投稿。
+	thread, err := s.threads.CreateThread(c.Request.Context(), req.Title,
+		authorIDFromContext(c.Request.Context()))
 	if err != nil {
 		respondError(c, err)
 		return
@@ -303,7 +305,8 @@ func (s *Server) CreateComment(c *gin.Context, threadID oapigen.ThreadId) {
 		authorName = *req.AuthorName
 	}
 
-	comment, err := s.comments.PostComment(c.Request.Context(), threadID, authorName, req.Body)
+	comment, err := s.comments.PostComment(c.Request.Context(), threadID, authorName, req.Body,
+		authorIDFromContext(c.Request.Context()))
 	if err != nil {
 		respondError(c, err)
 		return
