@@ -125,7 +125,15 @@ cover: ## 手書きロジックのカバレッジを測り、下限を下回っ�
 	# 既定の -cover は「そのパッケージ自身のテスト」しか数えない。
 	# httpapi のテストが usecase を通しても usecase には計上されないため、
 	# 実態より低く出る。
-	@cd $(GO_API_DIR) && 		pkgs=$$(go list ./internal/... | grep -vE 'oapigen|sqlcgen|/infrastructure/' | paste -sd, -) && 		go test -coverpkg="$$pkgs" -coverprofile=/tmp/cover.out $$(echo "$$pkgs" | tr ',' ' ') > /dev/null && 		total=$$(go tool cover -func=/tmp/cover.out | tail -1 | grep -oE '[0-9]+\.[0-9]+') && 		echo "手書きロジックのカバレッジ: $$total% (下限 $(COVER_MIN)%)" && 		awk -v t="$$total" -v m="$(COVER_MIN)" 'BEGIN { if (t+0 < m+0) { print "下限を下回りました"; exit 1 } }'
+	#
+	# 【-count=1 が要る理由】
+	# **テストキャッシュに当たると、出てくる数字が壊れる。**
+	# 「(cached)」で再生されたプロファイルは行数が減り (実測 3115 -> 3055 行)、
+	# 同じコードのまま 83.8% が 54.8〜57.1% に化ける。
+	# 一度でも同じコマンドを流したあとに測ると下限割れで落ちるので、毎回走らせる。
+	# カバレッジは「実行した事実」の記録であって、
+	# キャッシュから復元してよい値ではない。
+	@cd $(GO_API_DIR) && 		pkgs=$$(go list ./internal/... | grep -vE 'oapigen|sqlcgen|/infrastructure/' | paste -sd, -) && 		go test -count=1 -coverpkg="$$pkgs" -coverprofile=/tmp/cover.out $$(echo "$$pkgs" | tr ',' ' ') > /dev/null && 		total=$$(go tool cover -func=/tmp/cover.out | tail -1 | grep -oE '[0-9]+\.[0-9]+') && 		echo "手書きロジックのカバレッジ: $$total% (下限 $(COVER_MIN)%)" && 		awk -v t="$$total" -v m="$(COVER_MIN)" 'BEGIN { if (t+0 < m+0) { print "下限を下回りました"; exit 1 } }'
 
 .PHONY: cover-html
 cover-html: cover ## カバレッジをブラウザで開く (どこが通っていないかを見る)
