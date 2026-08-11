@@ -182,6 +182,23 @@ arch-probe: ## 境界検査そのものが機能しているかをプローブ�
 	# 設定を読んだだけでは正しさを判断できないため CI で回す
 	.github/scripts/arch-probe.sh
 
+# 変異リスト。PR ごとの使い捨てなので既定値は置かない。
+MUTATIONS ?=
+
+.PHONY: mutation-probe
+mutation-probe: ## テストが実際に効くかを、実装をわざと壊して実測する (MUTATIONS=<変異リスト>)
+	# 「テストが通った」は「テストが何かを守っている」ことを意味しない。
+	# 実装を壊してもテストが通るなら、そのテストは何も守っていない。
+	#
+	# arch-probe と違って CI には載せない。壊し方は変更のたびに陳腐化するため、
+	# 変異リストは PR ごとの使い捨てにする (書式はスクリプト冒頭)。
+	@test -n "$(MUTATIONS)" || { \
+		echo "MUTATIONS=<変異リスト> を指定してください。"; \
+		echo "書式は .github/scripts/mutation-probe.py の冒頭にあります。"; \
+		exit 2; \
+	}
+	.github/scripts/mutation-probe.py $(MUTATIONS)
+
 .PHONY: verify-generated
 verify-generated: generate ## 生成物がコミット済みの内容と一致するか検査する
 	@git diff --exit-code -- \
