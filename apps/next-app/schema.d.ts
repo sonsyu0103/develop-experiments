@@ -44,6 +44,10 @@ export interface paths {
          *     退会済みの利用者が同じ Google アカウントで再ログインした場合は
          *     401 になります。行を復活させるかは未決です
          *     (docs/adr/0005-authentication.md)。
+         *
+         *     同意画面で拒否された場合、Google は code を付けずに
+         *     error だけを返します。この経路もフロントエンドへリダイレクトし、
+         *     API のエラー JSON をブラウザに直接見せません。
          */
         get: operations["googleLoginCallback"];
         put?: never;
@@ -441,10 +445,22 @@ export interface operations {
     googleLoginCallback: {
         parameters: {
             query: {
-                /** @description Google が発行した認可コード */
-                code: string;
-                /** @description 開始時に発行した state。Cookie の値と照合します */
+                /**
+                 * @description 開始時に発行した state。Cookie の値と照合します。
+                 *     拒否された場合も Google はこれを返すため、必須にしています
+                 */
                 state: string;
+                /**
+                 * @description Google が発行した認可コード。
+                 *     **同意画面で拒否されたときは付きません** (代わりに error が付きます)。
+                 *     必須にすると、拒否した利用者に検証エラーの JSON が直接見えてしまいます
+                 */
+                code?: string;
+                /**
+                 * @description 拒否や設定不備のときに Google が返すエラー識別子
+                 *     (access_denied など)
+                 */
+                error?: string;
             };
             header?: never;
             path?: never;

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"time"
 
 	"develop-experiments/apps/go-api/internal/apperr"
 
@@ -113,42 +112,58 @@ func (s *Server) GoogleLoginCallback(c *gin.Context, params oapigen.GoogleLoginC
 		return
 	}
 
-	// state の照合は HTTP 層の仕事。Cookie を読むのはここだけにする。
+	// Cookie を読むのはここだけ。読み終えたら**検査より先に**捨てる。
 	//
+	// defer にしてはいけない。defer が走るのはハンドラから戻るときで、
+	// その時点では c.Redirect / respondError がヘッダを書き出し済みのため
+	// Set-Cookie がレスポンスに載らない。
+	// 早期 return する経路 (ログイン CSRF の検知など) では
+	// そもそも defer の登録前に抜けてしまう。捨てたいのはむしろその経路。
+	wantState, _ := c.Cookie(stateCookieName)
+	nonce, _ := c.Cookie(nonceCookieName)
+	verifier, _ := c.Cookie(verifierCookieName)
+	s.clearFlowCookies(c)
+
+	// state の照合は HTTP 層の仕事。
 	// 一致を確認できなければ先へ進まない。これが無いと、攻撃者が用意した
 	// 認可コードを被害者のブラウザで交換させられる (ログイン CSRF)。
-	wantState, err := c.Cookie(stateCookieName)
-	if err != nil || wantState == "" || wantState != params.State {
+	//
+	// 拒否された場合も Google は state を返すので、error の判定より先に置ける。
+	if wantState == "" || wantState != params.State {
 		respondError(c, fmt.Errorf("state が一致しません: %w", apperr.ErrUnauthenticated))
 		return
 	}
 
-	nonce, err := c.Cookie(nonceCookieName)
-	if err != nil || nonce == "" {
+	// 同意画面で拒否された場合。code は付かず error だけが返る。
+	// ここで 4xx の JSON を返すと、ブラウザにそれが直接表示されてしまう。
+	if params.Error != nil && *params.Error != "" {
+		c.Redirect(http.StatusFound, s.frontendURLWithError(*params.Error))
+		return
+	}
+
+	if params.Code == nil || *params.Code == "" {
+		respondError(c, fmt.Errorf("認可コードがありません: %w", apperr.ErrUnauthenticated))
+		return
+	}
+	if nonce == "" {
 		respondError(c, fmt.Errorf("nonce がありません: %w", apperr.ErrUnauthenticated))
 		return
 	}
-	verifier, err := c.Cookie(verifierCookieName)
-	if err != nil || verifier == "" {
+	if verifier == "" {
 		respondError(c, fmt.Errorf("code_verifier がありません: %w", apperr.ErrUnauthenticated))
 		return
 	}
 
-	// 使い終わったフロー用 Cookie は、成否にかかわらず必ず捨てる。
-	// 残すと再利用の余地ができる。
-	defer func() {
-		s.clearCookie(c, stateCookieName)
-		s.clearCookie(c, nonceCookieName)
-		s.clearCookie(c, verifierCookieName)
-	}()
-
-	result, err := s.auth.CompleteLogin(c.Request.Context(), params.Code, verifier, nonce)
+	result, err := s.auth.CompleteLogin(c.Request.Context(), *params.Code, verifier, nonce)
 	if err != nil {
 		respondError(c, err)
 		return
 	}
 
-	s.setSessionCookie(c, result.Token, int(time.Until(result.ExpiresAt).Seconds()))
+	// MaxAge はインタラクタが返す寿命をそのまま使う。
+	// ここで time.Until(ExpiresAt) を計算すると、インタラクタの時計と
+	// 壁時計がずれたときに負になり、発行と同時に失効する Cookie ができる。
+	s.setSessionCookie(c, result.Token, int(result.TTL.Seconds()))
 	c.Redirect(http.StatusFound, s.authCfg.FrontendURL)
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,6 +36,13 @@ type MeDTO struct {
 type LoginResult struct {
 	Token     model.SessionToken
 	ExpiresAt time.Time
+	// TTL はセッションの寿命です。Cookie の MaxAge にそのまま使えます。
+	//
+	// ExpiresAt だけを渡すと、呼び出し側が time.Until で差を取ることになり、
+	// **このインタラクタの時計と壁時計がずれた分だけ MaxAge がずれます**。
+	// 時計を固定したテストでは負の値になり、発行と同時に失効する Cookie が
+	// できていました。時計は 1 か所に閉じます。
+	TTL time.Duration
 }
 
 // AuthInteractor は認証のユースケースを担当します。
@@ -99,6 +107,11 @@ func (i *AuthInteractor) CompleteLogin(
 ) (*LoginResult, error) {
 	claims, err := i.provider.Exchange(ctx, code, codeVerifier, nonce)
 	if err != nil {
+		// 認可コードの不正と、IdP へ到達できないこと (DNS / TLS / 障害) を
+		// ここでは区別できない。利用者へは同じ 401 を返すが、
+		// 切り分けの手がかりが何も残らないのは困るのでログには出す。
+		slog.WarnContext(ctx, "認可コードの交換に失敗しました",
+			slog.String("error", err.Error()))
 		return nil, fmt.Errorf("ID トークンの検証に失敗しました: %w", errors.Join(err, apperr.ErrUnauthenticated))
 	}
 
@@ -128,7 +141,8 @@ func (i *AuthInteractor) CompleteLogin(
 		return nil, err
 	}
 
-	session, token, err := model.NewSession(saved.ID, i.now(), model.DefaultSessionTTL)
+	now := i.now()
+	session, token, err := model.NewSession(saved.ID, now, model.DefaultSessionTTL)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +150,12 @@ func (i *AuthInteractor) CompleteLogin(
 		return nil, err
 	}
 
-	return &LoginResult{Token: token, ExpiresAt: session.ExpiresAt}, nil
+	return &LoginResult{
+		Token:     token,
+		ExpiresAt: session.ExpiresAt,
+		// NewSession が既定値へ丸める場合があるので、引数ではなく結果から取る。
+		TTL: session.ExpiresAt.Sub(now),
+	}, nil
 }
 
 // Authenticate はセッショントークンを検証し、持ち主を返します。

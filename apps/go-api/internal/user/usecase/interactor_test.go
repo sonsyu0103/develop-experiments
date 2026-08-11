@@ -193,6 +193,12 @@ func TestCompleteLogin_IssuesSession(t *testing.T) {
 	if !got.ExpiresAt.Equal(fixedNow.Add(model.DefaultSessionTTL)) {
 		t.Errorf("ExpiresAt = %v, want %v", got.ExpiresAt, fixedNow.Add(model.DefaultSessionTTL))
 	}
+	// TTL は**このインタラクタの時計**から測ったもの。
+	// 呼び出し側が time.Until(ExpiresAt) を取ると壁時計との差が混ざり、
+	// 時計を固定した環境では負になる (= 即失効の Cookie)。
+	if got.TTL != model.DefaultSessionTTL {
+		t.Errorf("TTL = %v, want %v", got.TTL, model.DefaultSessionTTL)
+	}
 
 	// 保存されたのはハッシュで、返したトークンそのものではないこと。
 	if sessions.created == nil {

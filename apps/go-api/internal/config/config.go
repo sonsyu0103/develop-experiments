@@ -51,8 +51,15 @@ type AuthConfig struct {
 	GoogleClientSecret string
 	// RedirectURL は Google からのコールバック先です。
 	// Google Cloud 側の「承認済みのリダイレクト URI」と一致している必要があります。
+	//
+	// **既定値を持たせません。** localhost を既定にすると、本番で
+	// AUTH_REDIRECT_URL を入れ忘れても Enabled() が true になり、
+	// Google に redirect_uri=http://localhost:8080/... を送って
+	// redirect_uri_mismatch で初めて気づくことになります。
+	// 未設定なら認証ごと無効 (503) にするほうが、原因が分かりやすくなります。
 	RedirectURL string
-	// FrontendURL はログイン完了後に戻す先です。
+	// FrontendURL はログイン完了後に戻す先です。RedirectURL と同じ理由で
+	// 既定値を持たせません。
 	FrontendURL string
 	// SecureCookie は Cookie に Secure 属性を付けるかどうかです。
 	//
@@ -110,9 +117,10 @@ func Load() (*Config, error) {
 		Auth: AuthConfig{
 			GoogleClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
 			GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),
-			RedirectURL: stringEnv("AUTH_REDIRECT_URL",
-				"http://localhost:8080/auth/google/callback"),
-			FrontendURL: stringEnv("AUTH_FRONTEND_URL", "http://localhost:3000"),
+			// 既定値を入れない (AuthConfig のコメントを参照)。
+			// compose.yaml と apps/go-api/.env.example が明示的に渡す。
+			RedirectURL: os.Getenv("AUTH_REDIRECT_URL"),
+			FrontendURL: os.Getenv("AUTH_FRONTEND_URL"),
 			// 開発時だけ Secure を外す。未設定の環境は本番扱いで付ける。
 			SecureCookie: !debug,
 		},

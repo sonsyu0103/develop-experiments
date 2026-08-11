@@ -2,8 +2,12 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"net/url"
+	"regexp"
 
 	"github.com/getkin/kin-openapi/openapi3filter"
 	"github.com/gin-gonic/gin"
@@ -71,7 +75,20 @@ func (s *Server) resolveSession() gin.HandlerFunc {
 		if err != nil {
 			// 無効なセッションは「未ログイン」として扱い、ここでは弾かない。
 			// security を宣言したエンドポイントだけが 401 になる。
-			c.Next()
+			if errors.Is(err, apperr.ErrUnauthenticated) {
+				c.Next()
+				return
+			}
+
+			// **それ以外 (DB 障害など) を素通ししない。**
+			// 素通しすると 401 に化け、利用者からは全員が突然ログアウトされた
+			// ように見えるうえ、原因の手がかりがどこにも残らない。
+			slog.ErrorContext(c.Request.Context(), "セッションの解決に失敗しました",
+				slog.String("path", c.Request.URL.Path),
+				slog.String("error", err.Error()),
+			)
+			c.Abort()
+			respondError(c, err)
 			return
 		}
 
@@ -145,6 +162,39 @@ func (s *Server) setFlowCookie(c *gin.Context, name, value string) {
 		SameSite: http.SameSiteLaxMode,
 	})
 }
+
+// clearFlowCookies はログインフロー用の Cookie をまとめて破棄します。
+//
+// **レスポンスを書き出す前に呼ぶ必要があります。** ヘッダを送出したあとに
+// Set-Cookie を足しても、レスポンスには載りません。
+func (s *Server) clearFlowCookies(c *gin.Context) {
+	s.clearCookie(c, stateCookieName)
+	s.clearCookie(c, nonceCookieName)
+	s.clearCookie(c, verifierCookieName)
+}
+
+// frontendURLWithError はログイン失敗をフロントへ伝えるリダイレクト先を組み立てます。
+//
+// IdP が返した文字列をそのまま載せません。フロント側でそのまま描画されると
+// 反射型 XSS の入口になるため、既知の書式に収まるものだけ通します。
+func (s *Server) frontendURLWithError(reason string) string {
+	if !loginErrorPattern.MatchString(reason) {
+		reason = "login_failed"
+	}
+
+	u, err := url.Parse(s.authCfg.FrontendURL)
+	if err != nil {
+		return s.authCfg.FrontendURL
+	}
+	q := u.Query()
+	q.Set("login_error", reason)
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// loginErrorPattern は OAuth 2.0 の error に許す書式です
+// (RFC 6749 4.1.2.1 は access_denied のような小文字の識別子を定めています)。
+var loginErrorPattern = regexp.MustCompile(`^[a-z_]{1,64}$`)
 
 // clearCookie は Cookie を破棄します。MaxAge を負にすると即時削除になります。
 func (s *Server) clearCookie(c *gin.Context, name string) {

@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -73,6 +74,8 @@ type fakeSessionRepo struct {
 	liveToken usermodel.SessionToken
 	owner     usermodel.SessionOwner
 	deleted   []usermodel.SessionToken
+	// findErr が非 nil なら FindLive がそれを返します。DB 障害の再現に使います。
+	findErr error
 }
 
 var _ userrepo.SessionRepository = (*fakeSessionRepo)(nil)
@@ -84,6 +87,9 @@ func (f *fakeSessionRepo) Create(_ context.Context, s *usermodel.Session) (*user
 func (f *fakeSessionRepo) FindLive(
 	_ context.Context, token usermodel.SessionToken,
 ) (*usermodel.AuthenticatedSession, error) {
+	if f.findErr != nil {
+		return nil, f.findErr
+	}
 	if token != f.liveToken || token == "" {
 		return nil, apperr.ErrNotFound
 	}
@@ -173,6 +179,46 @@ func sessionCookie(token usermodel.SessionToken) *http.Cookie {
 	return &http.Cookie{Name: sessionCookieName, Value: string(token)}
 }
 
+// flowCookies はコールバックに持ち込むフロー用 Cookie 一式です。
+func flowCookies(state string) []*http.Cookie {
+	return []*http.Cookie{
+		{Name: stateCookieName, Value: state},
+		{Name: nonceCookieName, Value: "n1"},
+		{Name: verifierCookieName, Value: "v1"},
+	}
+}
+
+// findCookie はレスポンスから名前で Cookie を探します。無ければ nil。
+func findCookie(rec *httptest.ResponseRecorder, name string) *http.Cookie {
+	var found *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == name {
+			found = c
+		}
+	}
+	return found
+}
+
+// assertFlowCookiesCleared はフロー用 Cookie 3 つが破棄されたことを確かめます。
+//
+// **破棄はレスポンスを書き出す前に行う必要があります。**
+// defer で書くとハンドラ復帰時、つまり c.Redirect / respondError が
+// ヘッダを送出したあとに走るため、Set-Cookie がレスポンスに載りません。
+func assertFlowCookiesCleared(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+
+	for _, name := range []string{stateCookieName, nonceCookieName, verifierCookieName} {
+		c := findCookie(rec, name)
+		if c == nil {
+			t.Errorf("%s の破棄が返っていない", name)
+			continue
+		}
+		if c.MaxAge >= 0 {
+			t.Errorf("%s が破棄されていない (MaxAge=%d)", name, c.MaxAge)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // security 宣言が実際に効いているか
 // ---------------------------------------------------------------------------
@@ -246,6 +292,35 @@ func TestAuth_AnonymousPostIsStillAllowed(t *testing.T) {
 	}
 }
 
+// **DB 障害を 401 に化けさせない。**
+//
+// セッションの解決に失敗したのが「無効なセッション」なのか
+// 「DB に届かなかった」のかを区別せず素通しすると、障害中は
+// 全利用者が突然ログアウトされたように見え、痕跡も残らない。
+func TestAuth_SessionLookupFailureIs500(t *testing.T) {
+	env := newAuthEnv(t, true)
+	env.sessions.findErr = errors.New("connection refused")
+
+	rec := env.do(t, http.MethodGet, "/me", sessionCookie(env.token))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if code := decodeError(t, rec).Error.Code; code != oapigen.INTERNAL {
+		t.Errorf("code = %q, want INTERNAL", code)
+	}
+}
+
+// 一方、Cookie が無効なだけなら従来どおり 401。
+// 500 に倒しすぎると、期限切れの Cookie を持つ利用者に 500 を返してしまう。
+func TestAuth_ExpiredSessionIsStill401(t *testing.T) {
+	env := newAuthEnv(t, true)
+
+	rec := env.do(t, http.MethodGet, "/me", sessionCookie("期限切れのトークン"))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 設定が無いときの振る舞い
 // ---------------------------------------------------------------------------
@@ -316,13 +391,15 @@ func TestGoogleLoginCallback_RejectsStateMismatch(t *testing.T) {
 	env := newAuthEnv(t, true)
 
 	rec := env.do(t, http.MethodGet, "/auth/google/callback?code=xyz&state=attacker",
-		&http.Cookie{Name: stateCookieName, Value: "victim"},
-		&http.Cookie{Name: nonceCookieName, Value: "n"},
-		&http.Cookie{Name: verifierCookieName, Value: "v"},
+		flowCookies("victim")...,
 	)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
 	}
+
+	// **攻撃を検知した経路でこそ、古い state を捨てたい。**
+	// 破棄を state の照合より後ろに置くと、ここだけ 10 分残ってしまう。
+	assertFlowCookiesCleared(t, rec)
 }
 
 // state の Cookie が無い場合も 401。
@@ -340,9 +417,7 @@ func TestGoogleLoginCallback_IssuesSessionCookie(t *testing.T) {
 	env := newAuthEnv(t, true)
 
 	rec := env.do(t, http.MethodGet, "/auth/google/callback?code=xyz&state=s1",
-		&http.Cookie{Name: stateCookieName, Value: "s1"},
-		&http.Cookie{Name: nonceCookieName, Value: "n1"},
-		&http.Cookie{Name: verifierCookieName, Value: "v1"},
+		flowCookies("s1")...,
 	)
 	if rec.Code != http.StatusFound {
 		t.Fatalf("status = %d, want 302 (body=%s)", rec.Code, rec.Body.String())
@@ -351,12 +426,7 @@ func TestGoogleLoginCallback_IssuesSessionCookie(t *testing.T) {
 		t.Errorf("Location = %q", loc)
 	}
 
-	var session *http.Cookie
-	for _, c := range rec.Result().Cookies() {
-		if c.Name == sessionCookieName {
-			session = c
-		}
-	}
+	session := findCookie(rec, sessionCookieName)
 	if session == nil {
 		t.Fatal("セッション Cookie が発行されていない")
 	}
@@ -369,6 +439,67 @@ func TestGoogleLoginCallback_IssuesSessionCookie(t *testing.T) {
 	if session.SameSite != http.SameSiteLaxMode {
 		t.Errorf("SameSite = %v, want Lax", session.SameSite)
 	}
+
+	// **MaxAge を検査する。** 値と属性だけを見ていると、
+	// 発行と同時に失効する Cookie (MaxAge が負) を見逃す。
+	// このテストはインタラクタの時計を 2023 年に固定しているので、
+	// 壁時計との差で計算する実装ではここが負になる。
+	wantMaxAge := int(usermodel.DefaultSessionTTL.Seconds())
+	if session.MaxAge != wantMaxAge {
+		t.Errorf("MaxAge = %d, want %d", session.MaxAge, wantMaxAge)
+	}
+
+	// 使い終わったフロー用 Cookie は残さない。残すと再利用の余地ができる。
+	assertFlowCookiesCleared(t, rec)
+}
+
+// **同意画面で拒否されたら、API のエラー JSON をブラウザに見せない。**
+//
+// Google は code を付けず error だけを返す。code を必須にしていると
+// 仕様検証が 400 で弾き、生の JSON がアドレスバーの下に表示される。
+func TestGoogleLoginCallback_UserDeniedRedirectsToFrontend(t *testing.T) {
+	env := newAuthEnv(t, true)
+
+	rec := env.do(t, http.MethodGet, "/auth/google/callback?error=access_denied&state=s1",
+		flowCookies("s1")...,
+	)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "http://localhost:3000?login_error=access_denied" {
+		t.Errorf("Location = %q", loc)
+	}
+	assertFlowCookiesCleared(t, rec)
+
+	// 拒否されただけなのでセッションは発行しない。
+	if c := findCookie(rec, sessionCookieName); c != nil && c.MaxAge > 0 {
+		t.Errorf("拒否したのにセッションが発行された: %+v", c)
+	}
+}
+
+// IdP が返した文字列をそのままリダイレクト先へ載せない。
+// フロントでそのまま描画されると反射型 XSS の入口になる。
+func TestGoogleLoginCallback_SanitizesErrorParam(t *testing.T) {
+	env := newAuthEnv(t, true)
+
+	rec := env.do(t, http.MethodGet,
+		"/auth/google/callback?error=%3Cscript%3Ealert(1)%3C/script%3E&state=s1",
+		flowCookies("s1")...,
+	)
+	if loc := rec.Header().Get("Location"); loc != "http://localhost:3000?login_error=login_failed" {
+		t.Errorf("Location = %q, want 既知の識別子に丸める", loc)
+	}
+}
+
+// code も error も無い場合は 401。仕様検証を緩めた分をここで受け止める。
+func TestGoogleLoginCallback_RejectsMissingCode(t *testing.T) {
+	env := newAuthEnv(t, true)
+
+	rec := env.do(t, http.MethodGet, "/auth/google/callback?state=s1", flowCookies("s1")...)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	}
+	assertFlowCookiesCleared(t, rec)
 }
 
 // ログアウトはセッションを消し、Cookie を破棄する。
