@@ -4,12 +4,14 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
 	"develop-experiments/apps/go-api/internal/logging"
 )
 
@@ -74,7 +76,16 @@ func cors(allowedOrigins []string) gin.HandlerFunc {
 		if origin != "" && slices.Contains(allowedOrigins, origin) {
 			h.Set("Access-Control-Allow-Origin", origin)
 			h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			h.Set("Access-Control-Allow-Headers", "Content-Type")
+			// X-Request-Id は送る側にも許す。ALB やフロントが既に採番している
+			// 場合に前後をつなぐため (requestID のコメントを参照)。
+			// ここに無いと preflight で弾かれ、リクエスト自体が失敗する。
+			h.Set("Access-Control-Allow-Headers", "Content-Type, "+requestIDHeader)
+			// **返すだけでは JavaScript から読めない。**
+			// 既定で読めるのは限られたヘッダだけで、独自ヘッダは
+			// Expose-Headers に挙げないと fetch の res.headers から消える。
+			// 「問い合わせが来たときに引く」ためには、まず利用者側が
+			// 値を知れる必要がある。
+			h.Set("Access-Control-Expose-Headers", requestIDHeader)
 			h.Set("Access-Control-Max-Age", "600")
 			// セッションは Cookie で運ぶ (ADR 0005 決定 1)。
 			// これが無いと、ブラウザは credentials 付きの要求に対する
@@ -89,6 +100,50 @@ func cors(allowedOrigins []string) gin.HandlerFunc {
 		}
 
 		c.Next()
+	}
+}
+
+// recovery はパニックを拾い、構造化ログに残してから 500 を返します。
+//
+// gin.Recovery は stderr へ平文で書くだけで、service / version / request_id が
+// 付きません。**ADR 0010 の 4-3 はパニックを ERROR に分類し、
+// CloudWatch のアラームはこのレベルを起点に組む**と決めているため、
+// そのままだと最もアラートが要る事象で ERROR が立ちません。
+//
+// 本文も返します。gin.Recovery は 500 を空ボディで返すので、
+// 「エラーは必ず JSON」という API の約束から外れます。
+//
+// **requestLogger より内側に置く必要があります。** 外側に置くと、
+// パニックが requestLogger の c.Next() を巻き戻して抜けてしまい、
+// http_request の行が 1 本も出ません (実測で確認済み)。
+func recovery() gin.HandlerFunc {
+	return gin.CustomRecovery(func(c *gin.Context, recovered any) {
+		// スタックは復帰処理の中で取る。パニックしたフレームがまだ
+		// 積まれているため、発生箇所まで辿れる。
+		slog.ErrorContext(c.Request.Context(), "panic",
+			slog.Any("panic", recovered),
+			slog.String("stack", string(debug.Stack())),
+		)
+		c.AbortWithStatusJSON(http.StatusInternalServerError,
+			newErrorBody(oapigen.INTERNAL, "サーバ内部でエラーが発生しました"))
+	})
+}
+
+// middlewares はルータに積むミドルウェアを順番どおりに返します。
+//
+// **並びに意味があるので 1 か所にまとめます。** テストが同じ並びを
+// 書き写す形にすると、順序を変えたときに検査だけが古くなります。
+//
+//	requestID     すべてのログに相関 ID を載せるため最初
+//	requestLogger recovery より外。内側だとパニック時に行が出ない
+//	recovery      パニックを ERROR として残す
+//	cors          プリフライトをここで打ち切る
+func middlewares(allowedOrigins []string) []gin.HandlerFunc {
+	return []gin.HandlerFunc{
+		requestID(),
+		requestLogger(),
+		recovery(),
+		cors(allowedOrigins),
 	}
 }
 

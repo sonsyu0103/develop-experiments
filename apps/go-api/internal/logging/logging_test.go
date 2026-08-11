@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"testing"
+	"time"
 )
 
 // newTestLogger は出力を捕まえられるロガーを組み立てます。
@@ -162,5 +163,38 @@ func TestContextHandler_ZeroValueIsSafe(t *testing.T) {
 
 	if got := decode(t, &buf)["request_id"]; got != "req-zero" {
 		t.Errorf("request_id = %v, want req-zero", got)
+	}
+}
+
+// **time は実行環境のタイムゾーンに関わらず UTC で出ること。**
+//
+// ADR 0010 の 4-2 は time を「RFC3339 (UTC)」と定めているが、
+// slog は Record.Time をそのロケーションのまま書き出す。
+// TZ=Asia/Tokyo が入ると +09:00 付きになり、
+// Athena の範囲指定とパーティション整合が 9 時間ずれる。
+func TestNewHandler_TimeIsUTC(t *testing.T) {
+	original := time.Local
+	t.Cleanup(func() { time.Local = original })
+
+	loc, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		t.Skipf("タイムゾーンを読み込めない環境: %v", err)
+	}
+	time.Local = loc
+
+	var buf bytes.Buffer
+	slog.New(NewHandler(&buf, false)).InfoContext(context.Background(), "http_request")
+
+	raw, ok := decode(t, &buf)["time"].(string)
+	if !ok {
+		t.Fatalf("time が文字列で出ていない: %s", buf.String())
+	}
+
+	got, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		t.Fatalf("time を RFC3339 として読めない (%q): %v", raw, err)
+	}
+	if _, offset := got.Zone(); offset != 0 {
+		t.Errorf("time = %q, want UTC (オフセット %d 秒が付いている)", raw, offset)
 	}
 }

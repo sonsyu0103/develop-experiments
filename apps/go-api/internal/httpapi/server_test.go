@@ -638,6 +638,18 @@ func TestCORS(t *testing.T) {
 		if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
 			t.Errorf("Access-Control-Allow-Credentials = %q, want true", got)
 		}
+		// **返すだけでは JavaScript から読めない。**
+		// Expose-Headers に挙げないと、fetch の res.headers から消える。
+		// 「問い合わせが来たら request_id で引く」には、
+		// まず利用者側が値を知れる必要がある。
+		if got := rec.Header().Get("Access-Control-Expose-Headers"); !strings.Contains(got, requestIDHeader) {
+			t.Errorf("Access-Control-Expose-Headers = %q, want %s を含む", got, requestIDHeader)
+		}
+		// 送る側にも許す。無いと preflight で弾かれ、
+		// 「フロントが採番済みの ID を渡す」経路が成立しない。
+		if got := rec.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, requestIDHeader) {
+			t.Errorf("Access-Control-Allow-Headers = %q, want %s を含む", got, requestIDHeader)
+		}
 	})
 
 	t.Run("未許可オリジンにはヘッダを返さない", func(t *testing.T) {
@@ -864,5 +876,80 @@ func TestRequestID_ReachesTheLog(t *testing.T) {
 	// クエリ文字列を丸ごと出さないこと (ADR 0010 の 4-5)。
 	if got["path"] != "/threads" {
 		t.Errorf("path = %v, want /threads", got["path"])
+	}
+}
+
+// **パニックしても構造化ログが残ること。**
+//
+// gin.Recovery を requestLogger より外側に置いていたときは、
+// パニックが c.Next() を巻き戻して抜けるため http_request が 1 行も出ず、
+// gin が stderr へ平文を書くだけだった (status=500 / ログ空 を実測)。
+//
+// ADR 0010 の 4-3 はパニックを ERROR に分類し、
+// CloudWatch のアラームはこのレベルを起点に組むと決めている。
+// **最もアラートが要る事象でだけ ERROR が立たない**状態になっていた。
+func TestPanic_IsLoggedAsError(t *testing.T) {
+	var buf bytes.Buffer
+	original := slog.Default()
+	slog.SetDefault(slog.New(logging.NewHandler(&buf, false)))
+	t.Cleanup(func() { slog.SetDefault(original) })
+
+	// 仕様書から生成されるルータにはパニックする経路が無いため、
+	// ミドルウェアの並びだけを本番と共有して確かめる。
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(middlewares([]string{"http://localhost:3000"})...)
+	r.GET("/zz-panic", func(*gin.Context) { panic("わざと落とす") })
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/zz-panic", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	// 500 でも本文は JSON。gin.Recovery の既定は空ボディで、API の約束から外れる。
+	if code := decodeError(t, rec).Error.Code; code != oapigen.INTERNAL {
+		t.Errorf("code = %q, want INTERNAL", code)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if buf.Len() == 0 {
+		t.Fatal("パニックしたのにログが 1 行も出ていない")
+	}
+
+	var sawPanic, sawRequest bool
+	for _, line := range lines {
+		var got map[string]any
+		if err := json.Unmarshal([]byte(line), &got); err != nil {
+			t.Fatalf("ログを JSON として読めない: %v (raw=%s)", err, line)
+		}
+		if got["request_id"] == nil {
+			t.Errorf("相関 ID が付いていない: %s", line)
+		}
+		switch got["msg"] {
+		case "panic":
+			sawPanic = true
+			if got["level"] != "ERROR" {
+				t.Errorf("panic の level = %v, want ERROR", got["level"])
+			}
+			if got["stack"] == nil {
+				t.Error("スタックが出ていない")
+			}
+		case "http_request":
+			sawRequest = true
+			if got["level"] != "ERROR" {
+				t.Errorf("http_request の level = %v, want ERROR (status 500)", got["level"])
+			}
+			if got["status"] != float64(500) {
+				t.Errorf("status = %v, want 500", got["status"])
+			}
+		}
+	}
+	if !sawPanic {
+		t.Error("panic のログが出ていない")
+	}
+	if !sawRequest {
+		t.Error("http_request のログが出ていない (パニックで巻き戻されている)")
 	}
 }

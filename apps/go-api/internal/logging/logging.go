@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime/debug"
+	"time"
 )
 
 // ServiceName は全ログに載せるサービス名です。
@@ -128,12 +129,33 @@ func (h ContextHandler) Handle(ctx context.Context, r slog.Record) error {
 
 	if !h.grouped {
 		// 速い方。グループが無ければ AddAttrs で最上位に載る。
+		//
+		// **Clone してから書き換える。** slog.Handler の契約であり、
+		// Record が内部で持つスライスの backing array は共有されうる。
+		// いまは出力先が 1 つなので表に出ないが、stdout とファイルへ
+		// 同時に流す tee のようなハンドラを挟んだ瞬間に、
+		// 先に走った枝の request_id が後の枝へ混ざる形で壊れる。
+		//
+		// **これはテストで守れていない。** 出力先が 1 つで、しかも
+		// ハンドラがその場で整形してしまうため、Clone を外しても
+		// 観測できる違いが出ない (変異プローブで確認済み)。
+		// tee を入れるときに、この行を消していないか必ず確かめること。
+		r = r.Clone()
 		r.AddAttrs(attrs...)
 		return h.Handler.Handle(ctx, r)
 	}
 
 	// グループが開いている。相関情報を最上位に置くため、
 	// root に先に載せてから、これまでの操作を順に再現する。
+	//
+	// 【コスト】**この経路は 1 行ごとにハンドラを組み直す。**
+	// stdlib のハンドラは WithAttrs のたびに整形バッファを作り直すので、
+	// slog.With を重ねたロガーほど 1 行あたりの割り当てが増える。
+	//
+	// 現在この経路を通るコードは無い。誰かが WithGroup を入れると、
+	// そのロガーから出る全ログがここに落ちることを承知して入れること。
+	// 高頻度の経路でグループを使いたくなったら、相関情報を先に載せた
+	// ハンドラを使い回す形へ作り替える (今は使う人が居ないので作らない)。
 	built := h.base().WithAttrs(attrs)
 	for _, step := range h.steps {
 		built = step(built)
@@ -187,21 +209,42 @@ func Setup(debug bool) {
 // os.Stdout に直接書く形だと、そこを検査する手立てが無くなります。
 func NewHandler(w io.Writer, debug bool) slog.Handler {
 	level := slog.LevelInfo
-	var base slog.Handler
-
 	if debug {
 		// DEBUG を本番で出さない理由は ADR 0010 の 4-3。
 		// 保管コストと機密情報の露出リスクが同時に上がります。
 		level = slog.LevelDebug
-		base = slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})
+	}
+	opts := &slog.HandlerOptions{Level: level, ReplaceAttr: toUTC}
+
+	var base slog.Handler
+	if debug {
+		base = slog.NewTextHandler(w, opts)
 	} else {
-		base = slog.NewJSONHandler(w, &slog.HandlerOptions{Level: level})
+		base = slog.NewJSONHandler(w, opts)
 	}
 
 	return NewContextHandler(base).WithAttrs([]slog.Attr{
 		slog.String("service", ServiceName),
 		slog.String("version", Version()),
 	})
+}
+
+// toUTC は time を UTC に正規化します。
+//
+// ADR 0010 の 4-2 は time を「RFC3339 (UTC)」と定めていますが、
+// slog は Record.Time をそのロケーションのまま書き出します。
+// コンテナに TZ=Asia/Tokyo が入ると +09:00 付きで出力され、
+// **Athena の範囲指定とパーティション整合が 9 時間ずれます**
+// (決定 2 の「パーティションの時刻はアプリの出力時刻ではない」と重なると厄介)。
+//
+// 出力の時点で揃えておけば、実行環境の設定に依存しません。
+func toUTC(groups []string, a slog.Attr) slog.Attr {
+	if len(groups) == 0 && a.Key == slog.TimeKey {
+		if t, ok := a.Value.Any().(time.Time); ok {
+			a.Value = slog.TimeValue(t.UTC())
+		}
+	}
+	return a
 }
 
 // Version はデプロイ間の比較に使う版数です (ADR 0010 の 4-2)。
