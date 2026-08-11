@@ -16,8 +16,8 @@
 毎回書き捨てていた部分のうち **間違えると害が大きいところだけ**:
 
   - 壊す前に、そのテストが通っていることの確認 (最初から赤いなら実測に意味がない)
-  - 置換対象が実在し、意図した箇所だけに当たることの確認
-  - **どう終わっても元に戻すこと** (例外・Ctrl-C・失敗のいずれでも)
+  - 置換対象が実在し、**意図した件数だけに当たる**ことの確認 (max)
+  - **どう終わっても元に戻すこと** (例外・Ctrl-C・kill・失敗のいずれでも)
   - 「ビルドが落ちた」を「テストが落ちた」と混同しないこと
 
 最後の 1 つは実際に踏んだ。LEFT JOIN を INNER JOIN に変えたところ
@@ -46,6 +46,8 @@ sqlc の推論型が変わってビルドが落ちた。テストは赤くなる
   test    go test -run に渡すパターン
   expect  fail = 壊したらテストが落ちるべき (既定)
           pass = 壊しても落ちない (= 検出できない) ことを記録として残す
+  max     from が一致してよい最大件数 (既定 1)。
+          意図せず複数箇所に当たると、測っているものが変わる
   from    置換対象。**そのままの文字列**として探す。前後の空白も含めて一致させる
   to      置換後。空にすると削除になる
 
@@ -54,6 +56,7 @@ sqlc の推論型が変わってビルドが落ちた。テストは赤くなる
 
 import os
 import re
+import signal
 import subprocess
 import sys
 
@@ -74,6 +77,7 @@ class Mutation:
         self.pkg = None
         self.test = None
         self.expect = "fail"
+        self.max = "1"
         self.frm = None
         self.to = ""
 
@@ -83,6 +87,9 @@ class Mutation:
                 raise ValueError(f"{self.label}: {name} が指定されていません")
         if self.expect not in ("fail", "pass"):
             raise ValueError(f"{self.label}: expect は fail か pass です (got {self.expect})")
+        if not str(self.max).isdigit() or int(self.max) < 1:
+            raise ValueError(f"{self.label}: max は 1 以上の整数です (got {self.max})")
+        self.max = int(self.max)
 
 
 def parse(path):
@@ -133,7 +140,7 @@ def parse(path):
             if not line.strip() or line.startswith("#"):
                 continue
 
-            m = re.match(r"^(file|pkg|test|expect):\s*(.*)$", line)
+            m = re.match(r"^(file|pkg|test|expect|max):\s*(.*)$", line)
             if not m:
                 raise ValueError(f"{path}:{lineno}: 解釈できません: {line!r}")
             setattr(current, m.group(1), m.group(2).strip())
@@ -174,6 +181,44 @@ def run_test(pkg, pattern):
             return "empty", out
         return "pass", out
     return "fail", out
+
+
+class Restorer:
+    """壊したファイルを必ず戻すための後始末。
+
+    finally だけでは足りない。**SIGTERM では finally が走らない** ——
+    Python は SIGTERM の既定ハンドラでそのままプロセスを終えるため、
+    例外が上がらず finally に到達しない。実測すると、
+    kill したあとファイルは壊れたまま残る。
+
+    このスクリプトの存在意義の大半は「確実に戻すこと」なので、
+    シグナルを捕まえて戻してから終了する。
+    兄弟の arch-probe.sh も trap ... EXIT INT TERM で同じことをしている。
+    """
+
+    def __init__(self):
+        self.pending = {}  # path -> 元の内容
+
+    def hold(self, path, content):
+        self.pending[path] = content
+
+    def restore(self):
+        for path, content in self.pending.items():
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        self.pending = {}
+
+    def install(self):
+        def handler(signum, _frame):
+            self.restore()
+            print(f"\n{YELLOW}シグナル {signum} を受けたので、"
+                  f"壊したファイルを元に戻して終了します。{OFF}", file=sys.stderr)
+            # 既定の動作で終わり直す。終了コードをシグナル由来のまま残すため。
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(sig, handler)
 
 
 def main():
@@ -218,6 +263,8 @@ def main():
 
     results = []
     failed = 0
+    restorer = Restorer()
+    restorer.install()
 
     for mut in mutations:
         path = os.path.join(ROOT, mut.file)
@@ -236,18 +283,27 @@ def main():
             print(f"{RED}{mut.label}: from に一致する箇所がありません "
                   f"({mut.file})。実装が変わって変異が古くなっています。{OFF}", file=sys.stderr)
             return 1
+        if occurrences > mut.max:
+            # 意図せず複数箇所に当たると、測っているものが変わる。
+            # 「1 箇所を壊したらテストが落ちた」のつもりで
+            # 実は 5 箇所壊していた、では検出力の証明にならない。
+            print(f"{RED}{mut.label}: from が {occurrences} 箇所に一致します "
+                  f"(max={mut.max})。範囲を狭めるか、意図どおりなら "
+                  f"max: {occurrences} と宣言してください。{OFF}", file=sys.stderr)
+            return 1
 
         mutated = original.replace(mut.frm, mut.to)
 
+        # 壊す前に「戻すべき内容」を預ける。
+        # 例外・Ctrl-C は finally が、SIGTERM / SIGHUP は Restorer が戻す。
+        # 戻し忘れたまま次の作業に入るのが、この手順で一番害の大きい失敗になる。
+        restorer.hold(path, original)
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(mutated)
             result, out = run_test(mut.pkg, mut.test)
         finally:
-            # **何があっても戻す。** 例外でも Ctrl-C でも finally は通る。
-            # 戻し忘れたまま次の作業に入るのが、この手順で一番害の大きい失敗になる。
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(original)
+            restorer.restore()
 
         want = "落ちる" if mut.expect == "fail" else "通る"
         actual = {"pass": "通る", "fail": "落ちる",
