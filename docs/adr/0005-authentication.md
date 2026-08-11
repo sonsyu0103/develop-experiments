@@ -316,6 +316,108 @@ ADR 0004 は「忘れると新モジュールだけ無検査になる」と書�
 投稿者の解決が要る場合は、利用側が必要な操作だけのインターフェースを定義する
 (ADR 0004 の `ThreadExistenceChecker` と同じ形)。
 
+## 検証状況 (2026-08-11)
+
+**実際の Google アカウントで 1 往復させ、実データで確認した。**
+それまではフェイクのプロバイダ越しでしか通っておらず、
+ディスカバリ・トークン交換・JWKS による署名検証は未検証のままだった。
+
+### 実物で確認できたもの
+
+| 項目 | 確認方法 |
+| --- | --- |
+| ディスカバリ / 認可コードの交換 / 署名検証 / nonce 照合 | ブラウザでログインし `/me` が返った (どれか 1 つでも落ちれば 401 になる) |
+| **セッションをハッシュで保存している** | `sessions.id` が 64 桁の 16 進 (SHA-256)。生のトークンは DB に無い |
+| セッションの寿命が 14 日 | `expires_at - created_at` = `13 days 23:59:59.999371` |
+| `public_id` が UUID v7 | `019ff028-048d-7ba5-…` (3 ブロック目の先頭が `7`) |
+| **内部 ID を外へ出していない** | `/me` の応答に `id` が無い |
+| ログアウトが即座に効く | `POST /auth/logout` → 204、`sessions` の行が消える |
+| 無効なセッションが 401 | `{"error":{"code":"UNAUTHENTICATED",…}}` |
+| **フロー用 Cookie が破棄される** | ログイン後のブラウザに残っているのは `session` だけ |
+| **セッション Cookie の `MaxAge` が正** | Cookie の期限 `2026-08-25T10:12:45Z` が DB の `expires_at` と一致 |
+
+後ろの 2 つは PR #16 のレビューで直した箇所そのもの。
+
+- `defer` で Cookie を破棄していたため、ヘッダ送出後になって
+  `Set-Cookie` がレスポンスに載っていなかった (指摘 ①②)
+- `MaxAge` を壁時計から計算していたため、
+  **発行と同時に失効する Cookie** (`MaxAge=-1`) を作りうる状態だった (指摘 ③)
+
+どちらもユニットテストで固定したうえで、実物でも効いていることを確認した。
+
+投稿者の紐付け ([ADR 0014](0014-author-resolution.md)) も同じ利用者で確認した。
+
+| 経路 | 結果 |
+| --- | --- |
+| ログイン状態で `POST /threads` | `author` に公開 ID / 表示名 / アバターが載る |
+| ログイン状態で `authorName` を送る | **捨てられて「名無しさん」になる** |
+| 未ログインで投稿 | `author` は `null`、`authorName` は送った値のまま |
+
+ログ ([ADR 0010](0010-log-pipeline.md)) も実データで確認した。
+`request_id` は全リクエストに、`user_id` は**認証済みのときだけ**乗る。
+
+### 拒否された場合も実サーバで確認した
+
+**同意画面は 2 回目以降は出ない。** Google は初回の認可でのみ同意を求め、
+以降は省略する。そのため「拒否」の操作を再現するには、
+アカウントの権限設定から連携を取り消すか、
+認可 URL に `prompt=consent` を付けて毎回出す必要がある。
+
+どちらも Google 側の状態をいじることになるので、
+**コールバックへ直接 `error` を渡して確認した。**
+検証したいのはサーバ側の分岐であり、
+Google が `error=access_denied` を返すこと自体は RFC 6749 の定めによる。
+
+```
+GET /auth/google/callback?state=<Cookie と一致>&error=access_denied
+
+HTTP/1.1 302 Found
+Location: http://localhost:3000?login_error=access_denied
+Set-Cookie: oauth_state=;    Max-Age=0; HttpOnly; SameSite=Lax
+Set-Cookie: oauth_nonce=;    Max-Age=0; HttpOnly; SameSite=Lax
+Set-Cookie: oauth_verifier=; Max-Age=0; HttpOnly; SameSite=Lax
+```
+
+エラー JSON をブラウザに見せずフロントへ戻ること、
+そのときフロー用 Cookie 3 つが同時に破棄されることを同時に確認できた。
+
+IdP が想定外の値を返した場合も見た。
+
+```
+GET /auth/google/callback?state=…&error=<script>alert(1)</script>
+Location: http://localhost:3000?login_error=login_failed
+```
+
+**受け取った文字列をそのままリダイレクト先へ載せない。**
+既知の書式に合わないものは `login_failed` に丸める
+(フロントでそのまま描画されると反射型 XSS の入口になる)。
+
+### 検証の方法について
+
+投稿者の紐付けの検証は、セッション行を直接作って HTTP を通す形で行った。
+資格情報に触れずに済ませるためで、その経路では
+コールバックのハンドラ自体は通っていない。
+Cookie まわりは上記のとおり別途確認している。
+
+**未検証のまま残っているものは無い。**
+
+### 罠: `expires_at` は Go の時計、`created_at` は DB の時計
+
+実測した寿命が `14 days` ちょうどではなく
+`13 days 23:59:59.999371` だったのは、両者の出所が違うため。
+
+- `expires_at` — アプリが `i.now().Add(ttl)` で計算して送る
+- `created_at` — DB の `DEFAULT now()`
+
+一方で**期限切れの判定は SQL 側** (`expires_at > now()`) で行う。
+つまり**書くのはアプリの時計、判定するのは DB の時計**になる。
+同一ホストなら誤差は 1 ミリ秒未満だが、
+アプリと DB が別ホストで時刻がずれると、その分だけ寿命が伸び縮みする。
+
+現状は許容する。数分のずれが問題になる設計ではない。
+**ずれが分単位になったら、`expires_at` も SQL 側で
+`now() + interval` として計算する**ほうへ寄せる。
+
 ## 引き受けるコスト
 
 - **OIDC のフローを自前で持つ。** state / nonce / PKCE / ID トークン検証の
