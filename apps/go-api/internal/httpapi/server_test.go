@@ -1,10 +1,12 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +23,7 @@ import (
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
+	"develop-experiments/apps/go-api/internal/logging"
 	"develop-experiments/apps/go-api/internal/pagination"
 	threadmodel "develop-experiments/apps/go-api/internal/thread/domain/model"
 	threadrepo "develop-experiments/apps/go-api/internal/thread/domain/repository"
@@ -746,5 +749,120 @@ func TestListThreads_WithdrawnAuthor(t *testing.T) {
 	// 匿名投稿。**LEFT ではなく INNER で結合すると、ここが一覧から消える。**
 	if got.Threads[2].Author != nil {
 		t.Errorf("匿名スレッドに author が付いている: %+v", *got.Threads[2].Author)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// リクエスト ID (ADR 0010 の 4-1)
+// ---------------------------------------------------------------------------
+
+// 相関 ID が採番され、レスポンスヘッダにも返ること。
+// 利用者から問い合わせが来たときに、この値でログを引く。
+func TestRequestID_GeneratedAndReturned(t *testing.T) {
+	env := newTestEnv(t)
+
+	rec := env.do(t, http.MethodGet, "/threads", "")
+
+	got := rec.Header().Get(requestIDHeader)
+	if got == "" {
+		t.Fatal("X-Request-Id が返っていない")
+	}
+	if _, err := uuid.Parse(got); err != nil {
+		t.Errorf("X-Request-Id = %q, UUID として読めない: %v", got, err)
+	}
+}
+
+// 受信したヘッダを尊重する。ALB やフロントが採番済みの場合に前後をつなぐため。
+func TestRequestID_HonorsIncomingHeader(t *testing.T) {
+	env := newTestEnv(t)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/threads", nil)
+	req.Header.Set(requestIDHeader, "01J8ZC5N9K2QX7V3MTB4RSAHDF")
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get(requestIDHeader); got != "01J8ZC5N9K2QX7V3MTB4RSAHDF" {
+		t.Errorf("X-Request-Id = %q, want 受信した値", got)
+	}
+}
+
+// **受け取った値をそのまま信じない。**
+//
+// ログは S3 に長期保管され Athena から検索される。
+// 改行や制御文字を通すと偽のログ行を作られる (ログインジェクション)。
+// 長大な値は保管コストにも効く。
+func TestRequestID_RejectsUntrustedValues(t *testing.T) {
+	tests := map[string]string{
+		"改行を含む":      "abc\ndef",
+		"空白を含む":      "abc def",
+		"引用符を含む":     `abc"def`,
+		"長すぎる":       strings.Repeat("a", 65),
+		"空":          "",
+		"JSON らしきもの": `{"level":"ERROR"}`,
+	}
+
+	for name, value := range tests {
+		t.Run(name, func(t *testing.T) {
+			env := newTestEnv(t)
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/threads", nil)
+			// ヘッダ値に制御文字を直接入れると net/http が弾くため、
+			// 検証したいのは「ミドルウェアが値を採用しないこと」に絞る。
+			req.Header[requestIDHeader] = []string{value}
+			rec := httptest.NewRecorder()
+			env.router.ServeHTTP(rec, req)
+
+			got := rec.Header().Get(requestIDHeader)
+			if got == value {
+				t.Errorf("信用できない値をそのまま採用した: %q", got)
+			}
+			if _, err := uuid.Parse(got); err != nil {
+				t.Errorf("採番し直されていない: %q", got)
+			}
+		})
+	}
+}
+
+// **相関 ID が実際にログへ届くこと。**
+//
+// ヘッダを返すだけでは意味が無い。ログに乗って初めて Athena で串刺しにできる。
+// ミドルウェアがコンテキストに載せ忘れても、ヘッダの検査だけでは通ってしまう。
+func TestRequestID_ReachesTheLog(t *testing.T) {
+	env := newTestEnv(t)
+
+	// 既定ロガーを差し替えて出力を捕まえる。
+	var buf bytes.Buffer
+	original := slog.Default()
+	slog.SetDefault(slog.New(logging.NewHandler(&buf, false)))
+	t.Cleanup(func() { slog.SetDefault(original) })
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/threads", nil)
+	req.Header.Set(requestIDHeader, "01J8ZC5N9K2QX7V3MTB4RSAHDF")
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("ログを JSON として読めない: %v (raw=%s)", err, buf.String())
+	}
+
+	if got["msg"] != "http_request" {
+		t.Errorf("msg = %v, want http_request (イベント名として固定する)", got["msg"])
+	}
+	if got["request_id"] != "01J8ZC5N9K2QX7V3MTB4RSAHDF" {
+		t.Errorf("ログの request_id = %v, want 受信した値", got["request_id"])
+	}
+	// レスポンスヘッダと同じ値であること。突き合わせられないと問い合わせに使えない。
+	if got["request_id"] != rec.Header().Get(requestIDHeader) {
+		t.Errorf("ログとヘッダで request_id が違う: log=%v header=%q",
+			got["request_id"], rec.Header().Get(requestIDHeader))
+	}
+	// 単位をフィールド名に含めた数値であること (ADR 0010 の 4-4)。
+	if _, ok := got["latency_ms"].(float64); !ok {
+		t.Errorf("latency_ms が数値で出ていない: %v", got["latency_ms"])
+	}
+	// クエリ文字列を丸ごと出さないこと (ADR 0010 の 4-5)。
+	if got["path"] != "/threads" {
+		t.Errorf("path = %v, want /threads", got["path"])
 	}
 }

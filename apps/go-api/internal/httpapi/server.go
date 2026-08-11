@@ -340,7 +340,9 @@ func NewRouter(deps Deps) (*gin.Engine, error) {
 	spec.Servers = nil
 
 	r := gin.New()
-	r.Use(gin.Recovery(), requestLogger(), cors(deps.AllowedOrigins))
+	// requestID を最初に置く。後ろに置くと、それより前で出たログに
+	// request_id が付かず、1 リクエストの相関から外れる。
+	r.Use(requestID(), gin.Recovery(), requestLogger(), cors(deps.AllowedOrigins))
 
 	// セッションの解決は仕様検証より前に置く。
 	// AuthenticationFunc がここで載せた結果を見るため、順序が逆だと

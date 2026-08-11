@@ -14,6 +14,7 @@ import (
 	ginmiddleware "github.com/oapi-codegen/gin-middleware"
 
 	"develop-experiments/apps/go-api/internal/apperr"
+	"develop-experiments/apps/go-api/internal/logging"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
 )
@@ -109,6 +110,9 @@ func (s *Server) resolveSession() gin.HandlerFunc {
 		}
 
 		ctx := context.WithValue(c.Request.Context(), principalKey{}, principal)
+		// 以降のログに user_id が自動で乗る (ADR 0010 の 4-2)。
+		// 載せるのは内部 ID だけ。メールアドレスと google_sub は出さない (4-5)。
+		ctx = logging.WithUserID(ctx, principal.UserID)
 		c.Request = c.Request.WithContext(ctx)
 		c.Next()
 	}

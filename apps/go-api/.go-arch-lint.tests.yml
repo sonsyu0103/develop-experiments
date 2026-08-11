@@ -44,6 +44,10 @@ components:
     in: internal/pagination
   shared-config:
     in: internal/config
+  # 構造化ログの共通フィールドと相関 ID (docs/adr/0010-log-pipeline.md 決定 4)。
+  # どの層からもログを出すため、下地として扱う
+  shared-logging:
+    in: internal/logging
 
   thread-model:
     in: internal/thread/domain/model
@@ -81,6 +85,7 @@ components:
 commonComponents:
   - shared-apperr
   - shared-pagination
+  - shared-logging
 
 deps:
   main:
@@ -155,7 +160,10 @@ deps:
     canUse:
       - gin
       - openapi
-      # 緩和: フェイクの user-repository を組むために必要 (本体用では許可しない)
+      # リクエスト ID の採番 (ADR 0010 の 4-1) と、
+      # フェイクの user-repository を組むために必要。
+      # 以前は後者だけの緩和で「本体用では許可しない」と書いていたが、
+      # 相関 ID の採番で本体側にも入ったため、いまは両方で許可している
       - uuid
     mayDependOn:
       - thread-usecase
