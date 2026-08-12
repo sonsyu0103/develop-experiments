@@ -22,7 +22,7 @@
 -- 重複して転送されるため。初手は A で揃え、B (ListAuthorsByIDs) との
 -- 比較は Phase 4 のベンチマークで行う。
 WITH page AS (
-    SELECT id, thread_id, author_name, body, created_at, author_id
+    SELECT id, thread_id, seq, author_name, body, created_at, author_id
     FROM comments
     WHERE thread_id = sqlc.arg('thread_id')
       AND deleted_at IS NULL
@@ -33,6 +33,7 @@ WITH page AS (
 SELECT
     p.id,
     p.thread_id,
+    p.seq,
     p.author_name,
     p.body,
     p.created_at,
@@ -44,39 +45,106 @@ FROM page p
 LEFT JOIN users u ON u.id = p.author_id
 ORDER BY p.id DESC;
 
--- name: CreateComment :one
--- 親スレッドが「生存している」場合にだけ挿入する。
+-- name: NextCommentSeq :one
+-- スレッド内の次のレス番号を求める。**Phase 2 の題材の中心** (ADR 0019 決定 1)。
 --
--- 外部キー制約だけでは不十分である。threads は論理削除 (deleted_at) なので、
--- 削除済みスレッドでも行は残っており FK は満たされてしまう。
--- その結果「GET /threads/{id} は 404 なのにコメントは投稿できる」という
--- 矛盾が生じる。
+-- この 1 文は comments_thread_id_seq_idx の逆順スキャン 1 回で終わる。
+-- 速いが、**速さは正しさと関係がない** —— 同時に実行した 2 つの
+-- トランザクションは、どちらも同じ値を読む。
+-- 読んだ値が有効であり続けることを保証するのは、呼び出し側の
+-- 分離レベル (SERIALIZABLE) か明示ロック (LockThreadForUpdate) になる。
 --
--- 事前に SELECT で存在確認してから INSERT する方法は、
--- 確認と挿入の間に削除される競合 (TOCTOU) を許してしまう。
--- INSERT ... SELECT ... WHERE EXISTS なら 1 文で完結し、競合しない。
--- 挿入されなかった場合は 0 行が返るため、pgx.ErrNoRows として検出できる。
+-- deleted_at で絞らないのは、削除されたコメントの番号を再利用しないため
+-- (ADR 0019 決定 5)。再利用すると過去の >>5 が別の投稿を指すようになる。
 --
--- 投稿者の解決も 1 往復に含める。RETURNING は挿入行しか返せないので
+-- ::int で明示的にキャストしているのは、COALESCE(MAX(...), 0) + 1 の
+-- 型推論が sqlc 側で interface{} に落ちるのを避けるため。
+SELECT (COALESCE(MAX(seq), 0) + 1)::int AS next_seq
+FROM comments
+WHERE thread_id = sqlc.arg('thread_id');
+
+-- name: CreateCommentWithSeq :one
+-- レス番号を呼び出し側が決めて挿入する。
+-- ssi / pessimistic / naive の 3 モードが共有する (ADR 0019 決定 2)。
+--
+-- **親スレッドの存在確認をこの文に含めていない。**
+-- 3 モードはいずれもトランザクションの中で、先に threads を読んでいる
+-- (SERIALIZABLE では述語ロック、悲観ロックでは FOR UPDATE)。
+-- ここで WHERE EXISTS を重ねると、
+--   - SERIALIZABLE では同じ読み取りを 2 回行うだけ
+--   - 「0 行が返る」原因が「スレッドが無い」と「採番が衝突した」の
+--     2 通りになり、呼び出し側でエラーを取り違える
+-- 存在確認をどこでやるかは、モードごとに呼び出し側が持つ。
+--
+-- 投稿者の解決は 1 往復に含める。RETURNING は挿入行しか返せないので
 -- CTE で包んで LEFT JOIN する (threads.sql の CreateThread と同じ理由)。
--- 親スレッドが無ければ inserted が 0 行になり、外側も 0 行になるため、
--- pgx.ErrNoRows での検出はそのまま効く。
 WITH inserted AS (
-    INSERT INTO comments (thread_id, author_name, body, author_id)
-    SELECT
+    INSERT INTO comments (thread_id, seq, author_name, body, author_id)
+    VALUES (
         sqlc.arg('thread_id'),
+        sqlc.arg('seq'),
         sqlc.arg('author_name'),
         sqlc.arg('body'),
         sqlc.narg('author_id')
-    WHERE EXISTS (
-        SELECT 1 FROM threads
-        WHERE id = sqlc.arg('thread_id') AND deleted_at IS NULL
     )
-    RETURNING id, thread_id, author_name, body, created_at, author_id
+    RETURNING id, thread_id, seq, author_name, body, created_at, author_id
 )
 SELECT
     i.id,
     i.thread_id,
+    i.seq,
+    i.author_name,
+    i.body,
+    i.created_at,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at
+FROM inserted i
+LEFT JOIN users u ON u.id = i.author_id;
+
+-- name: CreateCommentAutoSeq :one
+-- 採番と挿入を 1 文で行う。unique モード専用 (ADR 0019 決定 2)。
+--
+-- **1 文にしても競合は消えない。** 集約はスナップショットから計算されるため、
+-- 同時に走った 2 つの文は同じ MAX(seq) を読む。
+-- 違うのは「衝突したことが必ず一意制約違反 (23505) として返る」点であり、
+-- 呼び出し側がそれをリトライすることで正しさが保たれる。
+-- READ COMMITTED のまま 1 往復で済むので、実務ではこれが最も安い。
+--
+-- 【HAVING であって WHERE ではない】
+-- 親スレッドの生存確認を WHERE に置くと壊れる。
+-- WHERE は集約の**入力行**を絞るため、スレッドが削除済みでも
+-- 入力 0 行の集約が 1 行 (MAX = NULL) を返し、seq = 1 で挿入されてしまう。
+-- HAVING は集約後の 1 行を絞るので、意図どおり 0 行になる。
+-- 0 行のときは pgx.ErrNoRows として 404 に翻訳される。
+--
+-- 【23505 の制約名は子パーティションのもの】
+-- パーティション親に張った comments_thread_id_seq_idx への違反は、
+-- 実際には子の索引で検出されるため、SQLSTATE 23505 が返すのは
+-- **comments_p5_thread_id_seq_idx のような子の名前**になる (実測)。
+-- 親の名前だけで一致を見るとリトライ判定が永久に偽になり、
+-- unique モードが競合のたびに 409 を返すようになる。
+WITH inserted AS (
+    INSERT INTO comments (thread_id, seq, author_name, body, author_id)
+    SELECT
+        sqlc.arg('thread_id'),
+        COALESCE(MAX(c.seq), 0) + 1,
+        sqlc.arg('author_name'),
+        sqlc.arg('body'),
+        sqlc.narg('author_id')
+    FROM comments c
+    WHERE c.thread_id = sqlc.arg('thread_id')
+    HAVING EXISTS (
+        SELECT 1 FROM threads
+        WHERE id = sqlc.arg('thread_id') AND deleted_at IS NULL
+    )
+    RETURNING id, thread_id, seq, author_name, body, created_at, author_id
+)
+SELECT
+    i.id,
+    i.thread_id,
+    i.seq,
     i.author_name,
     i.body,
     i.created_at,
@@ -97,12 +165,21 @@ WHERE thread_id = sqlc.arg('thread_id')
   AND deleted_at IS NULL;
 
 -- name: LockThreadForUpdate :one
--- スレッド行に行ロックを取る。Phase 2 の排他制御で、
--- 「コメント投稿と同時にスレッドの集計列を更新する」ようなケースに使う。
+-- スレッド行に行ロックを取る。**pessimistic モードの起点** (ADR 0019 決定 2)。
 --
--- SSI (SERIALIZABLE) を使うなら本来この明示ロックは不要だが、
--- 悲観ロック版と楽観 (SSI) 版を比較実装して、
--- スループット差を計測できるようにするために両方用意している。
+-- 同じスレッドへの投稿をこの 1 行で直列化する。
+-- レス番号の採番はこのロックを取ったあとに行うため、
+-- 「読んだ MAX(seq) が他トランザクションに書き換えられる」ことが起きない。
+--
+-- 行が返らない場合は「スレッドが無い / 論理削除済み」であり、
+-- 存在確認をこの 1 文が兼ねている。
+--
+-- **ロックの対象が threads であって comments でないことが重要。**
+-- 採番は「まだ存在しない行」を巡る競合なので、コメント側の行ロックでは防げない
+-- (ロックできる行が無い)。親を掴んで範囲ごと直列化する必要がある。
+--
+-- SSI (SERIALIZABLE) を使うならこの明示ロックは不要だが、
+-- 悲観ロック版と楽観 (SSI) 版のスループット差を計測するために両方用意している。
 SELECT id
 FROM threads
 WHERE id = sqlc.arg('id')

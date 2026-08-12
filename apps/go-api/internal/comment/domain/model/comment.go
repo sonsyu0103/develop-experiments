@@ -24,6 +24,15 @@ const (
 type Comment struct {
 	ID       int64
 	ThreadID int64
+	// Seq はスレッド内のレス番号 (`>>1` の 1) です。**1 から始まります。**
+	//
+	// 採番は永続化層が行います。NewComment を通した時点ではまだ 0 です。
+	// スレッドごとに独立しており、削除しても詰めません
+	// (docs/adr/0019-comment-concurrency.md 決定 5)。
+	//
+	// **この採番がこのリポジトリの主題 (並行制御) の題材です。**
+	// 「読んでから書く」処理なので、同時投稿で必ず競合します。
+	Seq int32
 	// AuthorName は匿名投稿の表示名です。
 	// ログイン中の投稿では既定値のまま保存され、表示には使いません
 	// (NewComment のコメントを参照)。
@@ -90,11 +99,13 @@ func NewComment(threadID int64, authorName, body string, authorID *int64) (*Comm
 
 // Reconstruct は永続化層から読み出した値でコメントを復元します。
 func Reconstruct(
-	id, threadID int64, authorName string, author *Author, body string, createdAt time.Time,
+	id, threadID int64, seq int32, authorName string,
+	author *Author, body string, createdAt time.Time,
 ) *Comment {
 	return &Comment{
 		ID:         id,
 		ThreadID:   threadID,
+		Seq:        seq,
 		AuthorName: authorName,
 		Author:     author,
 		Body:       body,

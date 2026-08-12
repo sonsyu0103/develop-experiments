@@ -277,6 +277,17 @@ ORDER BY failures DESC
 LIMIT 10;
 ```
 
+> **このクエリは本番では常に 0 行を返す。**
+> `serialization_failure` は 4-3 で `DEBUG` と定めており、
+> 同じ 4-3 が「DEBUG は本番で出さない」とも定めているため、
+> **この行は S3 に 1 件も届かない。** 上の例と 4-3 は両立していない。
+>
+> Phase 2 の実装時に発覚した。`serialization_failure` は開発時の
+> 各試行ログとして残し、**本番で集計する起点は `INFO` の
+> `comment_created` (`attempts` フィールド) に移す。**
+> 置き換え後のクエリを含め、詳細は
+> [ADR 0019](0019-comment-concurrency.md) の決定 4 を参照。
+
 [ADR 0009](0009-scaling-strategy.md) で「測るべきは平均 RPS ではなく
 単一スレッドへの集中度」と書いたが、
 **この集計を行う場所がまさにここになる**。

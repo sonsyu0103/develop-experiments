@@ -322,6 +322,7 @@ golang-migrate はマイグレーションをトランザクションで包む�
 | 索引 | 区分 | 根拠 |
 | --- | --- | --- |
 | `(id)` | A | 問題 2。通報・モデレーションからの参照 |
+| **`UNIQUE (thread_id, seq)`** | **A** | レス番号の一意性 ([ADR 0019](0019-comment-concurrency.md))。採番の `MAX(seq)` もこれを逆順に辿る |
 | `(author_id, id DESC) WHERE author_id IS NOT NULL` | **A** | 外部キー + 匿名化 (`UPDATE ... WHERE author_id = $1`) + マイページ |
 | `(image_id) WHERE image_id IS NOT NULL` | A | **外部キー**。ここが最も重要 |
 
@@ -375,25 +376,46 @@ Phase 4 の測定対象に加える。
 
 **Phase 単位で分ける。** 一括で作らない。
 
-| 番号 | 内容 | Phase |
-| --- | --- | --- |
-| `000002` | `users` / `sessions`、`threads`・`comments` への `author_id` | 5 |
-| `000003` | `users.role` (+ 部分索引) | 10 前半 |
-| `000004` | `reports` / `moderation_actions` | 10 後半 |
-| `000005` | `idempotency_keys` | 2 |
-| `000006` | `images`、添付列 3 つ | 6 |
-| `000007` | `threads.view_count` と人気順索引 | 7 |
-| `000008` | `pg_trgm` の索引 | 11 |
-| `000009` | `contact_messages` | 8 |
+**番号は [README](../../README.md) の着手順に一致させる。**
+Phase 番号の昇順ではない。
+
+| 番号 | 内容 | Phase | 着手順 |
+| --- | --- | --- | --- |
+| `000002` | `users` / `sessions`、`threads`・`comments` への `author_id` | 5 | 1 |
+| `000003` | `users.role` (+ 部分索引) | 10 前半 | 1 |
+| `000004` | **`comments.seq` と `UNIQUE (thread_id, seq)`** | **2** | 2 |
+| `000005` | `idempotency_keys` | 2 | 2 |
+| `000006` | `images`、添付列 3 つ | 6 | 3 |
+| `000007` | `reports` / `moderation_actions` | 10 後半 | 4 |
+| `000008` | `pg_trgm` の索引 | 11 | 5 |
+| `000009` | `threads.view_count` と人気順索引 | 7 | 6 |
+| `000010` | `contact_messages` | 8 | 7 |
 
 使わないテーブルを先に作ると、
 **「設計したが実装していない」がスキーマに残る**。
 
-> **初版は `000003` に `reports` と `moderation_actions` を入れていた。**
-> しかし [README](../../README.md) の着手順は Phase 10 を
-> 前半 (`role` と権限判定) と後半 (通報・管理画面) に割っており、
-> 通報は後半になる。上の原則に自分で反していたので、
-> `000004` へ分けた (以降の番号もずらしている)。
+> **この表は 2 回直している。どちらも同じ誤りだった。**
+>
+> - **初版は `000003` に `reports` と `moderation_actions` を入れていた。**
+>   しかし [README](../../README.md) の着手順は Phase 10 を
+>   前半 (`role` と権限判定) と後半 (通報・管理画面) に割っており、
+>   通報は後半になる。上の原則に自分で反していたので分けた
+> - **2 版は `000004` を Phase 10 後半、`000005` を Phase 2 に割り当てていた。**
+>   着手順では Phase 2 が 2 番、Phase 10 後半は 4 番なので、番号が逆だった。
+>   Phase 2 のマイグレーションを `000004` / `000005` に置き直し、
+>   以降を 1 つずつ繰り下げた ([ADR 0019](0019-comment-concurrency.md) 決定 6)
+>
+> **Phase 番号の昇順で並べようとすると、毎回同じ間違いをする。**
+> 着手順の列を足したのはそのためになる。
+
+### `000004` は Phase 2 が題材のために足す列
+
+`comments.seq` (レス番号) は [ADR 0019](0019-comment-concurrency.md) の決定 1 で、
+**並行制御の題材として**導入する。他の ADR から来た断片ではないため、
+この ADR の「集約して初めて見えた問題」には含まれていない。
+
+一意制約 `UNIQUE (thread_id, seq)` はパーティションキーを先頭に含むので、
+**問題 2 の制約 (`comments (id)` を UNIQUE にできない) には当たらない。**
 
 ### 既存テーブルへの `ALTER` は安全
 
@@ -411,12 +433,13 @@ PostgreSQL 11 以降、**`DEFAULT` 付きの `ADD COLUMN` はテーブルを書�
 ## 引き受けるコスト
 
 - **`comments` の索引は 8 倍になる。** 親に 1 本作ると 8 パーティションに作られる。
-  今回 3 本追加するので、実体としては 24 本増える
+  この ADR で 3 本、[ADR 0019](0019-comment-concurrency.md) で 1 本
+  (`UNIQUE (thread_id, seq)`) 追加するので、実体としては 32 本増える
 - **`view_count` の索引が HOT update を殺す** (上記)
 - **`comments (id)` は一意性を保証しない。** シーケンス任せであり、
   DB は重複を防がない。手動で `id` を挿入する経路を作らないこと
 - **区分 C の索引は、使われないまま書き込みコストだけ払う可能性がある。**
   `pg_stat_user_indexes` の `idx_scan` が 0 のまま推移するなら削除する
 - **マイグレーションを分割したことで、順序依存が生まれる。**
-  `000005` (images) より前に添付列を参照するコードを書けない。
+  `000006` (images) より前に添付列を参照するコードを書けない。
   Phase の着手順と一致させる必要がある

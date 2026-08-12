@@ -131,7 +131,8 @@ func (f *fakeCommentRepo) Create(_ context.Context, c *commentmodel.Comment) (*c
 	if c.AuthorID != nil {
 		author = commentmodel.NewAuthor(fakeAuthorPublicID, "ホシノ", nil, nil)
 	}
-	return commentmodel.Reconstruct(7, c.ThreadID, c.AuthorName, author, c.Body, time.Unix(0, 0).UTC()), nil
+	// レス番号は永続化層が採番する。フェイクなので固定値を返す。
+	return commentmodel.Reconstruct(7, c.ThreadID, 3, c.AuthorName, author, c.Body, time.Unix(0, 0).UTC()), nil
 }
 
 func (f *fakeCommentRepo) SoftDelete(context.Context, int64, int64) error { return f.err }
@@ -162,7 +163,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	}
 	comments := &fakeCommentRepo{
 		comments: []commentmodel.Comment{
-			*commentmodel.Reconstruct(10, 2, "ホシノ", nil, "ふぁ〜", time.Unix(3, 0).UTC()),
+			*commentmodel.Reconstruct(10, 2, 1, "ホシノ", nil, "ふぁ〜", time.Unix(3, 0).UTC()),
 		},
 	}
 	pinger := &fakePinger{}
@@ -311,6 +312,61 @@ func TestCreateComment(t *testing.T) {
 	if got.AuthorName != "先生" || got.Body != "おはよう" || got.ThreadId != 2 {
 		t.Errorf("got = %+v", got)
 	}
+}
+
+// レス番号が JSON に出ること (docs/adr/0019-comment-concurrency.md)。
+//
+// **生成された構造体へ復号するだけでは検査にならない。**
+// oapigen.Comment.Seq は必須フィールドなので、
+// 詰め替えを落としても復号は成功し、0 が入るだけで通ってしまう。
+// 生の JSON でキーの有無まで見る。
+func TestComments_SeqIsExposedInJSON(t *testing.T) {
+	env := newTestEnv(t)
+
+	t.Run("一覧", func(t *testing.T) {
+		rec := env.do(t, http.MethodGet, "/threads/2/comments", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+
+		var raw struct {
+			Comments []map[string]any `json:"comments"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("JSON が読めない: %v", err)
+		}
+		if len(raw.Comments) == 0 {
+			t.Fatal("コメントが 0 件")
+		}
+		for _, c := range raw.Comments {
+			seq, ok := c["seq"]
+			if !ok {
+				t.Fatalf("応答に seq が無い: %v", c)
+			}
+			if n, isNum := seq.(float64); !isNum || n == 0 {
+				t.Errorf("seq = %v, want 1 以上の数値 (詰め替えが落ちている)", seq)
+			}
+		}
+	})
+
+	t.Run("投稿", func(t *testing.T) {
+		rec := env.do(t, http.MethodPost, "/threads/2/comments", `{"body":"採番の確認"}`)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201", rec.Code)
+		}
+
+		var raw map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("JSON が読めない: %v", err)
+		}
+		seq, ok := raw["seq"]
+		if !ok {
+			t.Fatalf("投稿の応答に seq が無い: %v", raw)
+		}
+		if n, isNum := seq.(float64); !isNum || n == 0 {
+			t.Errorf("seq = %v, want 1 以上の数値 (採番結果が返っていない)", seq)
+		}
+	})
 }
 
 func TestCreateComment_AuthorNameDefaults(t *testing.T) {

@@ -34,6 +34,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8080").rstrip("/")
 SQL_EXEC = os.environ.get("SQL_EXEC", "")
@@ -231,6 +232,15 @@ status, payload, _ = call("GET", "/threads/5/comments")
 check("コメント 0 件のスレッドは 200 かつ空配列",
       status == 200 and payload["comments"] == [], f"status={status}")
 
+# レス番号 (docs/adr/0019-comment-concurrency.md)。
+# シードはスレッド 1 の 1 番を論理削除しているので、2..4 が残る。
+status, payload, _ = call("GET", "/threads/1/comments")
+if status == 200:
+    seqs = sorted(c["seq"] for c in payload["comments"])
+    check("レス番号が API に出る", all("seq" in c for c in payload["comments"]))
+    # **削除しても番号を詰めない。** 詰めると過去の >>5 が別の投稿を指す。
+    check("削除されたコメントの番号は欠番のまま残る", seqs == [2, 3, 4], f"got={seqs}")
+
 section("書き込み")
 check_status("POST /threads", "POST", "/threads", 201, '{"title":"smoke test"}')
 status, payload, _ = call("POST", "/threads/1/comments", '{"body":"smoke test"}')
@@ -238,6 +248,62 @@ check("POST /threads/1/comments が 201", status == 201, f"status={status}")
 if status == 201:
     check("authorName が既定値になる", payload["authorName"] == "名無しさん",
           f"got={payload['authorName']}")
+
+section("コメント投稿の並行制御")
+
+# **ユニットテストでは絶対に検出できない領域。**
+# フェイクのリポジトリは採番を競合させないため、
+# 「同時に投稿したらレス番号がどうなるか」はここでしか分からない。
+#
+# 並列数は控えめにしてある。ここで測りたいのは性能ではなく正しさで、
+# モード別のスループット比較は make concurrency-probe の担当。
+CONCURRENT_POSTS = 12
+
+status, thread, _ = call("POST", "/threads", '{"title":"同時投稿の検証"}')
+if status != 201:
+    check("並行投稿用のスレッドを作れる", False, f"status={status}")
+else:
+    tid = thread["id"]
+
+    def _post(i: int):
+        return call("POST", f"/threads/{tid}/comments",
+                    json.dumps({"body": f"同時投稿 {i}"}))
+
+    with ThreadPoolExecutor(max_workers=CONCURRENT_POSTS) as pool:
+        results = list(pool.map(_post, range(CONCURRENT_POSTS)))
+
+    created = [p for s, p, _ in results if s == 201]
+    codes = sorted(s for s, _, _ in results)
+    seqs = sorted(c["seq"] for c in created)
+
+    check(f"{CONCURRENT_POSTS} 件の同時投稿がすべて 201",
+          len(created) == CONCURRENT_POSTS, f"status={codes}")
+
+    # **ここが Phase 2 の本体。** 重複したら一意制約が拒否するので、
+    # 実際には「重複した seq が保存される」ことは起きない。
+    # 起きるのは投稿の失敗なので、上の 201 の数と合わせて意味を持つ。
+    check("レス番号が重複しない", len(set(seqs)) == len(seqs), f"seqs={seqs}")
+
+    # 成功したぶんは必ず 1..N の連番になる。
+    # 採番が「読み直していない」なら、ここに飛びが出る。
+    check("レス番号が 1 から始まる連番になる",
+          seqs == list(range(1, len(created) + 1)), f"seqs={seqs}")
+
+    if SQL_EXEC:
+        # 正しさの根拠を API の応答ではなく DB に置く。
+        #
+        # **件数ではなく合言葉を返させる。** psql の既定は整形済みの表
+        # (罫線と "(1 row)" つき) なので、"0" を探す形だと
+        # 罫線の一部や別の桁に当たって、壊れていても通りうる。
+        dup = subprocess.run(
+            shlex.split(SQL_EXEC) + [
+                "SELECT CASE WHEN count(*) = 0 THEN 'NO_DUPLICATE_SEQ' "
+                "ELSE 'DUPLICATE_SEQ_FOUND' END FROM ("
+                f"SELECT seq FROM comments WHERE thread_id = {tid} "
+                "GROUP BY seq HAVING count(*) > 1) d;"],
+            check=True, capture_output=True, text=True).stdout
+        check("DB 側にも重複した (thread_id, seq) が無い",
+              "NO_DUPLICATE_SEQ" in dup, f"got={dup.strip()!r}")
 
 section("仕様書によるリクエスト検証")
 for label, method, path, body in [
@@ -360,8 +426,8 @@ if SQL_EXEC:
             ON CONFLICT (id) DO UPDATE SET deleted_at = NULL, author_id = 900001;
         """)
         sql("""
-            INSERT INTO comments (thread_id, author_name, body, author_id)
-            VALUES (900001, '名無しさん', 'スモーク: 投稿者つきコメント', 900001)
+            INSERT INTO comments (thread_id, seq, author_name, body, author_id)
+            VALUES (900001, 1, '名無しさん', 'スモーク: 投稿者つきコメント', 900001)
             ON CONFLICT DO NOTHING;
         """)
 

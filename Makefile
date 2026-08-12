@@ -199,6 +199,27 @@ mutation-probe: ## テストが実際に効くかを、実装をわざと壊し�
 	}
 	.github/scripts/mutation-probe.py $(MUTATIONS)
 
+PROBE_WORKERS ?= 32
+
+.PHONY: concurrency-probe
+concurrency-probe: ## 4 つの並行制御モードを実 DB で比較計測する (PROBE_WORKERS=<並列数>)
+	# 同一バイナリのまま COMMENT_POST_MODE だけを差し替え、
+	# 同じスレッドへ同時投稿したときに何が起きるかを測る。
+	# 設計は docs/adr/0019-comment-concurrency.md。
+	#
+	# **モードごとにコンテナを作り直すため、数十秒かかる。**
+	# CI には載せない (結果は環境の性能に左右されるので、通す/落とすの
+	# 基準にできない)。正しさの検査は smoke 側にある。
+	@$(MAKE) --no-print-directory up
+	@echo "API の起動を待っています..."
+	@for i in $$(seq 1 30); do \
+		curl -sf -o /dev/null http://localhost:8080/healthz && break || sleep 2; \
+	done
+	BASE_URL=http://localhost:8080 \
+	SQL_EXEC="docker compose exec -T postgres psql -U app -d bbs -X -q" \
+	PROBE_WORKERS=$(PROBE_WORKERS) \
+	python3 .github/scripts/concurrency-probe.py
+
 .PHONY: verify-generated
 verify-generated: generate ## 生成物がコミット済みの内容と一致するか検査する
 	@git diff --exit-code -- \
