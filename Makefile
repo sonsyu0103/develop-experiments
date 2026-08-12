@@ -2,6 +2,17 @@
 
 GO_API_DIR  := apps/go-api
 NEXT_DIR    := apps/next-app
+
+# Node を叩くターゲットは NODE_OPTIONS を外して実行する。
+#
+# 親シェルに NODE_OPTIONS=--require=... が入っていると、そのモジュールを
+# 解決できない環境で node が起動時に落ちる。**Makefile の中身とは無関係な
+# 理由で make が失敗する**ため、原因が分かりにくい。
+#
+# 呼ぶ側に env -u NODE_OPTIONS を付けて回避していたが、
+# 回避策を文書に書いた時点で直す場所が違う。ここで閉じる。
+NODE := env -u NODE_OPTIONS
+
 # migrate コンテナは compose ネットワーク内から接続するため、ホスト名はサービス名
 MIGRATE_URL := postgres://app:password@postgres:5432/bbs?sslmode=disable
 
@@ -90,7 +101,7 @@ sqlc: ## SQL から Go のコードを生成する
 .PHONY: openapi
 openapi: ## openapi.yaml から Go スタブと TypeScript 型を生成する
 	cd $(GO_API_DIR) && oapi-codegen -config oapi-codegen.yaml ../../api/openapi.yaml
-	cd $(NEXT_DIR) && npm run gen:types
+	cd $(NEXT_DIR) && $(NODE) npm run gen:types
 
 .PHONY: generate
 generate: sqlc openapi ## 生成物をすべて作り直す
@@ -166,8 +177,8 @@ bench: ## ベンチマークを実行する
 .PHONY: lint
 lint: arch ## Go / TypeScript の静的解析を実行する
 	cd $(GO_API_DIR) && golangci-lint run ./...
-	cd $(NEXT_DIR) && npx tsc --noEmit
-	cd $(NEXT_DIR) && npm run lint
+	cd $(NEXT_DIR) && $(NODE) npx tsc --noEmit
+	cd $(NEXT_DIR) && $(NODE) npm run lint
 
 .PHONY: arch
 arch: ## モジュール境界とレイヤの依存方向を検査する
