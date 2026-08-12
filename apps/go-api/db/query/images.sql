@@ -6,6 +6,10 @@
 -- 過不足なく一致していれば、sqlc は共通の行型 (sqlcgen.Image) を再利用する。
 -- ずれるとクエリごとに別の行型が生成され、詰め替えが増える。
 --
+-- object_reclaimed_at は**まだ誰も読み書きしない**が、列一覧には並べる。
+-- 揃える条件は「テーブルの全列と過不足なく一致する」であり、
+-- 1 つ抜けるだけで共通行型が消える (users.sql で実際に踏んだ)。
+--
 -- 【回収バッチのクエリはここに無い】
 -- Phase 6 の後半 (プロフィール画像 / スレッドアイコンと同時) で足す。
 -- 先に書くと「実装していないクエリ」が残る。
@@ -24,7 +28,7 @@ INSERT INTO images (
     id, owner_id, kind, object_key, content_type, width, height, byte_size, status
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
-RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at;
+RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at;
 
 -- name: CommitImage :one
 -- ストレージへの PUT が成功したあとに呼ぶ (ADR 0007 決定 3 の手順 3)。
@@ -41,7 +45,7 @@ SET status = 'committed',
     committed_at = now()
 WHERE id = $1
   AND status = 'pending'
-RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at;
+RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at;
 
 -- name: GetImageByID :one
 -- 1 件取得。
@@ -50,6 +54,6 @@ RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size
 -- 呼び出し側が「確定していない」「削除された」を区別する必要があり、
 -- ここで隠すと「元から存在しない」と同じに見えてしまう
 -- (ADR 0016 問題 3 が DB 行を残す理由と同じ話)。
-SELECT id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at
+SELECT id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at
 FROM images
 WHERE id = $1;

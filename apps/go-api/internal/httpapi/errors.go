@@ -56,9 +56,17 @@ func respondError(c *gin.Context, err error) {
 	// 409 は時間をおけば通るが、422 はキーを作り直さない限り永久に通らない。
 	// 422 を 409 に丸めると、クライアントが同じキーで再送を繰り返す
 	// (ADR 0013 決定 3)。
+	// **固定文言にしない。** 422 は冪等キー専用ではない ——
+	// 画像の確定 (ImageRepository.Commit) もここに来る。
+	// 冪等キーの説明を固定で返すと、削除済み画像への確定要求に対して
+	// 「キーを作り直してください」と案内することになり、
+	// クライアントを無関係な対処へ誘導する。
+	//
+	// 400 / 413 と同じく err.Error() を返す。そのため
+	// **ErrFailedPrecondition を返す側は、メッセージに操作名や
+	// 内部構造を含めてはいけない** (translateError の CHECK 違反と同じ約束)。
 	case errors.Is(err, apperr.ErrFailedPrecondition):
-		c.JSON(http.StatusUnprocessableEntity, newErrorBody(oapigen.FAILEDPRECONDITION,
-			"同じ Idempotency-Key で別の内容が送られました。キーを作り直してください"))
+		c.JSON(http.StatusUnprocessableEntity, newErrorBody(oapigen.FAILEDPRECONDITION, err.Error()))
 
 	case errors.Is(err, apperr.ErrConflict):
 		c.JSON(http.StatusConflict, newErrorBody(oapigen.CONFLICT,

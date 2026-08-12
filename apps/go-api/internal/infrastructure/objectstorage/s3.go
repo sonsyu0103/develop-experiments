@@ -13,14 +13,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/image/domain/repository"
@@ -48,10 +50,24 @@ func New(ctx context.Context, cfg config.StorageConfig) (*S3Storage, error) {
 		return nil, fmt.Errorf("objectstorage: 設定が揃っていません (bucket / public_base_url が必要です)")
 	}
 
+	// **片方だけ設定されている状態を黙って無視しない。**
+	// AND で判定すると、S3_SECRET_ACCESS_KEY を書き忘れた環境では
+	// 静的資格情報が丸ごと捨てられて SDK の既定チェーンに落ちる。
+	// ECS の外では IMDS への到達待ちでタイムアウトし、
+	// 「MinIO を指しているのに認証で失敗する」という分かりにくい形で、
+	// 最初のアップロード時に初めて表面化する。
+	// Enabled() が「揃っていなければ止める」方針なのと揃える。
+	hasID, hasSecret := cfg.AccessKeyID != "", cfg.SecretAccessKey != ""
+	if hasID != hasSecret {
+		return nil, fmt.Errorf(
+			"objectstorage: S3_ACCESS_KEY_ID と S3_SECRET_ACCESS_KEY は両方揃えるか、両方空にしてください " +
+				"(両方空なら SDK の既定チェーンで解決します)")
+	}
+
 	opts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
 	}
-	if cfg.AccessKeyID != "" && cfg.SecretAccessKey != "" {
+	if hasID {
 		opts = append(opts, awsconfig.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
 		))
@@ -120,11 +136,41 @@ func (s *S3Storage) Delete(ctx context.Context, key string) error {
 		return nil
 	}
 
-	var notFound *types.NoSuchKey
-	if errors.As(err, &notFound) {
+	if isNotFound(err) {
 		return nil
 	}
 	return fmt.Errorf("objectstorage: DELETE に失敗しました (key=%s): %w", key, err)
+}
+
+// isNotFound は「対象が無い」を表すエラーかを判定します。
+//
+// **types.NoSuchKey で判定してはいけません。**
+// aws-sdk-go-v2 の DeleteObject のエラー逆シリアライズ
+// (deserializers.go の awsRestxml_deserializeOpErrorDeleteObject) は
+// switch が default だけで、**必ず *smithy.GenericAPIError を返します** ——
+// NoSuchKey は GetObject にしかモデル化されていません。
+// つまり errors.As(err, &notFound) は**一度も成立しません**。
+//
+// 初版はそう書いており、コメントで意図した「互換実装が NoSuchKey を
+// 返した場合に吸収する」が成立していませんでした。
+// MinIO は 204 を返すので CI のテストは通ってしまい、穴を検出できません。
+//
+// エラーコードと HTTP 404 の両方を見ます。互換実装が
+// NoSuchKey / NotFound のどちらを名乗るかは実装によって違うためです。
+func isNotFound(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NoSuchKey", "NotFound":
+			return true
+		}
+	}
+
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) {
+		return respErr.HTTPStatusCode() == http.StatusNotFound
+	}
+	return false
 }
 
 // URL は配信用の絶対 URL を返します (ADR 0007 決定 5)。

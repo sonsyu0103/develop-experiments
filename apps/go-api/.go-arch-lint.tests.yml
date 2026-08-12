@@ -34,7 +34,12 @@ vendors:
       - golang.org/x/oauth2
       - golang.org/x/oauth2/**
   aws-s3:
-    in: github.com/aws/aws-sdk-go-v2/**
+    in:
+      - github.com/aws/aws-sdk-go-v2/**
+      # smithy-go は SDK が返すエラーの共通インターフェース。
+      # DeleteObject のエラーは *smithy.GenericAPIError になるため、
+      # 「対象が無い」の判定にこちらが要る (s3.go の isNotFound)
+      - github.com/aws/smithy-go
   imaging:
     in:
       - golang.org/x/image/**

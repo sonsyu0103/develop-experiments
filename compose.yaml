@@ -108,8 +108,16 @@ services:
     volumes:
       - minio-data:/data
     healthcheck:
-      # /minio/health/live はプロセスの生存だけを見る。
-      # バケットの有無はこの下の minio-init が担保する。
+      # mc ready はクラスタが要求を受けられる状態かを見る。
+      # **HTTP の /minio/health/live とは別物** (あちらはプロセスの生存だけ)。
+      # ここで mc を使えるのは、minio イメージが mc を同梱しているため。
+      #
+      # CI は同じイメージを services ではなく docker run で起動しており、
+      # 待ち合わせは curl で /minio/health/live を叩いている。
+      # **非対称なのは意図的**で、CI 側はランナーから叩くので
+      # コンテナ内のツールに依存させたくない。
+      #
+      # バケットの有無はどちらも見ない。それは下の minio-init が担保する。
       test: ["CMD", "mc", "ready", "local"]
       interval: 5s
       timeout: 5s

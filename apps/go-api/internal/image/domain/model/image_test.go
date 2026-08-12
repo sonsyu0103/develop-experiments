@@ -249,7 +249,17 @@ func TestUploadLimits(t *testing.T) {
 	if MaxUploadBytes != 5<<20 {
 		t.Errorf("MaxUploadBytes = %d, want 5 MiB", MaxUploadBytes)
 	}
-	if MaxPixels != 50_000_000 {
-		t.Errorf("MaxPixels = %d, want 5000 万", MaxPixels)
+	// **ADR 0007 決定 2 の「5000 万」から下げてある。**
+	// 5000 万画素は RGBA で 191 MB / 枚になり、5 MiB の入力上限を
+	// 守ったまま到達できる (平坦な PNG)。同時 10 件で 1.9 GB。
+	if MaxPixels != 25_000_000 {
+		t.Errorf("MaxPixels = %d, want 2500 万", MaxPixels)
+	}
+
+	// 上限どうしの関係を固定する。**バイト数の上限が画素数の上限を
+	// 含意しないこと**がこの 2 つを別に持つ理由になる。
+	// 1 画素 4 バイトで見ても、MaxUploadBytes は MaxPixels に遠く届かない。
+	if MaxUploadBytes >= MaxPixels {
+		t.Error("バイト数の上限が画素数の上限を上回っている (画素数の検査が無意味になる)")
 	}
 }

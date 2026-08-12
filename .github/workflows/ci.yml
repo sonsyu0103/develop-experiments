@@ -21,6 +21,10 @@ env:
   SQLC_VERSION: v1.31.1
   OAPI_CODEGEN_VERSION: v2.8.0
   GO_ARCH_LINT_VERSION: v1.17.0
+  # MinIO とそのクライアント。compose.yaml と同じタグに揃える
+  # (docs/adr/0007-image-storage.md)
+  MINIO_VERSION: RELEASE.2025-04-22T22-12-26Z
+  MC_VERSION: RELEASE.2025-04-16T18-13-26Z
 
 jobs:
   # --------------------------------------------------
@@ -263,7 +267,7 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+            "minio/minio:${MINIO_VERSION}" server /data
           for i in $(seq 1 30); do
             curl -sf -o /dev/null http://localhost:9000/minio/health/live && exit 0
             sleep 2
@@ -278,7 +282,12 @@ jobs:
       # ADR 0007 決定 4)。
       - name: Create the MinIO bucket
         run: |
-          curl -sSfL https://dl.min.io/client/mc/release/linux-amd64/mc -o /tmp/mc
+          # **バージョンを固定する。** 素の .../linux-amd64/mc は常に最新版で、
+          # Makefile 冒頭の方針 (@latest にしない) に反する。
+          # mc は過去に mc policy set -> mc anonymous set の改名を実施しており、
+          # 同種の変更が入るとコード変更なしに CI が落ちる。
+          # compose の minio/mc と同じタグに揃えてある。
+          curl -sSfL "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.${MC_VERSION}" -o /tmp/mc
           chmod +x /tmp/mc
           /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin
           /tmp/mc mb --ignore-existing local/bbs-images

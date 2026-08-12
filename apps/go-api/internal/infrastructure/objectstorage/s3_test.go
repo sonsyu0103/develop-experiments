@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 
 	"develop-experiments/apps/go-api/internal/config"
@@ -117,14 +118,29 @@ func TestNew_RejectsIncompleteConfig(t *testing.T) {
 //
 // S3_TEST_ENDPOINT が無ければスキップします。CI では migration-ci が
 // MinIO を立てて設定します (make smoke と同じ「実物に当てる」層)。
+//
+// **CI ではスキップを失敗として扱います。**
+// go test は全件 SKIP でも exit 0 になるため、S3_TEST_ENDPOINT を
+// 消す / 打ち間違える / MinIO の起動ステップを削る、のいずれでも
+// 検証が消滅したまま CI が緑のままになります。
+// スモークの SMOKE_REQUIRE_FULL と同じ性質の穴なので、同じ形で塞ぎます
+// (docs/adr/0005-authentication.md 決定 4 の経緯)。
 
 // liveConfig は環境変数から実 MinIO の設定を組み立てます。
-// 未設定ならテストをスキップします。
+//
+// 未設定なら通常はスキップしますが、CI (または S3_TEST_REQUIRE=1) では
+// 失敗させます。fail-closed 側に倒すのは、
+// **明示的な env を必須にするとその 1 行を消しただけで検出が止まる**ためです。
 func liveConfig(t *testing.T) config.StorageConfig {
 	t.Helper()
 
 	endpoint := os.Getenv("S3_TEST_ENDPOINT")
 	if endpoint == "" {
+		if requireLive() {
+			t.Fatal("S3_TEST_ENDPOINT が未設定です。" +
+				"CI では実 MinIO に対する検証を省略できません " +
+				"(意図的に飛ばすなら S3_TEST_REQUIRE=0)")
+		}
 		t.Skip("S3_TEST_ENDPOINT が未設定のためスキップ (実 MinIO が必要)")
 	}
 
@@ -144,6 +160,19 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// requireLive は実 MinIO への検証を必須とするかを返します。
+//
+// 既定は「CI なら必須」。スモークの SMOKE_REQUIRE_FULL と同じ判断で、
+// 明示的な env を必須にすると、その 1 行を消しただけで検出が止まります。
+func requireLive() bool {
+	if raw, ok := os.LookupEnv("S3_TEST_REQUIRE"); ok {
+		return strings.TrimSpace(raw) != "" &&
+			strings.TrimSpace(raw) != "0" &&
+			!strings.EqualFold(strings.TrimSpace(raw), "false")
+	}
+	return os.Getenv("CI") != ""
 }
 
 // PUT した内容が、返した URL でそのまま読めること。

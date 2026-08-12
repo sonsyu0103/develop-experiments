@@ -78,7 +78,15 @@ func (r *ImageRepository) Commit(ctx context.Context, id uuid.UUID) (*model.Imag
 	// **1 往復増えるのは失敗経路だけ**なので、通常の流れは変わらない。
 	current, findErr := r.FindByID(ctx, id)
 	if findErr != nil {
-		// 本当に無い (または引けない)。元のエラーの意味をそのまま返す。
+		// **引けなかった理由を潰さない。**
+		// ここで一律に translated (= ErrNotFound) を返すと、接続断や
+		// タイムアウトが 404「対象のリソースが見つかりません」に化ける。
+		// 実際には画像は存在し、pending のまま孤児として残っている ——
+		// 利用者にもログにも「無かった」としか残らないのが一番困る。
+		if !errors.Is(findErr, apperr.ErrNotFound) {
+			return nil, findErr
+		}
+		// 本当に無い。元のエラーの意味をそのまま返す。
 		return nil, translated
 	}
 	return nil, fmt.Errorf(

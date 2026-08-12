@@ -22,17 +22,18 @@ type IdempotencyKey struct {
 }
 
 type Image struct {
-	ID          uuid.UUID
-	OwnerID     int64
-	Kind        string
-	ObjectKey   string
-	ContentType string
-	Width       int32
-	Height      int32
-	ByteSize    int64
-	Status      string
-	CreatedAt   time.Time
-	CommittedAt *time.Time
+	ID                uuid.UUID
+	OwnerID           int64
+	Kind              string
+	ObjectKey         string
+	ContentType       string
+	Width             int32
+	Height            int32
+	ByteSize          int64
+	Status            string
+	CreatedAt         time.Time
+	CommittedAt       *time.Time
+	ObjectReclaimedAt *time.Time
 }
 
 type Session struct {

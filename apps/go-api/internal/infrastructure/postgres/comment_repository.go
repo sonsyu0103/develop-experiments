@@ -431,9 +431,18 @@ func (r *CommentRepository) replayRecorded(
 	// **同じキーで別の内容。** 黙って前回の結果を返すと、
 	// クライアントのバグが見えなくなる (ADR 0015)。
 	if existing.RequestHash != req.RequestHash {
+		// **メッセージに op を含めない。** 422 の本文はそのまま
+		// クライアントへ返るため (respondError)、操作名は内部構造の露出になる。
+		// translateError の CHECK 違反が同じ理由で op を外しているのに、
+		// ここだけ揃っていなかった。切り分けに要る情報はログへ。
+		slog.WarnContext(ctx, "idempotency_request_mismatch",
+			slog.String("op", op),
+			slog.Int64("user_id", userID),
+			slog.String("endpoint", req.Endpoint),
+		)
 		return fmt.Errorf(
-			"%s: 同じ Idempotency-Key で別の内容が送られました: %w",
-			op, apperr.ErrFailedPrecondition)
+			"同じ Idempotency-Key で別の内容が送られました。キーを作り直してください: %w",
+			apperr.ErrFailedPrecondition)
 	}
 
 	// 記録が無いのは「確保したが応答を書かずにコミットされた」場合だけ。
@@ -453,8 +462,8 @@ func (r *CommentRepository) replayRecorded(
 			slog.String("endpoint", req.Endpoint),
 		)
 		return fmt.Errorf(
-			"%s: 冪等キーの記録が未完了のままです: %w",
-			op, apperr.ErrFailedPrecondition)
+			"冪等キーの記録が未完了です。キーを作り直してください: %w",
+			apperr.ErrFailedPrecondition)
 	}
 
 	*replayed = existing.ResponseBody

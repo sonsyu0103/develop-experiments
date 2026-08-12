@@ -63,6 +63,22 @@ CREATE TABLE images (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     committed_at TIMESTAMPTZ,
 
+    -- 回収バッチが S3 のオブジェクトを消した時刻。
+    --
+    -- **この列が無いと 'deleted' の行が回収対象から永久に抜けない。**
+    -- 'pending' の孤児は DB 行ごと消えるので索引からも消えるが、
+    -- 'deleted' は行を残す (ADR 0016 問題 3)。「消したかどうか」を
+    -- 記録する場所が無いと、下の部分索引に該当し続けることになり、
+    --   1. 回収バッチが毎回すべての削除済み画像へ DELETE を投げ直す
+    --      (Delete は存在しないキーを成功として扱うので静かに空回りする)
+    --   2. 「大多数の committed を索引に載せない」という部分索引の狙いに反して、
+    --      索引が単調増加する
+    --
+    -- **書き込むのは Phase 6 後半の回収バッチ**になる。列と索引の述語は
+    -- 対で決まるものなので、索引を作るこのマイグレーションで一緒に入れる
+    -- (あとから述語を変えると、育ったテーブルへの張り直しになる)。
+    object_reclaimed_at TIMESTAMPTZ,
+
     CONSTRAINT images_status_valid CHECK (status IN ('pending', 'committed', 'deleted')),
     CONSTRAINT images_kind_valid   CHECK (kind IN ('comment_attachment', 'avatar', 'thread_icon')),
 
@@ -100,9 +116,15 @@ CREATE TABLE images (
 --
 -- 部分インデックスにしているのは、大多数を占める 'committed' を
 -- 索引に載せないため。回収バッチはこの述語でしか引かない。
+--
+-- **object_reclaimed_at IS NULL を述語に含める。**
+-- 含めないと、S3 から消し終えた 'deleted' の行が永久に該当し続ける
+-- (上の列コメントを参照)。'pending' 側は行ごと消えるので条件は無害だが、
+-- 述語を 1 本にまとめるため両方に効かせている。
 CREATE INDEX images_reclaimable_idx
     ON images (created_at)
-    WHERE status IN ('pending', 'deleted');
+    WHERE status IN ('pending', 'deleted')
+      AND object_reclaimed_at IS NULL;
 
 -- マイページの「自分が上げた画像」用 (ADR 0016 では区分 C)。
 --
