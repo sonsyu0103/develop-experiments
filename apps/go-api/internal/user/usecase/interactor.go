@@ -63,8 +63,15 @@ type LoginResult struct {
 	TTL time.Duration
 }
 
-// AuthInteractor は認証のユースケースを担当します。
-type AuthInteractor struct {
+// LoginInteractor はログイン (認可コードの交換) を担当します。
+//
+// **セッションの検証はここに置きません** (SessionInteractor を参照)。
+// 分けているのは、IdP を必要とするのがログインだけだからです。
+// 一体にしていた頃は、Google の資格情報が無い環境では
+// セッションの検証ごと動かず、認証を要する経路が CI で
+// まったく検証できませんでした
+// (docs/adr/0005-authentication.md 決定 4 / ADR 0003 未決 #16)。
+type LoginInteractor struct {
 	users    repository.UserRepository
 	sessions repository.SessionRepository
 	provider Provider
@@ -78,23 +85,23 @@ type AuthInteractor struct {
 //
 // コンストラクタの引数にしないのは、**認証の主経路とは独立した運用設定**
 // だからです。引数に混ぜると、テストのたびにこの値を意識することになります。
-func (i *AuthInteractor) WithBootstrapAdmin(googleSub string) *AuthInteractor {
+func (i *LoginInteractor) WithBootstrapAdmin(googleSub string) *LoginInteractor {
 	i.bootstrapAdminSub = googleSub
 	return i
 }
 
-// NewAuthInteractor は依存を注入してインタラクターを生成します。
+// NewLoginInteractor は依存を注入してインタラクターを生成します。
 // now が nil の場合は time.Now を使います。
-func NewAuthInteractor(
+func NewLoginInteractor(
 	users repository.UserRepository,
 	sessions repository.SessionRepository,
 	provider Provider,
 	now Clock,
-) *AuthInteractor {
+) *LoginInteractor {
 	if now == nil {
 		now = time.Now
 	}
-	return &AuthInteractor{users: users, sessions: sessions, provider: provider, now: now}
+	return &LoginInteractor{users: users, sessions: sessions, provider: provider, now: now}
 }
 
 // StartLogin はログインを開始し、リダイレクト先と持ち回る値を返します。
@@ -106,7 +113,7 @@ func NewAuthInteractor(
 //
 // どれか 1 つでも落とすと静かに脆弱になります
 // (docs/adr/0005-authentication.md の引き受けるコスト)。
-func (i *AuthInteractor) StartLogin() (*AuthRequest, error) {
+func (i *LoginInteractor) StartLogin() (*AuthRequest, error) {
 	state, err := randomToken()
 	if err != nil {
 		return nil, fmt.Errorf("state の生成に失敗しました: %w", err)
@@ -132,7 +139,7 @@ func (i *AuthInteractor) StartLogin() (*AuthRequest, error) {
 //
 // state の照合は呼び出し側 (ハンドラ) が Cookie と突き合わせて行います。
 // ここに持ち込まないのは、Cookie の読み取りが HTTP 層の責務だからです。
-func (i *AuthInteractor) CompleteLogin(
+func (i *LoginInteractor) CompleteLogin(
 	ctx context.Context, code, codeVerifier, nonce string,
 ) (*LoginResult, error) {
 	claims, err := i.provider.Exchange(ctx, code, codeVerifier, nonce)
@@ -195,7 +202,7 @@ func (i *AuthInteractor) CompleteLogin(
 // **失敗してもログインは通します。** 昇格は運用の都合であり、
 // ここで失敗を返すと「管理者にしたい人だけログインできない」ことになります。
 // 記録は残すので、あとから気づけます。
-func (i *AuthInteractor) promoteBootstrapAdmin(ctx context.Context, googleSub string) {
+func (i *LoginInteractor) promoteBootstrapAdmin(ctx context.Context, googleSub string) {
 	if i.bootstrapAdminSub == "" {
 		return
 	}
@@ -227,46 +234,6 @@ func (i *AuthInteractor) promoteBootstrapAdmin(ctx context.Context, googleSub st
 		// 監査記録 (ADR 0011 決定 3) が入るまでログだけが頼りになる。
 		slog.InfoContext(ctx, "bootstrap_admin_promoted")
 	}
-}
-
-// Authenticate はセッショントークンを検証し、持ち主を返します。
-//
-// **毎リクエスト通る経路**です。期限切れと退会の判定は SQL 側にあり、
-// ここでは再判定しません (判定を 2 か所に置くと片方だけ直したときに食い違うため)。
-func (i *AuthInteractor) Authenticate(
-	ctx context.Context, token model.SessionToken,
-) (*PrincipalDTO, error) {
-	if token == "" {
-		return nil, fmt.Errorf("セッションがありません: %w", apperr.ErrUnauthenticated)
-	}
-
-	auth, err := i.sessions.FindLive(ctx, token)
-	if err != nil {
-		// 「見つからない」は 404 ではなく 401 として扱う。
-		// セッションの有無は認証の問題であり、リソースの有無ではない。
-		if errors.Is(err, apperr.ErrNotFound) {
-			return nil, fmt.Errorf("セッションが無効です: %w", apperr.ErrUnauthenticated)
-		}
-		return nil, err
-	}
-
-	return &PrincipalDTO{
-		UserID: auth.Owner.ID,
-		Role:   auth.Owner.Role,
-		Me: MeDTO{
-			PublicID:    auth.Owner.PublicID,
-			DisplayName: auth.Owner.DisplayName,
-			Email:       auth.Owner.Email,
-			AvatarURL:   auth.Owner.AvatarURL,
-			Role:        auth.Owner.Role,
-		},
-	}, nil
-}
-
-// Logout はセッションを削除します。
-// 対象が無い場合も成功として扱います (目的は「もう使えないこと」のため)。
-func (i *AuthInteractor) Logout(ctx context.Context, token model.SessionToken) error {
-	return i.sessions.Delete(ctx, token)
 }
 
 // randomToken は URL 安全な乱数文字列を返します。

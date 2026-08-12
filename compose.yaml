@@ -120,7 +120,8 @@ services:
       COMMENT_POST_MODE: ${COMMENT_POST_MODE:-}
       # 認証 (Google OIDC)。
       # 値はここに書かず、リポジトリ直下の .env から補間する (.gitignore 済み)。
-      # 未設定でも API は起動し、認証エンドポイントだけが 503 になる。
+      # 未設定でも API は起動し、ログインの 2 経路だけが 503 になる。
+      # セッションの検証は設定に依らず動く (ADR 0005 決定 4)。
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       AUTH_REDIRECT_URL: http://localhost:8080/auth/google/callback

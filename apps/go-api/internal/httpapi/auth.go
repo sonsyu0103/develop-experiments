@@ -70,25 +70,24 @@ func authorIDFromContext(ctx context.Context) *int64 {
 // 「認証が必須かどうか」は仕様書の security 宣言が決め、
 // 検証ミドルウェアが強制します。
 //
+// **OIDC の設定の有無で分岐しません** (ADR 0005 決定 4)。
+// セッションの検証は sessions テーブルを引いて期限を見るだけで、
+// Google を必要としないためです。ここで
+// 「資格情報が無ければ何もしない」と分岐していた頃は、
+// CI が Cookie を無視して全リクエストを匿名として扱っており、
+// 認証を要する経路が 1 件も検証されていませんでした。
+//
 // 仕様検証ミドルウェアより前に置く必要があります。
 // AuthenticationFunc がここで載せた値を見るためです。
 func (s *Server) resolveSession() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 認証の設定が無い環境では何もしない。
-		// この場合 security を宣言したエンドポイントは常に 401 になるが、
-		// そもそもログインできないので正しい振る舞いになる。
-		if s.auth == nil {
-			c.Next()
-			return
-		}
-
 		raw, err := c.Cookie(sessionCookieName)
 		if err != nil || raw == "" {
 			c.Next()
 			return
 		}
 
-		principal, err := s.auth.Authenticate(c.Request.Context(), usermodel.SessionToken(raw))
+		principal, err := s.sessions.Authenticate(c.Request.Context(), usermodel.SessionToken(raw))
 		if err != nil {
 			// 無効なセッションは「未ログイン」として扱い、ここでは弾かない。
 			// security を宣言したエンドポイントだけが 401 になる。
@@ -230,12 +229,17 @@ func (s *Server) clearCookie(c *gin.Context, name string) {
 	})
 }
 
-// requireAuthEnabled は認証の設定が入っているかを確認します。
+// requireLoginEnabled は**ログインに必要な**設定が入っているかを確認します。
 //
 // 設定が無くても API は起動します。掲示板の閲覧と匿名投稿は認証に依存せず、
-// 全体を落とすほうが害が大きいためです。使えないのはこの経路だけになります。
-func (s *Server) requireAuthEnabled() error {
-	if s.auth == nil {
+// 全体を落とすほうが害が大きいためです。
+//
+// **503 になるのはログインの 2 経路だけ**です (ADR 0005 決定 4)。
+// セッションの検証・/me・ログアウトは発行済みのセッションを見るだけなので、
+// 設定の有無にかかわらず動きます。ここを「認証まわり全部」に広げると、
+// 資格情報の無い環境 (CI) で認証済みの経路が検証できなくなります。
+func (s *Server) requireLoginEnabled() error {
+	if s.login == nil {
 		return fmt.Errorf("認証プロバイダが設定されていません: %w", apperr.ErrUnavailable)
 	}
 	return nil

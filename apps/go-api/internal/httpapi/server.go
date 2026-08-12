@@ -32,24 +32,43 @@ type Server struct {
 	threads  *threadusecase.ThreadInteractor
 	comments *commentusecase.CommentInteractor
 	db       Pinger
-	// auth は認証の設定が無い場合 nil になります。
-	// そのとき認証エンドポイントだけが 503 を返します。
-	auth    *userusecase.AuthInteractor
+	// sessions は**必ず存在します**。セッションの検証は OIDC の設定に
+	// 依存しません (docs/adr/0005-authentication.md 決定 4)。
+	sessions *userusecase.SessionInteractor
+	// login は認証の設定が無い場合 nil になります。
+	// そのとき**ログインの 2 経路だけ**が 503 を返します。
+	login   *userusecase.LoginInteractor
 	authCfg config.AuthConfig
 }
 
 var _ oapigen.ServerInterface = (*Server)(nil)
 
 // NewServer はハンドラ実装を生成します。
-// auth が nil の場合、認証エンドポイントは 503 を返します。
+// login が nil の場合、ログインの経路 (/auth/google と そのコールバック) は
+// 503 を返します。セッションの検証とログアウトはそのまま動きます。
+//
+// **sessions に nil を渡せません。** 許すと resolveSession が黙って
+// 素通しする状態に戻り、Cookie を持っていても全員が匿名として扱われます。
+// 設定ではなく結線の誤りなので、起動時に落とします。
 func NewServer(
 	threads *threadusecase.ThreadInteractor,
 	comments *commentusecase.CommentInteractor,
 	db Pinger,
-	auth *userusecase.AuthInteractor,
+	sessions *userusecase.SessionInteractor,
+	login *userusecase.LoginInteractor,
 	authCfg config.AuthConfig,
 ) *Server {
-	return &Server{threads: threads, comments: comments, db: db, auth: auth, authCfg: authCfg}
+	if sessions == nil {
+		panic("httpapi: SessionInteractor は必須です (nil だとセッションが解決されません)")
+	}
+	return &Server{
+		threads:  threads,
+		comments: comments,
+		db:       db,
+		sessions: sessions,
+		login:    login,
+		authCfg:  authCfg,
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -87,12 +106,12 @@ func (s *Server) GetReadyz(c *gin.Context) {
 // state / nonce / code_verifier を発行し、短命な Cookie に預けてから
 // Google の認可エンドポイントへリダイレクトします。
 func (s *Server) StartGoogleLogin(c *gin.Context) {
-	if err := s.requireAuthEnabled(); err != nil {
+	if err := s.requireLoginEnabled(); err != nil {
 		respondError(c, err)
 		return
 	}
 
-	req, err := s.auth.StartLogin()
+	req, err := s.login.StartLogin()
 	if err != nil {
 		respondError(c, err)
 		return
@@ -107,7 +126,7 @@ func (s *Server) StartGoogleLogin(c *gin.Context) {
 
 // GoogleLoginCallback は GET /auth/google/callback を処理します。
 func (s *Server) GoogleLoginCallback(c *gin.Context, params oapigen.GoogleLoginCallbackParams) {
-	if err := s.requireAuthEnabled(); err != nil {
+	if err := s.requireLoginEnabled(); err != nil {
 		respondError(c, err)
 		return
 	}
@@ -154,7 +173,7 @@ func (s *Server) GoogleLoginCallback(c *gin.Context, params oapigen.GoogleLoginC
 		return
 	}
 
-	result, err := s.auth.CompleteLogin(c.Request.Context(), *params.Code, verifier, nonce)
+	result, err := s.login.CompleteLogin(c.Request.Context(), *params.Code, verifier, nonce)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -168,15 +187,14 @@ func (s *Server) GoogleLoginCallback(c *gin.Context, params oapigen.GoogleLoginC
 }
 
 // Logout は POST /auth/logout を処理します。
+//
+// **認証の設定を要求しません。** 発行済みのセッションを捨てるだけで、
+// IdP には触れないためです。ここを 503 で塞ぐと、資格情報を外した環境に
+// 「破棄できないセッション」が残ります (ADR 0005 決定 4)。
 func (s *Server) Logout(c *gin.Context) {
-	if err := s.requireAuthEnabled(); err != nil {
-		respondError(c, err)
-		return
-	}
-
 	// ここに到達している時点で、仕様書の security 要件は満たされている。
 	if raw, err := c.Cookie(sessionCookieName); err == nil && raw != "" {
-		if err := s.auth.Logout(c.Request.Context(), usermodel.SessionToken(raw)); err != nil {
+		if err := s.sessions.Logout(c.Request.Context(), usermodel.SessionToken(raw)); err != nil {
 			respondError(c, err)
 			return
 		}
