@@ -46,6 +46,14 @@ func respondError(c *gin.Context, err error) {
 	case errors.Is(err, apperr.ErrUnavailable):
 		c.JSON(http.StatusServiceUnavailable, newErrorBody(oapigen.UNAVAILABLE, err.Error()))
 
+	// 422 と 409 を分けるのは、**再試行で解決するかが違う**ため。
+	// 409 は時間をおけば通るが、422 はキーを作り直さない限り永久に通らない。
+	// 422 を 409 に丸めると、クライアントが同じキーで再送を繰り返す
+	// (ADR 0013 決定 3)。
+	case errors.Is(err, apperr.ErrFailedPrecondition):
+		c.JSON(http.StatusUnprocessableEntity, newErrorBody(oapigen.FAILEDPRECONDITION,
+			"同じ Idempotency-Key で別の内容が送られました。キーを作り直してください"))
+
 	case errors.Is(err, apperr.ErrConflict):
 		c.JSON(http.StatusConflict, newErrorBody(oapigen.CONFLICT,
 			"同時更新が競合しました。時間をおいて再試行してください"))

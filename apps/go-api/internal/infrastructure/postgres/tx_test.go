@@ -473,7 +473,7 @@ func TestRunInTx_TranslatesCommitError(t *testing.T) {
 			db := &fakeBeginner{tx: &fakeTx{commitErr: tt.commitErr}}
 
 			err := runInTx(t.Context(), "テスト", db, pgx.Serializable,
-				func(*sqlcgen.Queries) error { return nil })
+				func(pgx.Tx, *sqlcgen.Queries) error { return nil })
 
 			if !errors.Is(err, tt.wantErrIs) {
 				t.Errorf("err = %v, want %v を含む (409 にならず 500 になる)", err, tt.wantErrIs)
@@ -496,7 +496,7 @@ func TestRunInTx_CommitSuccess(t *testing.T) {
 	db := &fakeBeginner{tx: tx}
 
 	if err := runInTx(t.Context(), "テスト", db, pgx.ReadCommitted,
-		func(*sqlcgen.Queries) error { return nil }); err != nil {
+		func(pgx.Tx, *sqlcgen.Queries) error { return nil }); err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
 	if !tx.committed {
@@ -518,7 +518,7 @@ func TestRunInTx_RollsBackOnError(t *testing.T) {
 	db := &fakeBeginner{tx: tx}
 
 	err := runInTx(t.Context(), "テスト", db, pgx.Serializable,
-		func(*sqlcgen.Queries) error { return sentinel })
+		func(pgx.Tx, *sqlcgen.Queries) error { return sentinel })
 
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("err = %v, want %v", err, sentinel)
@@ -538,7 +538,7 @@ func TestRunInTx_TranslatesBeginError(t *testing.T) {
 	db := &fakeBeginner{beginErr: &pgconn.PgError{Code: codeSerializationFailure}}
 
 	err := runInTx(t.Context(), "テスト", db, pgx.Serializable,
-		func(*sqlcgen.Queries) error {
+		func(pgx.Tx, *sqlcgen.Queries) error {
 			t.Error("BEGIN に失敗したのに fn が呼ばれた")
 			return nil
 		})

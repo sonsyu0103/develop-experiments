@@ -3,6 +3,7 @@ package usecase
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 	"develop-experiments/apps/go-api/internal/apperr"
 	"develop-experiments/apps/go-api/internal/comment/domain/model"
 	"develop-experiments/apps/go-api/internal/comment/domain/repository"
+	"develop-experiments/apps/go-api/internal/idempotency"
 	"develop-experiments/apps/go-api/internal/pagination"
 )
 
@@ -126,6 +128,55 @@ func (i *CommentInteractor) PostComment(
 	created, err := i.repo.Create(ctx, comment)
 	if err != nil {
 		return CommentDTO{}, err
+	}
+
+	return toDTO(*created), nil
+}
+
+// PostCommentIdempotent は冪等キーつきで投稿します。
+//
+// 同じキーで再送された場合は**投稿せずに**前回の応答を返します
+// (docs/adr/0015-idempotency.md)。
+//
+// **匿名では冪等キーを使えません。** キーの名前空間を分ける手段が無く、
+// IP で分けると NAT の背後で他人のキーと衝突するためです (同 決定 4)。
+// 呼び出し側 (HTTP 層) が匿名のヘッダを落とす前提ですが、
+// 他人の結果を返す事故に直結するのでここでも弾きます。
+func (i *CommentInteractor) PostCommentIdempotent(
+	ctx context.Context, threadID int64, authorName, body string, authorID *int64,
+	req idempotency.Request,
+) (CommentDTO, error) {
+	if authorID == nil {
+		return CommentDTO{}, fmt.Errorf(
+			"匿名では Idempotency-Key を使えません: %w", apperr.ErrInvalidArgument)
+	}
+
+	comment, err := model.NewComment(threadID, authorName, body, authorID)
+	if err != nil {
+		return CommentDTO{}, err
+	}
+
+	// **記録するのは応答そのもの** (ADR 0015)。
+	// 永続化層に DTO の形を知らせないため、詰め替えと符号化はここで行い、
+	// バイト列だけを渡します。
+	encode := func(c *model.Comment) ([]byte, error) {
+		return json.Marshal(toDTO(*c))
+	}
+
+	created, replayed, err := i.repo.CreateIdempotent(ctx, comment, req, encode)
+	if err != nil {
+		return CommentDTO{}, err
+	}
+
+	if replayed != nil {
+		var dto CommentDTO
+		if err := json.Unmarshal(replayed, &dto); err != nil {
+			// 記録した本文が読めない = こちらが書式を変えた可能性が高い。
+			// **前回と違う応答を返すくらいなら失敗させる。**
+			return CommentDTO{}, fmt.Errorf(
+				"記録済みの応答を復元できませんでした: %w", err)
+		}
+		return dto, nil
 	}
 
 	return toDTO(*created), nil

@@ -2,8 +2,11 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -12,6 +15,7 @@ import (
 	"develop-experiments/apps/go-api/internal/comment/domain/model"
 	"develop-experiments/apps/go-api/internal/comment/domain/repository"
 	"develop-experiments/apps/go-api/internal/config"
+	"develop-experiments/apps/go-api/internal/idempotency"
 	"develop-experiments/apps/go-api/internal/infrastructure/postgres/sqlcgen"
 	"develop-experiments/apps/go-api/internal/pagination"
 )
@@ -133,31 +137,10 @@ func (r *CommentRepository) createInTx(
 
 	var row sqlcgen.CreateCommentWithSeqRow
 	attempts, err := run.do(ctx, func() error {
-		return runInTx(ctx, op, r.pool, s.iso, func(q *sqlcgen.Queries) error {
-			if err := r.ensureThreadAlive(ctx, q, comment.ThreadID, s.lockParent); err != nil {
-				return err
-			}
-
-			// **ここが競合する 1 行。**
-			// 読んだ値が有効であり続ける保証は、この文自身には無い。
-			// ssi では SSI の述語ロックが、pessimistic では上の FOR UPDATE が、
-			// naive では**何も**保証しない。
-			seq, err := q.NextCommentSeq(ctx, comment.ThreadID)
-			if err != nil {
-				return translateError(op, err)
-			}
-
-			row, err = q.CreateCommentWithSeq(ctx, sqlcgen.CreateCommentWithSeqParams{
-				ThreadID:   comment.ThreadID,
-				Seq:        seq,
-				AuthorName: comment.AuthorName,
-				Body:       comment.Body,
-				AuthorID:   comment.AuthorID,
-			})
-			if err != nil {
-				return translateError(op, err)
-			}
-			return nil
+		return runInTx(ctx, op, r.pool, s.iso, func(_ pgx.Tx, q *sqlcgen.Queries) error {
+			var err error
+			row, err = r.insertWithSeq(ctx, q, comment, s.lockParent)
+			return err
 		})
 	})
 	if err != nil {
@@ -165,6 +148,40 @@ func (r *CommentRepository) createInTx(
 	}
 
 	return r.toModel(row, comment.AuthorID), attempts, nil
+}
+
+// insertWithSeq は「存在確認 → 採番 → 挿入」の 3 手順です。
+// ssi / pessimistic / naive が共有し、冪等な経路からも呼ばれます。
+func (r *CommentRepository) insertWithSeq(
+	ctx context.Context, q *sqlcgen.Queries, comment *model.Comment, lockParent bool,
+) (sqlcgen.CreateCommentWithSeqRow, error) {
+	const op = "CommentRepository.Create"
+
+	var zero sqlcgen.CreateCommentWithSeqRow
+	if err := r.ensureThreadAlive(ctx, q, comment.ThreadID, lockParent); err != nil {
+		return zero, err
+	}
+
+	// **ここが競合する 1 行。**
+	// 読んだ値が有効であり続ける保証は、この文自身には無い。
+	// ssi では SSI の述語ロックが、pessimistic では上の FOR UPDATE が、
+	// naive では**何も**保証しない。
+	seq, err := q.NextCommentSeq(ctx, comment.ThreadID)
+	if err != nil {
+		return zero, translateError(op, err)
+	}
+
+	row, err := q.CreateCommentWithSeq(ctx, sqlcgen.CreateCommentWithSeqParams{
+		ThreadID:   comment.ThreadID,
+		Seq:        seq,
+		AuthorName: comment.AuthorName,
+		Body:       comment.Body,
+		AuthorID:   comment.AuthorID,
+	})
+	if err != nil {
+		return zero, translateError(op, err)
+	}
+	return row, nil
 }
 
 // createAutoSeq は unique モードを実装します。
@@ -214,6 +231,223 @@ func (r *CommentRepository) createAutoSeq(
 	}
 
 	return r.toModel(sqlcgen.CreateCommentWithSeqRow(row), comment.AuthorID), attempts, nil
+}
+
+// idempotencyWaitTimeout は冪等キーの確保が待てる上限です。
+//
+// 同じキーの処理が未コミットのとき、ON CONFLICT DO NOTHING は
+// 相手のトランザクションが終わるまで待ちます。
+// **待ちはコネクションを占有する**ため、上限を設けて 409 に落とします
+// (docs/adr/0015-idempotency.md)。
+const idempotencyWaitTimeout = 3 * time.Second
+
+// CreateIdempotent は冪等キーの確保・投稿・応答の記録を **1 トランザクション**で行います。
+//
+// **別トランザクションにしてはいけません** (ADR 0015 決定 3)。
+// 「キーを記録した直後に処理が失敗」したとき、リトライしても
+// 「処理済み」と誤判定されて投稿が永久に失われます。
+//
+// 戻り値は排他的です。
+//   - 初回:   created が埋まり、replayed は nil
+//   - 再送:   created は nil で、replayed に記録済みの応答本文が入る
+//
+// encode は初回にだけ呼ばれ、その戻り値が記録されます。
+// **応答の組み立てをユースケース層に残すため**の受け口です
+// (永続化層が API の表現を知る必要はありません)。
+func (r *CommentRepository) CreateIdempotent(
+	ctx context.Context, comment *model.Comment, req idempotency.Request,
+	encode func(*model.Comment) ([]byte, error),
+) (created *model.Comment, replayed []byte, err error) {
+	const op = "CommentRepository.CreateIdempotent"
+
+	// 匿名にはキーの名前空間を分ける手段がありません (ADR 0015 決定 4)。
+	// ユースケース層が弾いているはずですが、他人の結果を返す事故に直結するため
+	// ここでも閉じておきます。
+	if comment.AuthorID == nil {
+		return nil, nil, fmt.Errorf("%s: 匿名では冪等キーを使えません: %w", op, apperr.ErrInvalidArgument)
+	}
+	userID := *comment.AuthorID
+
+	s := r.strategy()
+	run := retrier{
+		policy: s.policy,
+		// ssi の直列化失敗と、unique モードの採番衝突の両方をやり直します。
+		// **どちらもトランザクションごと巻き戻る**ので、
+		// 冪等キーの記録も一緒に消えて、やり直しで再度 INSERT されます。
+		retryable: func(err error) bool {
+			return IsRetryable(err) || isCommentSeqConflict(err)
+		},
+		attrs: []slog.Attr{
+			slog.Int64("thread_id", comment.ThreadID),
+			slog.String("mode", string(r.mode)),
+			slog.Bool("idempotent", true),
+		},
+	}
+
+	var row sqlcgen.CreateCommentWithSeqRow
+	attempts, err := run.do(ctx, func() error {
+		row, replayed = sqlcgen.CreateCommentWithSeqRow{}, nil
+		return runInTx(ctx, op, r.pool, s.iso, func(tx pgx.Tx, q *sqlcgen.Queries) error {
+			if timeoutErr := setStatementTimeout(ctx, tx, idempotencyWaitTimeout); timeoutErr != nil {
+				return translateError(op, timeoutErr)
+			}
+			return r.claimAndInsert(ctx, q, comment, req, userID, encode, &row, &replayed)
+		})
+	})
+	if err != nil {
+		// 待ちを打ち切られたのは競合であって、サーバの不具合ではありません。
+		//
+		// **PgError を捨てずに包みます。** ここで apperr.ErrConflict だけにすると、
+		// IsRetryable が「競合だからやり直す」と判断し、
+		// **3 秒の待ちを最大 12 回繰り返す**ことになります。
+		if isStatementTimeout(err) {
+			return nil, nil, fmt.Errorf("%s: 冪等キーの待ちが %s を超えました: %w",
+				op, idempotencyWaitTimeout, errors.Join(err, apperr.ErrConflict))
+		}
+		return nil, nil, err
+	}
+
+	if replayed != nil {
+		slog.LogAttrs(ctx, slog.LevelInfo, "idempotent_replay",
+			slog.Int64("thread_id", comment.ThreadID),
+			slog.Int64("user_id", userID),
+			slog.String("endpoint", req.Endpoint),
+		)
+		return nil, replayed, nil
+	}
+
+	created = r.toModel(row, comment.AuthorID)
+	slog.LogAttrs(ctx, slog.LevelInfo, "comment_created",
+		slog.Int64("thread_id", created.ThreadID),
+		slog.Int64("comment_id", created.ID),
+		slog.Int("seq", int(created.Seq)),
+		slog.Int("attempts", attempts),
+		slog.String("mode", string(r.mode)),
+		slog.Bool("idempotent", true),
+	)
+	return created, nil, nil
+}
+
+// claimAndInsert は ADR 0015 の「処理の流れ」をそのまま実装したものです。
+//
+//  1. INSERT ... ON CONFLICT DO NOTHING で先着を決める
+//     ├─ 挿入できた   → 処理を実行 → response を記録
+//     └─ 挿入できない → 既存行を読む
+//     ├─ request_hash が違う → 422
+//     └─ 一致する           → 記録した response を返す
+func (r *CommentRepository) claimAndInsert(
+	ctx context.Context, q *sqlcgen.Queries, comment *model.Comment,
+	req idempotency.Request, userID int64,
+	encode func(*model.Comment) ([]byte, error),
+	row *sqlcgen.CreateCommentWithSeqRow, replayed *[]byte,
+) error {
+	const op = "CommentRepository.CreateIdempotent"
+
+	_, err := q.ClaimIdempotencyKey(ctx, sqlcgen.ClaimIdempotencyKeyParams{
+		UserID:      userID,
+		Key:         req.Key,
+		Endpoint:    req.Endpoint,
+		RequestHash: req.RequestHash,
+	})
+	switch {
+	case err == nil:
+		// 先着。ここから下は初回の処理。
+	case errors.Is(err, pgx.ErrNoRows):
+		// 既に取られている。**待った結果ここに来ているので、相手はコミット済み。**
+		return r.replayRecorded(ctx, q, req, userID, replayed)
+	default:
+		return translateError(op, err)
+	}
+
+	inserted, err := r.insertComment(ctx, q, comment)
+	if err != nil {
+		return err
+	}
+
+	body, err := encode(r.toModel(inserted, comment.AuthorID))
+	if err != nil {
+		return fmt.Errorf("%s: 応答を記録できませんでした: %w", op, err)
+	}
+
+	status := int32(http.StatusCreated)
+	affected, err := q.CompleteIdempotencyKey(ctx, sqlcgen.CompleteIdempotencyKeyParams{
+		UserID:         userID,
+		Key:            req.Key,
+		ResponseStatus: &status,
+		ResponseBody:   body,
+	})
+	if err != nil {
+		return translateError(op, err)
+	}
+	if affected != 1 {
+		// 自分が確保した行なので、必ず 1 行のはず。
+		// 0 行なら「キーは確保したが応答を記録していない」状態でコミットされ、
+		// 次の再送が永久に待つ側に倒れる。**コミットさせない。**
+		return fmt.Errorf("%s: 冪等キーの記録が %d 行に当たりました: %w",
+			op, affected, apperr.ErrConflict)
+	}
+
+	*row = inserted
+	return nil
+}
+
+// replayRecorded は記録済みの応答を取り出します。
+func (r *CommentRepository) replayRecorded(
+	ctx context.Context, q *sqlcgen.Queries, req idempotency.Request,
+	userID int64, replayed *[]byte,
+) error {
+	const op = "CommentRepository.CreateIdempotent"
+
+	existing, err := q.GetIdempotencyKey(ctx, sqlcgen.GetIdempotencyKeyParams{
+		UserID: userID,
+		Key:    req.Key,
+	})
+	if err != nil {
+		return translateError(op, err)
+	}
+
+	// **同じキーで別の内容。** 黙って前回の結果を返すと、
+	// クライアントのバグが見えなくなる (ADR 0015)。
+	if existing.RequestHash != req.RequestHash {
+		return fmt.Errorf(
+			"%s: 同じ Idempotency-Key で別の内容が送られました: %w",
+			op, apperr.ErrFailedPrecondition)
+	}
+
+	// 記録が無いのは「確保したが応答を書かずにコミットされた」場合だけ。
+	// 決定 3 (同一トランザクション) が守られている限り起きない。
+	// 起きたら再試行では解決しないが、24 時間で行が消えるので競合として返す。
+	if existing.CompletedAt == nil || len(existing.ResponseBody) == 0 {
+		return fmt.Errorf(
+			"%s: 冪等キーの記録が未完了のままです (key=%s): %w",
+			op, req.Key, apperr.ErrConflict)
+	}
+
+	*replayed = existing.ResponseBody
+	return nil
+}
+
+// insertComment はモードに応じてコメントを 1 件挿入します。
+func (r *CommentRepository) insertComment(
+	ctx context.Context, q *sqlcgen.Queries, comment *model.Comment,
+) (sqlcgen.CreateCommentWithSeqRow, error) {
+	const op = "CommentRepository.Create"
+
+	if r.mode == config.CommentPostModeUnique {
+		// 1 文で採番する。トランザクションの中でもそのまま使える。
+		row, err := q.CreateCommentAutoSeq(ctx, sqlcgen.CreateCommentAutoSeqParams{
+			ThreadID:   comment.ThreadID,
+			AuthorName: comment.AuthorName,
+			Body:       comment.Body,
+			AuthorID:   comment.AuthorID,
+		})
+		if err != nil {
+			return sqlcgen.CreateCommentWithSeqRow{}, translateError(op, err)
+		}
+		return sqlcgen.CreateCommentWithSeqRow(row), nil
+	}
+
+	return r.insertWithSeq(ctx, q, comment, r.strategy().lockParent)
 }
 
 // ensureThreadAlive は親スレッドが生存していることを確かめます。
@@ -268,8 +502,14 @@ func (r *CommentRepository) strategy() postStrategy {
 		// 一意制約違反を偶然やり過ごして「壊れていない」ように見えてしまう。
 		// このモードの役目は壊れることを見せることにある。
 		return postStrategy{iso: pgx.ReadCommitted, lockParent: false, policy: noRetryPolicy}
+	case config.CommentPostModeUnique:
+		// 通常の投稿はトランザクションを持たない (createAutoSeq が 1 文で完結する)。
+		// **冪等キーがあるときだけ**この方針でトランザクションに入る ——
+		// キーの記録を主トランザクションに同居させる必要があるため
+		// (docs/adr/0015-idempotency.md 決定 3)。
+		return postStrategy{iso: pgx.ReadCommitted, lockParent: false, policy: r.retry}
 	default:
-		// ssi。unique は createAutoSeq が処理するのでここには来ない。
+		// ssi。
 		return postStrategy{iso: pgx.Serializable, lockParent: false, policy: r.retry}
 	}
 }

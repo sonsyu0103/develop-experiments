@@ -23,11 +23,13 @@ import (
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
+	"develop-experiments/apps/go-api/internal/idempotency"
 	"develop-experiments/apps/go-api/internal/logging"
 	"develop-experiments/apps/go-api/internal/pagination"
 	threadmodel "develop-experiments/apps/go-api/internal/thread/domain/model"
 	threadrepo "develop-experiments/apps/go-api/internal/thread/domain/repository"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
+	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
 )
 
 func TestMain(m *testing.M) {
@@ -108,6 +110,15 @@ type fakeCommentRepo struct {
 	err      error
 	// created は Create に渡された値です。
 	created *commentmodel.Comment
+
+	// 冪等キーの記録。キー -> 応答本文 / 要求の指紋。
+	recorded     map[string][]byte
+	recordedHash map[string]string
+	// createCalls は実際に投稿された回数です。
+	createCalls int
+	// gotIdempotency は永続化層まで届いたキーの情報です。
+	// **nil のままなら、ヘッダが握りつぶされている**ことになります。
+	gotIdempotency *idempotency.Request
 }
 
 var _ commentrepo.CommentRepository = (*fakeCommentRepo)(nil)
@@ -133,6 +144,38 @@ func (f *fakeCommentRepo) Create(_ context.Context, c *commentmodel.Comment) (*c
 	}
 	// レス番号は永続化層が採番する。フェイクなので固定値を返す。
 	return commentmodel.Reconstruct(7, c.ThreadID, 3, c.AuthorName, author, c.Body, time.Unix(0, 0).UTC()), nil
+}
+
+// CreateIdempotent は「同じキーなら 1 回しか作らない」ところだけを再現します。
+func (f *fakeCommentRepo) CreateIdempotent(
+	ctx context.Context, c *commentmodel.Comment, req idempotency.Request,
+	encode func(*commentmodel.Comment) ([]byte, error),
+) (*commentmodel.Comment, []byte, error) {
+	if f.recorded == nil {
+		f.recorded = map[string][]byte{}
+		f.recordedHash = map[string]string{}
+	}
+	f.gotIdempotency = &req
+
+	if body, ok := f.recorded[req.Key]; ok {
+		if f.recordedHash[req.Key] != req.RequestHash {
+			return nil, nil, fmt.Errorf("同じキーで別の内容: %w", apperr.ErrFailedPrecondition)
+		}
+		return nil, body, nil
+	}
+
+	created, err := f.Create(ctx, c)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, err := encode(created)
+	if err != nil {
+		return nil, nil, err
+	}
+	f.recorded[req.Key] = body
+	f.recordedHash[req.Key] = req.RequestHash
+	f.createCalls++
+	return created, nil, nil
 }
 
 func (f *fakeCommentRepo) SoftDelete(context.Context, int64, int64) error { return f.err }
@@ -1007,5 +1050,145 @@ func TestPanic_IsLoggedAsError(t *testing.T) {
 	}
 	if !sawRequest {
 		t.Error("http_request のログが出ていない (パニックで巻き戻されている)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 冪等キー (docs/adr/0015-idempotency.md)
+// ---------------------------------------------------------------------------
+
+// doAs はログイン済みの利用者としてリクエストを送ります。
+//
+// 認証の設定が無い環境では resolveSession が何もしない (c.Next() で素通しする)
+// ため、コンテキストに直接 principal を載せれば認証済みを再現できます。
+func (e *testEnv) doAs(
+	t *testing.T, userID int64, method, path, body string, headers map[string]string,
+) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	if userID != 0 {
+		ctx := context.WithValue(req.Context(), principalKey{},
+			&userusecase.PrincipalDTO{UserID: userID})
+		req = req.WithContext(ctx)
+	}
+
+	rec := httptest.NewRecorder()
+	e.router.ServeHTTP(rec, req)
+	return rec
+}
+
+// ログイン済み + ヘッダありなら、冪等な経路を通ること。
+func TestCreateComment_IdempotencyKeyReachesRepository(t *testing.T) {
+	env := newTestEnv(t)
+
+	rec := env.doAs(t, 42, http.MethodPost, "/threads/2/comments", `{"body":"ふぁ〜"}`,
+		map[string]string{"Idempotency-Key": "key-1"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	got := env.comments.gotIdempotency
+	if got == nil {
+		t.Fatal("Idempotency-Key が永続化層まで届いていない (握りつぶされている)")
+	}
+	if got.Key != "key-1" {
+		t.Errorf("Key = %q, want key-1", got.Key)
+	}
+	// **経路は具体的なパスであること。**
+	// 雛形 (/threads/:threadId/comments) だと、別スレッドへの投稿が
+	// 「同じ内容の再送」と判定される。
+	if !strings.Contains(got.Endpoint, "/threads/2/comments") {
+		t.Errorf("Endpoint = %q, want 具体的なパスを含む", got.Endpoint)
+	}
+}
+
+// 同じキーで 2 回送っても投稿は 1 回。
+func TestCreateComment_IdempotentReplay(t *testing.T) {
+	env := newTestEnv(t)
+	headers := map[string]string{"Idempotency-Key": "key-1"}
+
+	first := env.doAs(t, 42, http.MethodPost, "/threads/2/comments", `{"body":"ふぁ〜"}`, headers)
+	second := env.doAs(t, 42, http.MethodPost, "/threads/2/comments", `{"body":"ふぁ〜"}`, headers)
+
+	if first.Code != http.StatusCreated || second.Code != http.StatusCreated {
+		t.Fatalf("status = %d, %d, want 201, 201", first.Code, second.Code)
+	}
+	if env.comments.createCalls != 1 {
+		t.Errorf("投稿が %d 回行われた, want 1 (二重投稿)", env.comments.createCalls)
+	}
+	if first.Body.String() != second.Body.String() {
+		t.Errorf("再送で別の応答が返った:\n1: %s\n2: %s", first.Body.String(), second.Body.String())
+	}
+}
+
+// 同じキーで別の内容を送ったら 422。
+func TestCreateComment_IdempotencyKeyReuseIs422(t *testing.T) {
+	env := newTestEnv(t)
+	headers := map[string]string{"Idempotency-Key": "key-1"}
+
+	if rec := env.doAs(t, 42, http.MethodPost, "/threads/2/comments",
+		`{"body":"ふぁ〜"}`, headers); rec.Code != http.StatusCreated {
+		t.Fatalf("1 回目の status = %d, want 201", rec.Code)
+	}
+
+	rec := env.doAs(t, 42, http.MethodPost, "/threads/2/comments", `{"body":"おはよう"}`, headers)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if code := decodeError(t, rec).Error.Code; code != oapigen.FAILEDPRECONDITION {
+		t.Errorf("code = %q, want FAILED_PRECONDITION", code)
+	}
+	if env.comments.createCalls != 1 {
+		t.Errorf("投稿が %d 回行われた, want 1", env.comments.createCalls)
+	}
+}
+
+// **匿名ではヘッダを無視する** (ADR 0015 決定 4)。
+//
+// エラーにせず無視するのは、ログインの有無でクライアントの実装を
+// 分けさせないため。この非対称は仕様書に明記してある。
+func TestCreateComment_IdempotencyKeyIgnoredWhenAnonymous(t *testing.T) {
+	env := newTestEnv(t)
+
+	rec := env.doAs(t, 0, http.MethodPost, "/threads/2/comments", `{"body":"ふぁ〜"}`,
+		map[string]string{"Idempotency-Key": "key-1"})
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (匿名でも投稿できる)", rec.Code)
+	}
+	if env.comments.gotIdempotency != nil {
+		t.Error("匿名なのに冪等な経路を通った (他人のキーと衝突しうる)")
+	}
+}
+
+// ヘッダが無ければ従来どおりの経路を通ること。
+// 必須にすると既存クライアントが即座に壊れる。
+func TestCreateComment_WithoutIdempotencyKey(t *testing.T) {
+	env := newTestEnv(t)
+
+	rec := env.doAs(t, 42, http.MethodPost, "/threads/2/comments", `{"body":"ふぁ〜"}`, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", rec.Code)
+	}
+	if env.comments.gotIdempotency != nil {
+		t.Error("ヘッダが無いのに冪等な経路を通った")
+	}
+}
+
+// 空のヘッダは 400。仕様書の minLength が弾く。
+func TestCreateComment_EmptyIdempotencyKeyIsRejected(t *testing.T) {
+	env := newTestEnv(t)
+
+	rec := env.doAs(t, 42, http.MethodPost, "/threads/2/comments", `{"body":"ふぁ〜"}`,
+		map[string]string{"Idempotency-Key": ""})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
 	}
 }

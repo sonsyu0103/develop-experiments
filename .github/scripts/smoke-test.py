@@ -570,6 +570,122 @@ else:
     print("  \033[33mSKIP\033[0m SQL_EXEC が未設定のためスキップ")
 
 # ---------------------------------------------------------------------------
+# 冪等キー (docs/adr/0015-idempotency.md)
+# ---------------------------------------------------------------------------
+#
+# **ユニットテストでは検証できない領域。**
+# キーの確保・投稿・応答の記録を 1 トランザクションに同居させる (決定 3) 部分は、
+# フェイクのリポジトリでは再現できない。ON CONFLICT DO NOTHING が
+# 未コミットの行を待つ挙動も、実 DB でしか出ない。
+
+if SQL_EXEC and auth_enabled:
+    section("冪等キー (ADR 0015)")
+
+    idem_token = "smoke-idem-" + secrets.token_hex(16)
+    idem_hash = hashlib.sha256(idem_token.encode()).hexdigest()
+    # 名前空間の検証用にもう 1 人。同じキーを使っても衝突しないこと。
+    other_token = "smoke-idem2-" + secrets.token_hex(16)
+    other_hash = hashlib.sha256(other_token.encode()).hexdigest()
+
+    try:
+        for uid, sub, sess in [
+            (900010, "smoke-sub-idem", idem_hash),
+            (900011, "smoke-sub-idem2", other_hash),
+        ]:
+            sql(f"""
+                INSERT INTO users (id, public_id, google_sub, email, display_name)
+                VALUES ({uid},
+                        '01920000-0000-7000-8000-000000{uid}'::uuid,
+                        '{sub}', '{sub}@example.com', '冪等検証')
+                ON CONFLICT (google_sub) DO NOTHING;
+            """)
+            sql(f"""
+                INSERT INTO sessions (id, user_id, expires_at)
+                VALUES ('{sess}', {uid}, now() + interval '5 minutes');
+            """)
+
+        me = {"Cookie": f"session={idem_token}"}
+        other = {"Cookie": f"session={other_token}"}
+
+        status, thread, _ = call("POST", "/threads", '{"title":"冪等キーの検証"}', headers=me)
+        if status != 201:
+            check("検証用スレッドを作れる", False, f"status={status}")
+        else:
+            tid = thread["id"]
+            key = "smoke-key-" + secrets.token_hex(8)
+            headers = dict(me, **{"Idempotency-Key": key})
+            body = '{"body":"二重送信の検証"}'
+
+            s1, first, _ = call("POST", f"/threads/{tid}/comments", body, headers=headers)
+            s2, second, _ = call("POST", f"/threads/{tid}/comments", body, headers=headers)
+
+            check("同じキーで 2 回送っても両方 201", s1 == 201 and s2 == 201, f"status={s1}, {s2}")
+            # **ここが主題。** 記録した応答をそのまま返すので、
+            # レス番号まで含めて一致する。
+            check("再送で同じ応答が返る", first == second, f"1: {first}\n2: {second}")
+
+            status, listed, _ = call("GET", f"/threads/{tid}/comments")
+            n = len(listed["comments"]) if status == 200 else -1
+            check("投稿は 1 件しか作られない", n == 1, f"件数={n}")
+
+            # 記録が主トランザクションと同時にコミットされていること。
+            # completed_at が NULL のまま残ると、次の再送が永久に待つ側に倒れる。
+            recorded = subprocess.run(
+                shlex.split(SQL_EXEC) + [
+                    "SELECT CASE WHEN count(*) = 1 THEN 'RECORDED' ELSE 'MISSING' END "
+                    f"FROM idempotency_keys WHERE user_id = 900010 AND key = '{key}' "
+                    "AND completed_at IS NOT NULL AND response_status = 201 "
+                    "AND response_body IS NOT NULL;"],
+                check=True, capture_output=True, text=True).stdout
+            check("応答が記録されている (completed_at と response_body が入る)",
+                  "RECORDED" in recorded, f"got={recorded.strip()!r}")
+
+            # 同じキーで別の内容 -> 422。黙って前回の結果を返さない。
+            s3, err3, _ = call("POST", f"/threads/{tid}/comments",
+                               '{"body":"別の内容"}', headers=headers)
+            code3 = err3["error"]["code"] if isinstance(err3, dict) and "error" in err3 else ""
+            check("同じキーで別の内容は 422", s3 == 422 and code3 == "FAILED_PRECONDITION",
+                  f"status={s3} code={code3}")
+
+            # **キーはユーザーごとに名前空間が分かれる。**
+            # 分かれていないと、他人の投稿結果が返るという最悪の事故になる。
+            s4, mine, _ = call("POST", f"/threads/{tid}/comments",
+                               '{"body":"別の人の投稿"}',
+                               headers=dict(other, **{"Idempotency-Key": key}))
+            check("別の利用者が同じキーを使っても衝突しない", s4 == 201, f"status={s4}")
+            if s4 == 201:
+                check("他人の投稿結果が返らない",
+                      mine.get("body") == "別の人の投稿", f"got={mine.get('body')!r}")
+
+            # 匿名ではヘッダを無視する (決定 4)。記録も残らない。
+            anon_key = "smoke-anon-" + secrets.token_hex(8)
+            s5, _, _ = call("POST", f"/threads/{tid}/comments", '{"body":"匿名の投稿"}',
+                            headers={"Idempotency-Key": anon_key})
+            check("匿名でもヘッダ付きで投稿できる (無視される)", s5 == 201, f"status={s5}")
+
+            ignored = subprocess.run(
+                shlex.split(SQL_EXEC) + [
+                    "SELECT CASE WHEN count(*) = 0 THEN 'NOT_RECORDED' ELSE 'RECORDED' END "
+                    f"FROM idempotency_keys WHERE key = '{anon_key}';"],
+                check=True, capture_output=True, text=True).stdout
+            check("匿名の投稿はキーを記録しない", "NOT_RECORDED" in ignored,
+                  f"got={ignored.strip()!r}")
+
+            sql(f"DELETE FROM threads WHERE id = {tid};")
+    finally:
+        sql("DELETE FROM idempotency_keys WHERE user_id IN (900010, 900011);")
+        sql("DELETE FROM threads WHERE author_id IN (900010, 900011);")
+        sql("DELETE FROM sessions WHERE user_id IN (900010, 900011);")
+        sql("DELETE FROM users WHERE id IN (900010, 900011);")
+else:
+    section("冪等キー (ADR 0015)")
+    # **CI ではここが必ずスキップされる。**
+    # 資格情報が無いと auth が nil になり、resolveSession がセッションを
+    # 解決しないため、常に匿名として扱われる。匿名は冪等キーの対象外 (決定 4)。
+    # docs/adr/0003-open-questions.md の未決 #16 を参照。
+    print("  \033[33mSKIP\033[0m 認証が未設定のためスキップ (セッションが要る)")
+
+# ---------------------------------------------------------------------------
 
 print()
 if failures:

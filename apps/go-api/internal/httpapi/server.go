@@ -14,6 +14,7 @@ import (
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
+	"develop-experiments/apps/go-api/internal/idempotency"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
@@ -288,7 +289,9 @@ func (s *Server) ListComments(
 }
 
 // CreateComment は POST /threads/{threadId}/comments を処理します。
-func (s *Server) CreateComment(c *gin.Context, threadID oapigen.ThreadId) {
+func (s *Server) CreateComment(
+	c *gin.Context, threadID oapigen.ThreadId, params oapigen.CreateCommentParams,
+) {
 	if err := validateThreadID(threadID); err != nil {
 		respondError(c, err)
 		return
@@ -305,14 +308,49 @@ func (s *Server) CreateComment(c *gin.Context, threadID oapigen.ThreadId) {
 		authorName = *req.AuthorName
 	}
 
-	comment, err := s.comments.PostComment(c.Request.Context(), threadID, authorName, req.Body,
-		authorIDFromContext(c.Request.Context()))
+	ctx := c.Request.Context()
+	authorID := authorIDFromContext(ctx)
+
+	// **匿名では冪等キーを無視する** (docs/adr/0015-idempotency.md 決定 4)。
+	// キーの名前空間を分ける手段が無く、IP で分けると NAT の背後で
+	// 他人のキーと衝突して「他人の投稿結果が返る」ことになる。
+	//
+	// エラーにせず無視するのは、ログインの有無でクライアントの実装を
+	// 分けさせないため。この非対称は仕様書に明記してある。
+	if key := params.IdempotencyKey; key != nil && authorID != nil {
+		idem, err := idempotency.New(*key, idempotencyEndpoint(c),
+			authorName, req.Body)
+		if err != nil {
+			respondError(c, err)
+			return
+		}
+
+		comment, err := s.comments.PostCommentIdempotent(
+			ctx, threadID, authorName, req.Body, authorID, *idem)
+		if err != nil {
+			respondError(c, err)
+			return
+		}
+		c.JSON(http.StatusCreated, toWireComment(comment))
+		return
+	}
+
+	comment, err := s.comments.PostComment(ctx, threadID, authorName, req.Body, authorID)
 	if err != nil {
 		respondError(c, err)
 		return
 	}
 
 	c.JSON(http.StatusCreated, toWireComment(comment))
+}
+
+// idempotencyEndpoint は冪等キーの指紋に含める経路名です。
+//
+// **具体的なパスを使います。** ルートの雛形 (/threads/:threadId/comments) だと
+// スレッドが違っても同じ値になり、同じキーで別スレッドへ投稿したときに
+// 「同じ内容の再送」と判定されてしまいます。
+func idempotencyEndpoint(c *gin.Context) string {
+	return c.Request.Method + " " + c.Request.URL.Path
 }
 
 // ---------------------------------------------------------------------------

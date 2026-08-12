@@ -424,7 +424,7 @@ export interface components {
                  * @example NOT_FOUND
                  * @enum {string}
                  */
-                code: "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "UNAVAILABLE" | "INTERNAL";
+                code: "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "FAILED_PRECONDITION" | "UNAVAILABLE" | "INTERNAL";
                 /**
                  * @description 人間向けの説明。文言は予告なく変わるため分岐に使わないでください。
                  * @example 対象のリソースが見つかりません
@@ -487,6 +487,28 @@ export interface components {
     parameters: {
         /** @description スレッド ID */
         ThreadId: number;
+        /**
+         * @description 二重送信を防ぐためのキー。クライアントが投稿ごとに 1 つ生成します
+         *     (UUID v4 など、推測されない値)。
+         *
+         *     タイムアウト後の再送・回線の切り替え・複数タブ・送信直後のリロードで
+         *     **同じ投稿が 2 件できる**のを防ぎます。送信中のボタン無効化では
+         *     「タイムアウトしたが実は成功していた」を原理的に防げません
+         *     (docs/adr/0015-idempotency.md 決定 1)。
+         *
+         *     - **省略できます。** 省略した場合は冪等性なしで処理します
+         *       (必須にすると既存クライアントが即座に壊れるため)
+         *     - **同じキーで再送すると、前回の結果がそのまま返ります**
+         *       (処理は 1 回しか行われません)
+         *     - **同じキーで別の内容を送ると 422 になります。**
+         *       黙って前回の結果を返すと、クライアントのバグが見えなくなるため
+         *     - **未ログインでは無視されます。** 匿名にはキーの名前空間を分ける
+         *       手段がなく、IP で分けると NAT の背後で他人と衝突します
+         *       (同 決定 4)。この非対称は仕様として明記しています
+         *     - 記録は **24 時間**で削除されます。それ以降の再送は新規投稿になります
+         * @example 6f0c2a1e-6e6a-4e2f-9c4a-2f0f7f2d5c11
+         */
+        IdempotencyKey: string;
         /**
          * @description 次ページの取得位置を表す不透明トークン。
          *     直前のレスポンスの `nextCursor` をそのまま渡します。
@@ -803,7 +825,30 @@ export interface operations {
     createComment: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description 二重送信を防ぐためのキー。クライアントが投稿ごとに 1 つ生成します
+                 *     (UUID v4 など、推測されない値)。
+                 *
+                 *     タイムアウト後の再送・回線の切り替え・複数タブ・送信直後のリロードで
+                 *     **同じ投稿が 2 件できる**のを防ぎます。送信中のボタン無効化では
+                 *     「タイムアウトしたが実は成功していた」を原理的に防げません
+                 *     (docs/adr/0015-idempotency.md 決定 1)。
+                 *
+                 *     - **省略できます。** 省略した場合は冪等性なしで処理します
+                 *       (必須にすると既存クライアントが即座に壊れるため)
+                 *     - **同じキーで再送すると、前回の結果がそのまま返ります**
+                 *       (処理は 1 回しか行われません)
+                 *     - **同じキーで別の内容を送ると 422 になります。**
+                 *       黙って前回の結果を返すと、クライアントのバグが見えなくなるため
+                 *     - **未ログインでは無視されます。** 匿名にはキーの名前空間を分ける
+                 *       手段がなく、IP で分けると NAT の背後で他人と衝突します
+                 *       (同 決定 4)。この非対称は仕様として明記しています
+                 *     - 記録は **24 時間**で削除されます。それ以降の再送は新規投稿になります
+                 * @example 6f0c2a1e-6e6a-4e2f-9c4a-2f0f7f2d5c11
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
             path: {
                 /** @description スレッド ID */
                 threadId: components["parameters"]["ThreadId"];
@@ -839,8 +884,26 @@ export interface operations {
              * @description 同時更新が競合しました。再試行可能です。
              *     SERIALIZABLE 分離レベルでの直列化失敗 (SQLSTATE 40001) や
              *     デッドロック (40P01) がここに対応します。
+             *
+             *     同じ `Idempotency-Key` の処理がまだ完了していない場合も
+             *     ここに入ります (docs/adr/0015-idempotency.md)。
              */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description **同じ `Idempotency-Key` で、前回と違う内容が送られました。**
+             *
+             *     前回の結果を黙って返すと、クライアントのバグが見えなくなります。
+             *     キーを作り直して送り直してください
+             *     (docs/adr/0015-idempotency.md)。
+             */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

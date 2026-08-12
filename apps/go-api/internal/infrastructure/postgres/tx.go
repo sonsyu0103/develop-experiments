@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"time"
@@ -205,6 +206,18 @@ func (r retrier) logAttrs(err error) []slog.Attr {
 	return attrs
 }
 
+// setStatementTimeout はこのトランザクションの中だけに文の実行上限を設けます。
+//
+// **SET LOCAL なので、コミット / ロールバックで元に戻ります。**
+// 接続はプールへ返されるため、LOCAL でないと後続のリクエストへ漏れます。
+//
+// 値をリテラルで埋め込んでいるのは、`SET` がプレースホルダを受け付けないためです。
+// 引数は呼び出し側の定数だけで、外部入力は入りません。
+func setStatementTimeout(ctx context.Context, tx pgx.Tx, d time.Duration) error {
+	_, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = %d", d.Milliseconds()))
+	return err
+}
+
 // txBeginner はトランザクションを開始できるものです。*pgxpool.Pool が満たします。
 //
 // **具体型ではなくこれを受け取るのは、テストのためです。**
@@ -231,9 +244,12 @@ var _ txBeginner = (*pgxpool.Pool)(nil)
 // 素通しすると、リトライを使い切った最後の失敗が COMMIT 由来だったときに
 // apperr.ErrConflict が付かず、409 であるべき応答が 500 になります
 // (試行中は IsRetryable が生の PgError を見るので表に出ません)。
+// fn が tx を受け取るのは、生成コードで表せない文
+// (`SET LOCAL statement_timeout` など) を流す必要があるためです。
+// 使わない呼び出し側は `_ pgx.Tx` で受けてください。
 func runInTx(
 	ctx context.Context, op string, db txBeginner, iso pgx.TxIsoLevel,
-	fn func(*sqlcgen.Queries) error,
+	fn func(pgx.Tx, *sqlcgen.Queries) error,
 ) error {
 	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
 	if err != nil {
@@ -243,7 +259,7 @@ func runInTx(
 	// 正常系でも安全に呼べます。panic した場合もここで巻き戻ります。
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if err := fn(sqlcgen.New(tx)); err != nil {
+	if err := fn(tx, sqlcgen.New(tx)); err != nil {
 		return err
 	}
 	return translateError(op, tx.Commit(ctx))
