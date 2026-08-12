@@ -288,10 +288,7 @@ func (r *CommentRepository) CreateIdempotent(
 	attempts, err := run.do(ctx, func() error {
 		row, replayed = sqlcgen.CreateCommentWithSeqRow{}, nil
 		return runInTx(ctx, op, r.pool, s.iso, func(tx pgx.Tx, q *sqlcgen.Queries) error {
-			if timeoutErr := setStatementTimeout(ctx, tx, idempotencyWaitTimeout); timeoutErr != nil {
-				return translateError(op, timeoutErr)
-			}
-			return r.claimAndInsert(ctx, q, comment, req, userID, encode, &row, &replayed)
+			return r.claimAndInsert(ctx, tx, q, comment, req, userID, encode, &row, &replayed)
 		})
 	})
 	if err != nil {
@@ -301,8 +298,17 @@ func (r *CommentRepository) CreateIdempotent(
 		// IsRetryable が「競合だからやり直す」と判断し、
 		// **3 秒の待ちを最大 12 回繰り返す**ことになります。
 		if isStatementTimeout(err) {
-			return nil, nil, fmt.Errorf("%s: 冪等キーの待ちが %s を超えました: %w",
+			return nil, nil, fmt.Errorf("%s: 冪等キーの確保が %s 以内に終わりませんでした: %w",
 				op, idempotencyWaitTimeout, errors.Join(err, apperr.ErrConflict))
+		}
+		// リトライを使い切った採番の衝突は「競合」であって「サーバの不具合」ではありません。
+		//
+		// **createAutoSeq と同じ扱いに揃えます。** ここを素通しすると
+		// 生の 23505 が respondError の default に落ち、
+		// **Idempotency-Key を付けた途端に 409 が 500 に変わります。**
+		if isCommentSeqConflict(err) {
+			return nil, nil, fmt.Errorf(
+				"%s: レス番号の採番が %d 回連続で衝突しました: %w", op, attempts, apperr.ErrConflict)
 		}
 		return nil, nil, err
 	}
@@ -336,12 +342,21 @@ func (r *CommentRepository) CreateIdempotent(
 //     ├─ request_hash が違う → 422
 //     └─ 一致する           → 記録した response を返す
 func (r *CommentRepository) claimAndInsert(
-	ctx context.Context, q *sqlcgen.Queries, comment *model.Comment,
+	ctx context.Context, tx pgx.Tx, q *sqlcgen.Queries, comment *model.Comment,
 	req idempotency.Request, userID int64,
 	encode func(*model.Comment) ([]byte, error),
 	row *sqlcgen.CreateCommentWithSeqRow, replayed *[]byte,
 ) error {
 	const op = "CommentRepository.CreateIdempotent"
+
+	// **上限を張るのはこの 1 文だけ。**
+	// トランザクション全体に効かせたままにすると、
+	// pessimistic モードの FOR UPDATE 待ちや重い INSERT も同じ 3 秒で切られ、
+	// **すべてが「冪等キーの待ちが長すぎた」という同じ文言の 409 になる。**
+	// 障害の切り分けで誤った結論へ誘導することになる。
+	if err := setStatementTimeout(ctx, tx, idempotencyWaitTimeout); err != nil {
+		return translateError(op, err)
+	}
 
 	_, err := q.ClaimIdempotencyKey(ctx, sqlcgen.ClaimIdempotencyKeyParams{
 		UserID:      userID,
@@ -349,6 +364,13 @@ func (r *CommentRepository) claimAndInsert(
 		Endpoint:    req.Endpoint,
 		RequestHash: req.RequestHash,
 	})
+
+	// 確保の可否にかかわらず、ここで上限を戻す。
+	// 戻し忘れると、下の投稿処理まで 3 秒で切られる。
+	if resetErr := resetStatementTimeout(ctx, tx); resetErr != nil && err == nil {
+		return translateError(op, resetErr)
+	}
+
 	switch {
 	case err == nil:
 		// 先着。ここから下は初回の処理。
@@ -416,11 +438,23 @@ func (r *CommentRepository) replayRecorded(
 
 	// 記録が無いのは「確保したが応答を書かずにコミットされた」場合だけ。
 	// 決定 3 (同一トランザクション) が守られている限り起きない。
-	// 起きたら再試行では解決しないが、24 時間で行が消えるので競合として返す。
+	//
+	// **apperr.ErrConflict を返してはいけない。**
+	// IsRetryable が ErrConflict をリトライ可能と判定するため、
+	// **原理的に解消しない状態を 12 回やり直す**ことになる
+	// (行は 24 時間残るので、何度読んでも同じ結果になる)。
+	// BEGIN → claim → SELECT → ROLLBACK をバックオフつきで空回りさせるだけ。
+	//
+	// 利用者から見た正しい対処は「キーを作り直す」なので 422 に寄せる。
+	// 不変条件が壊れている印なので、記録は ERROR で残す。
 	if existing.CompletedAt == nil || len(existing.ResponseBody) == 0 {
+		slog.LogAttrs(ctx, slog.LevelError, "idempotency_record_incomplete",
+			slog.Int64("user_id", userID),
+			slog.String("endpoint", req.Endpoint),
+		)
 		return fmt.Errorf(
-			"%s: 冪等キーの記録が未完了のままです (key=%s): %w",
-			op, req.Key, apperr.ErrConflict)
+			"%s: 冪等キーの記録が未完了のままです: %w",
+			op, apperr.ErrFailedPrecondition)
 	}
 
 	*replayed = existing.ResponseBody

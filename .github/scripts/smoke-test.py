@@ -640,6 +640,25 @@ if SQL_EXEC and auth_enabled:
             check("応答が記録されている (completed_at と response_body が入る)",
                   "RECORDED" in recorded, f"got={recorded.strip()!r}")
 
+            # **結果に影響しない差で 422 にしない。**
+            # 指紋を「受け取ったままの値」から作ると、ここが落ちる。
+            # ログイン中は authorName が捨てられ、body は TrimSpace される
+            # ので、どちらも投稿結果を変えない。
+            # 422 は再試行では解けないので、誤検出の害が大きい。
+            norm_key = "smoke-norm-" + secrets.token_hex(8)
+            norm_headers = dict(me, **{"Idempotency-Key": norm_key})
+            n1, norm_first, _ = call("POST", f"/threads/{tid}/comments",
+                                     '{"authorName":"ホシノ","body":"正規化の検証"}',
+                                     headers=norm_headers)
+            # 再送では名前欄が空になり、本文の前後に空白が付いている。
+            n2, norm_second, _ = call("POST", f"/threads/{tid}/comments",
+                                      '{"body":"  正規化の検証  "}', headers=norm_headers)
+            check("結果に影響しない差 (名前欄・前後の空白) では 422 にならない",
+                  n1 == 201 and n2 == 201, f"status={n1}, {n2}")
+            if n1 == 201 and n2 == 201:
+                check("その再送でも同じ応答が返る", norm_first == norm_second,
+                      f"1: {norm_first}\n2: {norm_second}")
+
             # 同じキーで別の内容 -> 422。黙って前回の結果を返さない。
             s3, err3, _ = call("POST", f"/threads/{tid}/comments",
                                '{"body":"別の内容"}', headers=headers)

@@ -393,7 +393,8 @@ sqlc の推論型が変わってビルドが落ちた。テストは赤くなる
 スモークテストで確認している。CI の Migration Check でも実行される。
 
 項目数は環境によって変わる。Google の資格情報がある手元では **89 項目**、
-資格情報を持たない CI では認証まわりが減って **73 項目**になる。
+資格情報を持たない CI では認証まわりが減って **74 項目**になる
+(内訳: 認証セクション 4 件 + `/me` 2 件 + 冪等キー 9 件 = 15 件差)。
 
 **この差は放置していい大きさではない。** 冪等キー (9 項目) は
 ログイン済みでしか働かないため、CI で 1 件も検証されていない。
@@ -520,10 +521,11 @@ api/openapi.yaml を書く
 | [ADR 0017](docs/adr/0017-arch-lint-and-depguard.md) | モジュール境界の検査を go-arch-lint に移し、depguard を外す |
 | [ADR 0018](docs/adr/0018-opaque-cursor.md) | カーソルを不透明トークン (base64url + JSON) にする |
 | [ADR 0019](docs/adr/0019-comment-concurrency.md) | コメント投稿の並行制御 —— レス番号を題材に据える |
-
-冪等キーは [ADR 0015](docs/adr/0015-idempotency.md)。
-末尾に「実装して分かったこと」を追記してある。
 | [インフラ構成](docs/infrastructure.md) | AWS 理想構成 (実際にはデプロイしない) |
+
+[ADR 0015](docs/adr/0015-idempotency.md) と
+[ADR 0019](docs/adr/0019-comment-concurrency.md) には、
+実装したあとに分かったこと (設計時の想定が外れた点) を末尾に追記してある。
 
 未決事項は [ADR 0003](docs/adr/0003-open-questions.md) に一覧化している。
 

@@ -14,7 +14,6 @@ import (
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
-	"develop-experiments/apps/go-api/internal/idempotency"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
@@ -318,15 +317,12 @@ func (s *Server) CreateComment(
 	// エラーにせず無視するのは、ログインの有無でクライアントの実装を
 	// 分けさせないため。この非対称は仕様書に明記してある。
 	if key := params.IdempotencyKey; key != nil && authorID != nil {
-		idem, err := idempotency.New(*key, idempotencyEndpoint(c),
-			authorName, req.Body)
-		if err != nil {
-			respondError(c, err)
-			return
-		}
-
+		// **指紋はここで作りません。** ユースケース層が正規化したあとの値で
+		// 組み立てます (受け取ったままの値だと、結果に影響しない差で
+		// 422 になる。ADR 0015 の「実装して分かったこと」7)。
 		comment, err := s.comments.PostCommentIdempotent(
-			ctx, threadID, authorName, req.Body, authorID, *idem)
+			ctx, threadID, authorName, req.Body, authorID,
+			*key, idempotencyEndpoint(c))
 		if err != nil {
 			respondError(c, err)
 			return

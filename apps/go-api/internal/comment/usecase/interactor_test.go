@@ -389,17 +389,14 @@ func TestPostCommentIdempotent_SecondCallDoesNotCreate(t *testing.T) {
 	uc := newInteractor(repo)
 	authorID := int64(42)
 
-	req, err := idempotency.New("key-1", "POST /threads/1/comments", "ホシノ", "ふぁ〜")
-	if err != nil {
-		t.Fatalf("idempotency.New が失敗した: %v", err)
-	}
-
-	first, err := uc.PostCommentIdempotent(t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, *req)
+	first, err := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, "key-1", "POST /threads/1/comments")
 	if err != nil {
 		t.Fatalf("1 回目が失敗した: %v", err)
 	}
 
-	second, err := uc.PostCommentIdempotent(t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, *req)
+	second, err := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, "key-1", "POST /threads/1/comments")
 	if err != nil {
 		t.Fatalf("2 回目が失敗した: %v", err)
 	}
@@ -422,27 +419,86 @@ func TestPostCommentIdempotent_DifferentBodyIsRejected(t *testing.T) {
 	uc := newInteractor(repo)
 	authorID := int64(42)
 
-	first, err := idempotency.New("key-1", "POST /threads/1/comments", "ホシノ", "ふぁ〜")
-	if err != nil {
-		t.Fatalf("idempotency.New が失敗した: %v", err)
-	}
 	if _, postErr := uc.PostCommentIdempotent(
-		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, *first); postErr != nil {
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID,
+		"key-1", "POST /threads/1/comments"); postErr != nil {
 		t.Fatalf("1 回目が失敗した: %v", postErr)
 	}
 
 	// 同じキー、違う本文。
-	second, err := idempotency.New("key-1", "POST /threads/1/comments", "ホシノ", "おはよう")
-	if err != nil {
-		t.Fatalf("idempotency.New が失敗した: %v", err)
-	}
-	_, err = uc.PostCommentIdempotent(t.Context(), 1, "ホシノ", "おはよう", &authorID, *second)
+	_, err := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "おはよう", &authorID, "key-1", "POST /threads/1/comments")
 
 	if !errors.Is(err, apperr.ErrFailedPrecondition) {
 		t.Fatalf("err = %v, want apperr.ErrFailedPrecondition (422)", err)
 	}
 	if repo.createCalls != 1 {
 		t.Errorf("投稿が %d 回行われた, want 1", repo.createCalls)
+	}
+}
+
+// **結果に影響しない差で 422 にしないこと。**
+//
+// 指紋を「受け取ったままの値」から作ると、ここが 422 になる。
+// 422 は再試行では絶対に解けない (キーを作り直すしかない) ので、
+// 利用者から見て同じ操作が永久に通らなくなる。
+func TestPostCommentIdempotent_NormalizedFieldsDoNotChangeFingerprint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		firstAuthorName string
+		firstBody       string
+		retryAuthorName string
+		retryBody       string
+	}{
+		{
+			// ログイン中は authorName が捨てられる (model.NewComment)。
+			// 投稿結果は変わらないのに、指紋だけが変わってはいけない。
+			name:            "再送で名前欄が空になっても同じ",
+			firstAuthorName: "ホシノ", firstBody: "ふぁ〜",
+			retryAuthorName: "", retryBody: "ふぁ〜",
+		},
+		{
+			name:            "再送で名前欄が変わっても同じ",
+			firstAuthorName: "ホシノ", firstBody: "ふぁ〜",
+			retryAuthorName: "先生", retryBody: "ふぁ〜",
+		},
+		{
+			// 本文は TrimSpace される。末尾の空白の有無で別物にしない。
+			name:            "本文の前後の空白は無視される",
+			firstAuthorName: "ホシノ", firstBody: "ふぁ〜",
+			retryAuthorName: "ホシノ", retryBody: "  ふぁ〜  ",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			repo := newFakeCommentRepo(0)
+			uc := newInteractor(repo)
+			authorID := int64(42)
+
+			first, err := uc.PostCommentIdempotent(t.Context(), 1,
+				tt.firstAuthorName, tt.firstBody, &authorID, "key-1", "POST /threads/1/comments")
+			if err != nil {
+				t.Fatalf("1 回目が失敗した: %v", err)
+			}
+
+			second, err := uc.PostCommentIdempotent(t.Context(), 1,
+				tt.retryAuthorName, tt.retryBody, &authorID, "key-1", "POST /threads/1/comments")
+			if err != nil {
+				t.Fatalf("再送が失敗した (結果に影響しない差で 422 になっている): %v", err)
+			}
+
+			if repo.createCalls != 1 {
+				t.Errorf("投稿が %d 回行われた, want 1", repo.createCalls)
+			}
+			if first.ID != second.ID {
+				t.Errorf("再送で別の投稿になった: %+v vs %+v", first, second)
+			}
+		})
 	}
 }
 
@@ -457,12 +513,8 @@ func TestPostCommentIdempotent_AnonymousIsRejected(t *testing.T) {
 	repo := newFakeCommentRepo(0)
 	uc := newInteractor(repo)
 
-	req, err := idempotency.New("key-1", "POST /threads/1/comments", "", "ふぁ〜")
-	if err != nil {
-		t.Fatalf("idempotency.New が失敗した: %v", err)
-	}
-
-	_, err = uc.PostCommentIdempotent(t.Context(), 1, "", "ふぁ〜", nil, *req)
+	_, err := uc.PostCommentIdempotent(
+		t.Context(), 1, "", "ふぁ〜", nil, "key-1", "POST /threads/1/comments")
 	if !errors.Is(err, apperr.ErrInvalidArgument) {
 		t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
 	}
@@ -480,19 +532,36 @@ func TestPostCommentIdempotent_RequestReachesRepository(t *testing.T) {
 	uc := newInteractor(repo)
 	authorID := int64(42)
 
-	req, err := idempotency.New("key-xyz", "POST /threads/1/comments", "ホシノ", "ふぁ〜")
-	if err != nil {
-		t.Fatalf("idempotency.New が失敗した: %v", err)
-	}
-	if _, err := uc.PostCommentIdempotent(
-		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, *req); err != nil {
+	if _, err := uc.PostCommentIdempotent(t.Context(), 1, "ホシノ", "ふぁ〜", &authorID,
+		"key-xyz", "POST /threads/1/comments"); err != nil {
 		t.Fatalf("PostCommentIdempotent が失敗した: %v", err)
 	}
 
 	if repo.gotRequest.Key != "key-xyz" {
 		t.Errorf("リポジトリが受け取ったキー = %q, want key-xyz", repo.gotRequest.Key)
 	}
-	if repo.gotRequest.RequestHash != req.RequestHash {
+	if repo.gotRequest.RequestHash == "" {
 		t.Error("指紋がリポジトリまで届いていない (別内容の検出が効かない)")
+	}
+	if repo.gotRequest.Endpoint != "POST /threads/1/comments" {
+		t.Errorf("経路 = %q, want POST /threads/1/comments", repo.gotRequest.Endpoint)
+	}
+}
+
+// 不正なキーは投稿より先に弾くこと。
+func TestPostCommentIdempotent_InvalidKeyIsRejected(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	uc := newInteractor(repo)
+	authorID := int64(42)
+
+	_, err := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, "   ", "POST /threads/1/comments")
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
+	}
+	if repo.createCalls != 0 {
+		t.Errorf("キーが不正なのに投稿された (%d 回)", repo.createCalls)
 	}
 }

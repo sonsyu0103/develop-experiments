@@ -144,7 +144,7 @@ func (i *CommentInteractor) PostComment(
 // 他人の結果を返す事故に直結するのでここでも弾きます。
 func (i *CommentInteractor) PostCommentIdempotent(
 	ctx context.Context, threadID int64, authorName, body string, authorID *int64,
-	req idempotency.Request,
+	key, endpoint string,
 ) (CommentDTO, error) {
 	if authorID == nil {
 		return CommentDTO{}, fmt.Errorf(
@@ -156,6 +156,23 @@ func (i *CommentInteractor) PostCommentIdempotent(
 		return CommentDTO{}, err
 	}
 
+	// **指紋は正規化したあとの値から作ります。**
+	//
+	// 受け取ったままの値を使うと、結果に影響しない差で 422 になります。
+	//   - authorName はログイン中には捨てられる (NewComment)。
+	//     入っていても投稿結果は変わらないのに、指紋だけが変わる
+	//   - body は TrimSpace される。末尾の空白が落ちただけで別物になる
+	//
+	// **422 は再試行では絶対に解けません** (キーを作り直すしかない)。
+	// 「1 回目は名前欄あり、タイムアウト後の再送では名前欄が空」という、
+	// 利用者から見て同じ操作が弾かれることになります。
+	//
+	// 渡すのは投稿結果を決める値だけ。スレッドは endpoint に含まれています。
+	req, err := idempotency.New(key, endpoint, comment.Body)
+	if err != nil {
+		return CommentDTO{}, err
+	}
+
 	// **記録するのは応答そのもの** (ADR 0015)。
 	// 永続化層に DTO の形を知らせないため、詰め替えと符号化はここで行い、
 	// バイト列だけを渡します。
@@ -163,7 +180,7 @@ func (i *CommentInteractor) PostCommentIdempotent(
 		return json.Marshal(toDTO(*c))
 	}
 
-	created, replayed, err := i.repo.CreateIdempotent(ctx, comment, req, encode)
+	created, replayed, err := i.repo.CreateIdempotent(ctx, comment, *req, encode)
 	if err != nil {
 		return CommentDTO{}, err
 	}

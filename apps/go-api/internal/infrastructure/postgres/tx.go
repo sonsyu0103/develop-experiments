@@ -218,6 +218,20 @@ func setStatementTimeout(ctx context.Context, tx pgx.Tx, d time.Duration) error 
 	return err
 }
 
+// resetStatementTimeout は setStatementTimeout で張った上限を外します。
+//
+// **上限は必要な 1 文だけに掛けます。** トランザクション全体に効かせると、
+// 無関係な文 (行ロック待ちや重い挿入) まで同じ上限で切られ、
+// **どれも同じ理由の失敗として見えてしまいます。**
+//
+// `DEFAULT` はセッションの値へ戻す指定です。接続はプールへ返るため、
+// トランザクションを抜ければどのみち元に戻りますが、
+// 同じトランザクションの後続の文に漏らさないためにここで戻します。
+func resetStatementTimeout(ctx context.Context, tx pgx.Tx) error {
+	_, err := tx.Exec(ctx, "SET LOCAL statement_timeout = DEFAULT")
+	return err
+}
+
 // txBeginner はトランザクションを開始できるものです。*pgxpool.Pool が満たします。
 //
 // **具体型ではなくこれを受け取るのは、テストのためです。**
