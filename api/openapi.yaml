@@ -495,7 +495,7 @@ components:
 
     Comment:
       type: object
-      required: [id, threadId, authorName, author, body, createdAt]
+      required: [id, threadId, seq, authorName, author, body, createdAt]
       properties:
         id:
           type: integer
@@ -505,6 +505,20 @@ components:
           type: integer
           format: int64
           example: 1
+        seq:
+          type: integer
+          format: int32
+          minimum: 1
+          description: |
+            スレッド内のレス番号 (`>>1` の 1)。スレッドごとに 1 から振られます。
+
+            **欠番が出ます。** 削除されたコメントの番号は再利用しません
+            (docs/adr/0019-comment-concurrency.md 決定 5)。
+            再利用すると、過去の `>>5` が別の投稿を指すようになるためです。
+
+            採番は「読んでから書く」処理なので、同時投稿で競合します。
+            この採番がこのリポジトリの主題である並行制御の題材になっています。
+          example: 3
         authorName:
           type: string
           description: |

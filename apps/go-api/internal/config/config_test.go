@@ -133,3 +133,59 @@ func TestLoad_SucceedsWithoutGoogleCredentials(t *testing.T) {
 		t.Error("資格情報が無いのに認証が有効と判定された")
 	}
 }
+
+// コメント投稿の並行制御モード (docs/adr/0019-comment-concurrency.md 決定 2)。
+//
+// **Load を通して検査します。** parseCommentPostMode を直接呼ぶと、
+// 環境変数を読む経路そのものが検査から外れ、
+// 「関数は正しいが Load が呼んでいない」状態を見逃します。
+func TestLoad_CommentPostMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     string
+		devMode bool
+		want    CommentPostMode
+		wantErr bool
+	}{
+		{name: "未設定なら unique (実測で最速)", env: "", want: CommentPostModeUnique},
+		{name: "ssi", env: "ssi", want: CommentPostModeSSI},
+		{name: "pessimistic", env: "pessimistic", want: CommentPostModePessimistic},
+		{name: "unique", env: "unique", want: CommentPostModeUnique},
+		{name: "大文字と空白を許す", env: "  SSI ", want: CommentPostModeSSI},
+
+		// naive はレス番号が重複する。本番相当の設定では選ばせない。
+		{name: "naive は開発モードでのみ選べる", env: "naive", devMode: true, want: CommentPostModeNaive},
+		{name: "naive は本番相当だと起動しない", env: "naive", wantErr: true},
+
+		// **未知の値を既定値に落とさない。** 綴りを間違えたまま起動すると、
+		// ベンチマークで「pessimistic を測ったつもりの ssi の値」が出る。
+		{name: "未知の値は起動時に落とす", env: "serializable", wantErr: true},
+		{name: "空白だけも落とす", env: "   ", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://app:password@localhost:5432/bbs")
+			t.Setenv("COMMENT_POST_MODE", tt.env)
+			if tt.devMode {
+				t.Setenv("ENV", "development")
+			} else {
+				t.Setenv("ENV", "")
+			}
+
+			cfg, err := Load()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("COMMENT_POST_MODE=%q で Load が成功した (mode=%q)", tt.env, cfg.CommentPostMode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load が失敗した: %v", err)
+			}
+			if cfg.CommentPostMode != tt.want {
+				t.Errorf("CommentPostMode = %q, want %q", cfg.CommentPostMode, tt.want)
+			}
+		})
+	}
+}

@@ -28,6 +28,10 @@ type AuthorDTO struct {
 type CommentDTO struct {
 	ID       int64 `json:"id"`
 	ThreadID int64 `json:"threadId"`
+	// Seq はスレッド内のレス番号 (`>>1` の 1) です。
+	// 削除しても詰めないため、欠番が出ます
+	// (docs/adr/0019-comment-concurrency.md 決定 5)。
+	Seq int32 `json:"seq"`
 	// AuthorName は匿名投稿の表示名です。
 	// Author があるときは、そちらを表示してください。
 	AuthorName string `json:"authorName"`
@@ -131,6 +135,7 @@ func toDTO(c model.Comment) CommentDTO {
 	return CommentDTO{
 		ID:         c.ID,
 		ThreadID:   c.ThreadID,
+		Seq:        c.Seq,
 		AuthorName: c.AuthorName,
 		Author:     toAuthorDTO(c.Author),
 		Body:       c.Body,

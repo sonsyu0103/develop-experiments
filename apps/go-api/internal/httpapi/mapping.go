@@ -73,6 +73,7 @@ func toWireComment(d commentusecase.CommentDTO) oapigen.Comment {
 	return oapigen.Comment{
 		Id:         d.ID,
 		ThreadId:   d.ThreadID,
+		Seq:        d.Seq,
 		AuthorName: d.AuthorName,
 		Author:     author,
 		Body:       d.Body,

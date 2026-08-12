@@ -82,7 +82,8 @@ func run() error {
 
 	server := httpapi.NewServer(
 		threadusecase.NewThreadInteractor(threadRepo),
-		commentusecase.NewCommentInteractor(postgres.NewCommentRepository(pool), threadRepo),
+		commentusecase.NewCommentInteractor(
+			postgres.NewCommentRepository(pool, cfg.CommentPostMode), threadRepo),
 		pool,
 		authInteractor,
 		cfg.Auth,

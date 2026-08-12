@@ -31,8 +31,70 @@ type Config struct {
 	// 気づかないうちにデバッグモードで動くほうが危険なため、
 	// 安全側に倒しています。
 	Debug bool
+	// CommentPostMode はコメント投稿の並行制御の方式です。
+	CommentPostMode CommentPostMode
 	// Auth は Google OIDC の設定です。
 	Auth AuthConfig
+}
+
+// CommentPostMode はコメント投稿の並行制御の方式です。
+//
+// 4 つの実装を同一バイナリのまま切り替えられるようにしてあります
+// (docs/adr/0019-comment-concurrency.md 決定 2)。
+// モードごとにビルドを分けると、Phase 4 の比較に
+// 「ビルド差」という交絡が入ります。
+type CommentPostMode string
+
+const (
+	// CommentPostModeSSI は SERIALIZABLE + 直列化失敗のリトライです。
+	//
+	// **このリポジトリの主題ですが、既定ではありません。**
+	// 実測で 3 つの正しいモードの中で最も遅く、リトライも最も多かったため
+	// (ADR 0019 の「実測」節)。
+	CommentPostModeSSI CommentPostMode = "ssi"
+	// CommentPostModePessimistic は threads の行ロック (FOR UPDATE) です。
+	CommentPostModePessimistic CommentPostMode = "pessimistic"
+	// CommentPostModeUnique は 1 文で採番し、一意制約違反をリトライします。
+	// **既定値。** 実測で最も速く、往復も 1 回で済みます。
+	CommentPostModeUnique CommentPostMode = "unique"
+	// CommentPostModeNaive は防御なしの実装です。**レス番号が重複します。**
+	//
+	// 「SSI を入れたら正しくなった」は、入れる前が本当に壊れていたことを
+	// 示さない限り主張になりません。それを実測するためだけに存在します。
+	CommentPostModeNaive CommentPostMode = "naive"
+)
+
+// commentPostModes は選択できるモードと、本番相当の設定で許すかどうかです。
+var commentPostModes = map[CommentPostMode]bool{
+	CommentPostModeSSI:         true,
+	CommentPostModePessimistic: true,
+	CommentPostModeUnique:      true,
+	// naive は ENV=development でしか選べません。
+	CommentPostModeNaive: false,
+}
+
+// parseCommentPostMode は COMMENT_POST_MODE を読み取ります。
+//
+// **未知の値は既定値に落とさずエラーにします。** 綴りを間違えたときに
+// 黙って ssi で動くと、ベンチマークで「pessimistic を測ったつもりの ssi の値」が
+// 出ます。測定を汚す間違いは、起動時に止めるほうが安い。
+func parseCommentPostMode(raw string, debug bool) (CommentPostMode, error) {
+	if raw == "" {
+		return CommentPostModeUnique, nil
+	}
+
+	mode := CommentPostMode(strings.TrimSpace(strings.ToLower(raw)))
+	allowedInProduction, known := commentPostModes[mode]
+	if !known {
+		return "", fmt.Errorf(
+			"config: COMMENT_POST_MODE が不正です (got %q, 選べるのは ssi / pessimistic / unique / naive)", raw)
+	}
+	if !allowedInProduction && !debug {
+		// 既定を安全側に倒す方針は AuthConfig.SecureCookie と同じです。
+		return "", fmt.Errorf(
+			"config: COMMENT_POST_MODE=%s は ENV=development でのみ選べます (レス番号が重複します)", mode)
+	}
+	return mode, nil
 }
 
 // AuthConfig は Google OIDC による認証の設定です。
@@ -116,6 +178,11 @@ func Load() (*Config, error) {
 
 	debug := strings.EqualFold(os.Getenv("ENV"), "development")
 
+	commentPostMode, err := parseCommentPostMode(os.Getenv("COMMENT_POST_MODE"), debug)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		Addr:            stringEnv("ADDR", ":8080"),
 		DatabaseURL:     dsn,
@@ -124,6 +191,7 @@ func Load() (*Config, error) {
 		ShutdownTimeout: time.Duration(shutdownSec) * time.Second,
 		AllowedOrigins:  csvEnv("CORS_ALLOWED_ORIGINS", []string{"http://localhost:3000"}),
 		Debug:           debug,
+		CommentPostMode: commentPostMode,
 		Auth: AuthConfig{
 			GoogleClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
 			GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),

@@ -106,6 +106,18 @@ services:
       ADDR: ":8080"
       DATABASE_URL: postgres://app:password@postgres:5432/bbs?sslmode=disable
       CORS_ALLOWED_ORIGINS: http://localhost:3000
+      # コメント投稿の並行制御の方式 (docs/adr/0019-comment-concurrency.md 決定 2)。
+      # ssi / pessimistic / unique / naive。
+      #
+      # ここを外から差し替えられるようにしているのは、
+      # make concurrency-probe が同一バイナリのままモードを切り替えて
+      # 実測するため。naive は ENV=development でしか選べない。
+      #
+      # **既定値をここに書かない。** config 側 (parseCommentPostMode) が
+      # 未設定を unique として扱う。両方に既定を書くと二重管理になり、
+      # 実際に食い違った —— compose だけ ssi のままで、
+      # 本番既定であるはずの unique がスモークを一度も通っていなかった。
+      COMMENT_POST_MODE: ${COMMENT_POST_MODE:-}
       # 認証 (Google OIDC)。
       # 値はここに書かず、リポジトリ直下の .env から補間する (.gitignore 済み)。
       # 未設定でも API は起動し、認証エンドポイントだけが 503 になる。

@@ -33,8 +33,11 @@ func newFakeCommentRepo(n int) *fakeCommentRepo {
 	comments := make([]model.Comment, 0, n)
 	for id := int64(n); id >= 1; id-- {
 		comments = append(comments, model.Comment{
-			ID:         id,
-			ThreadID:   1,
+			ID:       id,
+			ThreadID: 1,
+			// レス番号。このフェイクでは 1 スレッドしか作らないので
+			// id と一致するが、意味は別物 (スレッドごとに 1 から振られる)。
+			Seq:        int32(id),
 			AuthorName: "名無しさん",
 			Body:       "本文",
 			CreatedAt:  time.Unix(0, 0).UTC(),
@@ -70,6 +73,9 @@ func (f *fakeCommentRepo) ListByThreadID(
 func (f *fakeCommentRepo) Create(_ context.Context, comment *model.Comment) (*model.Comment, error) {
 	created := *comment
 	created.ID = int64(len(f.comments) + 1)
+	// **採番は永続化層の責務** (docs/adr/0019-comment-concurrency.md)。
+	// フェイクなので競合しないが、「値が入って返る」ことだけは本物と揃える。
+	created.Seq = int32(len(f.comments) + 1)
 	created.CreatedAt = time.Unix(0, 0).UTC()
 	return &created, nil
 }
@@ -272,4 +278,51 @@ func idsOf(dtos []CommentDTO) []int64 {
 		ids = append(ids, d.ID)
 	}
 	return ids
+}
+
+// レス番号がユースケース層の DTO まで運ばれること。
+//
+// **これが無いと詰め替えを消してもテストが通る** (変異プローブで実測)。
+// ドメインからワイヤ型までの経路は、途中の 1 か所を落とすだけで
+// API から静かにフィールドが消える。
+func TestComments_SeqReachesDTO(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(3)
+	interactor := NewCommentInteractor(repo, &fakeThreadChecker{exists: true})
+
+	t.Run("一覧", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := interactor.FetchComments(t.Context(), 1, pagination.Page{Size: 10})
+		if err != nil {
+			t.Fatalf("FetchComments が失敗した: %v", err)
+		}
+		if len(got.Comments) == 0 {
+			t.Fatal("コメントが 0 件")
+		}
+		for _, c := range got.Comments {
+			// ID と一致することではなく、0 でないことを見る。
+			// 「ID をそのまま入れている」実装も通してしまわないよう、
+			// 対応関係はフェイク側 (Seq = id) で決めてある。
+			if c.Seq == 0 {
+				t.Errorf("id=%d のコメントに seq が入っていない", c.ID)
+			}
+			if c.Seq != int32(c.ID) {
+				t.Errorf("id=%d の seq = %d, want %d", c.ID, c.Seq, c.ID)
+			}
+		}
+	})
+
+	t.Run("投稿", func(t *testing.T) {
+		t.Parallel()
+
+		got, err := interactor.PostComment(t.Context(), 1, "ホシノ", "ふぁ〜", nil)
+		if err != nil {
+			t.Fatalf("PostComment が失敗した: %v", err)
+		}
+		if got.Seq == 0 {
+			t.Error("投稿の応答に seq が入っていない (採番結果が返らない)")
+		}
+	})
 }

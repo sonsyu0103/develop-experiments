@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -16,6 +17,13 @@ import (
 const (
 	// codeForeignKeyViolation は外部キー違反 (親行が存在しない) です。
 	codeForeignKeyViolation = "23503"
+	// codeUniqueViolation は一意制約違反です。
+	//
+	// **これを無条件にリトライ可能として扱ってはいけません。**
+	// ほとんどの一意制約違反は「同じものを二重に作ろうとした」であり、
+	// 何度やり直しても失敗します。リトライしてよいのは、
+	// やり直せば別の値を計算し直す経路 (レス番号の採番) だけです。
+	codeUniqueViolation = "23505"
 	// codeCheckViolation は CHECK 制約違反です。
 	codeCheckViolation = "23514"
 	// codeSerializationFailure は SERIALIZABLE / REPEATABLE READ における
@@ -71,4 +79,44 @@ func IsRetryable(err error) bool {
 		return pgErr.Code == codeSerializationFailure || pgErr.Code == codeDeadlockDetected
 	}
 	return errors.Is(err, apperr.ErrConflict)
+}
+
+// sqlState は PostgreSQL の SQLSTATE を取り出します。
+// PostgreSQL 由来でないエラーでは空文字を返します。
+func sqlState(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code
+	}
+	return ""
+}
+
+// commentSeqIndexSuffix は、レス番号の一意索引が名乗る名前の末尾です。
+//
+// **親の索引名 (comments_thread_id_seq_idx) では一致しません。**
+// comments はパーティションテーブルなので、一意性は子の索引で検出され、
+// SQLSTATE 23505 の ConstraintName には
+// comments_p5_thread_id_seq_idx のような子の名前が入ります (実測)。
+// 親と子の両方が同じ接尾辞で終わるように、
+// マイグレーションで索引名を _idx に揃えてあります。
+//
+// この前提は session_repository_test.go と同じく実 DB のテストで検査します。
+// PostgreSQL が子索引の命名規則を変えたら、そこで落ちます。
+const commentSeqIndexSuffix = "_thread_id_seq_idx"
+
+// isCommentSeqConflict は、レス番号の採番が衝突したかを返します。
+//
+// unique モード (ADR 0019 決定 2) は READ COMMITTED のまま 1 文で採番するため、
+// 同時実行では必ずこの違反が返ります。**やり直せば MAX(seq) を読み直す**ので、
+// 一意制約違反でありながらリトライして意味がある数少ない経路になります。
+//
+// 判定を索引名まで絞るのは、将来 comments に別の一意制約が増えたときに、
+// 永久に成功しない違反をリトライし続けないためです。
+func isCommentSeqConflict(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == codeUniqueViolation &&
+		strings.HasSuffix(pgErr.ConstraintName, commentSeqIndexSuffix)
 }
