@@ -164,15 +164,22 @@ func envOr(key, fallback string) string {
 
 // requireLive は実 MinIO への検証を必須とするかを返します。
 //
-// 既定は「CI なら必須」。スモークの SMOKE_REQUIRE_FULL と同じ判断で、
-// 明示的な env を必須にすると、その 1 行を消しただけで検出が止まります。
+// **CI 環境変数を既定にしてはいけません。**
+// スモークの SMOKE_REQUIRE_FULL は同じ形で正しく働きますが、
+// あちらは MinIO を持つジョブ (Migration Check) だけで動くのに対し、
+// go test は **Go Checks でも走ります**。そちらに MinIO はありません。
+// 既定を CI にすると Go Checks が必ず落ちます —— 実際に落としました。
+//
+// 「CI かどうか」ではなく「**この実行に MinIO が用意されているか**」が
+// 判定したいことなので、そこを表す env を明示的に受け取ります。
+//
+// 消し忘れの心配は、S3_TEST_REQUIRE と S3_TEST_ENDPOINT を
+// **同じ env ブロックに並べて置く**ことで扱います。
+// 片方だけ消した場合は fail-closed に倒れます ——
+// REQUIRE だけ残れば t.Fatal になり、静かなスキップにはなりません。
 func requireLive() bool {
-	if raw, ok := os.LookupEnv("S3_TEST_REQUIRE"); ok {
-		return strings.TrimSpace(raw) != "" &&
-			strings.TrimSpace(raw) != "0" &&
-			!strings.EqualFold(strings.TrimSpace(raw), "false")
-	}
-	return os.Getenv("CI") != ""
+	raw := strings.TrimSpace(os.Getenv("S3_TEST_REQUIRE"))
+	return raw != "" && raw != "0" && !strings.EqualFold(raw, "false")
 }
 
 // PUT した内容が、返した URL でそのまま読めること。
