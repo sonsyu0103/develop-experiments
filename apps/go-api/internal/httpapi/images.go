@@ -22,23 +22,13 @@ import (
 // model.MaxUploadBytes が行います。
 const multipartMemoryLimit = 1 << 20 // 1 MiB
 
-// maxUploadRequestBytes はリクエスト全体として読む上限です。
-//
-// **本文を読み切る前に打ち切ります。** ドメイン側の検証 (model.MaxUploadBytes) は
-// 「読み終えたバイト列」に対して働くので、それだけだと
-// 巨大な本文を最後まで受け取ってから捨てることになります。
-//
-// 画像本体 5 MiB に、マルチパートの境界・ヘッダ・kind フィールドの
-// 余地を足した値にしています。
-const maxUploadRequestBytes = imageusecase.MaxUploadBytes + (1 << 16) // 5 MiB + 64 KiB
-
 // UploadImage は POST /images を処理します。
 //
 // **ログインが必須です** (仕様書の security 宣言が強制します)。
 // 匿名で任意のバイト列をストレージに置けると、容量の消費と
 // 違法コンテンツの設置が追跡不能な形で可能になります
 // (docs/adr/0007-image-storage.md の背景)。
-func (s *Server) UploadImage(c *gin.Context, params oapigen.UploadImageParams) {
+func (s *Server) UploadImage(c *gin.Context) {
 	if err := s.requireImagesEnabled(); err != nil {
 		respondError(c, err)
 		return
@@ -53,11 +43,10 @@ func (s *Server) UploadImage(c *gin.Context, params oapigen.UploadImageParams) {
 		return
 	}
 
-	// **本文を読み切る前に上限で打ち切る。**
-	// MaxBytesReader は超過時に読み出しをエラーにするので、
-	// 5 MiB を超える本文をメモリにも一時ファイルにも溜めない。
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUploadRequestBytes)
-
+	// **本文の上限は bodyLimit ミドルウェアが張っています。**
+	// ここで http.MaxBytesReader を張っても手遅れです ——
+	// 仕様検証ミドルウェアが、この関数に入る前に本文を丸ごと読むため
+	// (初版はここに置いていて、実測で何の効果も無かった)。
 	if err := c.Request.ParseMultipartForm(multipartMemoryLimit); err != nil {
 		// MaxBytesReader の超過はここに現れる。413 として返す
 		// —— 400 だと「直せば通る」のか「大きすぎる」のかが伝わらない。
@@ -78,7 +67,7 @@ func (s *Server) UploadImage(c *gin.Context, params oapigen.UploadImageParams) {
 		return
 	}
 
-	// **冪等キーはここでは扱いません。**
+	// **冪等キーは受け付けません** (仕様書からも外してあります)。
 	//
 	// ADR 0015 決定 2 は画像アップロードも対象に挙げていますが、
 	// 冪等キーの記録は「応答を記録して再送に返す」仕組みであり、
@@ -86,13 +75,15 @@ func (s *Server) UploadImage(c *gin.Context, params oapigen.UploadImageParams) {
 	// 画像は DB とストレージの 2 システムにまたがるので、
 	// **1 トランザクションに収まりません**。
 	//
+	// 初版は仕様書にヘッダを宣言したまま無視していました。
+	// **仕様書が単一の情報源である以上、実装しないものは書かない**
+	// —— 書いてあると、クライアントは「再送すれば前回の結果が返る」と
+	// 信じて実装します (レビュー指摘)。
+	//
 	// 二重アップロードで起きるのは「使われない画像が 1 枚増える」ことだけで、
 	// コメントの二重投稿のような不可逆な結果にはなりません
 	// (添付されなかった画像は pending ではなく committed なので、
 	//  現在の回収バッチの対象外という別の問題は残ります —— 未決事項)。
-	//
-	// params は仕様書がヘッダを宣言しているため受け取りますが、使いません。
-	_ = params
 
 	// **用途の検証はユースケース層が行う。** HTTP 層はドメインの型を持たない。
 	dto, err := s.images.Upload(ctx, *ownerID, c.Request.FormValue("kind"), raw)

@@ -261,13 +261,17 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 	# 必ず落ちた**。CI は毎回クリーンなチェックアウトなので気づけない差になる。
 	# 見たいのは「tidy が go.mod を書き換えるか」であって、
 	# 「コミット済みと違うか」ではない。実行前の内容と比べる。
+	# 一時ファイルは mktemp で取る。固定パスにすると、同じマシンで
+	# 2 つの実行 (別チェックアウト / make -j) が互いの控えを踏む。
 	@cd $(GO_API_DIR) && \
-		cp go.mod /tmp/go.mod.before && cp go.sum /tmp/go.sum.before && \
+		tmp=$$(mktemp -d) && \
+		trap 'rm -rf "$$tmp"' EXIT && \
+		cp go.mod go.sum "$$tmp/" && \
 		go mod tidy && \
-		if ! diff -q go.mod /tmp/go.mod.before > /dev/null || \
-		   ! diff -q go.sum /tmp/go.sum.before > /dev/null; then \
+		if ! diff -q go.mod "$$tmp/go.mod" > /dev/null || \
+		   ! diff -q go.sum "$$tmp/go.sum" > /dev/null; then \
 			echo "go.mod / go.sum が最新ではありません。'go mod tidy' の結果をコミットしてください。"; \
-			diff /tmp/go.mod.before go.mod || true; \
+			diff "$$tmp/go.mod" go.mod || true; \
 			exit 1; \
 		fi
 

@@ -121,17 +121,15 @@ func (i *ImageInteractor) Upload(
 		return nil, err
 	}
 
-	// 再エンコードはピクセル分のメモリを確保するので、同時実行を絞る。
-	// **ctx を尊重する。** 待っている間にクライアントが切断したら、
-	// そこで諦めるほうが行儀がよい。
-	select {
-	case i.decodeSlots <- struct{}{}:
-		defer func() { <-i.decodeSlots }()
-	case <-ctx.Done():
-		return nil, fmt.Errorf("画像の処理を待っている間に中断されました: %w", ctx.Err())
-	}
-
-	out, err := reencode(raw, kind)
+	// **枠を握るのは再エンコードの間だけにする。**
+	//
+	// 初版は defer で関数の出口まで持っていたため、DB への書き込みと
+	// ストレージへの PUT (ネットワーク往復) の間も枠を占有していた。
+	// S3 の応答が 5 秒に伸びると 4 本の枠が張り付き、
+	// **以降のアップロードがストレージの遅さでまとめて失敗する**
+	// (待ち側には期限が無く、クライアントの切断でしか抜けない)。
+	// 枠が守りたいのはメモリであって、経路全体の同時実行数ではない。
+	out, err := i.decode(ctx, raw, kind)
 	if err != nil {
 		return nil, err
 	}
@@ -172,6 +170,24 @@ func (i *ImageInteractor) Upload(
 	}
 
 	return i.toDTO(committed), nil
+}
+
+// decode は同時実行を絞りながら再エンコードします。
+//
+// メモリを確保するのはこの中だけなので、枠もここに閉じます。
+//
+// **ctx を尊重します。** 待っている間にクライアントが切断したら、
+// そこで諦めるほうが行儀がよいためです。
+func (i *ImageInteractor) decode(
+	ctx context.Context, raw []byte, kind model.Kind,
+) (*decoded, error) {
+	select {
+	case i.decodeSlots <- struct{}{}:
+		defer func() { <-i.decodeSlots }()
+	case <-ctx.Done():
+		return nil, fmt.Errorf("画像の処理を待っている間に中断されました: %w", ctx.Err())
+	}
+	return reencode(raw, kind)
 }
 
 // FindOwned は自分が所有する画像を取得します。

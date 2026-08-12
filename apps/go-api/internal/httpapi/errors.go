@@ -91,6 +91,13 @@ func respondError(c *gin.Context, err error) {
 // (server_test.go の TestAuth_MissingCookieIs401 が検出します)。
 const securityFailureMarker = "openapi3filter.SecurityRequirementsError"
 
+// maxBytesErrorMarker は net/http が本文の上限超過で返す文言です。
+//
+// **型では受け取れません。** 検証ミドルウェアはエラーを整形済みの文字列で
+// 渡してくるため (securityFailureMarker と同じ事情)、ここで照合します。
+// net/http 側の文言が変われば追随が要ります —— bodylimit_test.go が検出します。
+const maxBytesErrorMarker = "request body too large"
+
 // respondSpecError は仕様書に基づく検証で弾かれた場合の応答です。
 // oapigen の生成コードと、仕様検証ミドルウェアの両方から呼ばれます。
 //
@@ -100,6 +107,21 @@ const securityFailureMarker = "openapi3filter.SecurityRequirementsError"
 // 本来のステータスに振り分け直すのがこの関数の役割です。
 func respondSpecError(c *gin.Context, status int, message string) {
 	switch {
+	// **本文の上限超過を 401 に化けさせない。**
+	//
+	// bodyLimit が張った MaxBytesReader は、検証ミドルウェアが本文を
+	// 読む時点でエラーになる。security の検証が本文を先に読むため
+	// (validate_request.go)、そのまま流すと**認証の失敗として 401** になる。
+	//
+	// 401 は「ログインすれば解決する」の意味を持つ (ADR 0013 決定 3)。
+	// 大きすぎる本文はログインしても解決しないので、413 に振り分ける。
+	//
+	// Content-Length がある通常の要求は bodyLimit が読む前に 413 を返すので、
+	// ここに来るのは chunked (長さ未申告) の場合だけになる。
+	case strings.Contains(message, maxBytesErrorMarker):
+		c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge,
+			newErrorBody(oapigen.PAYLOADTOOLARGE, "リクエストが大きすぎます"))
+
 	case message == routers.ErrMethodNotAllowed.Error():
 		c.AbortWithStatusJSON(http.StatusMethodNotAllowed,
 			newErrorBody(oapigen.METHODNOTALLOWED, "そのメソッドは許可されていません"))

@@ -96,6 +96,17 @@ func reencode(raw []byte, kind model.Kind) (*decoded, error) {
 		return nil, fmt.Errorf("画像をデコードできません: %w", apperr.ErrInvalidArgument)
 	}
 
+	// **EXIF の向きを適用してから縮小します。**
+	//
+	// image.Decode は Orientation タグを適用しません。再エンコードで
+	// EXIF は落ちるので (それは位置情報を消すための意図した挙動)、
+	// ここで向きを画素に焼き込まないと、**縦に構えて撮った写真が
+	// 横倒しのまま保存され、回転のヒントも失われます。**
+	//
+	// 縮小より前に置くのは、回転で幅と高さが入れ替わるためです。
+	// 後に置くと、長辺の上限が入れ替わる前の辺に適用されます。
+	src = applyOrientation(src, readOrientation(raw))
+
 	// 6. リサイズしてから、こちらの形式でエンコードし直します。
 	resized := resizeToFit(src, kind.MaxDimension())
 	bounds := resized.Bounds()

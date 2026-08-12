@@ -904,7 +904,7 @@ if SQL_EXEC:
                 # コメントへ添付する。
                 s, thread = call("POST", "/threads", '{"title":"画像つきの検証"}',
                                  headers={"Cookie": f"session={img_token}"})[:2]
-                tid = thread["id"] if s == 201 else None
+                tid = thread["id"] if s == 201 and isinstance(thread, dict) else None
                 if tid is None:
                     check("検証用スレッドを作れる", False, f"status={s}")
                     skip("画像", "検証用スレッドを作れなかった")
@@ -919,8 +919,15 @@ if SQL_EXEC:
                           f"image={posted.get('image') if isinstance(posted, dict) else posted}")
 
                     # **一覧でも画像が解決される** (LEFT JOIN が効いていること)。
+                    #
+                    # **listed が dict とは限らない。** call() は本文を
+                    # JSON として読めなければ None を返す (502 や HTML が
+                    # 返った場合)。添字で触るとトレースバックで全体が止まり、
+                    # 集計にも乗らない —— _decode の docstring が
+                    # 警告しているのと同じ形になる。
                     _, listed, _ = call("GET", f"/threads/{tid}/comments")
-                    first = (listed.get("comments") or [None])[0]
+                    comments = listed.get("comments") if isinstance(listed, dict) else None
+                    first = comments[0] if comments else None
                     check("一覧でも画像が解決される",
                           first is not None and (first.get("image") or {}).get("id") == image_id,
                           f"comment={first}")
@@ -928,9 +935,10 @@ if SQL_EXEC:
                     # **画像なしの投稿が一覧から消えないこと** (LEFT であること)。
                     call("POST", f"/threads/{tid}/comments", '{"body":"画像なし"}')
                     _, listed, _ = call("GET", f"/threads/{tid}/comments")
-                    no_image = [c for c in listed["comments"] if c.get("image") is None]
+                    comments = listed.get("comments") if isinstance(listed, dict) else None
+                    no_image = [c for c in (comments or []) if c.get("image") is None]
                     check("画像なしのコメントが一覧から消えない (LEFT であること)",
-                          len(no_image) > 0, f"comments={listed['comments']}")
+                          len(no_image) > 0, f"comments={comments}")
 
                     # **他人の画像は添付できない (404)。**
                     # 403 にすると「その ID が存在すること」が漏れる。

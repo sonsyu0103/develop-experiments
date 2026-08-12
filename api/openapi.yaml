@@ -208,10 +208,18 @@ paths:
         入力: JPEG / PNG / WebP。**SVG は受け付けません** ——
         ベクタ形式はスクリプトと外部参照を含められるため、
         「画像」として扱うと XSS と SSRF の経路になります。
+
+        **`Idempotency-Key` は受け付けません。**
+        [ADR 0015](../docs/adr/0015-idempotency.md) 決定 2 は画像も対象に
+        挙げていますが、同 決定 3 が要求する「キーの確保と応答の記録を
+        主トランザクションに同居させる」が、**DB とストレージの
+        2 システムにまたがるアップロードでは満たせない**ためです。
+
+        二重アップロードで起きるのは「使われない画像が 1 枚増える」ことだけで、
+        コメントの二重投稿のような不可逆な結果にはなりません。
+        添付する側 (コメント投稿) の冪等キーは、`imageId` を指紋に含めています。
       security:
         - sessionCookie: []
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -246,14 +254,6 @@ paths:
           description: |
             サイズまたは画素数の上限を超えました。
             縮小すれば通ります (docs/adr/0007-image-storage.md 決定 2)。
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '422':
-          description: |
-            同じ `Idempotency-Key` で別の内容が送られました。
-            **再試行では解決しません。** キーを作り直してください。
           content:
             application/json:
               schema:
@@ -627,7 +627,11 @@ components:
 
     Comment:
       type: object
-      required: [id, threadId, seq, authorName, author, body, createdAt]
+      # image を required に含める。**author と揃える。**
+      # 外すと oapi-codegen が omitempty を付け、画像が無いときに
+      # キーごと消える。description は「画像がなければ null」と
+      # 書いているので、契約と実装が食い違う。
+      required: [id, threadId, seq, authorName, author, image, body, createdAt]
       properties:
         id:
           type: integer

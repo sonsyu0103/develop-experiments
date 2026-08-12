@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"regexp"
@@ -11,7 +12,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 
+	"develop-experiments/apps/go-api/internal/apperr"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
+	imageusecase "develop-experiments/apps/go-api/internal/image/usecase"
 	"develop-experiments/apps/go-api/internal/logging"
 )
 
@@ -144,6 +147,9 @@ func middlewares(allowedOrigins []string) []gin.HandlerFunc {
 		requestLogger(),
 		recovery(),
 		cors(allowedOrigins),
+		// **仕様検証より前に置く。** 検証ミドルウェアは本文を
+		// 丸ごと読むため、ここより後ろでは手遅れになる (bodyLimit を参照)。
+		bodyLimit(),
 	}
 }
 
@@ -177,5 +183,62 @@ func requestLogger() gin.HandlerFunc {
 			// 単位をフィールド名に含めて、桁の取り違えを防ぎます。
 			slog.Float64("latency_ms", float64(time.Since(start).Microseconds())/1000),
 		)
+	}
+}
+
+// 本文の大きさの上限。
+//
+// **仕様検証ミドルウェアより前に置く必要があります。**
+// kin-openapi の openapi3filter は、ハンドラに入る前に本文を
+// io.ReadAll で丸ごと読みます。しかも security の検証
+// (validate_request.go の validateSecurityRequirement) が
+// **AuthenticationFunc を呼ぶ前に**読むため、
+// 未ログインの要求でも本文はすべてメモリに載ります。
+//
+// 初版はハンドラの中で http.MaxBytesReader を張っており、
+// **到達した時点で既に読み終わっていたので何の効果もありませんでした。**
+// 実測: 30 MiB の本文が、401 を返す経路でも全量読まれていた。
+const (
+	// maxJSONBodyBytes は JSON を受け取る経路の上限です。
+	//
+	// 本文は最大 2000 文字 + 投稿者名 50 文字なので、
+	// UTF-8 で最悪 3 倍としても 64 KiB あれば足ります。
+	// 余裕を持たせて 256 KiB。
+	maxJSONBodyBytes int64 = 256 << 10
+
+	// maxImageUploadBytes は POST /images の上限です。
+	// 画像本体 5 MiB に、マルチパートの境界・ヘッダ・kind の余地を足した値。
+	maxImageUploadBytes int64 = imageusecase.MaxUploadBytes + (1 << 16)
+)
+
+// bodyLimit は本文の大きさを経路ごとに制限します。
+//
+// 2 段構えにしています。
+//
+//  1. Content-Length が上限を超えていれば、**読む前に** 413 で返す
+//  2. Content-Length が無い (chunked) 場合に備えて MaxBytesReader を張る
+//
+// 1 だけだと chunked で回避され、2 だけだと上限まで読んでから気づきます。
+func bodyLimit() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		limit := maxJSONBodyBytes
+		// **経路で分ける。** 画像だけを大きくし、他は絞ったままにする。
+		// パスの雛形ではなく実際のパスで見る (この経路は 1 つしかない)。
+		if c.Request.Method == http.MethodPost && c.Request.URL.Path == "/images" {
+			limit = maxImageUploadBytes
+		}
+
+		// GET などに本文が付いていても、ここで縛って困ることはない。
+		if c.Request.ContentLength > limit {
+			c.Abort()
+			respondError(c, fmt.Errorf(
+				"リクエストが大きすぎます (%d バイト。上限は %d バイト): %w",
+				c.Request.ContentLength, limit, apperr.ErrPayloadTooLarge))
+			return
+		}
+		if c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
+		}
+		c.Next()
 	}
 }
