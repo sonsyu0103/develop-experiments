@@ -100,13 +100,18 @@ func parseCommentPostMode(raw string, debug bool) (CommentPostMode, error) {
 // AuthConfig は Google OIDC による認証の設定です。
 //
 // **すべて任意です。** 揃っていない場合、API は起動しますが
-// 認証エンドポイントだけが 503 を返します。
+// **ログインの 2 経路だけ**が 503 を返します
+// (`GET /auth/google` と そのコールバック)。
 //
 // 必須にしない理由:
 //   - 掲示板の閲覧と匿名投稿は認証に依存しない。認証の設定が無いだけで
 //     API 全体が起動しないのは害のほうが大きい
 //   - CI の Migration Check は API サーバを起動してスモークテストを回す。
 //     必須にすると、Google の資格情報を CI に置くまで CI が落ちる
+//
+// **この設定はセッションの検証を左右しません** (ADR 0005 決定 4)。
+// 発行済みのセッションは、資格情報が無い環境でも解決されます ——
+// そうしないと、CI で認証済みの経路を 1 件も検証できなくなります。
 type AuthConfig struct {
 	// GoogleClientID / GoogleClientSecret は Google Cloud で発行する資格情報です。
 	GoogleClientID     string

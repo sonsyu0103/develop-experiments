@@ -130,8 +130,8 @@ func newTestUser() *model.User {
 		fixedNow, fixedNow, nil)
 }
 
-func newInteractor(users *fakeUserRepo, sessions *fakeSessionRepo, provider *fakeProvider) *AuthInteractor {
-	return NewAuthInteractor(users, sessions, provider, func() time.Time { return fixedNow })
+func newLoginInteractor(users *fakeUserRepo, sessions *fakeSessionRepo, provider *fakeProvider) *LoginInteractor {
+	return NewLoginInteractor(users, sessions, provider, func() time.Time { return fixedNow })
 }
 
 func validClaims() *IDTokenClaims {
@@ -151,7 +151,7 @@ func TestStartLogin_GeneratesDistinctSecrets(t *testing.T) {
 	t.Parallel()
 
 	provider := &fakeProvider{}
-	uc := newInteractor(&fakeUserRepo{}, &fakeSessionRepo{}, provider)
+	uc := newLoginInteractor(&fakeUserRepo{}, &fakeSessionRepo{}, provider)
 
 	first, err := uc.StartLogin()
 	if err != nil {
@@ -191,7 +191,7 @@ func TestCompleteLogin_IssuesSession(t *testing.T) {
 
 	users := &fakeUserRepo{user: newTestUser()}
 	sessions := &fakeSessionRepo{}
-	uc := newInteractor(users, sessions, &fakeProvider{claims: validClaims()})
+	uc := newLoginInteractor(users, sessions, &fakeProvider{claims: validClaims()})
 
 	got, err := uc.CompleteLogin(context.Background(), "code-1", "verifier-1", "nonce-1")
 	if err != nil {
@@ -238,7 +238,7 @@ func TestCompleteLogin_RejectsUnverifiedEmail(t *testing.T) {
 
 	users := &fakeUserRepo{user: newTestUser()}
 	sessions := &fakeSessionRepo{}
-	uc := newInteractor(users, sessions, &fakeProvider{claims: claims})
+	uc := newLoginInteractor(users, sessions, &fakeProvider{claims: claims})
 
 	_, err := uc.CompleteLogin(context.Background(), "c", "v", "n")
 	if !errors.Is(err, apperr.ErrUnauthenticated) {
@@ -262,7 +262,7 @@ func TestCompleteLogin_RejectsWithdrawnUser(t *testing.T) {
 
 	users := &fakeUserRepo{err: repository.ErrWithdrawn}
 	sessions := &fakeSessionRepo{}
-	uc := newInteractor(users, sessions, &fakeProvider{claims: validClaims()})
+	uc := newLoginInteractor(users, sessions, &fakeProvider{claims: validClaims()})
 
 	_, err := uc.CompleteLogin(context.Background(), "c", "v", "n")
 	if !errors.Is(err, apperr.ErrUnauthenticated) {
@@ -281,7 +281,7 @@ func TestCompleteLogin_ProviderFailureIs401(t *testing.T) {
 	t.Parallel()
 
 	sessions := &fakeSessionRepo{}
-	uc := newInteractor(&fakeUserRepo{}, sessions,
+	uc := newLoginInteractor(&fakeUserRepo{}, sessions,
 		&fakeProvider{err: errors.New("署名が不正です")})
 
 	_, err := uc.CompleteLogin(context.Background(), "c", "v", "n")
@@ -299,7 +299,7 @@ func TestCompleteLogin_PassesVerifierAndNonceThrough(t *testing.T) {
 	t.Parallel()
 
 	provider := &fakeProvider{claims: validClaims()}
-	uc := newInteractor(&fakeUserRepo{user: newTestUser()}, &fakeSessionRepo{}, provider)
+	uc := newLoginInteractor(&fakeUserRepo{user: newTestUser()}, &fakeSessionRepo{}, provider)
 
 	if _, err := uc.CompleteLogin(context.Background(), "code-x", "verifier-x", "nonce-x"); err != nil {
 		t.Fatalf("CompleteLogin が失敗した: %v", err)
@@ -325,106 +325,13 @@ func TestCompleteLogin_EmptyPictureBecomesNil(t *testing.T) {
 	claims.Picture = ""
 
 	users := &fakeUserRepo{user: newTestUser()}
-	uc := newInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: claims})
+	uc := newLoginInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: claims})
 
 	if _, err := uc.CompleteLogin(context.Background(), "c", "v", "n"); err != nil {
 		t.Fatalf("CompleteLogin が失敗した: %v", err)
 	}
 	if users.upserted.AvatarURL != nil {
 		t.Errorf("AvatarURL = %v, want nil", *users.upserted.AvatarURL)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// セッション検証
-// ---------------------------------------------------------------------------
-
-func TestAuthenticate(t *testing.T) {
-	t.Parallel()
-
-	const token = model.SessionToken("live-token")
-	owner := model.SessionOwner{
-		ID:          42,
-		PublicID:    uuid.MustParse("01920000-0000-7000-8000-000000000001"),
-		Email:       "h@example.com",
-		DisplayName: "ホシノ",
-	}
-	uc := newInteractor(&fakeUserRepo{}, &fakeSessionRepo{liveToken: token, owner: owner}, &fakeProvider{})
-
-	got, err := uc.Authenticate(context.Background(), token)
-	if err != nil {
-		t.Fatalf("Authenticate が失敗した: %v", err)
-	}
-	if got.Me.PublicID != owner.PublicID {
-		t.Errorf("PublicID = %v, want %v", got.Me.PublicID, owner.PublicID)
-	}
-	if got.Me.DisplayName != "ホシノ" {
-		t.Errorf("DisplayName = %q", got.Me.DisplayName)
-	}
-	// **内部 ID も返る。** 投稿者の紐付け (author_id) に要る値で、
-	// これが欠けると匿名投稿しかできなくなる。
-	if got.UserID != owner.ID {
-		t.Errorf("UserID = %d, want %d", got.UserID, owner.ID)
-	}
-}
-
-// **見つからないセッションは 404 ではなく 401。**
-//
-// セッションの有無は認証の問題であり、リソースの有無ではない。
-// ここを ErrNotFound のまま通すと、未ログインが 404 で返る。
-func TestAuthenticate_NotFoundBecomesUnauthenticated(t *testing.T) {
-	t.Parallel()
-
-	uc := newInteractor(&fakeUserRepo{}, &fakeSessionRepo{liveToken: "other"}, &fakeProvider{})
-
-	_, err := uc.Authenticate(context.Background(), "無効なトークン")
-	if !errors.Is(err, apperr.ErrUnauthenticated) {
-		t.Fatalf("err = %v, want apperr.ErrUnauthenticated", err)
-	}
-	if errors.Is(err, apperr.ErrNotFound) {
-		t.Error("ErrNotFound のまま漏れている (HTTP 層で 404 になる)")
-	}
-}
-
-func TestAuthenticate_EmptyTokenIsUnauthenticated(t *testing.T) {
-	t.Parallel()
-
-	sessions := &fakeSessionRepo{liveToken: "x"}
-	uc := newInteractor(&fakeUserRepo{}, sessions, &fakeProvider{})
-
-	if _, err := uc.Authenticate(context.Background(), ""); !errors.Is(err, apperr.ErrUnauthenticated) {
-		t.Fatalf("err = %v, want apperr.ErrUnauthenticated", err)
-	}
-}
-
-// DB 由来のエラーは 401 に化けさせない。500 のまま上げる。
-// ここを握りつぶすと、DB 障害が「未ログイン」として見えてしまう。
-func TestAuthenticate_PropagatesOtherErrors(t *testing.T) {
-	t.Parallel()
-
-	sentinel := errors.New("DB がダウンしています")
-	uc := newInteractor(&fakeUserRepo{}, &fakeSessionRepo{findErr: sentinel}, &fakeProvider{})
-
-	_, err := uc.Authenticate(context.Background(), "t")
-	if !errors.Is(err, sentinel) {
-		t.Fatalf("err = %v, want %v", err, sentinel)
-	}
-	if errors.Is(err, apperr.ErrUnauthenticated) {
-		t.Error("DB 障害が未ログインとして扱われている")
-	}
-}
-
-func TestLogout(t *testing.T) {
-	t.Parallel()
-
-	sessions := &fakeSessionRepo{}
-	uc := newInteractor(&fakeUserRepo{}, sessions, &fakeProvider{})
-
-	if err := uc.Logout(context.Background(), "token-1"); err != nil {
-		t.Fatalf("Logout が失敗した: %v", err)
-	}
-	if len(sessions.deleted) != 1 || sessions.deleted[0] != "token-1" {
-		t.Errorf("削除されたトークン = %v", sessions.deleted)
 	}
 }
 
@@ -437,7 +344,7 @@ func TestCompleteLogin_PromotesBootstrapAdmin(t *testing.T) {
 	t.Parallel()
 
 	users := &fakeUserRepo{user: newTestUser(), promoteResult: true}
-	uc := newInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: validClaims()}).
+	uc := newLoginInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: validClaims()}).
 		WithBootstrapAdmin("sub-1")
 
 	if _, err := uc.CompleteLogin(context.Background(), "code", "verifier", "nonce"); err != nil {
@@ -454,7 +361,7 @@ func TestCompleteLogin_DoesNotPromoteOthers(t *testing.T) {
 	t.Parallel()
 
 	users := &fakeUserRepo{user: newTestUser()}
-	uc := newInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: validClaims()}).
+	uc := newLoginInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: validClaims()}).
 		WithBootstrapAdmin("だれか別の sub")
 
 	if _, err := uc.CompleteLogin(context.Background(), "code", "verifier", "nonce"); err != nil {
@@ -471,7 +378,7 @@ func TestCompleteLogin_NoBootstrapAdminConfigured(t *testing.T) {
 	t.Parallel()
 
 	users := &fakeUserRepo{user: newTestUser()}
-	uc := newInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: validClaims()})
+	uc := newLoginInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: validClaims()})
 
 	if _, err := uc.CompleteLogin(context.Background(), "code", "verifier", "nonce"); err != nil {
 		t.Fatalf("CompleteLogin が失敗した: %v", err)
@@ -490,7 +397,7 @@ func TestCompleteLogin_PromotionFailureDoesNotBlockLogin(t *testing.T) {
 	t.Parallel()
 
 	users := &fakeUserRepo{user: newTestUser(), promoteErr: errors.New("DB が落ちている")}
-	uc := newInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: validClaims()}).
+	uc := newLoginInteractor(users, &fakeSessionRepo{}, &fakeProvider{claims: validClaims()}).
 		WithBootstrapAdmin("sub-1")
 
 	got, err := uc.CompleteLogin(context.Background(), "code", "verifier", "nonce")
@@ -499,30 +406,5 @@ func TestCompleteLogin_PromotionFailureDoesNotBlockLogin(t *testing.T) {
 	}
 	if got.Token == "" {
 		t.Error("セッションが発行されていない")
-	}
-}
-
-// ロールがセッションの検証結果から運ばれること。
-// 毎リクエストの権限判定がここに依存する。
-func TestAuthenticate_CarriesRole(t *testing.T) {
-	t.Parallel()
-
-	const token = model.SessionToken("t")
-	owner := model.SessionOwner{
-		ID: 42, PublicID: uuid.MustParse("01920000-0000-7000-8000-000000000001"),
-		Email: "h@example.com", DisplayName: "ホシノ", Role: model.RoleModerator,
-	}
-	uc := newInteractor(&fakeUserRepo{}, &fakeSessionRepo{liveToken: token, owner: owner}, &fakeProvider{})
-
-	got, err := uc.Authenticate(context.Background(), token)
-	if err != nil {
-		t.Fatalf("Authenticate が失敗した: %v", err)
-	}
-	if got.Role != model.RoleModerator {
-		t.Errorf("Role = %q, want moderator", got.Role)
-	}
-	// 自分のロールは Me にも載る (フロントが導線を出し分けるため)。
-	if got.Me.Role != model.RoleModerator {
-		t.Errorf("Me.Role = %q, want moderator", got.Me.Role)
 	}
 }

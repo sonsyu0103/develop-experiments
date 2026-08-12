@@ -57,27 +57,35 @@ func run() error {
 	// スレッドのリポジトリは、コメント側の親スレッド存在確認にも使い回す。
 	threadRepo := postgres.NewThreadRepository(pool)
 
-	// 認証は設定が揃っているときだけ有効にする。
+	sessionRepo := postgres.NewSessionRepository(pool)
+
+	// **セッションの検証は常に結線する。** sessions を引いて期限を見るだけで、
+	// Google を必要としない (ADR 0005 決定 4)。
+	// ここを認証の設定で分岐させていた頃は、資格情報の無い環境が
+	// Cookie を無視して全リクエストを匿名として扱っていた。
+	sessionInteractor := userusecase.NewSessionInteractor(sessionRepo)
+
+	// **ログインだけが設定を要する。** 認可コードの交換に IdP が要るため。
 	//
 	// 揃っていなくても API は起動する。掲示板の閲覧と匿名投稿は認証に依存せず、
 	// 設定漏れで全体が落ちるほうが害が大きい (config.AuthConfig を参照)。
-	// 無効なときは認証エンドポイントだけが 503 を返す。
-	var authInteractor *userusecase.AuthInteractor
+	var loginInteractor *userusecase.LoginInteractor
 	if cfg.Auth.Enabled() {
 		provider, providerErr := oidcprovider.NewGoogle(ctx, cfg.Auth)
 		if providerErr != nil {
 			return fmt.Errorf("OIDC プロバイダの初期化に失敗しました: %w", providerErr)
 		}
-		authInteractor = userusecase.NewAuthInteractor(
+		loginInteractor = userusecase.NewLoginInteractor(
 			postgres.NewUserRepository(pool),
-			postgres.NewSessionRepository(pool),
+			sessionRepo,
 			provider,
 			nil,
 		).WithBootstrapAdmin(cfg.Auth.BootstrapAdminGoogleSub)
-		slog.Info("認証を有効にしました",
+		slog.Info("ログインを有効にしました",
 			slog.Bool("bootstrap_admin", cfg.Auth.BootstrapAdminGoogleSub != ""))
 	} else {
-		slog.Warn("認証の設定が無いため、/auth と /me は 503 を返します")
+		slog.Warn("認証の設定が無いため、/auth/google の 2 経路は 503 を返します " +
+			"(発行済みセッションの検証・/me・ログアウトは動きます)")
 	}
 
 	server := httpapi.NewServer(
@@ -85,7 +93,8 @@ func run() error {
 		commentusecase.NewCommentInteractor(
 			postgres.NewCommentRepository(pool, cfg.CommentPostMode), threadRepo),
 		pool,
-		authInteractor,
+		sessionInteractor,
+		loginInteractor,
 		cfg.Auth,
 	)
 

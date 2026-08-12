@@ -216,6 +216,10 @@ func newTestEnv(t *testing.T) *testEnv {
 			threadusecase.NewThreadInteractor(threads),
 			commentusecase.NewCommentInteractor(comments, threads),
 			pinger,
+			// セッションの解決は認証の設定に依らず常に結線する (ADR 0005 決定 4)。
+			// このテスト環境は Cookie を送らないので、生きたセッションは持たせない。
+			userusecase.NewSessionInteractor(&fakeSessionRepo{}),
+			// ログインは未設定 (= /auth/google が 503) の状態。
 			nil,
 			config.AuthConfig{},
 		),

@@ -131,9 +131,12 @@ type authEnv struct {
 	token    usermodel.SessionToken
 }
 
-// newAuthEnv は認証を有効にしたルータを組み立てます。
-// authEnabled が false の場合は、設定が無い状態 (認証が 503) を再現します。
-func newAuthEnv(t *testing.T, authEnabled bool) *authEnv {
+// newAuthEnv はルータを組み立てます。
+//
+// loginEnabled が false の場合は、**OIDC の設定が無い状態**を再現します。
+// このとき 503 になるのはログインの 2 経路だけで、
+// セッションの検証はそのまま動きます (ADR 0005 決定 4)。
+func newAuthEnv(t *testing.T, loginEnabled bool) *authEnv {
 	t.Helper()
 
 	const token = usermodel.SessionToken("test-session-token")
@@ -150,11 +153,11 @@ func newAuthEnv(t *testing.T, authEnabled bool) *authEnv {
 		},
 	}
 
-	var auth *userusecase.AuthInteractor
-	if authEnabled {
+	var login *userusecase.LoginInteractor
+	if loginEnabled {
 		user := usermodel.Reconstruct(1, publicID, "sub-1", "h@example.com", "ホシノ",
 			nil, usermodel.RoleUser, time.Unix(0, 0).UTC(), time.Unix(0, 0).UTC(), nil)
-		auth = userusecase.NewAuthInteractor(
+		login = userusecase.NewLoginInteractor(
 			&fakeUserRepo{user: user},
 			sessions,
 			&fakeProvider{claims: &userusecase.IDTokenClaims{
@@ -177,7 +180,10 @@ func newAuthEnv(t *testing.T, authEnabled bool) *authEnv {
 			threadusecase.NewThreadInteractor(threads),
 			commentusecase.NewCommentInteractor(comments, threads),
 			&fakePinger{},
-			auth,
+			// **セッションの解決は loginEnabled に依らず結線する。**
+			// ここを分岐させると、テストが本番と同じ穴を再現してしまう。
+			userusecase.NewSessionInteractor(sessions),
+			login,
 			config.AuthConfig{FrontendURL: "http://localhost:3000"},
 		),
 		AllowedOrigins: []string{"http://localhost:3000"},
@@ -360,19 +366,24 @@ func TestAuth_ExpiredSessionIsStill401(t *testing.T) {
 // 設定が無いときの振る舞い
 // ---------------------------------------------------------------------------
 
-// 認証の設定が無くても API は起動し、認証経路だけが 503 になること。
+// 認証の設定が無くても API は起動し、**ログインの経路だけ**が 503 になること。
 //
 // 必須にすると、Google の資格情報を置くまで CI が落ちる
 // (Migration Check は API を起動してスモークテストを回すため)。
 func TestAuth_DisabledReturns503(t *testing.T) {
 	env := newAuthEnv(t, false)
 
-	rec := env.do(t, http.MethodGet, "/auth/google")
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503 (body=%s)", rec.Code, rec.Body.String())
-	}
-	if code := decodeError(t, rec).Error.Code; code != oapigen.UNAVAILABLE {
-		t.Errorf("code = %q, want UNAVAILABLE", code)
+	for _, path := range []string{
+		"/auth/google",
+		"/auth/google/callback?code=c&state=s1",
+	} {
+		rec := env.do(t, http.MethodGet, path)
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s: status = %d, want 503 (body=%s)", path, rec.Code, rec.Body.String())
+		}
+		if code := decodeError(t, rec).Error.Code; code != oapigen.UNAVAILABLE {
+			t.Errorf("%s: code = %q, want UNAVAILABLE", path, code)
+		}
 	}
 }
 
@@ -383,6 +394,68 @@ func TestAuth_DisabledStillServesThreads(t *testing.T) {
 	rec := env.do(t, http.MethodGet, "/threads")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// **この PR の主旨。OIDC の設定が無くてもセッションは解決されること。**
+//
+// 分ける前は resolveSession が s.auth == nil で素通ししていたため、
+// 有効な Cookie を持っていても全員が匿名として扱われ、
+// security を宣言した経路は必ず 401 になっていた。
+// CI には資格情報が無いので、**認証済みの経路が 1 件も検証されない**
+// 状態がそのまま「緑」として通っていた
+// (docs/adr/0003-open-questions.md 未決 #16)。
+//
+// ここが落ちたら、CI のスモークが再び丸ごと SKIP に戻っている。
+func TestAuth_SessionResolvesWithoutLoginConfig(t *testing.T) {
+	env := newAuthEnv(t, false)
+
+	rec := env.do(t, http.MethodGet, "/me", sessionCookie(env.token))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if got := decodeJSON[oapigen.Me](t, rec); got.DisplayName != "ホシノ" {
+		t.Errorf("DisplayName = %q, want ホシノ", got.DisplayName)
+	}
+}
+
+// 設定が無い環境でも投稿者が紐付くこと。
+//
+// /me だけを見ていると、「principal は載っているが投稿へ渡っていない」
+// を見逃す。冪等キーも画像も、この経路が生きていることが前提になる。
+func TestAuth_AuthorIsAttachedWithoutLoginConfig(t *testing.T) {
+	env := newAuthEnv(t, false)
+
+	rec := postJSON(t, env, "/threads", `{"title":"設定が無くても投稿者は付く"}`,
+		sessionCookie(env.token))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if env.threads.created == nil {
+		t.Fatal("スレッドが保存されていない")
+	}
+	got := env.threads.created.AuthorID
+	if got == nil {
+		t.Fatal("author_id が渡っていない (匿名投稿として扱われた)")
+	}
+	if *got != 1 {
+		t.Errorf("author_id = %d, want 1", *got)
+	}
+}
+
+// **ログアウトは設定に依存しないこと。**
+//
+// 発行済みのセッションを捨てるだけで IdP には触れない。
+// ここを 503 で塞ぐと、資格情報を外した環境に破棄できないセッションが残る。
+func TestLogout_WorksWithoutLoginConfig(t *testing.T) {
+	env := newAuthEnv(t, false)
+
+	rec := env.do(t, http.MethodPost, "/auth/logout", sessionCookie(env.token))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if len(env.sessions.deleted) != 1 || env.sessions.deleted[0] != env.token {
+		t.Errorf("削除されたトークン = %v, want [%s]", env.sessions.deleted, env.token)
 	}
 }
 

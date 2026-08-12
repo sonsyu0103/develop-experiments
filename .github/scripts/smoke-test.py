@@ -338,9 +338,11 @@ section("認証")
 # **資格情報の有無で期待が変わるので、まず状態を判定する。**
 # CI は置いていないので 503、手元に .env を置くと 302 になる。
 # 決め打ちにすると、資格情報を入れた環境でスモークが落ちる (実際に踏んだ)。
+#
+# **分岐するのはこの節だけ。** セッションを要する検査は分岐しない ——
+# 設定が無くても発行済みセッションは解決されるため
+# (docs/adr/0005-authentication.md 決定 4)。
 auth_status, auth_payload, auth_headers = call("GET", "/auth/google")
-# 資格情報が入っているか。セッションを要する検査はこれで分岐する。
-auth_enabled = auth_status != 503
 
 if auth_status == 503:
     # 認証だけが使えない状態。全体が落ちる設計だと、
@@ -516,24 +518,31 @@ if SQL_EXEC:
         """)
         cookie = {"Cookie": f"session={probe_token}"}
 
-        # **セッションを要する検査は、認証が設定されている環境でだけ行う。**
-        # 資格情報が無いと auth が nil になり、ミドルウェアが
-        # セッションを解決しないため /me は必ず 401 になる。
-        # ここを決め打ちにすると CI (資格情報なし) で落ちる —— 実際に落とした。
-        if auth_enabled:
-            status, payload, _ = call("GET", "/me", headers=cookie)
-            check("ログイン中は /me に role が載る",
-                  status == 200 and (payload or {}).get("role") == "user",
-                  f"status={status} payload={payload}")
+        # **セッションを要する検査を、認証の設定で分岐させない。**
+        # 以前はここが auth_enabled で囲まれており、資格情報を置いていない
+        # CI では丸ごと SKIP されていた。セッションの検証は sessions を
+        # 引くだけで Google を必要としないので、切り離した
+        # (docs/adr/0005-authentication.md 決定 4 / ADR 0003 未決 #16)。
+        status, payload, _ = call("GET", "/me", headers=cookie)
+        check("ログイン中は /me に role が載る",
+              status == 200 and (payload or {}).get("role") == "user",
+              f"status={status} payload={payload}")
 
-            # **昇格が読み出し側に反映されること。**
-            # ここが繋がっていないと、権限を変えても API から見えない。
-            sql("UPDATE users SET role = 'moderator' WHERE id = 900002;")
-            _, payload, _ = call("GET", "/me", headers=cookie)
-            check("ロールを変えると /me に反映される",
-                  (payload or {}).get("role") == "moderator", f"payload={payload}")
-        else:
-            print("  \033[33mSKIP\033[0m /me の検査 (認証が未設定のためセッションを解決できない)")
+        # **昇格が読み出し側に反映されること。**
+        # ここが繋がっていないと、権限を変えても API から見えない。
+        sql("UPDATE users SET role = 'moderator' WHERE id = 900002;")
+        _, payload, _ = call("GET", "/me", headers=cookie)
+        check("ロールを変えると /me に反映される",
+              (payload or {}).get("role") == "moderator", f"payload={payload}")
+
+        # **ログアウトは OIDC の設定を要求しない。**
+        # 発行済みセッションを捨てるだけで IdP には触れないため。
+        # ここが 503 になる実装だと、資格情報の無い環境に
+        # 破棄できないセッションが残る。
+        status, _, _ = call("POST", "/auth/logout", headers=cookie)
+        check("ログアウトは認証が未設定でも 204", status == 204, f"status={status}")
+        status, _, _ = call("GET", "/me", headers=cookie)
+        check("ログアウト後のセッションは無効", status == 401, f"status={status}")
 
         # **他人のロールは投稿一覧に出さない。**
         # 誰がモデレーターかを晒す必要がない (Author に role は無い)。
@@ -578,7 +587,7 @@ else:
 # フェイクのリポジトリでは再現できない。ON CONFLICT DO NOTHING が
 # 未コミットの行を待つ挙動も、実 DB でしか出ない。
 
-if SQL_EXEC and auth_enabled:
+if SQL_EXEC:
     section("冪等キー (ADR 0015)")
 
     idem_token = "smoke-idem-" + secrets.token_hex(16)
@@ -698,11 +707,13 @@ if SQL_EXEC and auth_enabled:
         sql("DELETE FROM users WHERE id IN (900010, 900011);")
 else:
     section("冪等キー (ADR 0015)")
-    # **CI ではここが必ずスキップされる。**
-    # 資格情報が無いと auth が nil になり、resolveSession がセッションを
-    # 解決しないため、常に匿名として扱われる。匿名は冪等キーの対象外 (決定 4)。
-    # docs/adr/0003-open-questions.md の未決 #16 を参照。
-    print("  \033[33mSKIP\033[0m 認証が未設定のためスキップ (セッションが要る)")
+    # **以前はここが CI で必ずスキップされていた。**
+    # 資格情報が無いと resolveSession がセッションを解決せず、
+    # 常に匿名として扱われていたため (匿名は冪等キーの対象外・決定 4)。
+    # セッションの解決を OIDC の設定から切り離したので、
+    # 残る条件は SQL_EXEC だけになった
+    # (docs/adr/0005-authentication.md 決定 4)。
+    print("  \033[33mSKIP\033[0m SQL_EXEC が未設定のためスキップ")
 
 # ---------------------------------------------------------------------------
 
