@@ -70,6 +70,7 @@ func (r *CommentRepository) ListByThreadID(
 			row.ID, row.ThreadID, row.Seq, row.AuthorName,
 			toCommentAuthor(row.AuthorPublicID, row.AuthorDisplayName,
 				row.AuthorAvatarUrl, row.AuthorDeletedAt),
+			toCommentImage(row.ImageID, row.ImageObjectKey, row.ImageWidth, row.ImageHeight),
 			row.Body, row.CreatedAt,
 		))
 	}
@@ -177,6 +178,7 @@ func (r *CommentRepository) insertWithSeq(
 		AuthorName: comment.AuthorName,
 		Body:       comment.Body,
 		AuthorID:   comment.AuthorID,
+		ImageID:    comment.ImageID,
 	})
 	if err != nil {
 		return zero, translateError(op, err)
@@ -217,6 +219,7 @@ func (r *CommentRepository) createAutoSeq(
 			AuthorName: comment.AuthorName,
 			Body:       comment.Body,
 			AuthorID:   comment.AuthorID,
+			ImageID:    comment.ImageID,
 		})
 		return err
 	})
@@ -483,6 +486,7 @@ func (r *CommentRepository) insertComment(
 			AuthorName: comment.AuthorName,
 			Body:       comment.Body,
 			AuthorID:   comment.AuthorID,
+			ImageID:    comment.ImageID,
 		})
 		if err != nil {
 			return sqlcgen.CreateCommentWithSeqRow{}, translateError(op, err)
@@ -562,6 +566,7 @@ func (r *CommentRepository) toModel(row sqlcgen.CreateCommentWithSeqRow, authorI
 	created := model.Reconstruct(row.ID, row.ThreadID, row.Seq, row.AuthorName,
 		toCommentAuthor(row.AuthorPublicID, row.AuthorDisplayName,
 			row.AuthorAvatarUrl, row.AuthorDeletedAt),
+		toCommentImage(row.ImageID, row.ImageObjectKey, row.ImageWidth, row.ImageHeight),
 		row.Body, row.CreatedAt)
 	// 書いた内容を戻り値に反映させる (thread_repository.go と同じ理由)。
 	created.AuthorID = authorID

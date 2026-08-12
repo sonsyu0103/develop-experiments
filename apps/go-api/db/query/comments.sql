@@ -22,7 +22,7 @@
 -- 重複して転送されるため。初手は A で揃え、B (ListAuthorsByIDs) との
 -- 比較は Phase 4 のベンチマークで行う。
 WITH page AS (
-    SELECT id, thread_id, seq, author_name, body, created_at, author_id
+    SELECT id, thread_id, seq, author_name, body, created_at, author_id, image_id
     FROM comments
     WHERE thread_id = sqlc.arg('thread_id')
       AND deleted_at IS NULL
@@ -40,9 +40,17 @@ SELECT
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
-    u.deleted_at   AS author_deleted_at
+    u.deleted_at   AS author_deleted_at,
+    -- 添付画像も LEFT JOIN で解決する。
+    -- **LEFT であることが必須** (INNER にすると画像なしのコメントが消える)。
+    -- 参照は部分索引 comments_image_id_idx を使う。
+    i.id         AS image_id,
+    i.object_key AS image_object_key,
+    i.width      AS image_width,
+    i.height     AS image_height
 FROM page p
 LEFT JOIN users u ON u.id = p.author_id
+LEFT JOIN images i ON i.id = p.image_id
 ORDER BY p.id DESC;
 
 -- name: NextCommentSeq :one
@@ -79,15 +87,16 @@ WHERE thread_id = sqlc.arg('thread_id');
 -- 投稿者の解決は 1 往復に含める。RETURNING は挿入行しか返せないので
 -- CTE で包んで LEFT JOIN する (threads.sql の CreateThread と同じ理由)。
 WITH inserted AS (
-    INSERT INTO comments (thread_id, seq, author_name, body, author_id)
+    INSERT INTO comments (thread_id, seq, author_name, body, author_id, image_id)
     VALUES (
         sqlc.arg('thread_id'),
         sqlc.arg('seq'),
         sqlc.arg('author_name'),
         sqlc.arg('body'),
-        sqlc.narg('author_id')
+        sqlc.narg('author_id'),
+        sqlc.narg('image_id')
     )
-    RETURNING id, thread_id, seq, author_name, body, created_at, author_id
+    RETURNING id, thread_id, seq, author_name, body, created_at, author_id, image_id
 )
 SELECT
     i.id,
@@ -99,9 +108,14 @@ SELECT
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
-    u.deleted_at   AS author_deleted_at
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS image_id,
+    img.object_key AS image_object_key,
+    img.width      AS image_width,
+    img.height     AS image_height
 FROM inserted i
-LEFT JOIN users u ON u.id = i.author_id;
+LEFT JOIN users u ON u.id = i.author_id
+LEFT JOIN images img ON img.id = i.image_id;
 
 -- name: CreateCommentAutoSeq :one
 -- 採番と挿入を 1 文で行う。unique モード専用 (ADR 0019 決定 2)。
@@ -126,20 +140,21 @@ LEFT JOIN users u ON u.id = i.author_id;
 -- 親の名前だけで一致を見るとリトライ判定が永久に偽になり、
 -- unique モードが競合のたびに 409 を返すようになる。
 WITH inserted AS (
-    INSERT INTO comments (thread_id, seq, author_name, body, author_id)
+    INSERT INTO comments (thread_id, seq, author_name, body, author_id, image_id)
     SELECT
         sqlc.arg('thread_id'),
         COALESCE(MAX(c.seq), 0) + 1,
         sqlc.arg('author_name'),
         sqlc.arg('body'),
-        sqlc.narg('author_id')
+        sqlc.narg('author_id'),
+        sqlc.narg('image_id')
     FROM comments c
     WHERE c.thread_id = sqlc.arg('thread_id')
     HAVING EXISTS (
         SELECT 1 FROM threads
         WHERE id = sqlc.arg('thread_id') AND deleted_at IS NULL
     )
-    RETURNING id, thread_id, seq, author_name, body, created_at, author_id
+    RETURNING id, thread_id, seq, author_name, body, created_at, author_id, image_id
 )
 SELECT
     i.id,
@@ -151,9 +166,14 @@ SELECT
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
-    u.deleted_at   AS author_deleted_at
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS image_id,
+    img.object_key AS image_object_key,
+    img.width      AS image_width,
+    img.height     AS image_height
 FROM inserted i
-LEFT JOIN users u ON u.id = i.author_id;
+LEFT JOIN users u ON u.id = i.author_id
+LEFT JOIN images img ON img.id = i.image_id;
 
 -- name: SoftDeleteComment :execrows
 -- 現時点で HTTP エンドポイントからは呼ばれていない。

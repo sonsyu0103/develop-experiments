@@ -765,6 +765,215 @@ else:
     # (docs/adr/0005-authentication.md 決定 4)。
     skip("冪等キー", "SQL_EXEC が未設定")
 
+
+# ---------------------------------------------------------------------------
+# 画像 (docs/adr/0007-image-storage.md)
+# ---------------------------------------------------------------------------
+#
+# **ユニットテストのフェイクでは確かめられない領域。**
+#   - DB とストレージ 2 システムの整合 (pending -> PUT -> committed)
+#   - 実際に保存されたバイト列が配信 URL から読めること
+#   - 添付した画像がコメント一覧に載ること
+
+if SQL_EXEC:
+    section("画像 (ADR 0007)")
+
+    img_token = "smoke-img-" + secrets.token_hex(16)
+    img_hash = hashlib.sha256(img_token.encode()).hexdigest()
+    other_img_token = "smoke-img2-" + secrets.token_hex(16)
+    other_img_hash = hashlib.sha256(other_img_token.encode()).hexdigest()
+
+    # 32x32 の PNG を最小限の依存で作る (Pillow を入れない)。
+    # zlib と struct だけで組める。
+    def _png(width: int, height: int, rgb: tuple = (60, 120, 200)) -> bytes:
+        import struct
+        import zlib
+
+        raw = b""
+        for _ in range(height):
+            # 各行の先頭にフィルタ種別 (0 = None) が要る。
+            raw += b"\x00" + bytes(rgb) * width
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+        ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+                + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+    def _multipart(kind: str, body: bytes) -> tuple:
+        """multipart/form-data の本文と Content-Type を組み立てる。"""
+        boundary = "----smoke" + secrets.token_hex(8)
+        parts = []
+        if kind is not None:
+            parts.append(
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="kind"\r\n\r\n{kind}\r\n'.encode())
+        if body is not None:
+            parts.append(
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="a.png"\r\n'
+                f"Content-Type: image/png\r\n\r\n".encode() + body + b"\r\n")
+        parts.append(f"--{boundary}--\r\n".encode())
+        return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+    def upload(kind, body, cookie_token):
+        """画像をアップロードする。urllib を直接使う (call は JSON 専用)。"""
+        payload, content_type = _multipart(kind, body)
+        req = urllib.request.Request(BASE_URL + "/images", method="POST")
+        req.add_header("Content-Type", content_type)
+        if cookie_token:
+            req.add_header("Cookie", f"session={cookie_token}")
+        try:
+            with _opener.open(req, payload, timeout=30) as res:
+                return res.status, _decode(res.read())
+        except urllib.error.HTTPError as e:
+            return e.code, _decode(e.read())
+
+    try:
+        for uid, sub, sess in [
+            (900020, "smoke-sub-img", img_hash),
+            (900021, "smoke-sub-img2", other_img_hash),
+        ]:
+            sql(f"""
+                INSERT INTO users (id, public_id, google_sub, email, display_name)
+                VALUES ({uid},
+                        '01920000-0000-7000-8000-000000{uid}'::uuid,
+                        '{sub}', '{sub}@example.com', '画像検証')
+                ON CONFLICT (google_sub) DO NOTHING;
+            """)
+            sql(f"""
+                INSERT INTO sessions (id, user_id, expires_at)
+                VALUES ('{sess}', {uid}, now() + interval '5 minutes');
+            """)
+
+        # ストレージが設定されていない環境では画像だけが 503 になる。
+        probe_status, probe_body = upload("comment_attachment", _png(8, 8), img_token)
+        storage_enabled = probe_status != 503
+
+        if not storage_enabled:
+            code = (probe_body or {}).get("error", {}).get("code")
+            check("ストレージが未設定なら POST /images は 503 UNAVAILABLE",
+                  code == "UNAVAILABLE", f"status={probe_status} code={code}")
+            skip("画像", "ストレージが未設定")
+        else:
+            check("画像をアップロードできる", probe_status == 201, f"status={probe_status}")
+
+            status, uploaded = upload("comment_attachment", _png(64, 48), img_token)
+            check("アップロードが 201 を返す", status == 201, f"status={status} body={uploaded}")
+
+            if status == 201:
+                image_id = uploaded["id"]
+                # **絶対 URL を返す** (決定 5)。
+                check("絶対 URL が返る",
+                      isinstance(uploaded.get("url"), str)
+                      and uploaded["url"].startswith("http"),
+                      f"url={uploaded.get('url')!r}")
+                # **オブジェクトキーを外に出さない。**
+                check("応答にオブジェクトキーが含まれない",
+                      "objectKey" not in json.dumps(uploaded), f"body={uploaded}")
+
+                # **DB の状態が committed であること** (決定 3 の手順 3)。
+                # pending のまま残っていたら、確定の UPDATE が効いていない。
+                out = subprocess.run(
+                    shlex.split(SQL_EXEC) + [
+                        f"SELECT status || ':' || content_type FROM images "
+                        f"WHERE id = '{image_id}'::uuid;"],
+                    check=True, capture_output=True, text=True).stdout
+                check("DB では committed になっている", "committed" in out,
+                      f"got={out.strip()!r}")
+                # **コメント添付は JPEG で保存される** (決定 6)。
+                # PNG を送っても JPEG が返るのが再エンコードの証拠になる。
+                check("コメント添付は JPEG に再エンコードされる", "image/jpeg" in out,
+                      f"got={out.strip()!r}")
+
+                # 配信 URL から実際に読めること。
+                try:
+                    with urllib.request.urlopen(uploaded["url"], timeout=10) as res:  # noqa: S310
+                        fetched = res.read()
+                        fetched_type = res.headers.get("Content-Type", "")
+                    check("配信 URL から実体を取得できる", len(fetched) > 0,
+                          f"{len(fetched)} バイト")
+                    check("配信時の Content-Type が image/jpeg",
+                          fetched_type == "image/jpeg", f"got={fetched_type!r}")
+                    # **入力と別のバイト列** (再エンコードされている)。
+                    check("保存されたのは入力そのものではない",
+                          not fetched.startswith(b"\x89PNG"), "PNG のまま保存されている")
+                except Exception as e:  # noqa: BLE001
+                    check("配信 URL から実体を取得できる", False, f"{e}")
+
+                # コメントへ添付する。
+                s, thread = call("POST", "/threads", '{"title":"画像つきの検証"}',
+                                 headers={"Cookie": f"session={img_token}"})[:2]
+                tid = thread["id"] if s == 201 else None
+                if tid is None:
+                    check("検証用スレッドを作れる", False, f"status={s}")
+                    skip("画像", "検証用スレッドを作れなかった")
+                else:
+                    s, posted, _ = call(
+                        "POST", f"/threads/{tid}/comments",
+                        json.dumps({"body": "画像つき", "imageId": image_id}),
+                        headers={"Cookie": f"session={img_token}"})
+                    check("画像つきで投稿できる", s == 201, f"status={s} body={posted}")
+                    check("応答に画像が載る",
+                          isinstance(posted, dict) and (posted.get("image") or {}).get("id") == image_id,
+                          f"image={posted.get('image') if isinstance(posted, dict) else posted}")
+
+                    # **一覧でも画像が解決される** (LEFT JOIN が効いていること)。
+                    _, listed, _ = call("GET", f"/threads/{tid}/comments")
+                    first = (listed.get("comments") or [None])[0]
+                    check("一覧でも画像が解決される",
+                          first is not None and (first.get("image") or {}).get("id") == image_id,
+                          f"comment={first}")
+
+                    # **画像なしの投稿が一覧から消えないこと** (LEFT であること)。
+                    call("POST", f"/threads/{tid}/comments", '{"body":"画像なし"}')
+                    _, listed, _ = call("GET", f"/threads/{tid}/comments")
+                    no_image = [c for c in listed["comments"] if c.get("image") is None]
+                    check("画像なしのコメントが一覧から消えない (LEFT であること)",
+                          len(no_image) > 0, f"comments={listed['comments']}")
+
+                    # **他人の画像は添付できない (404)。**
+                    # 403 にすると「その ID が存在すること」が漏れる。
+                    s, err, _ = call(
+                        "POST", f"/threads/{tid}/comments",
+                        json.dumps({"body": "他人の画像", "imageId": image_id}),
+                        headers={"Cookie": f"session={other_img_token}"})
+                    code = err["error"]["code"] if isinstance(err, dict) and "error" in err else ""
+                    check("他人の画像を添付すると 404", s == 404 and code == "NOT_FOUND",
+                          f"status={s} code={code}")
+
+                    # **匿名は画像を添付できない。**
+                    s, _, _ = call("POST", f"/threads/{tid}/comments",
+                                   json.dumps({"body": "匿名で画像", "imageId": image_id}))
+                    check("匿名で画像を添付すると 401", s == 401, f"status={s}")
+
+                    sql(f"DELETE FROM comments WHERE thread_id = {tid};")
+                    sql(f"DELETE FROM threads WHERE id = {tid};")
+
+            # 未ログインは 401。
+            s, _ = upload("comment_attachment", _png(8, 8), None)
+            check("未ログインのアップロードは 401", s == 401, f"status={s}")
+
+            # SVG は受け付けない (決定 2)。
+            s, _ = upload("comment_attachment",
+                          b'<svg xmlns="http://www.w3.org/2000/svg"><script/></svg>', img_token)
+            check("SVG は 400 で拒否される", s == 400, f"status={s}")
+
+            # まだ開けていない用途は拒否する。
+            s, _ = upload("avatar", _png(8, 8), img_token)
+            check("未対応の kind は 400", s == 400, f"status={s}")
+    finally:
+        sql("DELETE FROM comments WHERE image_id IN "
+            "(SELECT id FROM images WHERE owner_id IN (900020, 900021));")
+        sql("UPDATE users SET avatar_image_id = NULL WHERE id IN (900020, 900021);")
+        sql("DELETE FROM images WHERE owner_id IN (900020, 900021);")
+        sql("DELETE FROM threads WHERE author_id IN (900020, 900021);")
+        sql("DELETE FROM sessions WHERE user_id IN (900020, 900021);")
+        sql("DELETE FROM users WHERE id IN (900020, 900021);")
+else:
+    section("画像 (ADR 0007)")
+    skip("画像", "SQL_EXEC が未設定")
+
 # ---------------------------------------------------------------------------
 
 print()

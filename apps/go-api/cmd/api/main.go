@@ -17,6 +17,8 @@ import (
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi"
+	imageusecase "develop-experiments/apps/go-api/internal/image/usecase"
+	"develop-experiments/apps/go-api/internal/infrastructure/objectstorage"
 	oidcprovider "develop-experiments/apps/go-api/internal/infrastructure/oidc"
 	"develop-experiments/apps/go-api/internal/infrastructure/postgres"
 	"develop-experiments/apps/go-api/internal/logging"
@@ -88,13 +90,46 @@ func run() error {
 			"(発行済みセッションの検証・/me・ログアウトは動きます)")
 	}
 
+	// 画像はストレージの設定が揃っているときだけ有効にする。
+	//
+	// 認証と同じ形 (ADR 0005 決定 4)。揃っていなくても API は起動し、
+	// **画像の経路だけが 503** になる。掲示板の閲覧・投稿・ログインは
+	// 画像に依存しない。
+	var imageInteractor *imageusecase.ImageInteractor
+	if cfg.Storage.Enabled() {
+		storage, storageErr := objectstorage.New(ctx, cfg.Storage)
+		if storageErr != nil {
+			return fmt.Errorf("オブジェクトストレージの初期化に失敗しました: %w", storageErr)
+		}
+		imageInteractor = imageusecase.NewImageInteractor(
+			postgres.NewImageRepository(pool), storage, nil)
+		slog.Info("画像アップロードを有効にしました",
+			slog.String("bucket", cfg.Storage.Bucket))
+	} else {
+		slog.Warn("ストレージの設定が無いため、POST /images は 503 を返します")
+	}
+
+	// **nil のポインタをインターフェースへ入れない。**
+	//
+	// commentusecase.ImageResolver に (*imageusecase.ImageInteractor)(nil) を
+	// 代入すると、**インターフェース値としては非 nil** になる
+	// (型情報を持つため)。受け取った側の `if i.images == nil` は偽になり、
+	// 設定が無い環境で画像を指定した投稿が 503 ではなく nil 参照で落ちる。
+	//
+	// Go でよく踏む形なので、代入をここで明示的に分岐させる。
+	var imageResolver commentusecase.ImageResolver
+	if imageInteractor != nil {
+		imageResolver = imageInteractor
+	}
+
 	server := httpapi.NewServer(
 		threadusecase.NewThreadInteractor(threadRepo),
 		commentusecase.NewCommentInteractor(
-			postgres.NewCommentRepository(pool, cfg.CommentPostMode), threadRepo),
+			postgres.NewCommentRepository(pool, cfg.CommentPostMode), threadRepo, imageResolver),
 		pool,
 		sessionInteractor,
 		loginInteractor,
+		imageInteractor,
 		cfg.Auth,
 	)
 

@@ -82,6 +82,8 @@ components:
     in: internal/image/domain/model
   image-repository:
     in: internal/image/domain/repository
+  image-usecase:
+    in: internal/image/usecase
 
   user-model:
     in: internal/user/domain/model
@@ -162,6 +164,16 @@ deps:
       - uuid
     mayDependOn:
       - image-model
+  # 画像のユースケース。**再エンコードはここで行う** ——
+  # ドメインに置くと、ドメインが画像ライブラリを知ることになる。
+  # S3 SDK は入らない (保存先は ObjectStorage の背後)
+  image-usecase:
+    canUse:
+      - uuid
+      - imaging
+    mayDependOn:
+      - image-model
+      - image-repository
 
   user-model:
     canUse:
@@ -212,6 +224,7 @@ deps:
       - comment-usecase
       - user-usecase
       - user-model
+      - image-usecase
       - httpapi-oapigen
       - shared-config
       # 緩和: ハンドラのテストはフェイクのリポジトリを組むため
@@ -225,6 +238,13 @@ deps:
       # user-repository のインターフェースを満たす必要があり、
       # その署名に uuid.UUID が出てくるため vendors も要る。
       - user-repository
+      # 画像も同じ。アップロードのテストは ImageRepository と
+      # ObjectStorage のフェイクを組む。
+      # **本体用には足していない** —— ハンドラがドメインの型を持つと、
+      # 内部表現がそのまま JSON に出る経路ができる (実際に一度踏んで、
+      # 用途の検証を usecase 層へ移した)。
+      - image-model
+      - image-repository
 
   postgres:
     canUse:

@@ -7,6 +7,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
+
 	"develop-experiments/apps/go-api/internal/apperr"
 )
 
@@ -44,9 +46,42 @@ type Comment struct {
 	// 匿名かどうかの判定は Author が nil かどうかで行います。
 	AuthorID *int64
 	// Author は表示用の投稿者情報です。匿名投稿では nil になります。
-	Author    *Author
+	Author *Author
+	// ImageID は添付画像の ID です。**nil が「画像なし」を意味します**。
+	// 書き込み時に使う値で、読み出し経路では埋まりません
+	// (AuthorID と同じ扱い。判定は Image が nil かどうかで行います)。
+	ImageID *uuid.UUID
+	// Image は表示用の添付画像です。画像がなければ nil になります。
+	//
+	// **モジュールをまたがないため、image モジュールの型は使いません**
+	// (docs/adr/0004-modular-monolith.md / ADR 0014 の Author と同じ形)。
+	Image     *Image
 	Body      string
 	CreatedAt time.Time
+}
+
+// Image は表示用の添付画像です。
+//
+// **URL ではなくオブジェクトキーを持ちます。** URL の組み立ては
+// 環境ごとの設定 (CDN のドメイン) を要するため、ドメインの外
+// (ユースケース層) で行います —— ここに URL を持たせると、
+// ドメインが配信基盤を知ることになります。
+type Image struct {
+	ID        uuid.UUID
+	ObjectKey string
+	Width     int
+	Height    int
+}
+
+// NewImage は永続化層が読み出した行から添付画像を組み立てます。
+//
+// **id がゼロ値なら nil を返します。** LEFT JOIN が成立しなかった
+// (画像が添付されていない) 場合がこれに当たります。
+func NewImage(id uuid.UUID, objectKey string, width, height int) *Image {
+	if id == uuid.Nil {
+		return nil
+	}
+	return &Image{ID: id, ObjectKey: objectKey, Width: width, Height: height}
 }
 
 // NewComment は永続化前の新しいコメントを組み立てます。
@@ -59,9 +94,19 @@ type Comment struct {
 // 保存された author_name ではないためです。ここで受け取った値を保存すると、
 // 「投稿時点の表示名」が残り、表示名の変更が過去の投稿に反映されなくなります
 // (docs/adr/0014-author-resolution.md はその挙動を選んでいません)。
-func NewComment(threadID int64, authorName, body string, authorID *int64) (*Comment, error) {
+// **画像は認証済みでなければ添付できません** (ADR 0007 の背景)。
+// 匿名の投稿に imageId が付いていたら、無視ではなくエラーにします ——
+// 冪等キー (無視する) と違い、こちらは「画像が消えた」ように見えるためです。
+func NewComment(
+	threadID int64, authorName, body string, authorID *int64, imageID *uuid.UUID,
+) (*Comment, error) {
 	if threadID <= 0 {
 		return nil, fmt.Errorf("スレッド ID が不正です (%d): %w", threadID, apperr.ErrInvalidArgument)
+	}
+
+	if imageID != nil && authorID == nil {
+		return nil, fmt.Errorf(
+			"画像を添付するにはログインが必要です: %w", apperr.ErrUnauthenticated)
 	}
 
 	if authorID != nil {
@@ -93,6 +138,7 @@ func NewComment(threadID int64, authorName, body string, authorID *int64) (*Comm
 		ThreadID:   threadID,
 		AuthorName: authorName,
 		AuthorID:   authorID,
+		ImageID:    imageID,
 		Body:       body,
 	}, nil
 }
@@ -100,7 +146,7 @@ func NewComment(threadID int64, authorName, body string, authorID *int64) (*Comm
 // Reconstruct は永続化層から読み出した値でコメントを復元します。
 func Reconstruct(
 	id, threadID int64, seq int32, authorName string,
-	author *Author, body string, createdAt time.Time,
+	author *Author, image *Image, body string, createdAt time.Time,
 ) *Comment {
 	return &Comment{
 		ID:         id,
@@ -108,6 +154,7 @@ func Reconstruct(
 		Seq:        seq,
 		AuthorName: authorName,
 		Author:     author,
+		Image:      image,
 		Body:       body,
 		CreatedAt:  createdAt,
 	}

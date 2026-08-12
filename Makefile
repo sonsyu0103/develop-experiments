@@ -255,9 +255,21 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 	# make check が通ったまま CI だけが赤くなる状態を実際に作った
 	# (import を足したのに go mod tidy を忘れ、直接依存が
 	#  indirect のままになっていた)。
-	@cd $(GO_API_DIR) && go mod tidy && \
-		git diff --exit-code -- go.mod go.sum \
-		|| { echo "go.mod / go.sum が最新ではありません。'go mod tidy' の結果をコミットしてください。"; exit 1; }
+	#
+	# 【HEAD と比べてはいけない】
+	# 初版は git diff で HEAD と比較しており、**依存を足した未コミットの状態では
+	# 必ず落ちた**。CI は毎回クリーンなチェックアウトなので気づけない差になる。
+	# 見たいのは「tidy が go.mod を書き換えるか」であって、
+	# 「コミット済みと違うか」ではない。実行前の内容と比べる。
+	@cd $(GO_API_DIR) && \
+		cp go.mod /tmp/go.mod.before && cp go.sum /tmp/go.sum.before && \
+		go mod tidy && \
+		if ! diff -q go.mod /tmp/go.mod.before > /dev/null || \
+		   ! diff -q go.sum /tmp/go.sum.before > /dev/null; then \
+			echo "go.mod / go.sum が最新ではありません。'go mod tidy' の結果をコミットしてください。"; \
+			diff /tmp/go.mod.before go.mod || true; \
+			exit 1; \
+		fi
 
 .PHONY: check
 check: lint test cover verify-tidy verify-generated arch-probe ## CI と同じ検証をローカルで一通り実行する (DB 不要)

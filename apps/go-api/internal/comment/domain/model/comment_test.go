@@ -84,7 +84,7 @@ func TestNewComment(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got, err := NewComment(tt.threadID, tt.authorName, tt.body, nil)
+			got, err := NewComment(tt.threadID, tt.authorName, tt.body, nil, nil)
 
 			if tt.wantErr {
 				if !errors.Is(err, apperr.ErrInvalidArgument) {
@@ -126,7 +126,7 @@ func TestNewComment_LoggedInDiscardsAuthorName(t *testing.T) {
 
 	authorID := int64(42)
 
-	got, err := NewComment(1, "別人を名乗る", "本文", &authorID)
+	got, err := NewComment(1, "別人を名乗る", "本文", &authorID, nil)
 	if err != nil {
 		t.Fatalf("NewComment が失敗した: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestNewComment_LoggedInDiscardsAuthorName(t *testing.T) {
 func TestNewComment_AnonymousKeepsAuthorName(t *testing.T) {
 	t.Parallel()
 
-	got, err := NewComment(1, "ホシノ", "本文", nil)
+	got, err := NewComment(1, "ホシノ", "本文", nil, nil)
 	if err != nil {
 		t.Fatalf("NewComment が失敗した: %v", err)
 	}

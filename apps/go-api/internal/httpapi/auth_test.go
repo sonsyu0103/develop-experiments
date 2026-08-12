@@ -178,12 +178,15 @@ func newAuthEnv(t *testing.T, loginEnabled bool) *authEnv {
 	router, err := NewRouter(Deps{
 		Server: NewServer(
 			threadusecase.NewThreadInteractor(threads),
-			commentusecase.NewCommentInteractor(comments, threads),
+			commentusecase.NewCommentInteractor(comments, threads, nil),
 			&fakePinger{},
 			// **セッションの解決は loginEnabled に依らず結線する。**
 			// ここを分岐させると、テストが本番と同じ穴を再現してしまう。
 			userusecase.NewSessionInteractor(sessions),
 			login,
+			// 画像は結線しない。**この環境では POST /images が 503 になる。**
+			// 画像を通す検査は images_test.go が別に組み立てる。
+			nil,
 			config.AuthConfig{FrontendURL: "http://localhost:3000"},
 		),
 		AllowedOrigins: []string{"http://localhost:3000"},

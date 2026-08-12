@@ -3,6 +3,7 @@ module develop-experiments/apps/go-api
 go 1.25.1
 
 require (
+	github.com/HugoSmits86/nativewebp v1.3.0
 	github.com/aws/aws-sdk-go-v2 v1.43.5
 	github.com/aws/aws-sdk-go-v2/config v1.32.36
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.35
@@ -15,6 +16,7 @@ require (
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/oapi-codegen/gin-middleware v1.1.0
 	github.com/oapi-codegen/runtime v1.6.0
+	golang.org/x/image v0.45.0
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sync v0.22.0
 )

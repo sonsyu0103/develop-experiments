@@ -141,7 +141,7 @@ func (f *fakeThreadChecker) Exists(context.Context, int64) (bool, error) {
 }
 
 func newInteractor(repo *fakeCommentRepo) *CommentInteractor {
-	return NewCommentInteractor(repo, &fakeThreadChecker{exists: true})
+	return NewCommentInteractor(repo, &fakeThreadChecker{exists: true}, nil)
 }
 
 func mustPage(t *testing.T, cursorID *int64, size int32) pagination.Page {
@@ -298,7 +298,7 @@ func TestFetchComments_EmptyReturnsNonNilSlice(t *testing.T) {
 func TestFetchComments_ThreadNotFound(t *testing.T) {
 	t.Parallel()
 
-	uc := NewCommentInteractor(newFakeCommentRepo(3), &fakeThreadChecker{exists: false})
+	uc := NewCommentInteractor(newFakeCommentRepo(3), &fakeThreadChecker{exists: false}, nil)
 
 	_, err := uc.FetchComments(context.Background(), 999, mustPage(t, nil, 10))
 	if !errors.Is(err, apperr.ErrNotFound) {
@@ -336,7 +336,7 @@ func TestComments_SeqReachesDTO(t *testing.T) {
 	t.Parallel()
 
 	repo := newFakeCommentRepo(3)
-	interactor := NewCommentInteractor(repo, &fakeThreadChecker{exists: true})
+	interactor := NewCommentInteractor(repo, &fakeThreadChecker{exists: true}, nil)
 
 	t.Run("一覧", func(t *testing.T) {
 		t.Parallel()
@@ -364,7 +364,7 @@ func TestComments_SeqReachesDTO(t *testing.T) {
 	t.Run("投稿", func(t *testing.T) {
 		t.Parallel()
 
-		got, err := interactor.PostComment(t.Context(), 1, "ホシノ", "ふぁ〜", nil)
+		got, err := interactor.PostComment(t.Context(), 1, "ホシノ", "ふぁ〜", nil, nil)
 		if err != nil {
 			t.Fatalf("PostComment が失敗した: %v", err)
 		}
@@ -390,13 +390,13 @@ func TestPostCommentIdempotent_SecondCallDoesNotCreate(t *testing.T) {
 	authorID := int64(42)
 
 	first, err := uc.PostCommentIdempotent(
-		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, "key-1", "POST /threads/1/comments")
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, nil, "key-1", "POST /threads/1/comments")
 	if err != nil {
 		t.Fatalf("1 回目が失敗した: %v", err)
 	}
 
 	second, err := uc.PostCommentIdempotent(
-		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, "key-1", "POST /threads/1/comments")
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, nil, "key-1", "POST /threads/1/comments")
 	if err != nil {
 		t.Fatalf("2 回目が失敗した: %v", err)
 	}
@@ -420,14 +420,14 @@ func TestPostCommentIdempotent_DifferentBodyIsRejected(t *testing.T) {
 	authorID := int64(42)
 
 	if _, postErr := uc.PostCommentIdempotent(
-		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID,
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, nil,
 		"key-1", "POST /threads/1/comments"); postErr != nil {
 		t.Fatalf("1 回目が失敗した: %v", postErr)
 	}
 
 	// 同じキー、違う本文。
 	_, err := uc.PostCommentIdempotent(
-		t.Context(), 1, "ホシノ", "おはよう", &authorID, "key-1", "POST /threads/1/comments")
+		t.Context(), 1, "ホシノ", "おはよう", &authorID, nil, "key-1", "POST /threads/1/comments")
 
 	if !errors.Is(err, apperr.ErrFailedPrecondition) {
 		t.Fatalf("err = %v, want apperr.ErrFailedPrecondition (422)", err)
@@ -481,13 +481,13 @@ func TestPostCommentIdempotent_NormalizedFieldsDoNotChangeFingerprint(t *testing
 			authorID := int64(42)
 
 			first, err := uc.PostCommentIdempotent(t.Context(), 1,
-				tt.firstAuthorName, tt.firstBody, &authorID, "key-1", "POST /threads/1/comments")
+				tt.firstAuthorName, tt.firstBody, &authorID, nil, "key-1", "POST /threads/1/comments")
 			if err != nil {
 				t.Fatalf("1 回目が失敗した: %v", err)
 			}
 
 			second, err := uc.PostCommentIdempotent(t.Context(), 1,
-				tt.retryAuthorName, tt.retryBody, &authorID, "key-1", "POST /threads/1/comments")
+				tt.retryAuthorName, tt.retryBody, &authorID, nil, "key-1", "POST /threads/1/comments")
 			if err != nil {
 				t.Fatalf("再送が失敗した (結果に影響しない差で 422 になっている): %v", err)
 			}
@@ -514,7 +514,7 @@ func TestPostCommentIdempotent_AnonymousIsRejected(t *testing.T) {
 	uc := newInteractor(repo)
 
 	_, err := uc.PostCommentIdempotent(
-		t.Context(), 1, "", "ふぁ〜", nil, "key-1", "POST /threads/1/comments")
+		t.Context(), 1, "", "ふぁ〜", nil, nil, "key-1", "POST /threads/1/comments")
 	if !errors.Is(err, apperr.ErrInvalidArgument) {
 		t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
 	}
@@ -532,7 +532,7 @@ func TestPostCommentIdempotent_RequestReachesRepository(t *testing.T) {
 	uc := newInteractor(repo)
 	authorID := int64(42)
 
-	if _, err := uc.PostCommentIdempotent(t.Context(), 1, "ホシノ", "ふぁ〜", &authorID,
+	if _, err := uc.PostCommentIdempotent(t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, nil,
 		"key-xyz", "POST /threads/1/comments"); err != nil {
 		t.Fatalf("PostCommentIdempotent が失敗した: %v", err)
 	}
@@ -557,7 +557,7 @@ func TestPostCommentIdempotent_InvalidKeyIsRejected(t *testing.T) {
 	authorID := int64(42)
 
 	_, err := uc.PostCommentIdempotent(
-		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, "   ", "POST /threads/1/comments")
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, nil, "   ", "POST /threads/1/comments")
 	if !errors.Is(err, apperr.ErrInvalidArgument) {
 		t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
 	}
