@@ -18,6 +18,23 @@
     SQL_EXEC  SQL を 1 文実行するコマンド。末尾に SQL が引数として渡される。
               指定しない場合、DB 直接操作を伴う検証はスキップする。
               例: "docker compose exec -T postgres psql -U app -d bbs -X -q -c"
+
+    SMOKE_REQUIRE_FULL
+              1 なら、**1 つでもスキップした節があれば失敗させる**。
+              未設定のときは CI 環境変数の有無で決まる (CI では既定で有効)。
+              0 を明示すると無効にできる。
+
+**スキップは黙って通してはいけない。**
+
+このスクリプトは以前、認証まわりが丸ごとスキップされた状態で
+「74 件すべて成功しました」と表示し、終了コード 0 で通っていた。
+冪等キーの 11 件は CI で一度も実行されていなかったのに、CI は緑だった
+(docs/adr/0005-authentication.md 決定 4)。
+
+原因はスキップを失敗として数えないことにある。設定を 1 つ落としただけで
+検証範囲が静かに縮む。**SQL_EXEC を消す / psql がランナーから消える**
+だけで、60 件近くが同じように消える。
+そのため CI では未実行の節そのものを失敗として扱う。
 """
 
 # macOS 標準の Python 3.9 でも動くよう、PEP 604 の "X | None" 記法を
@@ -39,6 +56,22 @@ from concurrent.futures import ThreadPoolExecutor
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8080").rstrip("/")
 SQL_EXEC = os.environ.get("SQL_EXEC", "")
 
+
+def _require_full() -> bool:
+    """スキップを失敗として扱うかどうか。
+
+    **既定は「CI なら扱う」。** 明示的な env を必須にすると、
+    その 1 行を消しただけで検出が止まる —— それは今回直した事故と同じ形になる。
+    ここは fail-closed 側に倒す。手元で一部だけ回したいときに 0 を渡す。
+    """
+    raw = os.environ.get("SMOKE_REQUIRE_FULL")
+    if raw is not None:
+        return raw.strip() not in ("", "0", "false", "no")
+    return bool(os.environ.get("CI"))
+
+
+REQUIRE_FULL = _require_full()
+
 # シードデータが作る状態 (db/seed/seed.sql と揃える)。
 # スレッド 1-4 に 4 件ずつ、スレッド 5 は 0 件。
 # うち最も古いコメント 1 件が論理削除されるため、スレッド 1 だけ 3 件になる。
@@ -46,6 +79,9 @@ EXPECTED_COUNTS = {1: 3, 2: 4, 3: 4, 4: 4, 5: 0}
 
 failures: list[str] = []
 checks = 0
+# 実行しなかった節。**件数ではなく節そのもの**を記録する ——
+# 「何件通ったか」は縮んでも気づけないが、「どの節を飛ばしたか」は残る。
+skipped: list[str] = []
 
 
 def _decode(raw: bytes):
@@ -154,6 +190,17 @@ def check_status(label: str, method: str, path: str, want: int,
 
 def section(title: str) -> None:
     print(f"\n\033[1m{title}\033[0m")
+
+
+def skip(title: str, reason: str) -> None:
+    """節を実行しなかったことを記録する。
+
+    **print だけで済ませない。** 済ませていた結果が
+    「CI が緑のまま冪等キーを 1 件も検証していない」状態だった。
+    REQUIRE_FULL が立っていれば、これは最後に失敗として集計される。
+    """
+    skipped.append(f"{title} ({reason})")
+    print(f"  \033[33mSKIP\033[0m {reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +456,7 @@ if SQL_EXEC:
         sql("UPDATE threads SET deleted_at = NULL WHERE id = 3;")
 else:
     section("論理削除されたスレッドの扱い")
-    print("  \033[33mSKIP\033[0m SQL_EXEC が未設定のためスキップ")
+    skip("論理削除されたスレッドの扱い", "SQL_EXEC が未設定")
 
 if SQL_EXEC:
     section("投稿者の紐付け (ADR 0005 決定 2 / ADR 0014)")
@@ -491,7 +538,7 @@ if SQL_EXEC:
         sql("DELETE FROM users WHERE id = 900001;")
 else:
     section("投稿者の紐付け")
-    print("  \033[33mSKIP\033[0m SQL_EXEC が未設定のためスキップ")
+    skip("投稿者の紐付け", "SQL_EXEC が未設定")
 
 if SQL_EXEC:
     section("権限 (ADR 0011 決定 1)")
@@ -576,7 +623,7 @@ if SQL_EXEC:
         sql("DELETE FROM users WHERE id = 900002;")
 else:
     section("権限")
-    print("  \033[33mSKIP\033[0m SQL_EXEC が未設定のためスキップ")
+    skip("権限", "SQL_EXEC が未設定")
 
 # ---------------------------------------------------------------------------
 # 冪等キー (docs/adr/0015-idempotency.md)
@@ -619,6 +666,9 @@ if SQL_EXEC:
         status, thread, _ = call("POST", "/threads", '{"title":"冪等キーの検証"}', headers=me)
         if status != 201:
             check("検証用スレッドを作れる", False, f"status={status}")
+            # **失敗 1 件では、残り 10 件が消えたことが分からない。**
+            # 前提が崩れた形の未実行なので、スキップとしても記録する。
+            skip("冪等キー", f"検証用スレッドを作れなかった (status={status})")
         else:
             tid = thread["id"]
             key = "smoke-key-" + secrets.token_hex(8)
@@ -713,15 +763,33 @@ else:
     # セッションの解決を OIDC の設定から切り離したので、
     # 残る条件は SQL_EXEC だけになった
     # (docs/adr/0005-authentication.md 決定 4)。
-    print("  \033[33mSKIP\033[0m SQL_EXEC が未設定のためスキップ")
+    skip("冪等キー", "SQL_EXEC が未設定")
 
 # ---------------------------------------------------------------------------
 
 print()
+
+# **スキップを先に報告する。** 失敗が 0 件でも、検証範囲が縮んでいれば
+# 「何件通ったか」は意味を持たない。
+if skipped:
+    print(f"\033[33m{len(skipped)} 節を実行していません\033[0m")
+    for s in skipped:
+        print(f"  - {s}")
+
 if failures:
     print(f"\033[31m{len(failures)} / {checks} 件が失敗しました\033[0m")
     for f in failures:
         print(f"  - {f}")
+    sys.exit(1)
+
+# **未実行の節を成功として扱わない。**
+#
+# ここが無かったせいで、認証まわりが丸ごと飛んだ状態の CI が
+# 「74 件すべて成功しました」と表示して緑になっていた。
+# 件数だけを見ていると、縮んだことに気づく手がかりが 1 つも無い。
+if skipped and REQUIRE_FULL:
+    print(f"\033[31m{checks} 件は通ったが、{len(skipped)} 節が未実行のため失敗とします\033[0m")
+    print("  (意図的に一部だけ回すなら SMOKE_REQUIRE_FULL=0)")
     sys.exit(1)
 
 print(f"\033[32m{checks} 件すべて成功しました\033[0m")

@@ -373,17 +373,23 @@ func TestAuth_ExpiredSessionIsStill401(t *testing.T) {
 func TestAuth_DisabledReturns503(t *testing.T) {
 	env := newAuthEnv(t, false)
 
+	// **サブテストにする。** ループの中で t.Fatalf を使うと、
+	// 1 本目が回帰した時点でテストが終わり、
+	// コールバック側の 503 は一度も評価されない。
+	// 2 経路に広げた意図が半分失われる。
 	for _, path := range []string{
 		"/auth/google",
 		"/auth/google/callback?code=c&state=s1",
 	} {
-		rec := env.do(t, http.MethodGet, path)
-		if rec.Code != http.StatusServiceUnavailable {
-			t.Fatalf("%s: status = %d, want 503 (body=%s)", path, rec.Code, rec.Body.String())
-		}
-		if code := decodeError(t, rec).Error.Code; code != oapigen.UNAVAILABLE {
-			t.Errorf("%s: code = %q, want UNAVAILABLE", path, code)
-		}
+		t.Run(path, func(t *testing.T) {
+			rec := env.do(t, http.MethodGet, path)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503 (body=%s)", rec.Code, rec.Body.String())
+			}
+			if code := decodeError(t, rec).Error.Code; code != oapigen.UNAVAILABLE {
+				t.Errorf("code = %q, want UNAVAILABLE", code)
+			}
+		})
 	}
 }
 
