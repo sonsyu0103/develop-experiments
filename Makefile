@@ -248,8 +248,19 @@ tools: ## 開発ツール (sqlc / golangci-lint / go-arch-lint) をインスト�
 	go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@$(OAPI_CODEGEN_VERSION)
 	go install github.com/fe3dback/go-arch-lint@$(GO_ARCH_LINT_VERSION)
 
+.PHONY: verify-tidy
+verify-tidy: ## go.mod / go.sum が最新か検査する
+	# **check が「CI と同じ検証」を名乗るなら、これも要る。**
+	# CI の Go Checks は最初にこれを回している。ここに無かったせいで、
+	# make check が通ったまま CI だけが赤くなる状態を実際に作った
+	# (import を足したのに go mod tidy を忘れ、直接依存が
+	#  indirect のままになっていた)。
+	@cd $(GO_API_DIR) && go mod tidy && \
+		git diff --exit-code -- go.mod go.sum \
+		|| { echo "go.mod / go.sum が最新ではありません。'go mod tidy' の結果をコミットしてください。"; exit 1; }
+
 .PHONY: check
-check: lint test cover verify-generated arch-probe ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test cover verify-tidy verify-generated arch-probe ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
 check-all: check smoke ## check に加えて実 DB での疎通確認まで行う
