@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"develop-experiments/apps/go-api/internal/apperr"
 )
 
@@ -154,5 +156,40 @@ func TestNewComment_AnonymousKeepsAuthorName(t *testing.T) {
 	}
 	if got.AuthorID != nil {
 		t.Errorf("AuthorID = %v, want nil (匿名)", *got.AuthorID)
+	}
+}
+
+// **匿名は画像を添付できない** (docs/adr/0007-image-storage.md の背景)。
+//
+// 冪等キー (匿名では無視する) と違い、こちらはエラーにします ——
+// 無視すると、利用者からは「添付したのに画像が消えた」としか見えません。
+//
+// HTTP 層にも同じ検査がありますが、**ドメインの不変条件を HTTP 層に
+// 預けない**ためにここでも弾きます。
+func TestNewComment_AnonymousCannotAttachImage(t *testing.T) {
+	t.Parallel()
+
+	imageID := uuid.New()
+
+	_, err := NewComment(1, "名無しさん", "画像つき", nil, &imageID)
+	if !errors.Is(err, apperr.ErrUnauthenticated) {
+		t.Fatalf("err = %v, want apperr.ErrUnauthenticated", err)
+	}
+}
+
+// ログイン中なら添付できること。
+// 上のテストだけだと「常に拒否する」実装でも通ってしまいます。
+func TestNewComment_LoggedInCanAttachImage(t *testing.T) {
+	t.Parallel()
+
+	imageID := uuid.New()
+	authorID := int64(42)
+
+	c, err := NewComment(1, "", "画像つき", &authorID, &imageID)
+	if err != nil {
+		t.Fatalf("NewComment が失敗した: %v", err)
+	}
+	if c.ImageID == nil || *c.ImageID != imageID {
+		t.Errorf("ImageID = %v, want %v", c.ImageID, imageID)
 	}
 }
