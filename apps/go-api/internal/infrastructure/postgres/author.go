@@ -4,7 +4,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	commentmodel "develop-experiments/apps/go-api/internal/comment/domain/model"
 	threadmodel "develop-experiments/apps/go-api/internal/thread/domain/model"
@@ -24,23 +23,28 @@ import (
 //
 // 退会済みの扱い (表示名の差し替え、public_id を返さない) は
 // 各モジュールの NewAuthor が行います。ここでは判定しません。
+//
+// 【型が pgtype.UUID から *uuid.UUID に変わった】
+// sqlc.yaml に NULL 許容 uuid の上書きを足したためです (000006 の副作用)。
+// 判定は publicID.Valid から publicID == nil に変わりましたが、
+// **意味は同じ**で「LEFT JOIN が成立したか」を見ています。
 
 func toThreadAuthor(
-	publicID pgtype.UUID, displayName, avatarURL *string, deletedAt *time.Time,
+	publicID *uuid.UUID, displayName, avatarURL *string, deletedAt *time.Time,
 ) *threadmodel.Author {
-	if !publicID.Valid {
+	if publicID == nil {
 		return nil
 	}
-	return threadmodel.NewAuthor(uuid.UUID(publicID.Bytes), derefString(displayName), avatarURL, deletedAt)
+	return threadmodel.NewAuthor(*publicID, derefString(displayName), avatarURL, deletedAt)
 }
 
 func toCommentAuthor(
-	publicID pgtype.UUID, displayName, avatarURL *string, deletedAt *time.Time,
+	publicID *uuid.UUID, displayName, avatarURL *string, deletedAt *time.Time,
 ) *commentmodel.Author {
-	if !publicID.Valid {
+	if publicID == nil {
 		return nil
 	}
-	return commentmodel.NewAuthor(uuid.UUID(publicID.Bytes), derefString(displayName), avatarURL, deletedAt)
+	return commentmodel.NewAuthor(*publicID, derefString(displayName), avatarURL, deletedAt)
 }
 
 // derefString は LEFT JOIN で NULL 許容になった列を読み出します。

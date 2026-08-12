@@ -263,6 +263,18 @@ golang-migrate はマイグレーションをトランザクションで包む�
 | `UNIQUE (google_sub)` | A | ログイン時の照合 ([ADR 0005](0005-authentication.md)) |
 | `UNIQUE (public_id)` | A | API からの参照はすべてこちら |
 | `(id) WHERE role <> 'user'` | C | 管理者一覧。該当は数十行なので索引は極小 |
+| `(avatar_image_id) WHERE avatar_image_id IS NOT NULL` | **A** | **外部キー**。画像削除時の走査 |
+
+> **最後の 1 行は初版に無かった** (`000006` の実装時に足した)。
+> `comments.image_id` と `threads.icon_image_id` は下の表に載せていたのに、
+> `users.avatar_image_id` だけ落としていた。
+> **この ADR 自身の「外部キーには必ず索引を貼る」に反していた。**
+>
+> 落ちると、回収バッチが画像 1 枚を消すたびに `users` の全表走査になる
+> ([ADR 0009](0009-scaling-strategy.md) の見積もりでは登録 100 万人)。
+>
+> 3 つの列が 3 つの別々の表に分かれて書かれていたことが原因になる。
+> **「集約して初めて見える」は、集約した表の内部でも起きる。**
 
 > **この表の索引は 2 つのマイグレーションに分かれる。**
 > `role` 列を足すのは `000003` ([ADR 0011](0011-moderation.md)) なので、

@@ -8,6 +8,14 @@
 -- ずらすとクエリごとに別の行型 (GetUserByIDRow / UpsertUserRow ...) が生成され、
 -- ドメインへの詰め替えが 1 か所から 4 か所に増える。
 -- 実際に一度そうなった (role を created_at の前に置いていた)。
+--
+-- 【並び替えだけでなく、列を足したときにも壊れる】
+-- 000006 で avatar_image_id を足したとき、ここを直さなかったため
+-- **一致が崩れて行型が 4 つに分かれた** (ビルドが落ちて気づいた)。
+-- 揃える条件は「順番が同じ」ではなく「テーブルの全列と過不足なく一致する」。
+--
+-- そのため、まだ読み出さない列もここに並べる必要がある。
+-- avatar_image_id を実際に使うのは Phase 6 の後半 (プロフィール画像) になる。
 -- =============================================================================
 
 -- name: UpsertUser :one
@@ -53,11 +61,11 @@ SET email        = EXCLUDED.email,
     -- 新規は DEFAULT 'user'、既存はログインしても変わらない。
     updated_at   = now()
 WHERE users.deleted_at IS NULL
-RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role;
+RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id;
 
 -- name: GetUserByID :one
 -- 内部 ID での取得。外部キーからの解決に使う。
-SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role
+SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id
 FROM users
 WHERE id = sqlc.arg('id')
   AND deleted_at IS NULL;
@@ -65,7 +73,7 @@ WHERE id = sqlc.arg('id')
 -- name: GetUserByPublicID :one
 -- API から来る識別子は public_id だけ (ADR 0003 未決 #11 の決定)。
 -- 内部 ID を URL に出すとユーザーを列挙できるため。
-SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role
+SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id
 FROM users
 WHERE public_id = sqlc.arg('public_id')
   AND deleted_at IS NULL;
@@ -112,4 +120,4 @@ SET role = 'admin', updated_at = now()
 WHERE google_sub = sqlc.arg('google_sub')
   AND deleted_at IS NULL
   AND role <> 'admin'
-RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role;
+RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id;

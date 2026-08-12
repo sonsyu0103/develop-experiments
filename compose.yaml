@@ -90,6 +90,53 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # S3 互換のオブジェクトストレージ (docs/adr/0007-image-storage.md 決定 4)。
+  #
+  # 本番は S3 + CloudFront を想定しており、アプリ側は S3 互換の
+  # インターフェースだけを見る。エンドポイントの差し替えで両方に対応できる。
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      # 9000 が S3 API、9001 が管理画面。
+      # 管理画面を開けているのは、アップロードされた実体を目で確認するため。
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      # /minio/health/live はプロセスの生存だけを見る。
+      # バケットの有無はこの下の minio-init が担保する。
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  # バケットを作って公開読み取りにする使い捨てコンテナ。
+  #
+  # **ローカルだけの妥協点。** 本番はバケットを公開せず、CloudFront の
+  # OAC 経由に限定する (ADR 0007 決定 4)。ここで anonymous download を
+  # 許しているのは、手元に CDN を立てないため。
+  # アプリが返す URL をブラウザでそのまま開けるようにしておく。
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    # mb は既に存在するとエラーになるので --ignore-existing を付ける。
+    # 付けないと 2 回目の up でこのコンテナが失敗し、
+    # depends_on の service_completed_successfully が満たされなくなる。
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/bbs-images &&
+      mc anonymous set download local/bbs-images
+      "
+
   go-api:
     build:
       context: ./apps/go-api
@@ -128,10 +175,26 @@ services:
       AUTH_FRONTEND_URL: http://localhost:3000
       # 最初の管理者。値はここに書かず .env から補間する (ADR 0011 決定 1)
       BOOTSTRAP_ADMIN_GOOGLE_SUB: ${BOOTSTRAP_ADMIN_GOOGLE_SUB:-}
+      # 画像のストレージ (ADR 0007)。
+      # 揃っていなければ画像の経路だけが 503 になる。
+      S3_BUCKET: bbs-images
+      S3_REGION: ap-northeast-1
+      # 実 S3 では空にする。MinIO のときだけ指定する。
+      S3_ENDPOINT: http://minio:9000
+      # MinIO は path-style が必要 (bucket.localhost は名前解決できない)。
+      S3_USE_PATH_STYLE: "true"
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      # **ブラウザから見える URL にする。** コンテナ内の名前 (minio:9000) を
+      # 入れると、API は動くのに <img src> が解決できない。
+      # API はこの値をそのまま絶対 URL として返す (ADR 0007 決定 5)。
+      S3_PUBLIC_BASE_URL: http://localhost:9000/bbs-images
     depends_on:
       postgres:
         condition: service_healthy
       migrate:
+        condition: service_completed_successfully
+      minio-init:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
@@ -163,3 +226,4 @@ services:
 volumes:
   postgres-data:
   go-mod-cache:
+  minio-data:

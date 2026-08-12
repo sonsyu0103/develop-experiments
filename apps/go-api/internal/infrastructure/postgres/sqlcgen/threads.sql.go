@@ -9,7 +9,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/google/uuid"
 )
 
 const countCommentsByThreadID = `-- name: CountCommentsByThreadID :one
@@ -53,7 +53,7 @@ type CreateThreadRow struct {
 	ID                int64
 	Title             string
 	CreatedAt         time.Time
-	AuthorPublicID    pgtype.UUID
+	AuthorPublicID    *uuid.UUID
 	AuthorDisplayName *string
 	AuthorAvatarUrl   *string
 	AuthorDeletedAt   *time.Time
@@ -110,7 +110,7 @@ type GetThreadWithCommentCountRow struct {
 	Title             string
 	CreatedAt         time.Time
 	CommentCount      int64
-	AuthorPublicID    pgtype.UUID
+	AuthorPublicID    *uuid.UUID
 	AuthorDisplayName *string
 	AuthorAvatarUrl   *string
 	AuthorDeletedAt   *time.Time
@@ -216,7 +216,7 @@ type ListThreadsWithCommentCountRow struct {
 	Title             string
 	CreatedAt         time.Time
 	CommentCount      int64
-	AuthorPublicID    pgtype.UUID
+	AuthorPublicID    *uuid.UUID
 	AuthorDisplayName *string
 	AuthorAvatarUrl   *string
 	AuthorDeletedAt   *time.Time

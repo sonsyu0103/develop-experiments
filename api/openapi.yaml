@@ -758,6 +758,9 @@ components:
                 - NOT_FOUND
                 - METHOD_NOT_ALLOWED
                 - CONFLICT
+                # 413。画像のサイズ・画素数の上限を超えた
+                # (docs/adr/0007-image-storage.md 決定 2 / ADR 0013 決定 3)
+                - PAYLOAD_TOO_LARGE
                 # 422。同じ冪等キーで別の内容が送られた
                 # (docs/adr/0013-http-defense.md 決定 3)
                 - FAILED_PRECONDITION

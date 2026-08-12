@@ -33,6 +33,12 @@ vendors:
       - github.com/coreos/go-oidc/**
       - golang.org/x/oauth2
       - golang.org/x/oauth2/**
+  aws-s3:
+    in: github.com/aws/aws-sdk-go-v2/**
+  imaging:
+    in:
+      - golang.org/x/image/**
+      - github.com/HugoSmits86/nativewebp
 
 components:
   main:
@@ -67,6 +73,11 @@ components:
   comment-usecase:
     in: internal/comment/usecase
 
+  image-model:
+    in: internal/image/domain/model
+  image-repository:
+    in: internal/image/domain/repository
+
   user-model:
     in: internal/user/domain/model
   user-repository:
@@ -83,6 +94,8 @@ components:
     in: internal/infrastructure/postgres
   oidc-provider:
     in: internal/infrastructure/oidc
+  object-storage:
+    in: internal/infrastructure/objectstorage
   postgres-sqlcgen:
     in: internal/infrastructure/postgres/sqlcgen
 
@@ -136,6 +149,15 @@ deps:
       - postgres
 
   # user モジュール。public_id (UUID v7) の採番をドメイン側で行うため uuid を許可する
+  image-model:
+    canUse:
+      - uuid
+  image-repository:
+    canUse:
+      - uuid
+    mayDependOn:
+      - image-model
+
   user-model:
     canUse:
       - uuid
@@ -154,6 +176,16 @@ deps:
       - user-repository
 
   # 外側のアダプタ。usecase が定義した Provider を実装する
+  # テストでも SDK を知ってよいのはここだけ。
+  # 実 MinIO に対する検証をこのパッケージ内で行うため、
+  # 本体用と同じ許可のままにしてある (緩和しない)。
+  object-storage:
+    canUse:
+      - aws-s3
+    mayDependOn:
+      - image-repository
+      - shared-config
+
   oidc-provider:
     canUse:
       - oidc
@@ -200,6 +232,8 @@ deps:
       - comment-repository
       - user-model
       - user-repository
+      - image-model
+      - image-repository
       - postgres-sqlcgen
       - shared-config
 

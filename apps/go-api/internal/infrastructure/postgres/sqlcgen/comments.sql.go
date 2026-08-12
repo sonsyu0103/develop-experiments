@@ -9,7 +9,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/google/uuid"
 )
 
 const createCommentAutoSeq = `-- name: CreateCommentAutoSeq :one
@@ -58,7 +58,7 @@ type CreateCommentAutoSeqRow struct {
 	AuthorName        string
 	Body              string
 	CreatedAt         time.Time
-	AuthorPublicID    pgtype.UUID
+	AuthorPublicID    *uuid.UUID
 	AuthorDisplayName *string
 	AuthorAvatarUrl   *string
 	AuthorDeletedAt   *time.Time
@@ -150,7 +150,7 @@ type CreateCommentWithSeqRow struct {
 	AuthorName        string
 	Body              string
 	CreatedAt         time.Time
-	AuthorPublicID    pgtype.UUID
+	AuthorPublicID    *uuid.UUID
 	AuthorDisplayName *string
 	AuthorAvatarUrl   *string
 	AuthorDeletedAt   *time.Time
@@ -234,7 +234,7 @@ type ListCommentsByThreadIDRow struct {
 	AuthorName        string
 	Body              string
 	CreatedAt         time.Time
-	AuthorPublicID    pgtype.UUID
+	AuthorPublicID    *uuid.UUID
 	AuthorDisplayName *string
 	AuthorAvatarUrl   *string
 	AuthorDeletedAt   *time.Time

@@ -46,6 +46,12 @@ func respondError(c *gin.Context, err error) {
 	case errors.Is(err, apperr.ErrUnavailable):
 		c.JSON(http.StatusServiceUnavailable, newErrorBody(oapigen.UNAVAILABLE, err.Error()))
 
+	// 413 は err.Error() をそのまま返す。
+	// 「何 MiB まで」「何画素まで」が分からないと、利用者は縮めようがない
+	// (上限はドメイン層が持っており、ここに定数を再掲すると二重管理になる)。
+	case errors.Is(err, apperr.ErrPayloadTooLarge):
+		c.JSON(http.StatusRequestEntityTooLarge, newErrorBody(oapigen.PAYLOADTOOLARGE, err.Error()))
+
 	// 422 と 409 を分けるのは、**再試行で解決するかが違う**ため。
 	// 409 は時間をおけば通るが、422 はキーを作り直さない限り永久に通らない。
 	// 422 を 409 に丸めると、クライアントが同じキーで再送を繰り返す
