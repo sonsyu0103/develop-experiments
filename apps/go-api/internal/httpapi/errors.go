@@ -46,13 +46,27 @@ func respondError(c *gin.Context, err error) {
 	case errors.Is(err, apperr.ErrUnavailable):
 		c.JSON(http.StatusServiceUnavailable, newErrorBody(oapigen.UNAVAILABLE, err.Error()))
 
+	// 413 は err.Error() をそのまま返す。
+	// 「何 MiB まで」「何画素まで」が分からないと、利用者は縮めようがない
+	// (上限はドメイン層が持っており、ここに定数を再掲すると二重管理になる)。
+	case errors.Is(err, apperr.ErrPayloadTooLarge):
+		c.JSON(http.StatusRequestEntityTooLarge, newErrorBody(oapigen.PAYLOADTOOLARGE, err.Error()))
+
 	// 422 と 409 を分けるのは、**再試行で解決するかが違う**ため。
 	// 409 は時間をおけば通るが、422 はキーを作り直さない限り永久に通らない。
 	// 422 を 409 に丸めると、クライアントが同じキーで再送を繰り返す
 	// (ADR 0013 決定 3)。
+	// **固定文言にしない。** 422 は冪等キー専用ではない ——
+	// 画像の確定 (ImageRepository.Commit) もここに来る。
+	// 冪等キーの説明を固定で返すと、削除済み画像への確定要求に対して
+	// 「キーを作り直してください」と案内することになり、
+	// クライアントを無関係な対処へ誘導する。
+	//
+	// 400 / 413 と同じく err.Error() を返す。そのため
+	// **ErrFailedPrecondition を返す側は、メッセージに操作名や
+	// 内部構造を含めてはいけない** (translateError の CHECK 違反と同じ約束)。
 	case errors.Is(err, apperr.ErrFailedPrecondition):
-		c.JSON(http.StatusUnprocessableEntity, newErrorBody(oapigen.FAILEDPRECONDITION,
-			"同じ Idempotency-Key で別の内容が送られました。キーを作り直してください"))
+		c.JSON(http.StatusUnprocessableEntity, newErrorBody(oapigen.FAILEDPRECONDITION, err.Error()))
 
 	case errors.Is(err, apperr.ErrConflict):
 		c.JSON(http.StatusConflict, newErrorBody(oapigen.CONFLICT,

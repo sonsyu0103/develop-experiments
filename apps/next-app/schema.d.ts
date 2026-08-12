@@ -424,7 +424,7 @@ export interface components {
                  * @example NOT_FOUND
                  * @enum {string}
                  */
-                code: "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "FAILED_PRECONDITION" | "UNAVAILABLE" | "INTERNAL";
+                code: "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "PAYLOAD_TOO_LARGE" | "FAILED_PRECONDITION" | "UNAVAILABLE" | "INTERNAL";
                 /**
                  * @description 人間向けの説明。文言は予告なく変わるため分岐に使わないでください。
                  * @example 対象のリソースが見つかりません

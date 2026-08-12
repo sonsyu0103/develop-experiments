@@ -26,6 +26,21 @@ var (
 	// SERIALIZABLE 分離レベルで直列化失敗が起きた場合などに使います。
 	ErrConflict = errors.New("競合が発生しました")
 
+	// ErrPayloadTooLarge は要求が受け入れ可能な大きさを超えたことを表します
+	// (HTTP 413)。
+	//
+	// **画像アップロードの 2 か所で使います** (docs/adr/0007-image-storage.md 決定 2)。
+	//
+	//   1. バイト数の上限 (既定 5 MiB)
+	//   2. **ピクセル数の上限** (既定 5000 万画素)
+	//
+	// 2 を分けて持つのが要点です。「圧縮後は数十 KB だが展開すると数十 GB」
+	// という画像 (decompression bomb) は、バイト数の上限だけでは防げません。
+	//
+	// ErrInvalidArgument (400) と分けるのは、入力の形式は正しいためです。
+	// クライアントは「小さくすれば通る」と分かります。
+	ErrPayloadTooLarge = errors.New("要求が大きすぎます")
+
 	// ErrFailedPrecondition は要求そのものは正しいが、
 	// 現在の状態と噛み合わないことを表します (HTTP 422)。
 	//

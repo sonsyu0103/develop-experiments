@@ -33,3 +33,20 @@ sql:
             go_type:
               type: "time.Time"
               pointer: true
+          # **NULL 許容の uuid には別に上書きが要る。**
+          # 上の uuid 上書きは NOT NULL の列にしか効かず、
+          # NULL 許容の列は pgtype.UUID のまま生成される。
+          # 000006 で足した画像への参照 3 列 (comments.image_id /
+          # users.avatar_image_id / threads.icon_image_id) がこれに当たり、
+          # 気づかないと「pgtype を漏らさない」という上の意図が
+          # 列を足すたびに静かに破れていく。timestamptz と同じ形で塞ぐ。
+          - db_type: "uuid"
+            nullable: true
+            go_type:
+              # **import と type を分ける。** 非 NULL 側で使っている
+              # "github.com/google/uuid.UUID" という 1 文字列の書き方は、
+              # オブジェクト形式では型名そのものとして扱われて効かない
+              # (黙って pgtype.UUID のまま生成される)。
+              import: "github.com/google/uuid"
+              type: "UUID"
+              pointer: true

@@ -21,6 +21,21 @@ type IdempotencyKey struct {
 	CompletedAt    *time.Time
 }
 
+type Image struct {
+	ID                uuid.UUID
+	OwnerID           int64
+	Kind              string
+	ObjectKey         string
+	ContentType       string
+	Width             int32
+	Height            int32
+	ByteSize          int64
+	Status            string
+	CreatedAt         time.Time
+	CommittedAt       *time.Time
+	ObjectReclaimedAt *time.Time
+}
+
 type Session struct {
 	ID        string
 	UserID    int64
@@ -29,14 +44,15 @@ type Session struct {
 }
 
 type User struct {
-	ID          int64
-	PublicID    uuid.UUID
-	GoogleSub   string
-	Email       string
-	DisplayName string
-	AvatarUrl   *string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	DeletedAt   *time.Time
-	Role        string
+	ID            int64
+	PublicID      uuid.UUID
+	GoogleSub     string
+	Email         string
+	DisplayName   string
+	AvatarUrl     *string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	DeletedAt     *time.Time
+	Role          string
+	AvatarImageID *uuid.UUID
 }

@@ -13,7 +13,7 @@ import (
 )
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role
+SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id
 FROM users
 WHERE id = $1
   AND deleted_at IS NULL
@@ -34,12 +34,13 @@ func (q *Queries) GetUserByID(ctx context.Context, id int64) (User, error) {
 		&i.UpdatedAt,
 		&i.DeletedAt,
 		&i.Role,
+		&i.AvatarImageID,
 	)
 	return i, err
 }
 
 const getUserByPublicID = `-- name: GetUserByPublicID :one
-SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role
+SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id
 FROM users
 WHERE public_id = $1
   AND deleted_at IS NULL
@@ -61,6 +62,7 @@ func (q *Queries) GetUserByPublicID(ctx context.Context, publicID uuid.UUID) (Us
 		&i.UpdatedAt,
 		&i.DeletedAt,
 		&i.Role,
+		&i.AvatarImageID,
 	)
 	return i, err
 }
@@ -128,7 +130,7 @@ SET role = 'admin', updated_at = now()
 WHERE google_sub = $1
   AND deleted_at IS NULL
   AND role <> 'admin'
-RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role
+RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id
 `
 
 // 最初の管理者を作る唯一の経路 (ADR 0011 決定 1「最初の管理者をどう作るか」)。
@@ -159,6 +161,7 @@ func (q *Queries) PromoteToAdmin(ctx context.Context, googleSub string) (User, e
 		&i.UpdatedAt,
 		&i.DeletedAt,
 		&i.Role,
+		&i.AvatarImageID,
 	)
 	return i, err
 }
@@ -187,7 +190,7 @@ SET email        = EXCLUDED.email,
     -- 新規は DEFAULT 'user'、既存はログインしても変わらない。
     updated_at   = now()
 WHERE users.deleted_at IS NULL
-RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role
+RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id
 `
 
 type UpsertUserParams struct {
@@ -208,6 +211,14 @@ type UpsertUserParams struct {
 // ずらすとクエリごとに別の行型 (GetUserByIDRow / UpsertUserRow ...) が生成され、
 // ドメインへの詰め替えが 1 か所から 4 か所に増える。
 // 実際に一度そうなった (role を created_at の前に置いていた)。
+//
+// 【並び替えだけでなく、列を足したときにも壊れる】
+// 000006 で avatar_image_id を足したとき、ここを直さなかったため
+// **一致が崩れて行型が 4 つに分かれた** (ビルドが落ちて気づいた)。
+// 揃える条件は「順番が同じ」ではなく「テーブルの全列と過不足なく一致する」。
+//
+// そのため、まだ読み出さない列もここに並べる必要がある。
+// avatar_image_id を実際に使うのは Phase 6 の後半 (プロフィール画像) になる。
 // =============================================================================
 // ログイン時に呼ぶ。google_sub で照合し、無ければ作る。
 //
@@ -249,6 +260,7 @@ func (q *Queries) UpsertUser(ctx context.Context, arg UpsertUserParams) (User, e
 		&i.UpdatedAt,
 		&i.DeletedAt,
 		&i.Role,
+		&i.AvatarImageID,
 	)
 	return i, err
 }

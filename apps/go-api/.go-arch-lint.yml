@@ -38,6 +38,21 @@ vendors:
       - github.com/coreos/go-oidc/**
       - golang.org/x/oauth2
       - golang.org/x/oauth2/**
+  # S3 互換ストレージ。**objectstorage だけに許可する** ——
+  # ここを広く許すと、image モジュールが SDK の型を知ってよいことになり、
+  # ADR 0007 の「image は S3 SDK の型を一切知らない」が破れる
+  aws-s3:
+    in:
+      - github.com/aws/aws-sdk-go-v2/**
+      # smithy-go は SDK が返すエラーの共通インターフェース。
+      # DeleteObject のエラーは *smithy.GenericAPIError になるため、
+      # 「対象が無い」の判定にこちらが要る (s3.go の isNotFound)
+      - github.com/aws/smithy-go
+  # 画像のデコード / エンコード。ドメインではなく usecase 側で使う
+  imaging:
+    in:
+      - golang.org/x/image/**
+      - github.com/HugoSmits86/nativewebp
 
 components:
   main:
@@ -72,6 +87,11 @@ components:
   comment-usecase:
     in: internal/comment/usecase
 
+  image-model:
+    in: internal/image/domain/model
+  image-repository:
+    in: internal/image/domain/repository
+
   user-model:
     in: internal/user/domain/model
   user-repository:
@@ -88,6 +108,8 @@ components:
     in: internal/infrastructure/postgres
   oidc-provider:
     in: internal/infrastructure/oidc
+  object-storage:
+    in: internal/infrastructure/objectstorage
   postgres-sqlcgen:
     in: internal/infrastructure/postgres/sqlcgen
 
@@ -137,6 +159,18 @@ deps:
       - comment-model
       - comment-repository
 
+  # image モジュール (docs/adr/0007-image-storage.md)。
+  # UUID v7 の採番と object_key の組み立てをドメイン側で行うため uuid を許可する。
+  # **S3 SDK は入れない。** 保存先の都合をドメインに持ち込まないため
+  image-model:
+    canUse:
+      - uuid
+  image-repository:
+    canUse:
+      - uuid
+    mayDependOn:
+      - image-model
+
   # user モジュール。public_id (UUID v7) の採番をドメイン側で行うため uuid を許可する
   user-model:
     canUse:
@@ -154,6 +188,15 @@ deps:
     mayDependOn:
       - user-model
       - user-repository
+
+  # 外側のアダプタ。image モジュールが定義した ObjectStorage を実装する。
+  # **SDK を知ってよいのはここだけ** (ADR 0007 のモジュール構成)
+  object-storage:
+    canUse:
+      - aws-s3
+    mayDependOn:
+      - image-repository
+      - shared-config
 
   # 外側のアダプタ。usecase が定義した Provider を実装する
   oidc-provider:
@@ -191,6 +234,8 @@ deps:
       - comment-repository
       - user-model
       - user-repository
+      - image-model
+      - image-repository
       - postgres-sqlcgen
       - shared-config
 

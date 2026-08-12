@@ -35,6 +35,53 @@ type Config struct {
 	CommentPostMode CommentPostMode
 	// Auth は Google OIDC の設定です。
 	Auth AuthConfig
+	// Storage は画像を置くオブジェクトストレージの設定です。
+	Storage StorageConfig
+}
+
+// StorageConfig は S3 互換ストレージの設定です (docs/adr/0007-image-storage.md)。
+//
+// **すべて任意です。** AuthConfig と同じ理由で、揃っていない場合は
+// 画像の経路だけが 503 になります。掲示板の閲覧・匿名投稿・
+// ログインは画像に依存しません。
+type StorageConfig struct {
+	// Bucket はオブジェクトを置くバケット名です。
+	Bucket string
+	// Region は S3 のリージョンです。MinIO では任意の値で動きますが、
+	// SDK が空を許さないため既定値を持たせます。
+	Region string
+	// Endpoint は S3 互換エンドポイントです。
+	//
+	// **本番 (実 S3) では空にします。** 空なら SDK がリージョンから
+	// 正規のエンドポイントを組み立てます。MinIO のときだけ指定します。
+	Endpoint string
+	// UsePathStyle は path-style アクセスを使うかどうかです。
+	//
+	// MinIO では true が必要になります。既定の virtual-hosted style は
+	// bucket.host という名前解決を要求し、localhost では引けません。
+	UsePathStyle bool
+	// AccessKeyID / SecretAccessKey は静的な資格情報です。
+	//
+	// **本番では空にします。** 空なら SDK の既定チェーン
+	// (タスクロールなど) で解決させます —— キーを環境変数に置かない構成を
+	// 選べるようにしておくためです。
+	AccessKeyID     string
+	SecretAccessKey string
+	// PublicBaseURL は配信 URL の前置きです。
+	//
+	// API は絶対 URL を返すため (ADR 0007 決定 5)、環境ごとの差を
+	// ここで吸収します。本番は CloudFront のドメイン、
+	// ローカルは MinIO のエンドポイント + バケット名になります。
+	PublicBaseURL string
+}
+
+// Enabled は画像を扱えるだけの設定が揃っているかを返します。
+//
+// **Endpoint と資格情報は判定に含めません。** どちらも
+// 「本番では空にする」ことに意味がある項目なので、必須にすると
+// 実 S3 の構成を選べなくなります。
+func (s StorageConfig) Enabled() bool {
+	return s.Bucket != "" && s.PublicBaseURL != ""
 }
 
 // CommentPostMode はコメント投稿の並行制御の方式です。
@@ -212,7 +259,34 @@ func Load() (*Config, error) {
 			// 開発時だけ Secure を外す。未設定の環境は本番扱いで付ける。
 			SecureCookie: !debug,
 		},
+		Storage: StorageConfig{
+			Bucket: os.Getenv("S3_BUCKET"),
+			// SDK が空リージョンを許さないため、ここだけ既定値を持たせる。
+			// **バケットと公開 URL には既定値を入れない** ——
+			// AuthConfig の RedirectURL と同じ理由で、入れ忘れに気づけなくなる。
+			Region:          stringEnv("S3_REGION", "ap-northeast-1"),
+			Endpoint:        os.Getenv("S3_ENDPOINT"),
+			UsePathStyle:    boolEnv("S3_USE_PATH_STYLE"),
+			AccessKeyID:     os.Getenv("S3_ACCESS_KEY_ID"),
+			SecretAccessKey: os.Getenv("S3_SECRET_ACCESS_KEY"),
+			PublicBaseURL:   os.Getenv("S3_PUBLIC_BASE_URL"),
+		},
 	}, nil
+}
+
+// boolEnv は真偽値の環境変数を読み取ります。
+//
+// **未知の値は false に倒します。** 起動を止めないのは、
+// この値が「動くかどうか」ではなく「アクセス形式の選択」であり、
+// 誤りは MinIO への接続失敗として即座に現れるためです
+// (COMMENT_POST_MODE のように、測定結果を静かに汚す種類の設定とは違います)。
+func boolEnv(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // csvEnv はカンマ区切りの環境変数を文字列スライスとして読み取ります。

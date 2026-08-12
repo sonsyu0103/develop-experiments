@@ -31,6 +31,16 @@ type Querier interface {
 	// 応答 (response_status / response_body) はこの時点では NULL。
 	// 処理が終わってから CompleteIdempotencyKey で埋める。
 	ClaimIdempotencyKey(ctx context.Context, arg ClaimIdempotencyKeyParams) (ClaimIdempotencyKeyRow, error)
+	// ストレージへの PUT が成功したあとに呼ぶ (ADR 0007 決定 3 の手順 3)。
+	//
+	// **status = 'pending' を条件に含める。** 含めないと、
+	// モデレーターが削除した画像 ('deleted') を再確定させてしまう経路ができる。
+	// 遅れて届いた確定要求が削除を取り消す形になり、
+	// 「消したはずの画像が S3 に残り続ける」ことになりうる。
+	//
+	// 0 行になった場合は :one なので sql.ErrNoRows 相当が返る。
+	// 呼び出し側はこれを「確定できなかった」として扱う。
+	CommitImage(ctx context.Context, id uuid.UUID) (Image, error)
 	// 処理の結果を記録する。**主トランザクションの中で呼ぶこと。**
 	//
 	// ここまでが 1 つのトランザクションなので、
@@ -76,6 +86,31 @@ type Querier interface {
 	// 投稿者の解決は 1 往復に含める。RETURNING は挿入行しか返せないので
 	// CTE で包んで LEFT JOIN する (threads.sql の CreateThread と同じ理由)。
 	CreateCommentWithSeq(ctx context.Context, arg CreateCommentWithSeqParams) (CreateCommentWithSeqRow, error)
+	// =============================================================================
+	// 画像 (docs/adr/0007-image-storage.md)
+	//
+	// 【列の順番をテーブルと揃えること】
+	// users.sql と同じ理由。SELECT / RETURNING の並びがテーブルの全列と
+	// 過不足なく一致していれば、sqlc は共通の行型 (sqlcgen.Image) を再利用する。
+	// ずれるとクエリごとに別の行型が生成され、詰め替えが増える。
+	//
+	// object_reclaimed_at は**まだ誰も読み書きしない**が、列一覧には並べる。
+	// 揃える条件は「テーブルの全列と過不足なく一致する」であり、
+	// 1 つ抜けるだけで共通行型が消える (users.sql で実際に踏んだ)。
+	//
+	// 【回収バッチのクエリはここに無い】
+	// Phase 6 の後半 (プロフィール画像 / スレッドアイコンと同時) で足す。
+	// 先に書くと「実装していないクエリ」が残る。
+	// =============================================================================
+	// ストレージへ書く前に呼ぶ (ADR 0007 決定 3 の手順 1)。
+	//
+	// **status は 'pending' 固定にする。** 引数にすると、呼び出し側が
+	// 誤って 'committed' を渡した瞬間に「ストレージに無い画像が確定済み」に
+	// なりうる。手順 3 の UPDATE だけが確定させる経路であるべき。
+	//
+	// committed_at を渡さないのは CHECK 制約 (images_committed_at_matches_status)
+	// がそれを要求するため。
+	CreatePendingImage(ctx context.Context, arg CreatePendingImageParams) (Image, error)
 	// セッション ID は Go 側で生成した暗号論的乱数を渡す。
 	// DB 側で採番しないのは、連番や推測可能な値になると
 	// 総当たりで他人のセッションを引けてしまうため。
@@ -120,6 +155,13 @@ type Querier interface {
 	// request_hash が違えば「同じキーで別の内容」なので 422 にする。
 	// 一致すれば、記録した応答をそのまま返す。
 	GetIdempotencyKey(ctx context.Context, arg GetIdempotencyKeyParams) (IdempotencyKey, error)
+	// 1 件取得。
+	//
+	// **status で絞らない。** 'pending' も 'deleted' も返す。
+	// 呼び出し側が「確定していない」「削除された」を区別する必要があり、
+	// ここで隠すと「元から存在しない」と同じに見えてしまう
+	// (ADR 0016 問題 3 が DB 行を残す理由と同じ話)。
+	GetImageByID(ctx context.Context, id uuid.UUID) (Image, error)
 	// セッションの検証。**毎リクエスト通る、最も高頻度の経路**になる。
 	//
 	// 【なぜ JOIN するか】
@@ -299,6 +341,14 @@ type Querier interface {
 	// ずらすとクエリごとに別の行型 (GetUserByIDRow / UpsertUserRow ...) が生成され、
 	// ドメインへの詰め替えが 1 か所から 4 か所に増える。
 	// 実際に一度そうなった (role を created_at の前に置いていた)。
+	//
+	// 【並び替えだけでなく、列を足したときにも壊れる】
+	// 000006 で avatar_image_id を足したとき、ここを直さなかったため
+	// **一致が崩れて行型が 4 つに分かれた** (ビルドが落ちて気づいた)。
+	// 揃える条件は「順番が同じ」ではなく「テーブルの全列と過不足なく一致する」。
+	//
+	// そのため、まだ読み出さない列もここに並べる必要がある。
+	// avatar_image_id を実際に使うのは Phase 6 の後半 (プロフィール画像) になる。
 	// =============================================================================
 	// ログイン時に呼ぶ。google_sub で照合し、無ければ作る。
 	//

@@ -21,6 +21,10 @@ env:
   SQLC_VERSION: v1.31.1
   OAPI_CODEGEN_VERSION: v2.8.0
   GO_ARCH_LINT_VERSION: v1.17.0
+  # MinIO とそのクライアント。compose.yaml と同じタグに揃える
+  # (docs/adr/0007-image-storage.md)
+  MINIO_VERSION: RELEASE.2025-04-22T22-12-26Z
+  MC_VERSION: RELEASE.2025-04-16T18-13-26Z
 
 jobs:
   # --------------------------------------------------
@@ -238,8 +242,56 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
+
     steps:
       - uses: actions/checkout@v4
+
+      # S3 互換ストレージ (docs/adr/0007-image-storage.md)。
+      #
+      # ADR 0003 未決 #14 で「スモークの依存サービスをどこまで CI で立てるか」を
+      # 保留にしていた。**立てる**ことにした —— DB とストレージという
+      # 2 システム間の整合 (pending 行と孤児オブジェクト) は、
+      # フェイクでは原理的に再現できない。
+      #
+      # 【services ではなく docker run を使う理由】
+      # **services にはコマンド引数を渡す口が無い。**
+      # minio の ENTRYPOINT は引数として `server /data` を要求するため、
+      # services で起動するとサブコマンド無しになり、usage を出して即終了する
+      # (実際に CI を 1 回落とした)。options は docker create のフラグなので
+      # --entrypoint は指定できても、その後ろの引数は渡せない。
+      #
+      # postgres は引数が要らないので services のままでよい。
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            "minio/minio:${MINIO_VERSION}" server /data
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://localhost:9000/minio/health/live && exit 0
+            sleep 2
+          done
+          echo "::error::MinIO が起動しませんでした"
+          docker logs minio
+          exit 1
+
+      # **compose の minio-init と同じことを CI でも行う。**
+      # anonymous download にするのは、配信 URL を HTTP GET で
+      # 検証するため (本番はバケットを公開せず CloudFront の OAC 経由。
+      # ADR 0007 決定 4)。
+      - name: Create the MinIO bucket
+        run: |
+          # **バージョンを固定する。** 素の .../linux-amd64/mc は常に最新版で、
+          # Makefile 冒頭の方針 (@latest にしない) に反する。
+          # mc は過去に mc policy set -> mc anonymous set の改名を実施しており、
+          # 同種の変更が入るとコード変更なしに CI が落ちる。
+          # compose の minio/mc と同じタグに揃えてある。
+          curl -sSfL "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.${MC_VERSION}" -o /tmp/mc
+          chmod +x /tmp/mc
+          /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin
+          /tmp/mc mb --ignore-existing local/bbs-images
+          /tmp/mc anonymous set download local/bbs-images
 
       - name: Install golang-migrate
         run: |
@@ -285,6 +337,29 @@ jobs:
           echo "::error::API が起動しませんでした"
           cat /tmp/api.log
           exit 1
+
+      # **実 MinIO に対する検証** (docs/adr/0007-image-storage.md)。
+      #
+      # ユニットテストのフェイクでは、path-style の要否・
+      # Content-Type が保存されて配信時に返ること・存在しないキーの
+      # DELETE が成功すること、のいずれも確かめられない。
+      #
+      # S3_TEST_ENDPOINT が無ければテスト側がスキップする。
+      # **ここを消すと静かにスキップに戻る**ので、
+      # スモークの SMOKE_REQUIRE_FULL と同じ性質の穴になる。
+      - name: Verify object storage against the real MinIO
+        working-directory: ./apps/go-api
+        env:
+          # **この 2 つは対で置く。** ENDPOINT だけ消えると REQUIRE が
+          # 残って t.Fatal になり、静かなスキップにはならない (fail-closed)。
+          #
+          # CI 環境変数を既定にはできない。go test は Go Checks でも走り、
+          # そちらに MinIO は無いため (既定にして 1 回落とした)。
+          S3_TEST_REQUIRE: "1"
+          S3_TEST_ENDPOINT: http://localhost:9000
+          S3_TEST_BUCKET: bbs-images
+          S3_TEST_PUBLIC_BASE_URL: http://localhost:9000/bbs-images
+        run: go test -v -run 'TestS3Storage|TestNew_' ./internal/infrastructure/objectstorage/
 
       - name: Run smoke test against the real database
         env:
