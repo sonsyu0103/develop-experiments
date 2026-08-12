@@ -239,6 +239,9 @@ jobs:
           --health-timeout 5s
           --health-retries 20
 
+    steps:
+      - uses: actions/checkout@v4
+
       # S3 互換ストレージ (docs/adr/0007-image-storage.md)。
       #
       # ADR 0003 未決 #14 で「スモークの依存サービスをどこまで CI で立てるか」を
@@ -246,25 +249,30 @@ jobs:
       # 2 システム間の整合 (pending 行と孤児オブジェクト) は、
       # フェイクでは原理的に再現できない。
       #
-      # services はヘルスチェックのコマンドをイメージ内から探すため、
-      # mc を持たない minio イメージでは curl を使う。
-      minio:
-        image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        ports:
-          - 9000:9000
-        options: >-
-          --health-cmd "curl -sf http://localhost:9000/minio/health/live"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-    steps:
-      - uses: actions/checkout@v4
+      # 【services ではなく docker run を使う理由】
+      # **services にはコマンド引数を渡す口が無い。**
+      # minio の ENTRYPOINT は引数として `server /data` を要求するため、
+      # services で起動するとサブコマンド無しになり、usage を出して即終了する
+      # (実際に CI を 1 回落とした)。options は docker create のフラグなので
+      # --entrypoint は指定できても、その後ろの引数は渡せない。
+      #
+      # postgres は引数が要らないので services のままでよい。
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://localhost:9000/minio/health/live && exit 0
+            sleep 2
+          done
+          echo "::error::MinIO が起動しませんでした"
+          docker logs minio
+          exit 1
 
       # **compose の minio-init と同じことを CI でも行う。**
-      # services にはコマンドを差し込む口が無いため、ここで作る。
       # anonymous download にするのは、配信 URL を HTTP GET で
       # 検証するため (本番はバケットを公開せず CloudFront の OAC 経由。
       # ADR 0007 決定 4)。
