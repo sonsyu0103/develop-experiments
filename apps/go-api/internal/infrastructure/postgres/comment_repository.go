@@ -133,7 +133,7 @@ func (r *CommentRepository) createInTx(
 
 	var row sqlcgen.CreateCommentWithSeqRow
 	attempts, err := run.do(ctx, func() error {
-		return runInTx(ctx, r.pool, s.iso, func(q *sqlcgen.Queries) error {
+		return runInTx(ctx, op, r.pool, s.iso, func(q *sqlcgen.Queries) error {
 			if err := r.ensureThreadAlive(ctx, q, comment.ThreadID, s.lockParent); err != nil {
 				return err
 			}

@@ -236,8 +236,12 @@ check("コメント 0 件のスレッドは 200 かつ空配列",
 # シードはスレッド 1 の 1 番を論理削除しているので、2..4 が残る。
 status, payload, _ = call("GET", "/threads/1/comments")
 if status == 200:
-    seqs = sorted(c["seq"] for c in payload["comments"])
+    # **c["seq"] を先に評価しない。** 詰め替えが落ちて seq が消えると
+    # KeyError でスモーク全体がトレースバックで止まり、
+    # 「何件中何件失敗したか」の集計にも FAIL としても残らない。
+    # この検査が守ろうとしているまさにその壊れ方で、検査が消える。
     check("レス番号が API に出る", all("seq" in c for c in payload["comments"]))
+    seqs = sorted(c.get("seq") for c in payload["comments"] if "seq" in c)
     # **削除しても番号を詰めない。** 詰めると過去の >>5 が別の投稿を指す。
     check("削除されたコメントの番号は欠番のまま残る", seqs == [2, 3, 4], f"got={seqs}")
 
@@ -274,10 +278,13 @@ else:
 
     created = [p for s, p, _ in results if s == 201]
     codes = sorted(s for s, _, _ in results)
-    seqs = sorted(c["seq"] for c in created)
+    # seq が欠けていても集計を止めない (上の一覧の検査と同じ理由)。
+    seqs = sorted(c["seq"] for c in created if "seq" in c)
 
     check(f"{CONCURRENT_POSTS} 件の同時投稿がすべて 201",
           len(created) == CONCURRENT_POSTS, f"status={codes}")
+    check("投稿の応答すべてに seq がある",
+          len(seqs) == len(created), f"{len(seqs)} / {len(created)} 件にしか入っていない")
 
     # **ここが Phase 2 の本体。** 重複したら一意制約が拒否するので、
     # 実際には「重複した seq が保存される」ことは起きない。

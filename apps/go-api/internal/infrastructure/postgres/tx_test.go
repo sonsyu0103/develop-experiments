@@ -10,9 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"develop-experiments/apps/go-api/internal/apperr"
+	"develop-experiments/apps/go-api/internal/infrastructure/postgres/sqlcgen"
 )
 
 // retryEverything はすべての失敗をやり直す判定です。
@@ -391,4 +393,211 @@ func TestIsCommentSeqConflict(t *testing.T) {
 // discardLogger は出力を捨てるロガーです。
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelError + 1}))
+}
+
+// ---------------------------------------------------------------------------
+// runInTx
+// ---------------------------------------------------------------------------
+
+// fakeTx は Commit / Rollback だけを差し替えたトランザクションです。
+//
+// pgx.Tx を埋め込んでいるので、それ以外のメソッドを呼ぶと nil で落ちます。
+// **意図的にそうしています** —— runInTx が使っていないはずのメソッドを
+// 使い始めたら、テストが静かに通るのではなく落ちてほしいためです。
+type fakeTx struct {
+	pgx.Tx
+
+	commitErr  error
+	committed  bool
+	rolledBack bool
+}
+
+func (f *fakeTx) Commit(context.Context) error {
+	f.committed = true
+	return f.commitErr
+}
+
+func (f *fakeTx) Rollback(context.Context) error {
+	f.rolledBack = true
+	return nil
+}
+
+type fakeBeginner struct {
+	tx       *fakeTx
+	beginErr error
+	gotIso   pgx.TxIsoLevel
+}
+
+func (f *fakeBeginner) BeginTx(_ context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	f.gotIso = opts.IsoLevel
+	if f.beginErr != nil {
+		return nil, f.beginErr
+	}
+	return f.tx, nil
+}
+
+// COMMIT が返した直列化失敗も apperr.ErrConflict へ翻訳されること。
+//
+// **実 DB を立てないと踏めない経路。** SERIALIZABLE の 40001 は
+// 文の実行中とは限らず、COMMIT で初めて返ることがあります。
+// ここを素通しすると、リトライを使い切った最後の失敗が COMMIT 由来だったとき、
+// 409 であるべき応答が 500 になります (試行中は IsRetryable が
+// 生の PgError を見るので、この不具合は最終試行でしか表に出ません)。
+func TestRunInTx_TranslatesCommitError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		commitErr error
+		wantErrIs error
+		wantRetry bool
+	}{
+		{
+			name:      "直列化失敗",
+			commitErr: &pgconn.PgError{Code: codeSerializationFailure},
+			wantErrIs: apperr.ErrConflict,
+			wantRetry: true,
+		},
+		{
+			name:      "デッドロック",
+			commitErr: &pgconn.PgError{Code: codeDeadlockDetected},
+			wantErrIs: apperr.ErrConflict,
+			wantRetry: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			db := &fakeBeginner{tx: &fakeTx{commitErr: tt.commitErr}}
+
+			err := runInTx(t.Context(), "テスト", db, pgx.Serializable,
+				func(*sqlcgen.Queries) error { return nil })
+
+			if !errors.Is(err, tt.wantErrIs) {
+				t.Errorf("err = %v, want %v を含む (409 にならず 500 になる)", err, tt.wantErrIs)
+			}
+			if got := IsRetryable(err); got != tt.wantRetry {
+				t.Errorf("IsRetryable = %v, want %v", got, tt.wantRetry)
+			}
+			if db.gotIso != pgx.Serializable {
+				t.Errorf("分離レベル = %q, want %q", db.gotIso, pgx.Serializable)
+			}
+		})
+	}
+}
+
+// COMMIT が成功したらエラーを作らないこと (translateError の nil 素通し)。
+func TestRunInTx_CommitSuccess(t *testing.T) {
+	t.Parallel()
+
+	tx := &fakeTx{}
+	db := &fakeBeginner{tx: tx}
+
+	if err := runInTx(t.Context(), "テスト", db, pgx.ReadCommitted,
+		func(*sqlcgen.Queries) error { return nil }); err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !tx.committed {
+		t.Error("COMMIT されていない")
+	}
+	// Commit 済みへの Rollback は pgx が no-op にするので、呼ばれること自体は正しい。
+	if !tx.rolledBack {
+		t.Error("defer の Rollback が呼ばれていない (panic 時に巻き戻らない)")
+	}
+}
+
+// fn が失敗したら COMMIT しないこと。
+// **途中まで書いた結果を残してはいけません。**
+func TestRunInTx_RollsBackOnError(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("採番に失敗")
+	tx := &fakeTx{}
+	db := &fakeBeginner{tx: tx}
+
+	err := runInTx(t.Context(), "テスト", db, pgx.Serializable,
+		func(*sqlcgen.Queries) error { return sentinel })
+
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want %v", err, sentinel)
+	}
+	if tx.committed {
+		t.Error("fn が失敗したのに COMMIT された")
+	}
+	if !tx.rolledBack {
+		t.Error("ロールバックされていない")
+	}
+}
+
+// BEGIN の失敗も翻訳されること。
+func TestRunInTx_TranslatesBeginError(t *testing.T) {
+	t.Parallel()
+
+	db := &fakeBeginner{beginErr: &pgconn.PgError{Code: codeSerializationFailure}}
+
+	err := runInTx(t.Context(), "テスト", db, pgx.Serializable,
+		func(*sqlcgen.Queries) error {
+			t.Error("BEGIN に失敗したのに fn が呼ばれた")
+			return nil
+		})
+
+	if !errors.Is(err, apperr.ErrConflict) {
+		t.Errorf("err = %v, want apperr.ErrConflict を含む", err)
+	}
+}
+
+// MaxDelay を設定していない方針で、待ち時間が丸ごと 0 にならないこと。
+//
+// **上限側から下げる書き方をすると、ここが静かに 0 になります。**
+// 指数バックオフを設定したつもりで full jitter の目的が消え、
+// 競合中の DB を全員で叩き続けることになります。
+func TestRetryPolicyBackoff_NoMaxDelay(t *testing.T) {
+	t.Parallel()
+
+	p := RetryPolicy{MaxAttempts: 5, BaseDelay: 10 * time.Millisecond}
+
+	seen := map[time.Duration]struct{}{}
+	for i := 0; i < 500; i++ {
+		got := p.backoff(3)
+		// 3 回目の指数値は 10ms << 2 = 40ms。
+		if got < 0 || got > 40*time.Millisecond {
+			t.Fatalf("backoff(3) = %v, want [0, 40ms]", got)
+		}
+		seen[got] = struct{}{}
+	}
+	if len(seen) < 10 {
+		t.Errorf("待ち時間が %d 通りしか出ていない (上限が 0 に潰れている)", len(seen))
+	}
+}
+
+// 試行を重ねるほど待ち時間が伸びること。
+//
+// **上限の検査だけでは、指数で伸ばすのをやめても気づけません。**
+// 常に BaseDelay を返す実装は [0, 上限] にすべて収まるため、
+// TestRetryPolicyBackoffBounds を素通りします (変異プローブで実測)。
+// 伸びないと、競合が続くときに全員が同じ短い間隔で再実行を繰り返します。
+func TestRetryPolicyBackoff_GrowsWithAttempt(t *testing.T) {
+	t.Parallel()
+
+	// MaxDelay を十分大きく取り、頭打ちの影響を受けないようにする。
+	p := RetryPolicy{MaxAttempts: 10, BaseDelay: time.Millisecond, MaxDelay: time.Hour}
+
+	maxOf := func(attempt int) time.Duration {
+		var got time.Duration
+		for i := 0; i < 500; i++ {
+			got = max(got, p.backoff(attempt))
+		}
+		return got
+	}
+
+	// 1 回目の上限は 1ms、5 回目は 16ms。
+	// full jitter なので観測値は上限そのものではないが、
+	// 500 回も引けば桁が違うことは確実に出る。
+	first, fifth := maxOf(1), maxOf(5)
+	if fifth <= first*4 {
+		t.Errorf("attempt=1 の最大 %v に対して attempt=5 の最大が %v しかない "+
+			"(指数で伸びていない)", first, fifth)
+	}
 }

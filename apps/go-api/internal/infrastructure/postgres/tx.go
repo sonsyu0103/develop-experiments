@@ -3,7 +3,6 @@ package postgres
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"math/rand/v2"
 	"time"
@@ -69,17 +68,28 @@ func (p RetryPolicy) backoff(attempt int) time.Duration {
 		return 0
 	}
 
-	ceiling := p.MaxDelay
-	// 1 << 62 を超えると time.Duration (int64) が溢れるため、
-	// シフトする前に打ち切ります。attempt は MaxAttempts で抑えられている
-	// はずですが、方針を外から渡せる以上ここで閉じておきます。
-	if shift := attempt - 1; shift < 62 {
-		if d := p.BaseDelay << shift; d > 0 && d < ceiling {
-			ceiling = d
+	// 指数で伸ばす。
+	//
+	// **MaxDelay を起点にして下げる方向だけで書いてはいけません。**
+	// その形だと MaxDelay が未設定 (ゼロ値) の方針で上限が 0 のままになり、
+	// 待ち時間が丸ごと 0 になります。指数バックオフを設定したつもりで
+	// **full jitter の目的 (再実行の位相をばらす) が黙って消える**ため、
+	// 競合中の DB を全員で叩き続けることになります。
+	delay := p.BaseDelay
+	for i := 1; i < attempt; i++ {
+		// time.Duration は int64 なので、倍にする前に頭打ちを見ます。
+		// attempt は MaxAttempts で抑えられているはずですが、
+		// 方針を外から渡せる以上ここで閉じておきます。
+		if delay > maxBackoff/2 {
+			delay = maxBackoff
+			break
 		}
+		delay *= 2
 	}
-	if ceiling <= 0 {
-		return 0
+
+	// MaxDelay が 0 以下なら「上限なし」として扱います。
+	if p.MaxDelay > 0 && delay > p.MaxDelay {
+		delay = p.MaxDelay
 	}
 
 	// 上限そのものも選ばれうるように +1 します。
@@ -87,8 +97,12 @@ func (p RetryPolicy) backoff(attempt int) time.Duration {
 	//nolint:gosec // 待ち時間を散らすためのゆらぎであり、秘密ではない。
 	// 予測されて困る値ではないので、crypto/rand を使う理由がない
 	// (セッション ID などとは要求が違う。ADR 0005)。
-	return time.Duration(rand.Int64N(int64(ceiling) + 1))
+	return time.Duration(rand.Int64N(int64(delay) + 1))
 }
+
+// maxBackoff は待ち時間の絶対上限です。
+// 2^62 ナノ秒 (約 146 年) で、+1 しても int64 を溢れさせません。
+const maxBackoff = time.Duration(1) << 62
 
 // sleepFor は待ち時間を消費します。ctx が終了したらそれを返します。
 func (p RetryPolicy) sleepFor(ctx context.Context, d time.Duration) error {
@@ -191,6 +205,17 @@ func (r retrier) logAttrs(err error) []slog.Attr {
 	return attrs
 }
 
+// txBeginner はトランザクションを開始できるものです。*pgxpool.Pool が満たします。
+//
+// **具体型ではなくこれを受け取るのは、テストのためです。**
+// COMMIT が返すエラーの扱い (下記) は実 DB を立てないと踏めない経路なので、
+// 差し替え口が無いと「翻訳を外しても誰も気づかない」状態になります。
+type txBeginner interface {
+	BeginTx(ctx context.Context, opts pgx.TxOptions) (pgx.Tx, error)
+}
+
+var _ txBeginner = (*pgxpool.Pool)(nil)
+
 // runInTx は fn を 1 つのトランザクションの中で実行します。
 //
 // **fn の中で返したエラーはロールバックになります。**
@@ -201,13 +226,18 @@ func (r retrier) logAttrs(err error) []slog.Attr {
 // SERIALIZABLE の 40001 は文の実行中とは限らず、COMMIT で初めて返ることがあります。
 // そのため**リトライは runInTx の呼び出しごと**包む必要があります
 // (この関数の中でリトライしてはいけません)。
+//
+// **COMMIT のエラーも translateError を通します。**
+// 素通しすると、リトライを使い切った最後の失敗が COMMIT 由来だったときに
+// apperr.ErrConflict が付かず、409 であるべき応答が 500 になります
+// (試行中は IsRetryable が生の PgError を見るので表に出ません)。
 func runInTx(
-	ctx context.Context, pool *pgxpool.Pool, iso pgx.TxIsoLevel,
+	ctx context.Context, op string, db txBeginner, iso pgx.TxIsoLevel,
 	fn func(*sqlcgen.Queries) error,
 ) error {
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
+	tx, err := db.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
 	if err != nil {
-		return fmt.Errorf("トランザクションを開始できませんでした: %w", err)
+		return translateError(op+": トランザクションを開始できませんでした", err)
 	}
 	// Commit 済みのトランザクションへの Rollback は pgx が no-op にするため、
 	// 正常系でも安全に呼べます。panic した場合もここで巻き戻ります。
@@ -216,5 +246,5 @@ func runInTx(
 	if err := fn(sqlcgen.New(tx)); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return translateError(op, tx.Commit(ctx))
 }

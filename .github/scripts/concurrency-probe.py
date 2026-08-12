@@ -55,7 +55,8 @@ LOG_EXEC = os.environ.get(
     "LOG_EXEC", "docker compose logs go-api --no-log-prefix --tail=2000")
 
 # モードを切り替えるにはコンテナを作り直す必要がある。
-# compose.yaml が COMMENT_POST_MODE を ${COMMENT_POST_MODE:-ssi} で受けている。
+# compose.yaml が COMMENT_POST_MODE をホストから補間して渡している
+# (既定値は compose 側に書かず、config の parseCommentPostMode に任せてある)。
 COMPOSE_UP = ["docker", "compose", "up", "-d", "--force-recreate", "go-api"]
 
 
@@ -177,7 +178,9 @@ def probe(mode: str) -> dict:
         "duplicates": duplicates or "?",
         "stored": stored or "?",
         "max_seq": max_seq or "?",
-        "seqs": sorted(c["seq"] for c in created),
+        # seq が欠けていても集計を止めない。
+        # KeyError で落ちると、全モードぶんの結果表が出ないまま終わる。
+        "seqs": sorted(c["seq"] for c in created if "seq" in c),
     }
 
 
