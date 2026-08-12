@@ -26,6 +26,17 @@ var (
 	// SERIALIZABLE 分離レベルで直列化失敗が起きた場合などに使います。
 	ErrConflict = errors.New("競合が発生しました")
 
+	// ErrFailedPrecondition は要求そのものは正しいが、
+	// 現在の状態と噛み合わないことを表します (HTTP 422)。
+	//
+	// **同じ冪等キーで別の内容が送られた場合**に使います
+	// (docs/adr/0015-idempotency.md / docs/adr/0013-http-defense.md 決定 3)。
+	//
+	// ErrInvalidArgument (400) と分けるのは、入力の形は正しいためです。
+	// ErrConflict (409) と分けるのは、**再試行しても解決しない**ためです
+	// —— クライアントはキーを作り直す必要があります。
+	ErrFailedPrecondition = errors.New("要求が現在の状態と噛み合いません")
+
 	// ErrUnavailable は依存する外部要素の設定や疎通が無く、
 	// その経路だけが使えないことを表します (HTTP 503)。
 	//

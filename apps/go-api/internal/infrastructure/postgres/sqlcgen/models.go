@@ -10,6 +10,17 @@ import (
 	"github.com/google/uuid"
 )
 
+type IdempotencyKey struct {
+	UserID         int64
+	Key            string
+	Endpoint       string
+	RequestHash    string
+	ResponseStatus *int32
+	ResponseBody   []byte
+	CreatedAt      time.Time
+	CompletedAt    *time.Time
+}
+
 type Session struct {
 	ID        string
 	UserID    int64

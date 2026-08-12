@@ -47,6 +47,10 @@ components:
     in: internal/apperr
   shared-pagination:
     in: internal/pagination
+  # 冪等キー (docs/adr/0015-idempotency.md)。
+  # HTTP 層でヘッダを読み、永続化層で記録するため、pagination と同じく横断する
+  shared-idempotency:
+    in: internal/idempotency
   shared-config:
     in: internal/config
   # 構造化ログの共通フィールドと相関 ID (docs/adr/0010-log-pipeline.md 決定 4)。
@@ -91,6 +95,7 @@ components:
 commonComponents:
   - shared-apperr
   - shared-pagination
+  - shared-idempotency
   - shared-logging
 
 deps:

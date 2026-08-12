@@ -3,12 +3,14 @@ package usecase
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"develop-experiments/apps/go-api/internal/apperr"
 	"develop-experiments/apps/go-api/internal/comment/domain/model"
 	"develop-experiments/apps/go-api/internal/comment/domain/repository"
+	"develop-experiments/apps/go-api/internal/idempotency"
 	"develop-experiments/apps/go-api/internal/pagination"
 )
 
@@ -24,6 +26,13 @@ type fakeCommentRepo struct {
 
 	// 受け取ったページ指定。カーソルが永続化層まで届いたかの確認に使う。
 	gotPage pagination.Page
+
+	// 冪等キーの記録。キー -> 記録済みの応答。
+	recorded map[string]recordedResponse
+	// createCalls は実際に投稿された回数。**二重送信で増えないこと**を見る。
+	createCalls int
+	// gotRequest は永続化層まで届いた冪等キーの情報。
+	gotRequest idempotency.Request
 }
 
 var _ repository.CommentRepository = (*fakeCommentRepo)(nil)
@@ -78,6 +87,44 @@ func (f *fakeCommentRepo) Create(_ context.Context, comment *model.Comment) (*mo
 	created.Seq = int32(len(f.comments) + 1)
 	created.CreatedAt = time.Unix(0, 0).UTC()
 	return &created, nil
+}
+
+// CreateIdempotent は「キーごとに 1 回だけ処理する」ところだけを再現します。
+// トランザクションと待ちは本物 (実 DB) の担当なので、ここでは扱いません。
+func (f *fakeCommentRepo) CreateIdempotent(
+	ctx context.Context, comment *model.Comment, req idempotency.Request,
+	encode func(*model.Comment) ([]byte, error),
+) (*model.Comment, []byte, error) {
+	if f.recorded == nil {
+		f.recorded = map[string]recordedResponse{}
+	}
+	f.gotRequest = req
+
+	if rec, ok := f.recorded[req.Key]; ok {
+		if rec.hash != req.RequestHash {
+			return nil, nil, fmt.Errorf(
+				"同じキーで別の内容: %w", apperr.ErrFailedPrecondition)
+		}
+		return nil, rec.body, nil
+	}
+
+	created, err := f.Create(ctx, comment)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, err := encode(created)
+	if err != nil {
+		return nil, nil, err
+	}
+	f.recorded[req.Key] = recordedResponse{hash: req.RequestHash, body: body}
+	f.createCalls++
+	return created, nil, nil
+}
+
+// recordedResponse は記録済みの応答です。
+type recordedResponse struct {
+	hash string
+	body []byte
 }
 
 func (f *fakeCommentRepo) SoftDelete(context.Context, int64, int64) error { return nil }
@@ -325,4 +372,196 @@ func TestComments_SeqReachesDTO(t *testing.T) {
 			t.Error("投稿の応答に seq が入っていない (採番結果が返らない)")
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// 冪等キー (docs/adr/0015-idempotency.md)
+// ---------------------------------------------------------------------------
+
+// 同じキーで 2 回送っても、投稿は 1 回しか行われないこと。
+//
+// **これが Phase 2 後半の主題。** タイムアウト後の再送は
+// 「サーバでは成功していた」場合があり、ボタン制御では原理的に防げない。
+func TestPostCommentIdempotent_SecondCallDoesNotCreate(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	uc := newInteractor(repo)
+	authorID := int64(42)
+
+	first, err := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, "key-1", "POST /threads/1/comments")
+	if err != nil {
+		t.Fatalf("1 回目が失敗した: %v", err)
+	}
+
+	second, err := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, "key-1", "POST /threads/1/comments")
+	if err != nil {
+		t.Fatalf("2 回目が失敗した: %v", err)
+	}
+
+	if repo.createCalls != 1 {
+		t.Errorf("投稿が %d 回行われた, want 1 (二重投稿)", repo.createCalls)
+	}
+	// 記録した応答をそのまま返す。ID が変わっていたら別の投稿になっている。
+	if first.ID != second.ID || first.Seq != second.Seq {
+		t.Errorf("再送で別の応答が返った: %+v vs %+v", first, second)
+	}
+}
+
+// 同じキーで別の内容を送ったら 422 相当になること。
+// 黙って前回の結果を返すと、クライアントのバグが見えなくなる。
+func TestPostCommentIdempotent_DifferentBodyIsRejected(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	uc := newInteractor(repo)
+	authorID := int64(42)
+
+	if _, postErr := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID,
+		"key-1", "POST /threads/1/comments"); postErr != nil {
+		t.Fatalf("1 回目が失敗した: %v", postErr)
+	}
+
+	// 同じキー、違う本文。
+	_, err := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "おはよう", &authorID, "key-1", "POST /threads/1/comments")
+
+	if !errors.Is(err, apperr.ErrFailedPrecondition) {
+		t.Fatalf("err = %v, want apperr.ErrFailedPrecondition (422)", err)
+	}
+	if repo.createCalls != 1 {
+		t.Errorf("投稿が %d 回行われた, want 1", repo.createCalls)
+	}
+}
+
+// **結果に影響しない差で 422 にしないこと。**
+//
+// 指紋を「受け取ったままの値」から作ると、ここが 422 になる。
+// 422 は再試行では絶対に解けない (キーを作り直すしかない) ので、
+// 利用者から見て同じ操作が永久に通らなくなる。
+func TestPostCommentIdempotent_NormalizedFieldsDoNotChangeFingerprint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		firstAuthorName string
+		firstBody       string
+		retryAuthorName string
+		retryBody       string
+	}{
+		{
+			// ログイン中は authorName が捨てられる (model.NewComment)。
+			// 投稿結果は変わらないのに、指紋だけが変わってはいけない。
+			name:            "再送で名前欄が空になっても同じ",
+			firstAuthorName: "ホシノ", firstBody: "ふぁ〜",
+			retryAuthorName: "", retryBody: "ふぁ〜",
+		},
+		{
+			name:            "再送で名前欄が変わっても同じ",
+			firstAuthorName: "ホシノ", firstBody: "ふぁ〜",
+			retryAuthorName: "先生", retryBody: "ふぁ〜",
+		},
+		{
+			// 本文は TrimSpace される。末尾の空白の有無で別物にしない。
+			name:            "本文の前後の空白は無視される",
+			firstAuthorName: "ホシノ", firstBody: "ふぁ〜",
+			retryAuthorName: "ホシノ", retryBody: "  ふぁ〜  ",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			repo := newFakeCommentRepo(0)
+			uc := newInteractor(repo)
+			authorID := int64(42)
+
+			first, err := uc.PostCommentIdempotent(t.Context(), 1,
+				tt.firstAuthorName, tt.firstBody, &authorID, "key-1", "POST /threads/1/comments")
+			if err != nil {
+				t.Fatalf("1 回目が失敗した: %v", err)
+			}
+
+			second, err := uc.PostCommentIdempotent(t.Context(), 1,
+				tt.retryAuthorName, tt.retryBody, &authorID, "key-1", "POST /threads/1/comments")
+			if err != nil {
+				t.Fatalf("再送が失敗した (結果に影響しない差で 422 になっている): %v", err)
+			}
+
+			if repo.createCalls != 1 {
+				t.Errorf("投稿が %d 回行われた, want 1", repo.createCalls)
+			}
+			if first.ID != second.ID {
+				t.Errorf("再送で別の投稿になった: %+v vs %+v", first, second)
+			}
+		})
+	}
+}
+
+// **匿名では冪等キーを使えない** (ADR 0015 決定 4)。
+//
+// キーの名前空間を分ける手段が無いため、通してしまうと
+// 他人のキーと衝突して「他人の投稿結果が返る」ことになる。
+// HTTP 層が落とす前提だが、事故の重さから見てここでも閉じる。
+func TestPostCommentIdempotent_AnonymousIsRejected(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	uc := newInteractor(repo)
+
+	_, err := uc.PostCommentIdempotent(
+		t.Context(), 1, "", "ふぁ〜", nil, "key-1", "POST /threads/1/comments")
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
+	}
+	if repo.createCalls != 0 {
+		t.Errorf("匿名なのに投稿された (%d 回)", repo.createCalls)
+	}
+}
+
+// キーの情報が永続化層まで届くこと。
+// ここで落ちると、冪等性が「実装したが効いていない」状態になる。
+func TestPostCommentIdempotent_RequestReachesRepository(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	uc := newInteractor(repo)
+	authorID := int64(42)
+
+	if _, err := uc.PostCommentIdempotent(t.Context(), 1, "ホシノ", "ふぁ〜", &authorID,
+		"key-xyz", "POST /threads/1/comments"); err != nil {
+		t.Fatalf("PostCommentIdempotent が失敗した: %v", err)
+	}
+
+	if repo.gotRequest.Key != "key-xyz" {
+		t.Errorf("リポジトリが受け取ったキー = %q, want key-xyz", repo.gotRequest.Key)
+	}
+	if repo.gotRequest.RequestHash == "" {
+		t.Error("指紋がリポジトリまで届いていない (別内容の検出が効かない)")
+	}
+	if repo.gotRequest.Endpoint != "POST /threads/1/comments" {
+		t.Errorf("経路 = %q, want POST /threads/1/comments", repo.gotRequest.Endpoint)
+	}
+}
+
+// 不正なキーは投稿より先に弾くこと。
+func TestPostCommentIdempotent_InvalidKeyIsRejected(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	uc := newInteractor(repo)
+	authorID := int64(42)
+
+	_, err := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, "   ", "POST /threads/1/comments")
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
+	}
+	if repo.createCalls != 0 {
+		t.Errorf("キーが不正なのに投稿された (%d 回)", repo.createCalls)
+	}
 }

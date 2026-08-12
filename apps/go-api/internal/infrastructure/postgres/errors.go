@@ -81,6 +81,19 @@ func IsRetryable(err error) bool {
 	return errors.Is(err, apperr.ErrConflict)
 }
 
+// codeQueryCanceled は文が打ち切られたことを表します。
+// `statement_timeout` を超えた場合がこれになります。
+const codeQueryCanceled = "57014"
+
+// isStatementTimeout は、文が実行時間の上限で打ち切られたかを返します。
+//
+// 冪等キーの確保は、同じキーの処理が未コミットのとき**相手の終了を待ちます**。
+// 待ちはコネクションを占有するため上限を設けており、
+// 超えたことをここで見分けます (docs/adr/0015-idempotency.md)。
+func isStatementTimeout(err error) bool {
+	return sqlState(err) == codeQueryCanceled
+}
+
 // sqlState は PostgreSQL の SQLSTATE を取り出します。
 // PostgreSQL 由来でないエラーでは空文字を返します。
 func sqlState(err error) string {
