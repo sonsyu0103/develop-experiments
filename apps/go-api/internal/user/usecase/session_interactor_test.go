@@ -30,7 +30,7 @@ func TestAuthenticate(t *testing.T) {
 		Email:       "h@example.com",
 		DisplayName: "ホシノ",
 	}
-	uc := NewSessionInteractor(&fakeSessionRepo{liveToken: token, owner: owner})
+	uc := NewSessionInteractor(&fakeSessionRepo{liveToken: token, owner: owner}, nil)
 
 	got, err := uc.Authenticate(context.Background(), token)
 	if err != nil {
@@ -56,7 +56,7 @@ func TestAuthenticate(t *testing.T) {
 func TestAuthenticate_NotFoundBecomesUnauthenticated(t *testing.T) {
 	t.Parallel()
 
-	uc := NewSessionInteractor(&fakeSessionRepo{liveToken: "other"})
+	uc := NewSessionInteractor(&fakeSessionRepo{liveToken: "other"}, nil)
 
 	_, err := uc.Authenticate(context.Background(), "無効なトークン")
 	if !errors.Is(err, apperr.ErrUnauthenticated) {
@@ -70,7 +70,7 @@ func TestAuthenticate_NotFoundBecomesUnauthenticated(t *testing.T) {
 func TestAuthenticate_EmptyTokenIsUnauthenticated(t *testing.T) {
 	t.Parallel()
 
-	uc := NewSessionInteractor(&fakeSessionRepo{liveToken: "x"})
+	uc := NewSessionInteractor(&fakeSessionRepo{liveToken: "x"}, nil)
 
 	if _, err := uc.Authenticate(context.Background(), ""); !errors.Is(err, apperr.ErrUnauthenticated) {
 		t.Fatalf("err = %v, want apperr.ErrUnauthenticated", err)
@@ -83,7 +83,7 @@ func TestAuthenticate_PropagatesOtherErrors(t *testing.T) {
 	t.Parallel()
 
 	sentinel := errors.New("DB がダウンしています")
-	uc := NewSessionInteractor(&fakeSessionRepo{findErr: sentinel})
+	uc := NewSessionInteractor(&fakeSessionRepo{findErr: sentinel}, nil)
 
 	_, err := uc.Authenticate(context.Background(), "t")
 	if !errors.Is(err, sentinel) {
@@ -104,7 +104,7 @@ func TestAuthenticate_CarriesRole(t *testing.T) {
 		ID: 42, PublicID: uuid.MustParse("01920000-0000-7000-8000-000000000001"),
 		Email: "h@example.com", DisplayName: "ホシノ", Role: model.RoleModerator,
 	}
-	uc := NewSessionInteractor(&fakeSessionRepo{liveToken: token, owner: owner})
+	uc := NewSessionInteractor(&fakeSessionRepo{liveToken: token, owner: owner}, nil)
 
 	got, err := uc.Authenticate(context.Background(), token)
 	if err != nil {
@@ -123,7 +123,7 @@ func TestLogout(t *testing.T) {
 	t.Parallel()
 
 	sessions := &fakeSessionRepo{}
-	uc := NewSessionInteractor(sessions)
+	uc := NewSessionInteractor(sessions, nil)
 
 	if err := uc.Logout(context.Background(), "token-1"); err != nil {
 		t.Fatalf("Logout が失敗した: %v", err)

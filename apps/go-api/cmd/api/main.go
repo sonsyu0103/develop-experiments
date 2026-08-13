@@ -22,6 +22,7 @@ import (
 	oidcprovider "develop-experiments/apps/go-api/internal/infrastructure/oidc"
 	"develop-experiments/apps/go-api/internal/infrastructure/postgres"
 	"develop-experiments/apps/go-api/internal/logging"
+	"develop-experiments/apps/go-api/internal/scheduler"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
 )
@@ -60,12 +61,6 @@ func run() error {
 	threadRepo := postgres.NewThreadRepository(pool)
 
 	sessionRepo := postgres.NewSessionRepository(pool)
-
-	// **セッションの検証は常に結線する。** sessions を引いて期限を見るだけで、
-	// Google を必要としない (ADR 0005 決定 4)。
-	// ここを認証の設定で分岐させていた頃は、資格情報の無い環境が
-	// Cookie を無視して全リクエストを匿名として扱っていた。
-	sessionInteractor := userusecase.NewSessionInteractor(sessionRepo)
 
 	// **ログインだけが設定を要する。** 認可コードの交換に IdP が要るため。
 	//
@@ -117,13 +112,28 @@ func run() error {
 	// 設定が無い環境で画像を指定した投稿が 503 ではなく nil 参照で落ちる。
 	//
 	// Go でよく踏む形なので、代入をここで明示的に分岐させる。
-	var imageResolver commentusecase.ImageResolver
+	var (
+		imageResolver        commentusecase.ImageResolver
+		threadImageResolver  threadusecase.ImageResolver
+		sessionImageResolver userusecase.ImageResolver
+	)
 	if imageInteractor != nil {
 		imageResolver = imageInteractor
+		threadImageResolver = imageInteractor
+		sessionImageResolver = imageInteractor
 	}
 
+	// **セッションの検証は常に結線する。** sessions を引いて期限を見るだけで、
+	// Google を必要としない (ADR 0005 決定 4)。
+	// ここを認証の設定で分岐させていた頃は、資格情報の無い環境が
+	// Cookie を無視して全リクエストを匿名として扱っていた。
+	//
+	// 画像の解決だけはストレージの設定に依存する
+	// (未設定なら /me の avatarUrl は Google のものだけになる)。
+	sessionInteractor := userusecase.NewSessionInteractor(sessionRepo, sessionImageResolver)
+
 	server := httpapi.NewServer(
-		threadusecase.NewThreadInteractor(threadRepo),
+		threadusecase.NewThreadInteractor(threadRepo, threadImageResolver),
 		commentusecase.NewCommentInteractor(
 			postgres.NewCommentRepository(pool, cfg.CommentPostMode), threadRepo, imageResolver),
 		pool,
@@ -140,6 +150,50 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// 定期処理を回す (ADR 0003 未決 #9 の決定: API プロセス内)。
+	//
+	// **レプリカの数だけ同時に走る**ので、登録する処理は冪等で、
+	// 同じ行を掴まない形になっている必要がある (scheduler の doc を参照)。
+	//
+	// 期限切れセッションと冪等キーの削除は、リポジトリまで実装済みで
+	// **配線されていなかった** —— 未決 #9 が決まるのを待っていた。
+	sessionCleaner := postgres.NewSessionRepository(pool)
+	idempotencyCleaner := postgres.NewIdempotencyRepository(pool)
+
+	jobs := []scheduler.Job{
+		{
+			Name:     "expired_sessions",
+			Interval: 1 * time.Hour,
+			Run: func(ctx context.Context) error {
+				_, err := sessionCleaner.DeleteExpired(ctx, 0)
+				return err
+			},
+		},
+		{
+			Name:     "expired_idempotency_keys",
+			Interval: 1 * time.Hour,
+			Run: func(ctx context.Context) error {
+				_, err := idempotencyCleaner.DeleteExpired(ctx, 0, 0)
+				return err
+			},
+		},
+	}
+
+	// 画像の回収はストレージが有効なときだけ。
+	// 設定が無い環境で回すと、毎回 S3 に届かず ERROR を吐き続ける。
+	if imageInteractor != nil {
+		jobs = append(jobs, scheduler.Job{
+			Name:     "image_reclaim",
+			Interval: 10 * time.Minute,
+			Run: func(ctx context.Context) error {
+				_, err := imageInteractor.Reclaim(ctx, 0, 0)
+				return err
+			},
+		})
+	}
+
+	scheduler.New(jobs...).Start(ctx)
 
 	srv := &http.Server{
 		Addr:    cfg.Addr,

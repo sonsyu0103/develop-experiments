@@ -63,6 +63,24 @@ func (f *fakeImageRepo) FindByID(_ context.Context, id uuid.UUID) (*imagemodel.I
 	return nil, fmt.Errorf("fake: %w", apperr.ErrNotFound)
 }
 
+// 回収バッチ用。この環境では回収を回さないので、素直な実装で足りる。
+func (f *fakeImageRepo) WithinTx(_ context.Context, fn func(imagerepo.ImageRepository) error) error {
+	return fn(f)
+}
+
+func (f *fakeImageRepo) ListReclaimable(
+	context.Context, time.Duration, int32,
+) ([]imagemodel.Image, error) {
+	return nil, nil
+}
+
+func (f *fakeImageRepo) MarkReclaimed(context.Context, uuid.UUID) error { return nil }
+
+func (f *fakeImageRepo) Delete(_ context.Context, id uuid.UUID) error {
+	delete(f.stored, id)
+	return nil
+}
+
 type fakeObjectStorage struct{ objects map[string][]byte }
 
 var _ imagerepo.ObjectStorage = (*fakeObjectStorage)(nil)
@@ -110,17 +128,17 @@ func newImageEnv(t *testing.T) *imageEnv {
 
 	threads := &fakeThreadRepo{
 		summaries: []threadmodel.Summary{
-			{Thread: *threadmodel.Reconstruct(1, "スレッド", nil, time.Unix(1, 0).UTC())},
+			{Thread: *threadmodel.Reconstruct(1, "スレッド", nil, nil, time.Unix(1, 0).UTC())},
 		},
 	}
 	comments := &fakeCommentRepo{}
 
 	router, err := NewRouter(Deps{
 		Server: NewServer(
-			threadusecase.NewThreadInteractor(threads),
+			threadusecase.NewThreadInteractor(threads, nil),
 			commentusecase.NewCommentInteractor(comments, threads, imageInteractor),
 			&fakePinger{},
-			userusecase.NewSessionInteractor(sessions),
+			userusecase.NewSessionInteractor(sessions, nil),
 			nil,
 			imageInteractor,
 			config.AuthConfig{FrontendURL: "http://localhost:3000"},
@@ -274,12 +292,11 @@ func TestUploadImage_RejectsTooLarge(t *testing.T) {
 	}
 }
 
-// **まだ開けていない用途は受け付けない。**
-// 受け付けると、どこからも参照されない画像が作れてしまう。
+// 未知の用途は受け付けない。
 func TestUploadImage_RejectsUnsupportedKind(t *testing.T) {
 	env := newImageEnv(t)
 
-	for _, kind := range []string{"avatar", "thread_icon", "banner", ""} {
+	for _, kind := range []string{"banner", "", "COMMENT_ATTACHMENT"} {
 		t.Run("kind="+kind, func(t *testing.T) {
 			rec := env.do(uploadRequest(t, kind, testPNG(t, 32, 32), sessionCookie(env.token)))
 			if rec.Code != http.StatusBadRequest {

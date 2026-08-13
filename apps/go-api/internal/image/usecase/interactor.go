@@ -43,10 +43,11 @@ const MaxUploadBytes = model.MaxUploadBytes
 // **マルチパートの本文は仕様書の検証を通りません** (kin-openapi は
 // JSON スキーマとしてしか検証しない)。ここが唯一の入口になります。
 //
-// いまはコメント添付だけを受け付けます。他の用途は、
-// **添付する経路 (どこから参照させるか) と同時に**開けます ——
-// 先に受け付けると、アップロードできるのにどこからも参照されない画像が
-// 作れてしまいます。
+// **3 つの用途をすべて受け付けます。**
+// PR 3 の時点ではコメント添付だけに絞っていました ——
+// 添付する経路 (どこから参照させるか) が無いうちに受け付けると、
+// アップロードできるのにどこからも参照されない画像が作れるためです。
+// プロフィール画像とスレッドアイコンの経路が入ったので開けました。
 func ParseKind(raw string) (model.Kind, error) {
 	if raw == "" {
 		return "", fmt.Errorf("kind フィールドがありません: %w", apperr.ErrInvalidArgument)
@@ -54,10 +55,6 @@ func ParseKind(raw string) (model.Kind, error) {
 	kind := model.Kind(raw)
 	if !kind.Valid() {
 		return "", fmt.Errorf("kind が不正です (got %q): %w", raw, apperr.ErrInvalidArgument)
-	}
-	if kind != model.KindCommentAttachment {
-		return "", fmt.Errorf(
-			"この用途はまだ受け付けていません (got %q): %w", raw, apperr.ErrInvalidArgument)
 	}
 	return kind, nil
 }

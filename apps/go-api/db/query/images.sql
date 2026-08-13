@@ -57,3 +57,65 @@ RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size
 SELECT id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at
 FROM images
 WHERE id = $1;
+
+-- name: ListReclaimableImages :many
+-- 回収バッチが拾う行 (ADR 0007 決定 3 / ADR 0016 問題 3)。
+--
+-- 対象は 3 種類ある。**扱いが status で分かれる**ので、
+-- どれに当たるかを呼び出し側が判断できるよう status ごと返す。
+--
+--   pending の孤児   確定しなかった。DB 行も S3 オブジェクトも消す
+--   deleted          モデレーターが消した。S3 だけ消し、DB 行は残す
+--   committed の孤立 アップロードしたが添付されなかった。両方消す
+--
+-- **committed の孤立を含めるのが Phase 6 後半で足した点になる。**
+-- アップロードと添付を分けた結果 (ADR 0007 の実装して分かったこと 1)、
+-- 「アップロードしたが投稿をやめた」画像がどこからも参照されないまま残る。
+-- 3 つの添付先を NOT EXISTS で見て判定する。
+--
+-- 【経過時間で守る】
+-- どの種類も created_at で足切りする。**アップロード直後の画像を
+-- 消してはいけない** —— 添付するまでの数十秒のあいだ、
+-- committed の孤立は正常な状態として存在する。
+--
+-- 【FOR UPDATE SKIP LOCKED】
+-- 定期処理を API プロセス内で動かすため (ADR 0003 未決 #9)、
+-- **レプリカの数だけ同時に走る**。ロックを取り、取れなかった行は
+-- 飛ばすことで、同じ画像を 2 つのプロセスが二重に処理しない。
+-- 待たせるのではなく飛ばすのは、次の周回で拾えば十分だから。
+SELECT id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at
+FROM images
+WHERE object_reclaimed_at IS NULL
+  AND created_at < now() - sqlc.arg('grace')::interval
+  AND (
+    status IN ('pending', 'deleted')
+    OR (
+      status = 'committed'
+      AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
+      AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id)
+      AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.icon_image_id = images.id)
+    )
+  )
+ORDER BY created_at
+LIMIT sqlc.arg('max_rows')
+FOR UPDATE SKIP LOCKED;
+
+-- name: MarkImageReclaimed :execrows
+-- S3 のオブジェクトを消したことを記録する。
+--
+-- **DB 行を残す種類 ('deleted') に使う。**
+-- これを書かないと、次の周回でも同じ行が対象に残り続け、
+-- 回収バッチが毎回すべての削除済み画像へ DELETE を投げ直す
+-- (索引も単調増加する。000006 の列コメントを参照)。
+UPDATE images
+SET object_reclaimed_at = now()
+WHERE id = $1
+  AND object_reclaimed_at IS NULL;
+
+-- name: DeleteImage :execrows
+-- DB 行ごと消す。
+--
+-- **参照されていない画像にだけ使う。** 参照があれば外部キーが拒否するので、
+-- 誤って呼んでも壊れはしないが、エラーとして表に出る。
+-- 'deleted' の画像に使ってはいけない (ADR 0016 問題 3 が行を残すと決めている)。
+DELETE FROM images WHERE id = $1;

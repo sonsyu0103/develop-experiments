@@ -116,6 +116,17 @@ func (f *fakeSessionRepo) Delete(_ context.Context, token usermodel.SessionToken
 	f.deleted = append(f.deleted, token)
 	return nil
 }
+func (f *fakeSessionRepo) SetAvatarImage(
+	_ context.Context, _ int64, imageID *uuid.UUID,
+) (*usermodel.SessionOwner, error) {
+	owner := f.owner
+	if imageID != nil {
+		key := "images/" + imageID.String() + ".webp"
+		owner.AvatarObjectKey = &key
+	}
+	return &owner, nil
+}
+
 func (f *fakeSessionRepo) DeleteByUserID(context.Context, int64) (int64, error) { return 0, nil }
 func (f *fakeSessionRepo) DeleteExpired(context.Context, int32) (int64, error)  { return 0, nil }
 
@@ -170,19 +181,19 @@ func newAuthEnv(t *testing.T, loginEnabled bool) *authEnv {
 	// コメント投稿の親スレッド確認に使うので、生存しているスレッドを 1 件持たせる。
 	threads := &fakeThreadRepo{
 		summaries: []threadmodel.Summary{
-			{Thread: *threadmodel.Reconstruct(1, "スレッド", nil, time.Unix(1, 0).UTC())},
+			{Thread: *threadmodel.Reconstruct(1, "スレッド", nil, nil, time.Unix(1, 0).UTC())},
 		},
 	}
 	comments := &fakeCommentRepo{}
 
 	router, err := NewRouter(Deps{
 		Server: NewServer(
-			threadusecase.NewThreadInteractor(threads),
+			threadusecase.NewThreadInteractor(threads, nil),
 			commentusecase.NewCommentInteractor(comments, threads, nil),
 			&fakePinger{},
 			// **セッションの解決は loginEnabled に依らず結線する。**
 			// ここを分岐させると、テストが本番と同じ穴を再現してしまう。
-			userusecase.NewSessionInteractor(sessions),
+			userusecase.NewSessionInteractor(sessions, nil),
 			login,
 			// 画像は結線しない。**この環境では POST /images が 503 になる。**
 			// 画像を通す検査は images_test.go が別に組み立てる。

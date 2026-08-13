@@ -48,7 +48,7 @@
 -- JOIN は page で 20 件に絞ったあとに掛ける。
 -- 内側の CTE に混ぜると、絞り込む前の全行に対して結合が走る。
 WITH page AS (
-    SELECT id, title, created_at, author_id
+    SELECT id, title, created_at, author_id, icon_image_id
     FROM threads
     WHERE deleted_at IS NULL
       AND (sqlc.narg('cursor_id')::bigint IS NULL OR id < sqlc.narg('cursor_id')::bigint)
@@ -68,9 +68,14 @@ SELECT
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
-    u.deleted_at   AS author_deleted_at
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
 FROM page p
 LEFT JOIN users u ON u.id = p.author_id
+LEFT JOIN images img ON img.id = p.icon_image_id
 ORDER BY p.id DESC;
 
 -- name: GetThreadWithCommentCount :one
@@ -88,9 +93,14 @@ SELECT
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
-    u.deleted_at   AS author_deleted_at
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
 FROM threads t
 LEFT JOIN users u ON u.id = t.author_id
+LEFT JOIN images img ON img.id = t.icon_image_id
 WHERE t.id = sqlc.arg('id')
   AND t.deleted_at IS NULL;
 
@@ -106,9 +116,9 @@ WHERE t.id = sqlc.arg('id')
 --
 -- author_id は NULL 許容。NULL が匿名を意味する (ADR 0005 決定 2)。
 WITH inserted AS (
-    INSERT INTO threads (title, author_id)
-    VALUES (sqlc.arg('title'), sqlc.narg('author_id'))
-    RETURNING id, title, created_at, author_id
+    INSERT INTO threads (title, author_id, icon_image_id)
+    VALUES (sqlc.arg('title'), sqlc.narg('author_id'), sqlc.narg('icon_image_id'))
+    RETURNING id, title, created_at, author_id, icon_image_id
 )
 SELECT
     i.id,
@@ -117,9 +127,14 @@ SELECT
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
-    u.deleted_at   AS author_deleted_at
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
 FROM inserted i
-LEFT JOIN users u ON u.id = i.author_id;
+LEFT JOIN users u ON u.id = i.author_id
+LEFT JOIN images img ON img.id = i.icon_image_id;
 
 -- name: ThreadExists :one
 SELECT EXISTS (

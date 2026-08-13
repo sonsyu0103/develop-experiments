@@ -28,9 +28,9 @@ func (q *Queries) CountCommentsByThreadID(ctx context.Context, threadID int64) (
 
 const createThread = `-- name: CreateThread :one
 WITH inserted AS (
-    INSERT INTO threads (title, author_id)
-    VALUES ($1, $2)
-    RETURNING id, title, created_at, author_id
+    INSERT INTO threads (title, author_id, icon_image_id)
+    VALUES ($1, $2, $3)
+    RETURNING id, title, created_at, author_id, icon_image_id
 )
 SELECT
     i.id,
@@ -39,14 +39,20 @@ SELECT
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
-    u.deleted_at   AS author_deleted_at
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
 FROM inserted i
 LEFT JOIN users u ON u.id = i.author_id
+LEFT JOIN images img ON img.id = i.icon_image_id
 `
 
 type CreateThreadParams struct {
-	Title    string
-	AuthorID *int64
+	Title       string
+	AuthorID    *int64
+	IconImageID *uuid.UUID
 }
 
 type CreateThreadRow struct {
@@ -57,6 +63,10 @@ type CreateThreadRow struct {
 	AuthorDisplayName *string
 	AuthorAvatarUrl   *string
 	AuthorDeletedAt   *time.Time
+	IconID            *uuid.UUID
+	IconObjectKey     *string
+	IconWidth         *int32
+	IconHeight        *int32
 }
 
 // RETURNING により INSERT と採番値の取得が 1 往復で完結する。
@@ -70,7 +80,7 @@ type CreateThreadRow struct {
 //
 // author_id は NULL 許容。NULL が匿名を意味する (ADR 0005 決定 2)。
 func (q *Queries) CreateThread(ctx context.Context, arg CreateThreadParams) (CreateThreadRow, error) {
-	row := q.db.QueryRow(ctx, createThread, arg.Title, arg.AuthorID)
+	row := q.db.QueryRow(ctx, createThread, arg.Title, arg.AuthorID, arg.IconImageID)
 	var i CreateThreadRow
 	err := row.Scan(
 		&i.ID,
@@ -80,6 +90,10 @@ func (q *Queries) CreateThread(ctx context.Context, arg CreateThreadParams) (Cre
 		&i.AuthorDisplayName,
 		&i.AuthorAvatarUrl,
 		&i.AuthorDeletedAt,
+		&i.IconID,
+		&i.IconObjectKey,
+		&i.IconWidth,
+		&i.IconHeight,
 	)
 	return i, err
 }
@@ -98,9 +112,14 @@ SELECT
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
-    u.deleted_at   AS author_deleted_at
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
 FROM threads t
 LEFT JOIN users u ON u.id = t.author_id
+LEFT JOIN images img ON img.id = t.icon_image_id
 WHERE t.id = $1
   AND t.deleted_at IS NULL
 `
@@ -114,6 +133,10 @@ type GetThreadWithCommentCountRow struct {
 	AuthorDisplayName *string
 	AuthorAvatarUrl   *string
 	AuthorDeletedAt   *time.Time
+	IconID            *uuid.UUID
+	IconObjectKey     *string
+	IconWidth         *int32
+	IconHeight        *int32
 }
 
 // 一覧と同じ理由で、JOIN + GROUP BY ではなく相関サブクエリで数える。
@@ -129,6 +152,10 @@ func (q *Queries) GetThreadWithCommentCount(ctx context.Context, id int64) (GetT
 		&i.AuthorDisplayName,
 		&i.AuthorAvatarUrl,
 		&i.AuthorDeletedAt,
+		&i.IconID,
+		&i.IconObjectKey,
+		&i.IconWidth,
+		&i.IconHeight,
 	)
 	return i, err
 }
@@ -180,7 +207,7 @@ func (q *Queries) ListThreadIDs(ctx context.Context, arg ListThreadIDsParams) ([
 
 const listThreadsWithCommentCount = `-- name: ListThreadsWithCommentCount :many
 WITH page AS (
-    SELECT id, title, created_at, author_id
+    SELECT id, title, created_at, author_id, icon_image_id
     FROM threads
     WHERE deleted_at IS NULL
       AND ($1::bigint IS NULL OR id < $1::bigint)
@@ -200,9 +227,14 @@ SELECT
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
-    u.deleted_at   AS author_deleted_at
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
 FROM page p
 LEFT JOIN users u ON u.id = p.author_id
+LEFT JOIN images img ON img.id = p.icon_image_id
 ORDER BY p.id DESC
 `
 
@@ -220,6 +252,10 @@ type ListThreadsWithCommentCountRow struct {
 	AuthorDisplayName *string
 	AuthorAvatarUrl   *string
 	AuthorDeletedAt   *time.Time
+	IconID            *uuid.UUID
+	IconObjectKey     *string
+	IconWidth         *int32
+	IconHeight        *int32
 }
 
 // スレッド一覧 + コメント数を「1 往復」で取得する。
@@ -288,6 +324,10 @@ func (q *Queries) ListThreadsWithCommentCount(ctx context.Context, arg ListThrea
 			&i.AuthorDisplayName,
 			&i.AuthorAvatarUrl,
 			&i.AuthorDeletedAt,
+			&i.IconID,
+			&i.IconObjectKey,
+			&i.IconWidth,
+			&i.IconHeight,
 		); err != nil {
 			return nil, err
 		}

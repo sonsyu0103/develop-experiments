@@ -114,6 +114,17 @@ func (f *fakeSessionRepo) Delete(_ context.Context, token model.SessionToken) er
 	f.deleted = append(f.deleted, token)
 	return nil
 }
+func (f *fakeSessionRepo) SetAvatarImage(
+	_ context.Context, _ int64, imageID *uuid.UUID,
+) (*model.SessionOwner, error) {
+	owner := f.owner
+	if imageID != nil {
+		key := "images/" + imageID.String() + ".webp"
+		owner.AvatarObjectKey = &key
+	}
+	return &owner, nil
+}
+
 func (f *fakeSessionRepo) DeleteByUserID(context.Context, int64) (int64, error) { return 0, nil }
 func (f *fakeSessionRepo) DeleteExpired(context.Context, int32) (int64, error)  { return 0, nil }
 

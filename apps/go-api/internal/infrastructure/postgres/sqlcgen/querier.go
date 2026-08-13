@@ -145,6 +145,12 @@ type Querier interface {
 	//
 	// sessions (expires_at) の索引で引く。
 	DeleteExpiredSessions(ctx context.Context, maxRows int32) (int64, error)
+	// DB 行ごと消す。
+	//
+	// **参照されていない画像にだけ使う。** 参照があれば外部キーが拒否するので、
+	// 誤って呼んでも壊れはしないが、エラーとして表に出る。
+	// 'deleted' の画像に使ってはいけない (ADR 0016 問題 3 が行を残すと決めている)。
+	DeleteImage(ctx context.Context, id uuid.UUID) (int64, error)
 	// ログアウト。0 行なら「既に無い」なので、呼び出し側で 404 にするかは任意。
 	DeleteSession(ctx context.Context, id string) (int64, error)
 	// 「全端末からログアウト」。パスワード変更に相当する操作や、
@@ -228,6 +234,31 @@ type Querier interface {
 	// 重複して転送されるため。初手は A で揃え、B (ListAuthorsByIDs) との
 	// 比較は Phase 4 のベンチマークで行う。
 	ListCommentsByThreadID(ctx context.Context, arg ListCommentsByThreadIDParams) ([]ListCommentsByThreadIDRow, error)
+	// 回収バッチが拾う行 (ADR 0007 決定 3 / ADR 0016 問題 3)。
+	//
+	// 対象は 3 種類ある。**扱いが status で分かれる**ので、
+	// どれに当たるかを呼び出し側が判断できるよう status ごと返す。
+	//
+	//   pending の孤児   確定しなかった。DB 行も S3 オブジェクトも消す
+	//   deleted          モデレーターが消した。S3 だけ消し、DB 行は残す
+	//   committed の孤立 アップロードしたが添付されなかった。両方消す
+	//
+	// **committed の孤立を含めるのが Phase 6 後半で足した点になる。**
+	// アップロードと添付を分けた結果 (ADR 0007 の実装して分かったこと 1)、
+	// 「アップロードしたが投稿をやめた」画像がどこからも参照されないまま残る。
+	// 3 つの添付先を NOT EXISTS で見て判定する。
+	//
+	// 【経過時間で守る】
+	// どの種類も created_at で足切りする。**アップロード直後の画像を
+	// 消してはいけない** —— 添付するまでの数十秒のあいだ、
+	// committed の孤立は正常な状態として存在する。
+	//
+	// 【FOR UPDATE SKIP LOCKED】
+	// 定期処理を API プロセス内で動かすため (ADR 0003 未決 #9)、
+	// **レプリカの数だけ同時に走る**。ロックを取り、取れなかった行は
+	// 飛ばすことで、同じ画像を 2 つのプロセスが二重に処理しない。
+	// 待たせるのではなく飛ばすのは、次の周回で拾えば十分だから。
+	ListReclaimableImages(ctx context.Context, arg ListReclaimableImagesParams) ([]Image, error)
 	// -----------------------------------------------------------------------------
 	// 以下 2 つは Phase 4 のベンチマーク専用 (N+1 実装の再現用)。
 	// 本番経路では使わない。
@@ -298,6 +329,13 @@ type Querier interface {
 	// SSI (SERIALIZABLE) を使うならこの明示ロックは不要だが、
 	// 悲観ロック版と楽観 (SSI) 版のスループット差を計測するために両方用意している。
 	LockThreadForUpdate(ctx context.Context, id int64) (int64, error)
+	// S3 のオブジェクトを消したことを記録する。
+	//
+	// **DB 行を残す種類 ('deleted') に使う。**
+	// これを書かないと、次の周回でも同じ行が対象に残り続け、
+	// 回収バッチが毎回すべての削除済み画像へ DELETE を投げ直す
+	// (索引も単調増加する。000006 の列コメントを参照)。
+	MarkImageReclaimed(ctx context.Context, id uuid.UUID) (int64, error)
 	// スレッド内の次のレス番号を求める。**Phase 2 の題材の中心** (ADR 0019 決定 1)。
 	//
 	// この 1 文は comments_thread_id_seq_idx の逆順スキャン 1 回で終わる。
@@ -327,6 +365,14 @@ type Querier interface {
 	// 毎ログインで UPDATE を撃つと、更新日時だけが動いて監査の邪魔になる。
 	// 該当が無ければ 0 行が返るので、呼び出し側は「昇格したか」を判定できる。
 	PromoteToAdmin(ctx context.Context, googleSub string) (User, error)
+	// プロフィール画像を設定する / 外す (ADR 0007)。
+	//
+	// **所有者の確認はここで行わない。** 画像が自分のものかは
+	// ユースケース層が先に確かめる (他人の画像は 404 にする必要があり、
+	// ここで弾くと外部キー違反として 400 になってしまう)。
+	//
+	// NULL を渡すと解除になり、Google のプロフィール画像に戻る。
+	SetUserAvatarImage(ctx context.Context, arg SetUserAvatarImageParams) (User, error)
 	// 現時点で HTTP エンドポイントからは呼ばれていない。
 	// 削除 API を公開するかは未決 (docs/adr/0003-open-questions.md 項目 7)。
 	SoftDeleteComment(ctx context.Context, arg SoftDeleteCommentParams) (int64, error)

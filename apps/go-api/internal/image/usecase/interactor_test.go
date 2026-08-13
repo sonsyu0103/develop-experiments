@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -29,6 +30,7 @@ type fakeImageRepo struct {
 	createErr error
 	commitErr error
 	findErr   error
+	listErr   error
 }
 
 var _ repository.ImageRepository = (*fakeImageRepo)(nil)
@@ -71,9 +73,56 @@ func (f *fakeImageRepo) FindByID(_ context.Context, id uuid.UUID) (*model.Image,
 	return img, nil
 }
 
+// 回収バッチ用。トランザクションは張らず、そのまま自分を渡します
+// (フェイクなので「同じトランザクション」を再現する必要がない)。
+func (f *fakeImageRepo) WithinTx(_ context.Context, fn func(repository.ImageRepository) error) error {
+	return fn(f)
+}
+
+func (f *fakeImageRepo) ListReclaimable(
+	_ context.Context, grace time.Duration, maxRows int32,
+) ([]model.Image, error) {
+	f.rec.add("db:list_reclaimable")
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var out []model.Image
+	for _, img := range f.stored {
+		if len(out) >= int(maxRows) {
+			break
+		}
+		if img.ObjectReclaimedAt != nil {
+			continue
+		}
+		// grace は「作られてからの経過」。フェイクでは createdAt を
+		// 明示的に古くした行だけを対象にする。
+		if !img.CreatedAt.Before(time.Now().Add(-grace)) {
+			continue
+		}
+		out = append(out, *img)
+	}
+	return out, nil
+}
+
+func (f *fakeImageRepo) MarkReclaimed(_ context.Context, id uuid.UUID) error {
+	f.rec.add("db:mark_reclaimed")
+	if img, ok := f.stored[id]; ok {
+		now := time.Now()
+		img.ObjectReclaimedAt = &now
+	}
+	return nil
+}
+
+func (f *fakeImageRepo) Delete(_ context.Context, id uuid.UUID) error {
+	f.rec.add("db:delete")
+	delete(f.stored, id)
+	return nil
+}
+
 type fakeStorage struct {
-	rec    *recorder
-	putErr error
+	rec       *recorder
+	putErr    error
+	deleteErr error
 	// objects は key -> バイト列。
 	objects map[string][]byte
 }
@@ -95,6 +144,9 @@ func (f *fakeStorage) Put(_ context.Context, key, _ string, body []byte) error {
 
 func (f *fakeStorage) Delete(_ context.Context, key string) error {
 	f.rec.add("storage:delete")
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	delete(f.objects, key)
 	return nil
 }
@@ -239,13 +291,15 @@ func TestUpload_StoresReencodedBytes(t *testing.T) {
 func TestParseKind(t *testing.T) {
 	t.Parallel()
 
-	if _, err := ParseKind("comment_attachment"); err != nil {
-		t.Errorf("comment_attachment が拒否された: %v", err)
+	// **3 つの用途をすべて受け付ける** (PR 4 で開けた)。
+	for _, raw := range []string{"comment_attachment", "avatar", "thread_icon"} {
+		if _, err := ParseKind(raw); err != nil {
+			t.Errorf("kind=%q が拒否された: %v", raw, err)
+		}
 	}
 
-	// **まだ開けていない用途を受け付けない。**
-	// 受け付けると、どこからも参照されない画像が作れてしまう。
-	for _, raw := range []string{"avatar", "thread_icon", "", "banner", "COMMENT_ATTACHMENT"} {
+	// 未知の値は受け付けない。
+	for _, raw := range []string{"", "banner", "COMMENT_ATTACHMENT", " avatar"} {
 		if _, err := ParseKind(raw); !errors.Is(err, apperr.ErrInvalidArgument) {
 			t.Errorf("kind=%q: err = %v, want apperr.ErrInvalidArgument", raw, err)
 		}

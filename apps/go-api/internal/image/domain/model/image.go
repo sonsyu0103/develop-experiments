@@ -167,6 +167,13 @@ type Image struct {
 	Status      Status
 	CreatedAt   time.Time
 	CommittedAt *time.Time
+	// ObjectReclaimedAt は回収バッチが S3 のオブジェクトを消した時刻です。
+	//
+	// **'deleted' の行を回収対象から外すために要ります** ——
+	// DB 行を残す種類なので、消したことを記録しないと
+	// 毎周回で同じ行へ DELETE を投げ直すことになります
+	// (000006 の列コメントを参照)。
+	ObjectReclaimedAt *time.Time
 }
 
 // NewPending は再エンコード済みの画像から pending の行を組み立てます。
@@ -234,19 +241,20 @@ func (i *Image) Commit(at time.Time) {
 func Reconstruct(
 	id uuid.UUID, ownerID int64, kind Kind, objectKey, contentType string,
 	width, height int, byteSize int64, status Status,
-	createdAt time.Time, committedAt *time.Time,
+	createdAt time.Time, committedAt, objectReclaimedAt *time.Time,
 ) *Image {
 	return &Image{
-		ID:          id,
-		OwnerID:     ownerID,
-		Kind:        kind,
-		ObjectKey:   objectKey,
-		ContentType: contentType,
-		Width:       width,
-		Height:      height,
-		ByteSize:    byteSize,
-		Status:      status,
-		CreatedAt:   createdAt,
-		CommittedAt: committedAt,
+		ID:                id,
+		OwnerID:           ownerID,
+		Kind:              kind,
+		ObjectKey:         objectKey,
+		ContentType:       contentType,
+		Width:             width,
+		Height:            height,
+		ByteSize:          byteSize,
+		Status:            status,
+		CreatedAt:         createdAt,
+		CommittedAt:       committedAt,
+		ObjectReclaimedAt: objectReclaimedAt,
 	}
 }

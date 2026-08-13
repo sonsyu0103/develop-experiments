@@ -103,24 +103,33 @@ SELECT
     -- 権限判定は毎リクエスト必要になる (ADR 0011 決定 1)。
     -- ここで一緒に引かないと、削除やモデレーションのたびに
     -- users をもう一度引くことになり、1 往復に畳んだ意味が薄れる。
-    u.role
+    u.role,
+    -- アップロードしたプロフィール画像 (ADR 0007)。
+    -- **LEFT であることが必須** —— INNER にすると、画像を設定していない
+    -- 利用者のセッションが 1 件も引けなくなる (= 全員ログアウト)。
+    --
+    -- ここで一緒に引くのは、/me が毎回返す値だからになる。
+    -- 別途引くと、認証つきリクエストのたびに 1 往復増える。
+    img.object_key AS avatar_object_key
 FROM sessions s
 JOIN users u ON u.id = s.user_id
+LEFT JOIN images img ON img.id = u.avatar_image_id
 WHERE s.id = $1
   AND s.expires_at > now()
   AND u.deleted_at IS NULL
 `
 
 type GetLiveSessionWithUserRow struct {
-	ID          string
-	UserID      int64
-	ExpiresAt   time.Time
-	CreatedAt   time.Time
-	PublicID    uuid.UUID
-	Email       string
-	DisplayName string
-	AvatarUrl   *string
-	Role        string
+	ID              string
+	UserID          int64
+	ExpiresAt       time.Time
+	CreatedAt       time.Time
+	PublicID        uuid.UUID
+	Email           string
+	DisplayName     string
+	AvatarUrl       *string
+	Role            string
+	AvatarObjectKey *string
 }
 
 // セッションの検証。**毎リクエスト通る、最も高頻度の経路**になる。
@@ -153,6 +162,7 @@ func (q *Queries) GetLiveSessionWithUser(ctx context.Context, id string) (GetLiv
 		&i.DisplayName,
 		&i.AvatarUrl,
 		&i.Role,
+		&i.AvatarObjectKey,
 	)
 	return i, err
 }

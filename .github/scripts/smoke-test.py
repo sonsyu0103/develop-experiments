@@ -967,9 +967,100 @@ if SQL_EXEC:
                           b'<svg xmlns="http://www.w3.org/2000/svg"><script/></svg>', img_token)
             check("SVG は 400 で拒否される", s == 400, f"status={s}")
 
-            # まだ開けていない用途は拒否する。
-            s, _ = upload("avatar", _png(8, 8), img_token)
-            check("未対応の kind は 400", s == 400, f"status={s}")
+            # 未知の用途は拒否する。
+            s, _ = upload("banner", _png(8, 8), img_token)
+            check("未知の kind は 400", s == 400, f"status={s}")
+
+            # --- プロフィール画像 (ADR 0007) ---
+            s, avatar = upload("avatar", _png(64, 64), img_token)
+            check("アバターをアップロードできる", s == 201, f"status={s} body={avatar}")
+            if s == 201:
+                s, me, _ = call("PUT", "/me/avatar",
+                                json.dumps({"imageId": avatar["id"]}),
+                                headers={"Cookie": f"session={img_token}"})
+                check("プロフィール画像を設定できる", s == 200, f"status={s} body={me}")
+                # **アップロードした画像が /me に出ること。**
+                # Google の画像より優先する (ADR 0007 のスキーマ)。
+                check("設定した画像が /me の avatarUrl に出る",
+                      isinstance(me, dict) and (me.get("avatarUrl") or "") == avatar["url"],
+                      f"avatarUrl={me.get('avatarUrl') if isinstance(me, dict) else me}")
+
+                # **他人の画像は 404。** 存在を隠すため。
+                s, err, _ = call("PUT", "/me/avatar",
+                                 json.dumps({"imageId": avatar["id"]}),
+                                 headers={"Cookie": f"session={other_img_token}"})
+                code = err["error"]["code"] if isinstance(err, dict) and "error" in err else ""
+                check("他人の画像はアバターにできない (404)",
+                      s == 404 and code == "NOT_FOUND", f"status={s} code={code}")
+
+                # null で解除できること。
+                s, me, _ = call("PUT", "/me/avatar", '{"imageId":null}',
+                                headers={"Cookie": f"session={img_token}"})
+                check("null で解除できる",
+                      s == 200 and isinstance(me, dict) and me.get("avatarUrl") != avatar["url"],
+                      f"status={s} avatarUrl={me.get('avatarUrl') if isinstance(me, dict) else me}")
+
+            # --- スレッドアイコン (ADR 0007) ---
+            s, icon = upload("thread_icon", _png(48, 48), img_token)
+            check("スレッドアイコンをアップロードできる", s == 201, f"status={s}")
+            if s == 201:
+                s, th, _ = call("POST", "/threads",
+                                json.dumps({"title": "アイコンつきスレッド",
+                                            "iconImageId": icon["id"]}),
+                                headers={"Cookie": f"session={img_token}"})
+                check("アイコンつきでスレッドを作れる", s == 201, f"status={s} body={th}")
+                check("応答にアイコンが載る",
+                      isinstance(th, dict) and (th.get("icon") or {}).get("id") == icon["id"],
+                      f"icon={th.get('icon') if isinstance(th, dict) else th}")
+
+                if s == 201:
+                    icon_tid = th["id"]
+                    # **一覧でも解決されること** (LEFT JOIN が効いている)。
+                    _, listed, _ = call("GET", f"/threads/{icon_tid}")
+                    check("詳細でもアイコンが解決される",
+                          isinstance(listed, dict) and (listed.get("icon") or {}).get("id") == icon["id"],
+                          f"thread={listed}")
+                    sql(f"DELETE FROM threads WHERE id = {icon_tid};")
+
+                # 匿名はアイコンを設定できない。
+                s, _, _ = call("POST", "/threads",
+                               json.dumps({"title": "匿名でアイコン",
+                                           "iconImageId": icon["id"]}))
+                check("匿名はアイコンを設定できない (401)", s == 401, f"status={s}")
+
+            # --- 回収バッチ (ADR 0007 決定 3 / ADR 0016 問題 3) ---
+            #
+            # **status で扱いが分かれることを実 DB で確かめる。**
+            # 定期処理は起動時にばらつかせて回るので、ここでは待たずに
+            # SQL で「対象になるか」を検査する。
+            s, orphan = upload("comment_attachment", _png(16, 16), img_token)
+            if s == 201:
+                # created_at を過去にして回収対象にする。
+                sql(f"UPDATE images SET created_at = now() - interval '2 hours' "
+                    f"WHERE id = '{orphan['id']}'::uuid;")
+                out = subprocess.run(
+                    shlex.split(SQL_EXEC) + [
+                        "SELECT count(*) FROM images WHERE object_reclaimed_at IS NULL "
+                        "AND created_at < now() - interval '1 hour' "
+                        "AND (status IN ('pending','deleted') OR (status = 'committed' "
+                        "AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id) "
+                        "AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id) "
+                        "AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.icon_image_id = images.id)));"],
+                    check=True, capture_output=True, text=True).stdout
+                check("添付されなかった画像が回収対象になる",
+                      out.strip().splitlines()[2].strip() != "0", f"got={out.strip()!r}")
+
+                # 添付すると対象から外れること。
+                sql(f"UPDATE users SET avatar_image_id = '{orphan['id']}'::uuid WHERE id = 900020;")
+                out = subprocess.run(
+                    shlex.split(SQL_EXEC) + [
+                        f"SELECT count(*) FROM images WHERE id = '{orphan['id']}'::uuid "
+                        "AND status = 'committed' "
+                        "AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id);"],
+                    check=True, capture_output=True, text=True).stdout
+                check("参照されている画像は回収対象にならない",
+                      out.strip().splitlines()[2].strip() == "0", f"got={out.strip()!r}")
+                sql("UPDATE users SET avatar_image_id = NULL WHERE id = 900020;")
     finally:
         sql("DELETE FROM comments WHERE image_id IN "
             "(SELECT id FROM images WHERE owner_id IN (900020, 900021));")

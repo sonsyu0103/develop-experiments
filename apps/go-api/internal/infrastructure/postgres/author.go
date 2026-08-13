@@ -84,3 +84,14 @@ func derefInt32(v *int32) int {
 	}
 	return int(*v)
 }
+
+// toThreadIcon は LEFT JOIN images で得た列を、スレッドのアイコンへ詰め替えます。
+// 判定に id を使う理由は toCommentImage と同じです。
+func toThreadIcon(
+	id *uuid.UUID, objectKey *string, width, height *int32,
+) *threadmodel.Image {
+	if id == nil {
+		return nil
+	}
+	return threadmodel.NewImage(*id, derefString(objectKey), derefInt32(width), derefInt32(height))
+}

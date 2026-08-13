@@ -166,6 +166,46 @@ func (q *Queries) PromoteToAdmin(ctx context.Context, googleSub string) (User, e
 	return i, err
 }
 
+const setUserAvatarImage = `-- name: SetUserAvatarImage :one
+UPDATE users
+SET avatar_image_id = $1,
+    updated_at = now()
+WHERE id = $2
+  AND deleted_at IS NULL
+RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id
+`
+
+type SetUserAvatarImageParams struct {
+	AvatarImageID *uuid.UUID
+	ID            int64
+}
+
+// プロフィール画像を設定する / 外す (ADR 0007)。
+//
+// **所有者の確認はここで行わない。** 画像が自分のものかは
+// ユースケース層が先に確かめる (他人の画像は 404 にする必要があり、
+// ここで弾くと外部キー違反として 400 になってしまう)。
+//
+// NULL を渡すと解除になり、Google のプロフィール画像に戻る。
+func (q *Queries) SetUserAvatarImage(ctx context.Context, arg SetUserAvatarImageParams) (User, error) {
+	row := q.db.QueryRow(ctx, setUserAvatarImage, arg.AvatarImageID, arg.ID)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.PublicID,
+		&i.GoogleSub,
+		&i.Email,
+		&i.DisplayName,
+		&i.AvatarUrl,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.Role,
+		&i.AvatarImageID,
+	)
+	return i, err
+}
+
 const upsertUser = `-- name: UpsertUser :one
 
 INSERT INTO users (public_id, google_sub, email, display_name, avatar_url)

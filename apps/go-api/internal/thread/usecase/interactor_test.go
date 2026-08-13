@@ -3,8 +3,11 @@ package usecase
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 
 	"develop-experiments/apps/go-api/internal/apperr"
 	"develop-experiments/apps/go-api/internal/pagination"
@@ -52,7 +55,7 @@ func TestThreadInteractor_FetchThreadList(t *testing.T) {
 	t.Parallel()
 
 	repo := newFakeRepo(5)
-	uc := NewThreadInteractor(repo)
+	uc := NewThreadInteractor(repo, nil)
 
 	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 3))
 	if err != nil {
@@ -83,7 +86,7 @@ func TestThreadInteractor_FetchThreadList(t *testing.T) {
 func TestThreadInteractor_FetchThreadList_NoCursorOnLastPage(t *testing.T) {
 	t.Parallel()
 
-	uc := NewThreadInteractor(newFakeRepo(2))
+	uc := NewThreadInteractor(newFakeRepo(2), nil)
 
 	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10))
 	if err != nil {
@@ -100,7 +103,7 @@ func TestThreadInteractor_FetchThreadList_NoCursorOnLastPage(t *testing.T) {
 func TestThreadInteractor_FetchThreadList_EmptyReturnsNonNilSlice(t *testing.T) {
 	t.Parallel()
 
-	uc := NewThreadInteractor(newFakeRepo(0))
+	uc := NewThreadInteractor(newFakeRepo(0), nil)
 
 	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10))
 	if err != nil {
@@ -118,7 +121,7 @@ func TestThreadInteractor_FetchThreadList_EmptyReturnsNonNilSlice(t *testing.T) 
 func TestThreadInteractor_FetchThreadList_WithCursor(t *testing.T) {
 	t.Parallel()
 
-	uc := NewThreadInteractor(newFakeRepo(5))
+	uc := NewThreadInteractor(newFakeRepo(5), nil)
 
 	cursor := int64(4)
 	got, err := uc.FetchThreadList(context.Background(), mustPage(t, &cursor, 10))
@@ -141,7 +144,7 @@ func TestThreadInteractor_FetchThreadList_PropagatesRepositoryError(t *testing.T
 	repo := newFakeRepo(3)
 	repo.listErr = sentinel
 
-	_, err := NewThreadInteractor(repo).FetchThreadList(context.Background(), mustPage(t, nil, 10))
+	_, err := NewThreadInteractor(repo, nil).FetchThreadList(context.Background(), mustPage(t, nil, 10))
 	if !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want %v", err, sentinel)
 	}
@@ -150,7 +153,7 @@ func TestThreadInteractor_FetchThreadList_PropagatesRepositoryError(t *testing.T
 func TestThreadInteractor_FetchThread(t *testing.T) {
 	t.Parallel()
 
-	uc := NewThreadInteractor(newFakeRepo(3))
+	uc := NewThreadInteractor(newFakeRepo(3), nil)
 
 	got, err := uc.FetchThread(context.Background(), 2)
 	if err != nil {
@@ -164,7 +167,7 @@ func TestThreadInteractor_FetchThread(t *testing.T) {
 func TestThreadInteractor_FetchThread_NotFound(t *testing.T) {
 	t.Parallel()
 
-	uc := NewThreadInteractor(newFakeRepo(3))
+	uc := NewThreadInteractor(newFakeRepo(3), nil)
 
 	_, err := uc.FetchThread(context.Background(), 999)
 	if !errors.Is(err, apperr.ErrNotFound) {
@@ -176,9 +179,9 @@ func TestThreadInteractor_CreateThread(t *testing.T) {
 	t.Parallel()
 
 	repo := newFakeRepo(0)
-	uc := NewThreadInteractor(repo)
+	uc := NewThreadInteractor(repo, nil)
 
-	got, err := uc.CreateThread(context.Background(), "  新しいスレッド  ", nil)
+	got, err := uc.CreateThread(context.Background(), "  新しいスレッド  ", nil, nil)
 	if err != nil {
 		t.Fatalf("CreateThread が失敗した: %v", err)
 	}
@@ -195,7 +198,7 @@ func TestThreadInteractor_CreateThread_ValidationStopsBeforeRepository(t *testin
 	t.Parallel()
 
 	repo := newFakeRepo(0)
-	uc := NewThreadInteractor(repo)
+	uc := NewThreadInteractor(repo, nil)
 
 	cases := map[string]string{
 		"空文字":    "",
@@ -205,7 +208,7 @@ func TestThreadInteractor_CreateThread_ValidationStopsBeforeRepository(t *testin
 
 	for name, title := range cases {
 		t.Run(name, func(t *testing.T) {
-			_, err := uc.CreateThread(context.Background(), title, nil)
+			_, err := uc.CreateThread(context.Background(), title, nil, nil)
 			if !errors.Is(err, apperr.ErrInvalidArgument) {
 				t.Errorf("err = %v, want apperr.ErrInvalidArgument", err)
 			}
@@ -215,4 +218,100 @@ func TestThreadInteractor_CreateThread_ValidationStopsBeforeRepository(t *testin
 	if len(repo.createdThreads) != 0 {
 		t.Errorf("リポジトリが %d 回呼ばれた, want 0 (検証で弾くため)", len(repo.createdThreads))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// スレッドアイコン (docs/adr/0007-image-storage.md)
+// ---------------------------------------------------------------------------
+
+// fakeIconResolver は所有権の判定を差し替えられるフェイクです。
+type fakeIconResolver struct{ err error }
+
+func (f *fakeIconResolver) EnsureOwned(context.Context, int64, uuid.UUID) error { return f.err }
+func (f *fakeIconResolver) URL(key string) string                               { return "https://cdn.test/" + key }
+
+func TestCreateThread_WithIcon(t *testing.T) {
+	t.Parallel()
+
+	authorID := int64(42)
+	iconID := uuid.New()
+
+	t.Run("アイコンつきで作れる", func(t *testing.T) {
+		t.Parallel()
+
+		uc := NewThreadInteractor(newFakeRepo(0), &fakeIconResolver{})
+
+		got, err := uc.CreateThread(context.Background(), "アイコンつき", &authorID, &iconID)
+		if err != nil {
+			t.Fatalf("CreateThread が失敗した: %v", err)
+		}
+		if got.Icon == nil {
+			t.Fatal("応答にアイコンが載っていない")
+		}
+		if got.Icon.ID != iconID {
+			t.Errorf("Icon.ID = %v, want %v", got.Icon.ID, iconID)
+		}
+		// **URL を組み立てて返す** (ADR 0007 決定 5)。
+		if got.Icon.URL == "" {
+			t.Error("Icon.URL が空 (組み立てていない)")
+		}
+	})
+
+	// **他人の画像は 404。** 存在を隠すため (ADR 0013)。
+	t.Run("他人の画像は拒否される", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newFakeRepo(0)
+		uc := NewThreadInteractor(repo,
+			&fakeIconResolver{err: fmt.Errorf("他人の画像です: %w", apperr.ErrNotFound)})
+
+		_, err := uc.CreateThread(context.Background(), "他人のアイコン", &authorID, &iconID)
+		if !errors.Is(err, apperr.ErrNotFound) {
+			t.Fatalf("err = %v, want apperr.ErrNotFound", err)
+		}
+		// **作られていないこと。** アイコンだけ落として作成が通ると、
+		// 利用者からは「設定したのに消えた」ようにしか見えない。
+		if len(repo.createdThreads) != 0 {
+			t.Error("他人の画像を指定したのにスレッドが作られた")
+		}
+	})
+
+	// **匿名はアイコンを設定できない** (ADR 0007 の背景)。
+	t.Run("匿名は設定できない", func(t *testing.T) {
+		t.Parallel()
+
+		uc := NewThreadInteractor(newFakeRepo(0), &fakeIconResolver{})
+
+		_, err := uc.CreateThread(context.Background(), "匿名でアイコン", nil, &iconID)
+		if !errors.Is(err, apperr.ErrUnauthenticated) {
+			t.Errorf("err = %v, want apperr.ErrUnauthenticated", err)
+		}
+	})
+
+	// ストレージが未設定なら 503。黙って無視しない。
+	t.Run("ストレージが未設定なら 503", func(t *testing.T) {
+		t.Parallel()
+
+		uc := NewThreadInteractor(newFakeRepo(0), nil)
+
+		_, err := uc.CreateThread(context.Background(), "アイコンつき", &authorID, &iconID)
+		if !errors.Is(err, apperr.ErrUnavailable) {
+			t.Errorf("err = %v, want apperr.ErrUnavailable", err)
+		}
+	})
+
+	// アイコンなしはこれまでどおり通ること。
+	t.Run("アイコンなしは通る", func(t *testing.T) {
+		t.Parallel()
+
+		uc := NewThreadInteractor(newFakeRepo(0), &fakeIconResolver{})
+
+		got, err := uc.CreateThread(context.Background(), "アイコンなし", &authorID, nil)
+		if err != nil {
+			t.Fatalf("CreateThread が失敗した: %v", err)
+		}
+		if got.Icon != nil {
+			t.Error("指定していないのにアイコンが入っている")
+		}
+	})
 }
