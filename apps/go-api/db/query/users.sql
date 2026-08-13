@@ -130,9 +130,43 @@ RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at
 -- ここで弾くと外部キー違反として 400 になってしまう)。
 --
 -- NULL を渡すと解除になり、Google のプロフィール画像に戻る。
+--
+-- 【添付先 3 つのうち、ここだけ「解除」がある】
+-- コメントとスレッドは作成時にしか画像を指定できないので、
+-- 一度 attached_at を書いたら戻すことはない。アバターは付け替えられる。
+-- **旧画像の attached_at を NULL に戻さないと、差し替えた画像が
+-- どこからも参照されないまま永久に回収されない** (000007)。
+--
+-- previous は主文と同じ条件 (id と deleted_at IS NULL) で引く。
+-- 退会済みの利用者を指定した場合、主文は 0 行になるので
+-- **画像側も何も触らない**必要がある —— previous が空になることで揃う。
+--
+-- **列は表名で修飾する。** この 1 文には users と images の 2 つが登場し、
+-- どちらにも id 列がある。修飾しないと sqlc の解析が
+-- "column reference \"id\" is ambiguous" で止まる (実測)。
+WITH previous AS (
+    SELECT users.avatar_image_id AS image_id
+    FROM users
+    WHERE users.id = sqlc.arg('id')
+      AND users.deleted_at IS NULL
+), detached AS (
+    -- 旧画像を未添付に戻す。同じ画像を指定し直した場合は触らない
+    -- (IS DISTINCT FROM は NULL 同士も「同じ」と扱うので、
+    --  解除の解除で余計な更新が走らない)。
+    UPDATE images
+    SET attached_at = NULL
+    WHERE images.id = (SELECT previous.image_id FROM previous)
+      AND images.id IS DISTINCT FROM sqlc.narg('avatar_image_id')
+), attached AS (
+    UPDATE images
+    SET attached_at = now()
+    WHERE images.id = sqlc.narg('avatar_image_id')
+      AND images.attached_at IS NULL
+      AND EXISTS (SELECT 1 FROM previous)
+)
 UPDATE users
 SET avatar_image_id = sqlc.narg('avatar_image_id'),
     updated_at = now()
-WHERE id = sqlc.arg('id')
-  AND deleted_at IS NULL
-RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id;
+WHERE users.id = sqlc.arg('id')
+  AND users.deleted_at IS NULL
+RETURNING users.id, users.public_id, users.google_sub, users.email, users.display_name, users.avatar_url, users.created_at, users.updated_at, users.deleted_at, users.role, users.avatar_image_id;

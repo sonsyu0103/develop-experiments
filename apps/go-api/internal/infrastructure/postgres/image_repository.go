@@ -189,6 +189,7 @@ func toImage(row sqlcgen.Image) *model.Image {
 		row.CreatedAt,
 		row.CommittedAt,
 		row.ObjectReclaimedAt,
+		row.AttachedAt,
 	)
 }
 

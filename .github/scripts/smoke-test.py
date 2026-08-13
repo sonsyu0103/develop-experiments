@@ -1064,14 +1064,21 @@ if SQL_EXEC:
                 # **対象の 1 件に絞る。** 絞らないと「DB のどこかに
                 # 回収対象がある」しか見ないので、判定が壊れても
                 # 古い行が 1 件あれば通ってしまう。
+                #
+                # **述語は db/query/images.sql の ListReclaimableImages と揃える。**
+                # ここは手書きの写しなので、本体を直したら一緒に直すこと ——
+                # 000007 で attached_at を足したとき、写しが古いまま
+                # 通り続けていた (実測)。写しがずれると、
+                # 「本体が壊れているのにスモークは緑」になる。
                 reclaimable = f"""
                     SELECT CASE WHEN EXISTS (
                         SELECT 1 FROM images
                         WHERE id = '{orphan['id']}'::uuid
                           AND object_reclaimed_at IS NULL
+                          AND (attached_at IS NULL OR status = 'deleted')
                           AND created_at < now() - interval '1 hour'
-                          AND (status IN ('pending','deleted') OR (status = 'committed'
-                            AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
+                          AND (status = 'deleted' OR (
+                            NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
                             AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id)
                             AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.icon_image_id = images.id)))
                     ) THEN 'RECLAIMABLE' ELSE 'NOT_RECLAIMABLE' END;
@@ -1083,12 +1090,51 @@ if SQL_EXEC:
                       f"got={out.strip()!r}")
 
                 # 添付すると対象から外れること。
+                #
+                # **attached_at を書かずに参照だけ張る。** 000007 で足した
+                # 「索引で絞る列」が書き漏れた状態そのものになるので、
+                # ここで効くのは NOT EXISTS 3 本の側だけになる。
+                # 落ちたときは、安全網が外れたという意味。
                 sql(f"UPDATE users SET avatar_image_id = '{orphan['id']}'::uuid WHERE id = 900020;")
                 out = subprocess.run(shlex.split(SQL_EXEC) + [reclaimable],
                                      check=True, capture_output=True, text=True).stdout
-                check("参照されている画像は回収対象にならない",
+                check("参照されている画像は回収対象にならない (NOT EXISTS の安全網)",
                       "NOT_RECLAIMABLE" in out, f"got={out.strip()!r}")
                 sql("UPDATE users SET avatar_image_id = NULL WHERE id = 900020;")
+
+            # **実際の API で添付すると attached_at が入ること** (000007)。
+            #
+            # 上の検査は SQL で参照を張っており、HTTP の経路を通っていない。
+            # attached_at を書くのは添付する側のクエリなので、
+            # **API を通さないと「書けているか」を一度も検査しないことになる。**
+            s, attach_probe = upload("avatar", _png(48, 48), img_token)
+            if s == 201:
+                attached_sql = f"""
+                    SELECT CASE WHEN attached_at IS NULL
+                                THEN 'NOT_ATTACHED' ELSE 'ATTACHED' END
+                    FROM images WHERE id = '{attach_probe['id']}'::uuid;
+                """
+                out = subprocess.run(shlex.split(SQL_EXEC) + [attached_sql],
+                                     check=True, capture_output=True, text=True).stdout
+                check("アップロード直後は未添付", "NOT_ATTACHED" in out, f"got={out.strip()!r}")
+
+                s, _, _ = call("PUT", "/me/avatar",
+                               json.dumps({"imageId": attach_probe["id"]}),
+                               headers={"Cookie": f"session={img_token}"})
+                out = subprocess.run(shlex.split(SQL_EXEC) + [attached_sql],
+                                     check=True, capture_output=True, text=True).stdout
+                check("API で設定すると attached_at が入る",
+                      s == 200 and "NOT_ATTACHED" not in out and "ATTACHED" in out,
+                      f"status={s} got={out.strip()!r}")
+
+                # **解除すると戻ること。** 戻らないと、差し替えた画像が
+                # どこからも参照されないまま永久に回収されない。
+                s, _, _ = call("PUT", "/me/avatar", json.dumps({"imageId": None}),
+                               headers={"Cookie": f"session={img_token}"})
+                out = subprocess.run(shlex.split(SQL_EXEC) + [attached_sql],
+                                     check=True, capture_output=True, text=True).stdout
+                check("解除すると attached_at が NULL に戻る",
+                      s == 200 and "NOT_ATTACHED" in out, f"status={s} got={out.strip()!r}")
     finally:
         # **参照を外すのが先。** images を先に消すと外部キー違反になり、
         # sql() は check=True なので finally からトレースバックが飛び、

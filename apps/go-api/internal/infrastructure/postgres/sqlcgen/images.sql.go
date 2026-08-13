@@ -18,7 +18,7 @@ SET status = 'committed',
     committed_at = now()
 WHERE id = $1
   AND status = 'pending'
-RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at
+RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at, attached_at
 `
 
 // ストレージへの PUT が成功したあとに呼ぶ (ADR 0007 決定 3 の手順 3)。
@@ -46,6 +46,7 @@ func (q *Queries) CommitImage(ctx context.Context, id uuid.UUID) (Image, error) 
 		&i.CreatedAt,
 		&i.CommittedAt,
 		&i.ObjectReclaimedAt,
+		&i.AttachedAt,
 	)
 	return i, err
 }
@@ -56,7 +57,7 @@ INSERT INTO images (
     id, owner_id, kind, object_key, content_type, width, height, byte_size, status
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
-RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at
+RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at, attached_at
 `
 
 type CreatePendingImageParams struct {
@@ -78,13 +79,14 @@ type CreatePendingImageParams struct {
 // 過不足なく一致していれば、sqlc は共通の行型 (sqlcgen.Image) を再利用する。
 // ずれるとクエリごとに別の行型が生成され、詰め替えが増える。
 //
-// object_reclaimed_at は**まだ誰も読み書きしない**が、列一覧には並べる。
 // 揃える条件は「テーブルの全列と過不足なく一致する」であり、
 // 1 つ抜けるだけで共通行型が消える (users.sql で実際に踏んだ)。
 //
-// 【回収バッチのクエリはここに無い】
-// Phase 6 の後半 (プロフィール画像 / スレッドアイコンと同時) で足す。
-// 先に書くと「実装していないクエリ」が残る。
+// 【attached_at はここから書かない】
+// 添付先から参照された時刻 (000007) は、**添付する側のクエリが
+// 同じ 1 文の中で更新する** —— comments.sql / threads.sql / users.sql を参照。
+// 別の文に分けると「コメントは作られたが添付の記録が無い」状態が作れ、
+// 回収バッチが参照済みの画像を消しにいく。
 // =============================================================================
 // ストレージへ書く前に呼ぶ (ADR 0007 決定 3 の手順 1)。
 //
@@ -119,6 +121,7 @@ func (q *Queries) CreatePendingImage(ctx context.Context, arg CreatePendingImage
 		&i.CreatedAt,
 		&i.CommittedAt,
 		&i.ObjectReclaimedAt,
+		&i.AttachedAt,
 	)
 	return i, err
 }
@@ -141,7 +144,7 @@ func (q *Queries) DeleteImage(ctx context.Context, id uuid.UUID) (int64, error) 
 }
 
 const getImageByID = `-- name: GetImageByID :one
-SELECT id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at
+SELECT id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at, attached_at
 FROM images
 WHERE id = $1
 `
@@ -168,20 +171,21 @@ func (q *Queries) GetImageByID(ctx context.Context, id uuid.UUID) (Image, error)
 		&i.CreatedAt,
 		&i.CommittedAt,
 		&i.ObjectReclaimedAt,
+		&i.AttachedAt,
 	)
 	return i, err
 }
 
 const listReclaimableImages = `-- name: ListReclaimableImages :many
-SELECT id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at
+SELECT id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at, attached_at
 FROM images
 WHERE object_reclaimed_at IS NULL
+  AND (attached_at IS NULL OR status = 'deleted')
   AND created_at < now() - $1::interval
   AND (
-    status IN ('pending', 'deleted')
+    status = 'deleted'
     OR (
-      status = 'committed'
-      AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
+      NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
       AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id)
       AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.icon_image_id = images.id)
     )
@@ -208,7 +212,24 @@ type ListReclaimableImagesParams struct {
 // **committed の孤立を含めるのが Phase 6 後半で足した点になる。**
 // アップロードと添付を分けた結果 (ADR 0007 の実装して分かったこと 1)、
 // 「アップロードしたが投稿をやめた」画像がどこからも参照されないまま残る。
-// 3 つの添付先を NOT EXISTS で見て判定する。
+//
+// 【絞りは attached_at、確認は NOT EXISTS】
+// 初版は committed の孤立を NOT EXISTS x3 だけで判定していた。
+// **索引が効かない。** 部分索引の述語は他テーブルを見られないので、
+// images_reclaimable_idx (000006) の述語に committed の行が入らず、
+// プランナが索引を選べない —— 10 分ごと・レプリカごとに images の
+// 全表走査 + created_at のソートになっていた。
+//
+// 000007 で attached_at 列を足し、述語を
+// 「object_reclaimed_at IS NULL AND (attached_at IS NULL OR status = 'deleted')」
+// に張り替えた。**下の WHERE はこの式をそのまま書いている** ——
+// 部分索引が使われるのは索引の述語がクエリの制約から導けるときだけで、
+// OR を含む式は同じ式が書かれている形でしか一致しない。並べ替えないこと。
+//
+// そのうえで NOT EXISTS x3 は残す。attached_at はアプリが書く値なので、
+// **新しい添付経路を足した人が書き忘れると参照中の画像を消しにいく**。
+// 索引で候補を数件に絞ったあと、行を消す種類 (pending / committed) にだけ
+// 確認をかける。deleted は添付されたまま S3 を消すので対象外。
 //
 // 【経過時間で守る】
 // どの種類も created_at で足切りする。**アップロード直後の画像を
@@ -242,6 +263,7 @@ func (q *Queries) ListReclaimableImages(ctx context.Context, arg ListReclaimable
 			&i.CreatedAt,
 			&i.CommittedAt,
 			&i.ObjectReclaimedAt,
+			&i.AttachedAt,
 		); err != nil {
 			return nil, err
 		}

@@ -29,6 +29,19 @@ WITH inserted AS (
         WHERE id = $1 AND deleted_at IS NULL
     )
     RETURNING id, thread_id, seq, author_name, body, created_at, author_id, image_id
+), attached AS (
+    -- **画像を「添付済み」にするのは、投稿を作るのと同じ 1 文の中で行う** (000007)。
+    -- 分けると「コメントは作られたが添付の記録が無い」窓ができ、
+    -- そこに回収バッチが入ると参照中の画像の実体を消してしまう。
+    --
+    -- **inserted を参照しているので、挿入が 0 行なら何も更新しない。**
+    -- CreateCommentAutoSeq は親スレッドが消えていると 0 行になる ——
+    -- そこで画像を添付済みにすると、投稿されていないのに
+    -- 二度と回収されない孤児が残る。
+    UPDATE images
+    SET attached_at = now()
+    WHERE id = (SELECT image_id FROM inserted)
+      AND attached_at IS NULL
 )
 SELECT
     i.id,
@@ -136,6 +149,18 @@ WITH inserted AS (
         $6
     )
     RETURNING id, thread_id, seq, author_name, body, created_at, author_id, image_id
+), attached AS (
+    -- **画像を「添付済み」にするのは、投稿を作るのと同じ 1 文の中で行う** (000007)。
+    -- 分けると「コメントは作られたが添付の記録が無い」窓ができ、
+    -- そこに回収バッチが入ると参照中の画像の実体を消してしまう。
+    --
+    -- inserted を参照しているので、挿入が 0 行なら何も更新しない。
+    -- こちらは VALUES なので必ず 1 行入るが、下の CreateCommentAutoSeq と
+    -- 形を揃えておく (片方だけ別の書き方だと、直すときに見落とす)。
+    UPDATE images
+    SET attached_at = now()
+    WHERE id = (SELECT image_id FROM inserted)
+      AND attached_at IS NULL
 )
 SELECT
     i.id,

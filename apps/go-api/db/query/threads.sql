@@ -119,6 +119,13 @@ WITH inserted AS (
     INSERT INTO threads (title, author_id, icon_image_id)
     VALUES (sqlc.arg('title'), sqlc.narg('author_id'), sqlc.narg('icon_image_id'))
     RETURNING id, title, created_at, author_id, icon_image_id
+), attached AS (
+    -- アイコンを「添付済み」にする (000007)。理由は comments.sql と同じ。
+    -- スレッドのアイコンは作成時にしか指定できないので、解除の経路は無い。
+    UPDATE images
+    SET attached_at = now()
+    WHERE id = (SELECT icon_image_id FROM inserted)
+      AND attached_at IS NULL
 )
 SELECT
     i.id,
