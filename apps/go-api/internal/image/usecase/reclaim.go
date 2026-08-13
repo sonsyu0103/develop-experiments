@@ -52,14 +52,20 @@ func (r ReclaimResult) Total() int { return r.Deleted + r.Marked + r.Failed }
 // 消すと外部キー違反になり、かつ「画像は削除されました」と
 // 「元から画像なし」を区別できなくなります。
 //
-// **S3 を先に消し、DB を後で更新します。** アップロード (決定 3) とは
-// 逆順です —— あちらは「記録の無いオブジェクト」を避けたい。
-// こちらは既に記録がある状態からの削除なので、
-// **先に DB を消すと、消し損ねたオブジェクトを追う手段が無くなります。**
-// 逆順なら、S3 だけ消えて DB が残った場合は次の周回で拾い直せます
-// (Delete は存在しないキーを成功として扱う)。
+// **3 段階に分けます。**
 //
-// 呼び出し側は「Total() が 0 になるまで繰り返す」形で使ってください。
+//  1. 確保        object_reclaimed_at を書く (トランザクション内)
+//  2. S3 削除      トランザクションの外
+//  3. DB 行の削除  1 件ずつ独立したトランザクション
+//
+// 1 を先に置くのは、**確保のあと実体が消えている画像を添付させない**ため。
+// FindOwned は確保済みの画像を返しません。
+//
+// S3 の削除をトランザクションの外へ出すのは、100 件ぶんの往復のあいだ
+// 行ロックと接続を占有しないためです。
+//
+// 呼び出し側は「Deleted + Marked が 0 になるまで繰り返す」形で使ってください
+// (Failed は繰り返しても減らないので、終了条件に含めてはいけません)。
 func (i *ImageInteractor) Reclaim(
 	ctx context.Context, grace time.Duration, batchSize int32,
 ) (ReclaimResult, error) {
@@ -70,44 +76,76 @@ func (i *ImageInteractor) Reclaim(
 		batchSize = DefaultReclaimBatchSize
 	}
 
-	var result ReclaimResult
-	err := i.images.WithinTx(ctx, func(tx repository.ImageRepository) error {
-		targets, err := tx.ListReclaimable(ctx, grace, batchSize)
-		if err != nil {
-			return err
+	// 1. **回収する行を「確保」する。** ここだけがトランザクション。
+	//
+	// object_reclaimed_at を先に書くことに 2 つの意味がある。
+	//
+	//   a. **添付できなくする。** FindOwned は確保済みの画像を返さないので、
+	//      「実体を消したのに、まだ添付できる」窓が閉じる。
+	//      初版は S3 の削除をトランザクションの中で行っており、
+	//      途中で DB がエラーになると**消えたオブジェクトの行が復活**し、
+	//      次の周回まで利用者が添付できてしまった (レビュー指摘)。
+	//   b. **S3 の往復でロックを持たない。** 100 件ぶんの DELETE を
+	//      トランザクション内で直列に投げると、行ロックと接続を
+	//      S3 のレイテンシぶん占有する。
+	var targets []model.Image
+	if err := i.images.WithinTx(ctx, func(tx repository.ImageRepository) error {
+		found, listErr := tx.ListReclaimable(ctx, grace, batchSize)
+		if listErr != nil {
+			return listErr
 		}
-
-		for _, img := range targets {
-			// **S3 を先に。** 失敗したら DB は触らず、次の周回に回す。
-			if err := i.storage.Delete(ctx, img.ObjectKey); err != nil {
-				result.Failed++
-				slog.WarnContext(ctx, "画像の実体を削除できませんでした (次の周回で再試行します)",
-					slog.String("image_id", img.ID.String()),
-					slog.String("status", string(img.Status)),
-					slog.String("error", err.Error()),
-				)
-				continue
+		for _, img := range found {
+			if markErr := tx.MarkReclaimed(ctx, img.ID); markErr != nil {
+				return markErr
 			}
-
-			if img.Status == model.StatusDeleted {
-				// **DB 行を残す。** 消したことだけ記録する。
-				if err := tx.MarkReclaimed(ctx, img.ID); err != nil {
-					return err
-				}
-				result.Marked++
-				continue
-			}
-
-			// pending の孤児と committed の孤立は行ごと消す。
-			if err := tx.Delete(ctx, img.ID); err != nil {
-				return err
-			}
-			result.Deleted++
 		}
+		targets = found
 		return nil
-	})
-	if err != nil {
-		return ReclaimResult{}, fmt.Errorf("画像の回収に失敗しました: %w", err)
+	}); err != nil {
+		return ReclaimResult{}, fmt.Errorf("画像の回収対象を確保できませんでした: %w", err)
+	}
+
+	var result ReclaimResult
+
+	// 2. **トランザクションの外で S3 を消す。**
+	for _, img := range targets {
+		if err := i.storage.Delete(ctx, img.ObjectKey); err != nil {
+			result.Failed++
+			// **確保したまま残る。** 実体が残り、行も残る。
+			// 次の周回では拾われないので、放置すると容量を食う ——
+			// ログに ERROR で出し、運用で気づけるようにする
+			// (ここで確保を戻すと、恒久的に消せないオブジェクトが
+			//  先頭に詰まって後続を止める)。
+			slog.ErrorContext(ctx, "image_reclaim_storage_failed",
+				slog.String("image_id", img.ID.String()),
+				slog.String("object_key", img.ObjectKey),
+				slog.String("status", string(img.Status)),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+
+		if img.Status == model.StatusDeleted {
+			// **DB 行を残す** (ADR 0016 問題 3)。確保の記録がそのまま結果になる。
+			result.Marked++
+			continue
+		}
+
+		// 3. pending の孤児と committed の孤立は行ごと消す。
+		//
+		// **1 件ずつ独立したトランザクションで消す。** まとめると、
+		// 途中の失敗で「S3 は消えたのに行が残る」件数が増える
+		// (残った行は status が committed のままなので、
+		//  再確保もされず実体だけ無い状態になる)。
+		if err := i.images.Delete(ctx, img.ID); err != nil {
+			result.Failed++
+			slog.ErrorContext(ctx, "image_reclaim_row_delete_failed",
+				slog.String("image_id", img.ID.String()),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		result.Deleted++
 	}
 
 	if result.Total() > 0 {

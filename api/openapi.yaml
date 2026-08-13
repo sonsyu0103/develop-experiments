@@ -404,6 +404,32 @@ paths:
                 $ref: '#/components/schemas/Thread'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          description: |
+            アイコンを指定したが未ログインです。
+            **画像の投稿にはログインが要ります**
+            (docs/adr/0007-image-storage.md の背景)。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: |
+            指定されたアイコンが存在しないか、自分のものではありません。
+            **403 ではなく 404** です —— 403 だと
+            「その ID の画像が存在すること」自体が漏れます。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: |
+            ストレージの設定が入っていないため、アイコンを指定できません。
+            アイコンなしのスレッド作成は影響を受けません。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalError'
 

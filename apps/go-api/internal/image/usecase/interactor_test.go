@@ -323,20 +323,45 @@ func TestEnsureOwned(t *testing.T) {
 	}
 
 	t.Run("所有者なら通る", func(t *testing.T) {
-		if err := uc.EnsureOwned(context.Background(), 42, dto.ID); err != nil {
+		if err := uc.EnsureOwned(context.Background(), 42, dto.ID, "comment_attachment"); err != nil {
 			t.Errorf("所有者なのに拒否された: %v", err)
 		}
 	})
 
 	t.Run("他人は 404", func(t *testing.T) {
-		if err := uc.EnsureOwned(context.Background(), 99, dto.ID); !errors.Is(err, apperr.ErrNotFound) {
+		if err := uc.EnsureOwned(context.Background(), 99, dto.ID, "comment_attachment"); !errors.Is(err, apperr.ErrNotFound) {
 			t.Errorf("err = %v, want apperr.ErrNotFound", err)
 		}
 	})
 
 	t.Run("存在しない画像も 404", func(t *testing.T) {
-		if err := uc.EnsureOwned(context.Background(), 42, uuid.New()); !errors.Is(err, apperr.ErrNotFound) {
+		if err := uc.EnsureOwned(context.Background(), 42, uuid.New(), "comment_attachment"); !errors.Is(err, apperr.ErrNotFound) {
 			t.Errorf("err = %v, want apperr.ErrNotFound", err)
+		}
+	})
+
+	// **用途が違う画像は添付できない** (ADR 0007 決定 6)。
+	// コメント添付として上げた JPEG をアバターに使えると、
+	// 仕様書の説明と実装が食い違う。
+	t.Run("用途が違うと 404", func(t *testing.T) {
+		if err := uc.EnsureOwned(context.Background(), 42, dto.ID, "avatar"); !errors.Is(err, apperr.ErrNotFound) {
+			t.Errorf("err = %v, want apperr.ErrNotFound", err)
+		}
+	})
+
+	// **回収が始まった画像は添付できない。**
+	// 確保のあとは実体が消えている可能性がある。
+	t.Run("回収済みは 404", func(t *testing.T) {
+		for _, img := range repo.stored {
+			now := time.Now()
+			img.ObjectReclaimedAt = &now
+		}
+		err := uc.EnsureOwned(context.Background(), 42, dto.ID, "comment_attachment")
+		if !errors.Is(err, apperr.ErrNotFound) {
+			t.Errorf("err = %v, want apperr.ErrNotFound", err)
+		}
+		for _, img := range repo.stored {
+			img.ObjectReclaimedAt = nil
 		}
 	})
 
@@ -346,7 +371,7 @@ func TestEnsureOwned(t *testing.T) {
 		for _, img := range repo.stored {
 			img.Status = model.StatusPending
 		}
-		if err := uc.EnsureOwned(context.Background(), 42, dto.ID); !errors.Is(err, apperr.ErrNotFound) {
+		if err := uc.EnsureOwned(context.Background(), 42, dto.ID, "comment_attachment"); !errors.Is(err, apperr.ErrNotFound) {
 			t.Errorf("err = %v, want apperr.ErrNotFound", err)
 		}
 	})

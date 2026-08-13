@@ -41,9 +41,33 @@ type Scheduler struct {
 	jobs []Job
 }
 
+// DefaultInterval は Interval が指定されなかった場合の間隔です。
+const DefaultInterval = 10 * time.Minute
+
 // New はスケジューラを生成します。
+//
+// **Interval が 0 以下の Job は既定値へ丸めます。**
+// 丸めないと rand.Int64N(0) が panic し、goroutine の中なので
+// recover されず**プロセスごと落ちます**。
+// Job は「実処理は main が渡す」公開 API なので、
+// 設定値由来の間隔 (未設定 = 0) がそのまま来る余地があります。
+//
+// 起動を止めない側に倒すのは、定期処理が動かないことより
+// API 全体が起動しないことのほうが害が大きいためです
+// (認証やストレージの設定と同じ考え方)。
 func New(jobs ...Job) *Scheduler {
-	return &Scheduler{jobs: jobs}
+	normalized := make([]Job, 0, len(jobs))
+	for _, job := range jobs {
+		if job.Interval <= 0 {
+			slog.Warn("定期処理の間隔が未設定のため既定値を使います",
+				slog.String("job", job.Name),
+				slog.Duration("interval", DefaultInterval),
+			)
+			job.Interval = DefaultInterval
+		}
+		normalized = append(normalized, job)
+	}
+	return &Scheduler{jobs: normalized}
 }
 
 // Start は各 Job を goroutine で回し始めます。

@@ -150,8 +150,10 @@ func newInteractor(repo *fakeCommentRepo) *CommentInteractor {
 // 所有者の判定そのものは image のユースケース側で検査しています。
 type fakeImageResolver struct{ err error }
 
-func (f *fakeImageResolver) EnsureOwned(context.Context, int64, uuid.UUID) error { return f.err }
-func (f *fakeImageResolver) URL(key string) string                               { return "https://cdn.test/" + key }
+func (f *fakeImageResolver) EnsureOwned(context.Context, int64, uuid.UUID, string) error {
+	return f.err
+}
+func (f *fakeImageResolver) URL(key string) string { return "https://cdn.test/" + key }
 
 func newInteractorWithImages(repo *fakeCommentRepo) *CommentInteractor {
 	return NewCommentInteractor(repo, &fakeThreadChecker{exists: true}, &fakeImageResolver{})

@@ -141,8 +141,10 @@ func TestLogout(t *testing.T) {
 // fakeImageResolver は所有権の判定を差し替えられるフェイクです。
 type fakeImageResolver struct{ err error }
 
-func (f *fakeImageResolver) EnsureOwned(context.Context, int64, uuid.UUID) error { return f.err }
-func (f *fakeImageResolver) URL(key string) string                               { return "https://cdn.test/" + key }
+func (f *fakeImageResolver) EnsureOwned(context.Context, int64, uuid.UUID, string) error {
+	return f.err
+}
+func (f *fakeImageResolver) URL(key string) string { return "https://cdn.test/" + key }
 
 // **アップロードした画像があればそちらを返す** (ADR 0007 のスキーマ)。
 // 無ければ Google のものを返す。クライアントは 1 つのフィールドだけを見る。

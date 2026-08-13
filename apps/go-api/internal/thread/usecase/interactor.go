@@ -68,9 +68,21 @@ type ThreadInteractor struct {
 // **image モジュールを import しません** (ADR 0004)。
 // 利用側が必要な操作だけのインターフェースを定義する形は、
 // comment モジュールと同じです。
+// imageKindThreadIcon は EnsureOwned に渡す用途です。
+// **image モジュールの定数を参照しません** (モジュールをまたがないため)。
+// 値がずれると添付が常に 404 になるので、スモークが検出します。
+const imageKindThreadIcon = "thread_icon"
+
+// ImageResolver は画像の解決を担います。
+//
+// **image モジュールを import しません** (docs/adr/0004-modular-monolith.md)。
+// 利用側が必要な操作だけのインターフェースを定義する形は、
+// ThreadExistenceChecker と同じです。実装は image のユースケースが満たします。
 type ImageResolver interface {
 	// EnsureOwned は「その利用者が所有する確定済みの画像か」を確認します。
-	EnsureOwned(ctx context.Context, ownerID int64, imageID uuid.UUID) error
+	// kind は用途 ("comment_attachment" / "avatar" / "thread_icon")。
+	// **文字列で渡します。** image モジュールの型を知らないためです。
+	EnsureOwned(ctx context.Context, ownerID int64, imageID uuid.UUID, kind string) error
 	// URL はオブジェクトキーから配信用の絶対 URL を組み立てます。
 	URL(objectKey string) string
 }
@@ -126,7 +138,7 @@ func (i *ThreadInteractor) CreateThread(
 		if i.images == nil {
 			return ThreadDTO{}, fmt.Errorf("画像は現在利用できません: %w", apperr.ErrUnavailable)
 		}
-		if iconErr := i.images.EnsureOwned(ctx, *authorID, *iconImageID); iconErr != nil {
+		if iconErr := i.images.EnsureOwned(ctx, *authorID, *iconImageID, imageKindThreadIcon); iconErr != nil {
 			return ThreadDTO{}, iconErr
 		}
 	}

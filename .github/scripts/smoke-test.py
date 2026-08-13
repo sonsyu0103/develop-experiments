@@ -1028,6 +1028,22 @@ if SQL_EXEC:
                                            "iconImageId": icon["id"]}))
                 check("匿名はアイコンを設定できない (401)", s == 401, f"status={s}")
 
+                # **用途が違う画像は使えない** (ADR 0007 決定 6)。
+                # 形式と寸法が用途で変わるので、取り違えると
+                # 仕様書の説明と実装が食い違う。404 にするのは存在を隠すため。
+                s, err, _ = call("PUT", "/me/avatar",
+                                 json.dumps({"imageId": icon["id"]}),
+                                 headers={"Cookie": f"session={img_token}"})
+                code = err["error"]["code"] if isinstance(err, dict) and "error" in err else ""
+                check("アイコン用の画像はアバターにできない (404)",
+                      s == 404 and code == "NOT_FOUND", f"status={s} code={code}")
+
+                s, _, _ = call("POST", f"/threads",
+                               json.dumps({"title": "コメント用をアイコンに",
+                                           "iconImageId": image_id}),
+                               headers={"Cookie": f"session={img_token}"})
+                check("コメント添付用の画像はアイコンにできない (404)", s == 404, f"status={s}")
+
             # --- 回収バッチ (ADR 0007 決定 3 / ADR 0016 問題 3) ---
             #
             # **status で扱いが分かれることを実 DB で確かめる。**
@@ -1038,35 +1054,56 @@ if SQL_EXEC:
                 # created_at を過去にして回収対象にする。
                 sql(f"UPDATE images SET created_at = now() - interval '2 hours' "
                     f"WHERE id = '{orphan['id']}'::uuid;")
-                out = subprocess.run(
-                    shlex.split(SQL_EXEC) + [
-                        "SELECT count(*) FROM images WHERE object_reclaimed_at IS NULL "
-                        "AND created_at < now() - interval '1 hour' "
-                        "AND (status IN ('pending','deleted') OR (status = 'committed' "
-                        "AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id) "
-                        "AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id) "
-                        "AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.icon_image_id = images.id)));"],
-                    check=True, capture_output=True, text=True).stdout
+                # **件数ではなく合言葉を返させる。**
+                # psql の既定は整形済みの表 (罫線と `(1 row)` つき) なので、
+                # 行番号で切り出すと、オプションが変わった瞬間に
+                # IndexError か誤検出になる。しかも != "0" 方向の検査は、
+                # パースがずれると**壊れていても通る**側へ倒れる。
+                # このファイルの他の DB 検査と同じ書き方に揃える。
+                #
+                # **対象の 1 件に絞る。** 絞らないと「DB のどこかに
+                # 回収対象がある」しか見ないので、判定が壊れても
+                # 古い行が 1 件あれば通ってしまう。
+                reclaimable = f"""
+                    SELECT CASE WHEN EXISTS (
+                        SELECT 1 FROM images
+                        WHERE id = '{orphan['id']}'::uuid
+                          AND object_reclaimed_at IS NULL
+                          AND created_at < now() - interval '1 hour'
+                          AND (status IN ('pending','deleted') OR (status = 'committed'
+                            AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
+                            AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id)
+                            AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.icon_image_id = images.id)))
+                    ) THEN 'RECLAIMABLE' ELSE 'NOT_RECLAIMABLE' END;
+                """
+                out = subprocess.run(shlex.split(SQL_EXEC) + [reclaimable],
+                                     check=True, capture_output=True, text=True).stdout
                 check("添付されなかった画像が回収対象になる",
-                      out.strip().splitlines()[2].strip() != "0", f"got={out.strip()!r}")
+                      "NOT_RECLAIMABLE" not in out and "RECLAIMABLE" in out,
+                      f"got={out.strip()!r}")
 
                 # 添付すると対象から外れること。
                 sql(f"UPDATE users SET avatar_image_id = '{orphan['id']}'::uuid WHERE id = 900020;")
-                out = subprocess.run(
-                    shlex.split(SQL_EXEC) + [
-                        f"SELECT count(*) FROM images WHERE id = '{orphan['id']}'::uuid "
-                        "AND status = 'committed' "
-                        "AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id);"],
-                    check=True, capture_output=True, text=True).stdout
+                out = subprocess.run(shlex.split(SQL_EXEC) + [reclaimable],
+                                     check=True, capture_output=True, text=True).stdout
                 check("参照されている画像は回収対象にならない",
-                      out.strip().splitlines()[2].strip() == "0", f"got={out.strip()!r}")
+                      "NOT_RECLAIMABLE" in out, f"got={out.strip()!r}")
                 sql("UPDATE users SET avatar_image_id = NULL WHERE id = 900020;")
     finally:
+        # **参照を外すのが先。** images を先に消すと外部キー違反になり、
+        # sql() は check=True なので finally からトレースバックが飛び、
+        # 失敗集計が印字されないまま終わる。
+        #
+        # threads.icon_image_id が参照になったので、
+        # **アイコン付きのスレッドは author_id では拾えない**
+        # (匿名で作られていた場合)。images を参照する行を id で消す。
         sql("DELETE FROM comments WHERE image_id IN "
             "(SELECT id FROM images WHERE owner_id IN (900020, 900021));")
+        sql("DELETE FROM threads WHERE icon_image_id IN "
+            "(SELECT id FROM images WHERE owner_id IN (900020, 900021));")
+        sql("DELETE FROM threads WHERE author_id IN (900020, 900021);")
         sql("UPDATE users SET avatar_image_id = NULL WHERE id IN (900020, 900021);")
         sql("DELETE FROM images WHERE owner_id IN (900020, 900021);")
-        sql("DELETE FROM threads WHERE author_id IN (900020, 900021);")
         sql("DELETE FROM sessions WHERE user_id IN (900020, 900021);")
         sql("DELETE FROM users WHERE id IN (900020, 900021);")
 else:

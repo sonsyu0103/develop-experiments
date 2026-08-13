@@ -1021,7 +1021,45 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            /**
+             * @description アイコンを指定したが未ログインです。
+             *     **画像の投稿にはログインが要ります**
+             *     (docs/adr/0007-image-storage.md の背景)。
+             */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description 指定されたアイコンが存在しないか、自分のものではありません。
+             *     **403 ではなく 404** です —— 403 だと
+             *     「その ID の画像が存在すること」自体が漏れます。
+             */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["InternalError"];
+            /**
+             * @description ストレージの設定が入っていないため、アイコンを指定できません。
+             *     アイコンなしのスレッド作成は影響を受けません。
+             */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     getThread: {

@@ -161,22 +161,48 @@ func run() error {
 	sessionCleaner := postgres.NewSessionRepository(pool)
 	idempotencyCleaner := postgres.NewIdempotencyRepository(pool)
 
+	// **「0 件になるまで繰り返す」が呼び出し規約になっている。**
+	//
+	// 1 周回しか呼ばないと、上限 (1000 件) を超える流量では単調増加が続く。
+	// ADR 0003 の表が「止まったときの影響: sessions が単調増加する」と
+	// 挙げていた事象が、そのまま起きる (レビュー指摘)。
+	//
+	// 回数に上限を置くのは、消しても減らない状態 (バグ) で
+	// 無限に回り続けないため。
+	drain := func(name string, step func(context.Context) (int64, error)) func(context.Context) error {
+		const maxRounds = 100
+		return func(ctx context.Context) error {
+			for round := range maxRounds {
+				n, err := step(ctx)
+				if err != nil {
+					return err
+				}
+				if n == 0 {
+					return nil
+				}
+				if round == maxRounds-1 {
+					slog.WarnContext(ctx, "定期処理が上限まで回りました (次の周回に持ち越します)",
+						slog.String("job", name), slog.Int("rounds", maxRounds))
+				}
+			}
+			return nil
+		}
+	}
+
 	jobs := []scheduler.Job{
 		{
 			Name:     "expired_sessions",
 			Interval: 1 * time.Hour,
-			Run: func(ctx context.Context) error {
-				_, err := sessionCleaner.DeleteExpired(ctx, 0)
-				return err
-			},
+			Run: drain("expired_sessions", func(ctx context.Context) (int64, error) {
+				return sessionCleaner.DeleteExpired(ctx, 0)
+			}),
 		},
 		{
 			Name:     "expired_idempotency_keys",
 			Interval: 1 * time.Hour,
-			Run: func(ctx context.Context) error {
-				_, err := idempotencyCleaner.DeleteExpired(ctx, 0, 0)
-				return err
-			},
+			Run: drain("expired_idempotency_keys", func(ctx context.Context) (int64, error) {
+				return idempotencyCleaner.DeleteExpired(ctx, 0, 0)
+			}),
 		},
 	}
 
@@ -186,10 +212,16 @@ func run() error {
 		jobs = append(jobs, scheduler.Job{
 			Name:     "image_reclaim",
 			Interval: 10 * time.Minute,
-			Run: func(ctx context.Context) error {
-				_, err := imageInteractor.Reclaim(ctx, 0, 0)
-				return err
-			},
+			// **Failed を終了条件に含めない。** 恒久的に消せない
+			// オブジェクトがあると、Total() は 0 にならず回り続ける。
+			// 進捗 (Deleted + Marked) が 0 になったら止める。
+			Run: drain("image_reclaim", func(ctx context.Context) (int64, error) {
+				got, err := imageInteractor.Reclaim(ctx, 0, 0)
+				if err != nil {
+					return 0, err
+				}
+				return int64(got.Deleted + got.Marked), nil
+			}),
 		})
 	}
 

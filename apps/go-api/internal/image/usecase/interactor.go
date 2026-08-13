@@ -209,17 +209,45 @@ func (i *ImageInteractor) FindOwned(
 		return nil, fmt.Errorf(
 			"確定していない画像です (id=%s status=%s): %w", id, img.Status, apperr.ErrNotFound)
 	}
+	// **回収が始まった画像は添付させません。**
+	//
+	// 回収は「確保 (object_reclaimed_at を書く) -> S3 削除 -> 行削除」の順で進み、
+	// 確保のあとは実体が消えている可能性があります。
+	// ここで弾かないと、**実体の無い画像を投稿に添付できてしまいます**
+	// (添付されると NOT EXISTS が偽になり、二度と回収されません)。
+	if img.ObjectReclaimedAt != nil {
+		return nil, fmt.Errorf(
+			"回収済みの画像です (id=%s): %w", id, apperr.ErrNotFound)
+	}
 	return img, nil
 }
 
-// EnsureOwned は「その利用者が所有する確定済みの画像か」を確認します。
+// EnsureOwned は「その利用者が所有する、その用途の確定済み画像か」を確認します。
 //
-// **添付する側 (コメント) がここを呼びます。**
-// comment モジュールはこの型を知らず、自分で定義した
-// インターフェース越しに呼びます (ADR 0004 の ThreadExistenceChecker と同じ形)。
-func (i *ImageInteractor) EnsureOwned(ctx context.Context, ownerID int64, imageID uuid.UUID) error {
-	_, err := i.FindOwned(ctx, ownerID, imageID)
-	return err
+// **添付する側 (コメント / アバター / アイコン) がここを呼びます。**
+// 各モジュールはこの型を知らず、自分で定義したインターフェース越しに
+// 呼びます (ADR 0004 の ThreadExistenceChecker と同じ形)。
+//
+// **kind も確認します。** 用途によって保存する形式と寸法が変わるため
+// (ADR 0007 決定 6)、コメント添付として上げた JPEG (長辺 1600) を
+// アバターに使えると、仕様書の説明と実装が食い違います。
+// 逆向き (アバター用の WebP をコメントに添付) も同じです。
+//
+// **404 として扱います。** 「その ID は存在するが用途が違う」と返すと、
+// 他人の画像の存在を確かめる手段になります (ADR 0013)。
+func (i *ImageInteractor) EnsureOwned(
+	ctx context.Context, ownerID int64, imageID uuid.UUID, kind string,
+) error {
+	img, err := i.FindOwned(ctx, ownerID, imageID)
+	if err != nil {
+		return err
+	}
+	if string(img.Kind) != kind {
+		return fmt.Errorf(
+			"用途が違う画像です (id=%s kind=%s want=%s): %w",
+			imageID, img.Kind, kind, apperr.ErrNotFound)
+	}
+	return nil
 }
 
 // URL はオブジェクトキーから配信用の絶対 URL を組み立てます。

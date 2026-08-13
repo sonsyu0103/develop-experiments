@@ -227,8 +227,10 @@ func TestThreadInteractor_CreateThread_ValidationStopsBeforeRepository(t *testin
 // fakeIconResolver は所有権の判定を差し替えられるフェイクです。
 type fakeIconResolver struct{ err error }
 
-func (f *fakeIconResolver) EnsureOwned(context.Context, int64, uuid.UUID) error { return f.err }
-func (f *fakeIconResolver) URL(key string) string                               { return "https://cdn.test/" + key }
+func (f *fakeIconResolver) EnsureOwned(context.Context, int64, uuid.UUID, string) error {
+	return f.err
+}
+func (f *fakeIconResolver) URL(key string) string { return "https://cdn.test/" + key }
 
 func TestCreateThread_WithIcon(t *testing.T) {
 	t.Parallel()

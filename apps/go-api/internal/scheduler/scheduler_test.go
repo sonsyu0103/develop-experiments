@@ -167,3 +167,41 @@ func TestScheduler_JittersFirstRun(t *testing.T) {
 		t.Error("初回がばらついていない (全部が即座に走った)")
 	}
 }
+
+// **Interval が 0 の Job でプロセスを落とさないこと。**
+//
+// rand.Int64N(0) は panic し、goroutine の中なので recover されない。
+// Job は公開 API なので、設定値由来の間隔 (未設定 = 0) が来る余地がある。
+func TestNew_NormalizesZeroInterval(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int64
+	s := New(Job{
+		Name:     "interval-なし",
+		Interval: 0,
+		Run: func(context.Context) error {
+			calls.Add(1)
+			return nil
+		},
+	})
+
+	if got := s.jobs[0].Interval; got != DefaultInterval {
+		t.Errorf("Interval = %v, want %v", got, DefaultInterval)
+	}
+
+	// **panic しないこと。** ここで落ちるとテストごと巻き込まれる。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+	time.Sleep(20 * time.Millisecond)
+}
+
+// 負の間隔も同じ扱い。
+func TestNew_NormalizesNegativeInterval(t *testing.T) {
+	t.Parallel()
+
+	s := New(Job{Name: "負", Interval: -time.Second, Run: func(context.Context) error { return nil }})
+	if got := s.jobs[0].Interval; got != DefaultInterval {
+		t.Errorf("Interval = %v, want %v", got, DefaultInterval)
+	}
+}
