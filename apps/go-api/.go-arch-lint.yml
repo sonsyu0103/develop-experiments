@@ -91,6 +91,8 @@ components:
     in: internal/image/domain/model
   image-repository:
     in: internal/image/domain/repository
+  image-usecase:
+    in: internal/image/usecase
 
   user-model:
     in: internal/user/domain/model
@@ -170,6 +172,16 @@ deps:
       - uuid
     mayDependOn:
       - image-model
+  # 画像のユースケース。**再エンコードはここで行う** ——
+  # ドメインに置くと、ドメインが画像ライブラリを知ることになる。
+  # S3 SDK は入らない (保存先は ObjectStorage の背後)
+  image-usecase:
+    canUse:
+      - uuid
+      - imaging
+    mayDependOn:
+      - image-model
+      - image-repository
 
   # user モジュール。public_id (UUID v7) の採番をドメイン側で行うため uuid を許可する
   user-model:
@@ -219,6 +231,7 @@ deps:
       - comment-usecase
       - user-usecase
       - user-model
+      - image-usecase
       - httpapi-oapigen
       - shared-config
 

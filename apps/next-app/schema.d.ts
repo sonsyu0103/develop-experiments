@@ -105,6 +105,53 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/images": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 画像をアップロードする
+         * @description 画像を受け取り、**再エンコードしてから**保存します
+         *     (docs/adr/0007-image-storage.md 決定 2)。
+         *
+         *     アップロードされたバイト列はそのまま保存されません。
+         *     デコードし、リサイズし、こちらの指定した形式でエンコードし直した
+         *     ものだけを保存します。これ 1 つで MIME 偽装・EXIF の位置情報・
+         *     SVG に埋めたスクリプト・ポリグロットがまとめて閉じます。
+         *
+         *     **ログインが必要です。** 匿名で任意のバイト列をストレージに置けると、
+         *     容量の消費と違法コンテンツの設置が追跡不能な形で可能になります。
+         *
+         *     **添付は別の操作です。** ここで得た `id` を
+         *     `POST /threads/{threadId}/comments` の `imageId` に渡してください。
+         *     アップロードした時点では、まだどこからも参照されていません。
+         *
+         *     入力: JPEG / PNG / WebP。**SVG は受け付けません** ——
+         *     ベクタ形式はスクリプトと外部参照を含められるため、
+         *     「画像」として扱うと XSS と SSRF の経路になります。
+         *
+         *     **`Idempotency-Key` は受け付けません。**
+         *     [ADR 0015](../docs/adr/0015-idempotency.md) 決定 2 は画像も対象に
+         *     挙げていますが、同 決定 3 が要求する「キーの確保と応答の記録を
+         *     主トランザクションに同居させる」が、**DB とストレージの
+         *     2 システムにまたがるアップロードでは満たせない**ためです。
+         *
+         *     二重アップロードで起きるのは「使われない画像が 1 枚増える」ことだけで、
+         *     コメントの二重投稿のような不可逆な結果にはなりません。
+         *     添付する側 (コメント投稿) の冪等キーは、`imageId` を指紋に含めています。
+         */
+        post: operations["uploadImage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -294,6 +341,15 @@ export interface components {
              * @example 2026-08-02T12:00:00Z
              */
             createdAt: string;
+            /**
+             * @description 添付された画像。**画像がなければ `null`** です。
+             *
+             *     モデレーターに削除された画像もここに現れます
+             *     (`url` は 404 になります)。行を残すのは
+             *     「画像は削除されました」と「元から画像なし」を区別するためです
+             *     (docs/adr/0016-schema-and-indexes.md 問題 3)。
+             */
+            image: components["schemas"]["Image"] | null;
         };
         ThreadList: {
             threads: components["schemas"]["Thread"][];
@@ -416,6 +472,60 @@ export interface components {
             authorName?: string;
             /** @example ふぁ〜、眠いよ〜 */
             body: string;
+            /**
+             * Format: uuid
+             * @description 添付する画像の ID。`POST /images` で得たものを渡します。
+             *
+             *     - **省略できます。** 画像のない投稿が既定です
+             *     - **自分がアップロードした画像だけ**を添付できます。
+             *       他人の画像 ID を指定すると 404 になります
+             *       (存在を隠すため。ADR 0013)
+             *     - 1 件のコメントに 1 枚だけです。複数枚にすると中間テーブルが要り、
+             *       パーティション済みテーブルとの結合がもう 1 段増えます
+             *     - **未ログインでは指定できません** (画像の投稿にログインが要るため)
+             * @example 018f2c00-0000-7000-8000-000000000001
+             */
+            imageId?: string;
+        };
+        /**
+         * @description 画像の用途。**用途によって保存する形式が変わります**
+         *     (docs/adr/0007-image-storage.md 決定 6)。
+         *
+         *     コメント添付は写真が主なので JPEG、小さい正方形になる
+         *     プロフィール画像とスレッドアイコンは可逆の WebP で保存します。
+         * @example comment_attachment
+         * @enum {string}
+         */
+        ImageKind: "comment_attachment";
+        Image: {
+            /**
+             * Format: uuid
+             * @description 添付するときに指定する ID。
+             * @example 018f2c00-0000-7000-8000-000000000001
+             */
+            id: string;
+            /**
+             * Format: uri
+             * @description **絶対 URL を返します** (docs/adr/0007-image-storage.md 決定 5)。
+             *
+             *     オブジェクトキーだけを返すと、フロントが CDN のベース URL を
+             *     知る必要が出て、組み立てロジックが Server Component と
+             *     Client Component の 2 か所に散ります。
+             *     環境ごとの差 (ローカルの MinIO と本番の CloudFront) は
+             *     API が吸収します。
+             * @example https://cdn.example.com/images/018f2c00-0000-7000-8000-000000000001.jpg
+             */
+            url: string;
+            /**
+             * @description 保存された画像の幅 (再エンコード後)。
+             * @example 1600
+             */
+            width: number;
+            /**
+             * @description 保存された画像の高さ (再エンコード後)。
+             * @example 1200
+             */
+            height: number;
         };
         Error: {
             error: {
@@ -638,6 +748,68 @@ export interface operations {
             };
             401: components["responses"]["Unauthorized"];
             500: components["responses"]["InternalError"];
+        };
+    };
+    uploadImage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": {
+                    /**
+                     * Format: binary
+                     * @description 画像本体。5 MiB まで。
+                     *
+                     *     デコード後の画素数にも上限があります (2500 万画素)。
+                     *     **サイズの上限だけでは decompression bomb を防げない**ため、
+                     *     全体を展開する前にヘッダから寸法を読んで判定します。
+                     */
+                    file: string;
+                    kind: components["schemas"]["ImageKind"];
+                };
+            };
+        };
+        responses: {
+            /** @description アップロード成功 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Image"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description サイズまたは画素数の上限を超えました。
+             *     縮小すれば通ります (docs/adr/0007-image-storage.md 決定 2)。
+             */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+            /**
+             * @description ストレージの設定が入っていないため、この経路だけが使えません。
+             *     掲示板の閲覧・投稿・ログインは影響を受けません。
+             */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     getHealthz: {

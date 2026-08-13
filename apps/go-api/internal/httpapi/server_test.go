@@ -142,8 +142,16 @@ func (f *fakeCommentRepo) Create(_ context.Context, c *commentmodel.Comment) (*c
 	if c.AuthorID != nil {
 		author = commentmodel.NewAuthor(fakeAuthorPublicID, "ホシノ", nil, nil)
 	}
+	// 実装では LEFT JOIN images が添付画像を解決する。
+	// **フェイクでも同じ形にしないと、応答の詰め替えを検証できない**
+	// (投稿者側の fakeAuthorFor と同じ理由。実際に一度、
+	//  toWireComment の書き忘れをここで見逃した)。
+	var image *commentmodel.Image
+	if c.ImageID != nil {
+		image = commentmodel.NewImage(*c.ImageID, "images/"+c.ImageID.String()+".jpg", 64, 64)
+	}
 	// レス番号は永続化層が採番する。フェイクなので固定値を返す。
-	return commentmodel.Reconstruct(7, c.ThreadID, 3, c.AuthorName, author, c.Body, time.Unix(0, 0).UTC()), nil
+	return commentmodel.Reconstruct(7, c.ThreadID, 3, c.AuthorName, author, image, c.Body, time.Unix(0, 0).UTC()), nil
 }
 
 // CreateIdempotent は「同じキーなら 1 回しか作らない」ところだけを再現します。
@@ -206,7 +214,7 @@ func newTestEnv(t *testing.T) *testEnv {
 	}
 	comments := &fakeCommentRepo{
 		comments: []commentmodel.Comment{
-			*commentmodel.Reconstruct(10, 2, 1, "ホシノ", nil, "ふぁ〜", time.Unix(3, 0).UTC()),
+			*commentmodel.Reconstruct(10, 2, 1, "ホシノ", nil, nil, "ふぁ〜", time.Unix(3, 0).UTC()),
 		},
 	}
 	pinger := &fakePinger{}
@@ -214,12 +222,14 @@ func newTestEnv(t *testing.T) *testEnv {
 	router, err := NewRouter(Deps{
 		Server: NewServer(
 			threadusecase.NewThreadInteractor(threads),
-			commentusecase.NewCommentInteractor(comments, threads),
+			commentusecase.NewCommentInteractor(comments, threads, nil),
 			pinger,
 			// セッションの解決は認証の設定に依らず常に結線する (ADR 0005 決定 4)。
 			// このテスト環境は Cookie を送らないので、生きたセッションは持たせない。
 			userusecase.NewSessionInteractor(&fakeSessionRepo{}),
 			// ログインは未設定 (= /auth/google が 503) の状態。
+			nil,
+			// 画像も未設定 (= POST /images が 503)。
 			nil,
 			config.AuthConfig{},
 		),

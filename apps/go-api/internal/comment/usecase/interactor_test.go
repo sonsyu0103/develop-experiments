@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"develop-experiments/apps/go-api/internal/apperr"
 	"develop-experiments/apps/go-api/internal/comment/domain/model"
 	"develop-experiments/apps/go-api/internal/comment/domain/repository"
@@ -141,7 +143,18 @@ func (f *fakeThreadChecker) Exists(context.Context, int64) (bool, error) {
 }
 
 func newInteractor(repo *fakeCommentRepo) *CommentInteractor {
-	return NewCommentInteractor(repo, &fakeThreadChecker{exists: true})
+	return NewCommentInteractor(repo, &fakeThreadChecker{exists: true}, nil)
+}
+
+// fakeImageResolver は「どの画像も自分のもの」として通します。
+// 所有者の判定そのものは image のユースケース側で検査しています。
+type fakeImageResolver struct{ err error }
+
+func (f *fakeImageResolver) EnsureOwned(context.Context, int64, uuid.UUID) error { return f.err }
+func (f *fakeImageResolver) URL(key string) string                               { return "https://cdn.test/" + key }
+
+func newInteractorWithImages(repo *fakeCommentRepo) *CommentInteractor {
+	return NewCommentInteractor(repo, &fakeThreadChecker{exists: true}, &fakeImageResolver{})
 }
 
 func mustPage(t *testing.T, cursorID *int64, size int32) pagination.Page {
@@ -298,7 +311,7 @@ func TestFetchComments_EmptyReturnsNonNilSlice(t *testing.T) {
 func TestFetchComments_ThreadNotFound(t *testing.T) {
 	t.Parallel()
 
-	uc := NewCommentInteractor(newFakeCommentRepo(3), &fakeThreadChecker{exists: false})
+	uc := NewCommentInteractor(newFakeCommentRepo(3), &fakeThreadChecker{exists: false}, nil)
 
 	_, err := uc.FetchComments(context.Background(), 999, mustPage(t, nil, 10))
 	if !errors.Is(err, apperr.ErrNotFound) {
@@ -336,7 +349,7 @@ func TestComments_SeqReachesDTO(t *testing.T) {
 	t.Parallel()
 
 	repo := newFakeCommentRepo(3)
-	interactor := NewCommentInteractor(repo, &fakeThreadChecker{exists: true})
+	interactor := NewCommentInteractor(repo, &fakeThreadChecker{exists: true}, nil)
 
 	t.Run("一覧", func(t *testing.T) {
 		t.Parallel()
@@ -364,7 +377,7 @@ func TestComments_SeqReachesDTO(t *testing.T) {
 	t.Run("投稿", func(t *testing.T) {
 		t.Parallel()
 
-		got, err := interactor.PostComment(t.Context(), 1, "ホシノ", "ふぁ〜", nil)
+		got, err := interactor.PostComment(t.Context(), 1, "ホシノ", "ふぁ〜", nil, nil)
 		if err != nil {
 			t.Fatalf("PostComment が失敗した: %v", err)
 		}
@@ -390,13 +403,13 @@ func TestPostCommentIdempotent_SecondCallDoesNotCreate(t *testing.T) {
 	authorID := int64(42)
 
 	first, err := uc.PostCommentIdempotent(
-		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, "key-1", "POST /threads/1/comments")
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, nil, "key-1", "POST /threads/1/comments")
 	if err != nil {
 		t.Fatalf("1 回目が失敗した: %v", err)
 	}
 
 	second, err := uc.PostCommentIdempotent(
-		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, "key-1", "POST /threads/1/comments")
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, nil, "key-1", "POST /threads/1/comments")
 	if err != nil {
 		t.Fatalf("2 回目が失敗した: %v", err)
 	}
@@ -420,20 +433,82 @@ func TestPostCommentIdempotent_DifferentBodyIsRejected(t *testing.T) {
 	authorID := int64(42)
 
 	if _, postErr := uc.PostCommentIdempotent(
-		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID,
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, nil,
 		"key-1", "POST /threads/1/comments"); postErr != nil {
 		t.Fatalf("1 回目が失敗した: %v", postErr)
 	}
 
 	// 同じキー、違う本文。
 	_, err := uc.PostCommentIdempotent(
-		t.Context(), 1, "ホシノ", "おはよう", &authorID, "key-1", "POST /threads/1/comments")
+		t.Context(), 1, "ホシノ", "おはよう", &authorID, nil, "key-1", "POST /threads/1/comments")
 
 	if !errors.Is(err, apperr.ErrFailedPrecondition) {
 		t.Fatalf("err = %v, want apperr.ErrFailedPrecondition (422)", err)
 	}
 	if repo.createCalls != 1 {
 		t.Errorf("投稿が %d 回行われた, want 1", repo.createCalls)
+	}
+}
+
+// **同じキーで別の画像も 422 になること。**
+//
+// 添付は投稿結果を変えるので、指紋に含める必要があります
+// (docs/adr/0015-idempotency.md の request_hash が存在する理由)。
+// 含めないと、画像を差し替えた再送が「同じ内容」と判定され、
+// **黙って前回の応答 (別の画像) が返ります。**
+//
+// 本文の違いを見るテストだけでは、この抜けを検出できませんでした
+// (変異プローブで実測)。
+func TestPostCommentIdempotent_DifferentImageIsRejected(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	uc := newInteractorWithImages(repo)
+	authorID := int64(42)
+	firstImage := uuid.New()
+	secondImage := uuid.New()
+
+	if _, postErr := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, &firstImage,
+		"key-img", "POST /threads/1/comments"); postErr != nil {
+		t.Fatalf("1 回目が失敗した: %v", postErr)
+	}
+
+	// 同じキー・同じ本文で、画像だけ違う。
+	_, err := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, &secondImage,
+		"key-img", "POST /threads/1/comments")
+
+	if !errors.Is(err, apperr.ErrFailedPrecondition) {
+		t.Fatalf("err = %v, want apperr.ErrFailedPrecondition (422)", err)
+	}
+	if repo.createCalls != 1 {
+		t.Errorf("投稿が %d 回行われた, want 1", repo.createCalls)
+	}
+}
+
+// 画像の有無が変わった場合も 422 になること。
+// 「画像あり -> なし」を握りつぶすと、添付が黙って消えたように見えます。
+func TestPostCommentIdempotent_DroppingImageIsRejected(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	uc := newInteractorWithImages(repo)
+	authorID := int64(42)
+	imageID := uuid.New()
+
+	if _, postErr := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, &imageID,
+		"key-drop", "POST /threads/1/comments"); postErr != nil {
+		t.Fatalf("1 回目が失敗した: %v", postErr)
+	}
+
+	_, err := uc.PostCommentIdempotent(
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, nil,
+		"key-drop", "POST /threads/1/comments")
+
+	if !errors.Is(err, apperr.ErrFailedPrecondition) {
+		t.Fatalf("err = %v, want apperr.ErrFailedPrecondition (422)", err)
 	}
 }
 
@@ -481,13 +556,13 @@ func TestPostCommentIdempotent_NormalizedFieldsDoNotChangeFingerprint(t *testing
 			authorID := int64(42)
 
 			first, err := uc.PostCommentIdempotent(t.Context(), 1,
-				tt.firstAuthorName, tt.firstBody, &authorID, "key-1", "POST /threads/1/comments")
+				tt.firstAuthorName, tt.firstBody, &authorID, nil, "key-1", "POST /threads/1/comments")
 			if err != nil {
 				t.Fatalf("1 回目が失敗した: %v", err)
 			}
 
 			second, err := uc.PostCommentIdempotent(t.Context(), 1,
-				tt.retryAuthorName, tt.retryBody, &authorID, "key-1", "POST /threads/1/comments")
+				tt.retryAuthorName, tt.retryBody, &authorID, nil, "key-1", "POST /threads/1/comments")
 			if err != nil {
 				t.Fatalf("再送が失敗した (結果に影響しない差で 422 になっている): %v", err)
 			}
@@ -514,7 +589,7 @@ func TestPostCommentIdempotent_AnonymousIsRejected(t *testing.T) {
 	uc := newInteractor(repo)
 
 	_, err := uc.PostCommentIdempotent(
-		t.Context(), 1, "", "ふぁ〜", nil, "key-1", "POST /threads/1/comments")
+		t.Context(), 1, "", "ふぁ〜", nil, nil, "key-1", "POST /threads/1/comments")
 	if !errors.Is(err, apperr.ErrInvalidArgument) {
 		t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
 	}
@@ -532,7 +607,7 @@ func TestPostCommentIdempotent_RequestReachesRepository(t *testing.T) {
 	uc := newInteractor(repo)
 	authorID := int64(42)
 
-	if _, err := uc.PostCommentIdempotent(t.Context(), 1, "ホシノ", "ふぁ〜", &authorID,
+	if _, err := uc.PostCommentIdempotent(t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, nil,
 		"key-xyz", "POST /threads/1/comments"); err != nil {
 		t.Fatalf("PostCommentIdempotent が失敗した: %v", err)
 	}
@@ -557,7 +632,7 @@ func TestPostCommentIdempotent_InvalidKeyIsRejected(t *testing.T) {
 	authorID := int64(42)
 
 	_, err := uc.PostCommentIdempotent(
-		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, "   ", "POST /threads/1/comments")
+		t.Context(), 1, "ホシノ", "ふぁ〜", &authorID, nil, "   ", "POST /threads/1/comments")
 	if !errors.Is(err, apperr.ErrInvalidArgument) {
 		t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
 	}

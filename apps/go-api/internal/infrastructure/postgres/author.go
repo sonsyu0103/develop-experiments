@@ -56,3 +56,31 @@ func derefString(s *string) string {
 	}
 	return *s
 }
+
+// toCommentImage は LEFT JOIN images で得た列を、コメントの添付画像へ詰め替えます。
+//
+// **判定に id を使います。** images.id は NOT NULL なので、
+// 結合が成立していれば必ず値が入ります。object_key で判定すると、
+// 将来その列が NULL 許容になったときに「画像があるのに無いことになる」
+// 形で静かに壊れます (投稿者の解決と同じ考え方)。
+//
+// URL は組み立てません。**ドメインは配信基盤を知りません** ——
+// 環境ごとの差 (MinIO と CloudFront) はユースケース層が吸収します
+// (docs/adr/0007-image-storage.md 決定 5)。
+func toCommentImage(
+	id *uuid.UUID, objectKey *string, width, height *int32,
+) *commentmodel.Image {
+	if id == nil {
+		return nil
+	}
+	return commentmodel.NewImage(*id, derefString(objectKey), derefInt32(width), derefInt32(height))
+}
+
+// derefInt32 は LEFT JOIN で NULL 許容になった数値列を読み出します。
+// id が入っている時点で寸法も必ず入っているため、ここに来る nil は理屈上ありません。
+func derefInt32(v *int32) int {
+	if v == nil {
+		return 0
+	}
+	return int(*v)
+}

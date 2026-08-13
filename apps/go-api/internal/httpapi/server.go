@@ -14,6 +14,7 @@ import (
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
+	imageusecase "develop-experiments/apps/go-api/internal/image/usecase"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
@@ -37,7 +38,10 @@ type Server struct {
 	sessions *userusecase.SessionInteractor
 	// login は認証の設定が無い場合 nil になります。
 	// そのとき**ログインの 2 経路だけ**が 503 を返します。
-	login   *userusecase.LoginInteractor
+	login *userusecase.LoginInteractor
+	// images はストレージの設定が無い場合 nil になります。
+	// そのとき**画像の経路だけ**が 503 を返します (ADR 0005 決定 4 と同じ形)。
+	images  *imageusecase.ImageInteractor
 	authCfg config.AuthConfig
 }
 
@@ -56,6 +60,7 @@ func NewServer(
 	db Pinger,
 	sessions *userusecase.SessionInteractor,
 	login *userusecase.LoginInteractor,
+	images *imageusecase.ImageInteractor,
 	authCfg config.AuthConfig,
 ) *Server {
 	if sessions == nil {
@@ -67,6 +72,7 @@ func NewServer(
 		db:       db,
 		sessions: sessions,
 		login:    login,
+		images:   images,
 		authCfg:  authCfg,
 	}
 }
@@ -325,6 +331,14 @@ func (s *Server) CreateComment(
 		authorName = *req.AuthorName
 	}
 
+	// 添付画像の ID。**所有者の確認はユースケース層が行う** ——
+	// 他人の画像を指定されたら 404 になる (存在を隠すため)。
+	imageID, err := parseImageID(req.ImageId)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
 	ctx := c.Request.Context()
 	authorID := authorIDFromContext(ctx)
 
@@ -338,18 +352,18 @@ func (s *Server) CreateComment(
 		// **指紋はここで作りません。** ユースケース層が正規化したあとの値で
 		// 組み立てます (受け取ったままの値だと、結果に影響しない差で
 		// 422 になる。ADR 0015 の「実装して分かったこと」7)。
-		comment, err := s.comments.PostCommentIdempotent(
-			ctx, threadID, authorName, req.Body, authorID,
+		comment, postErr := s.comments.PostCommentIdempotent(
+			ctx, threadID, authorName, req.Body, authorID, imageID,
 			*key, idempotencyEndpoint(c))
-		if err != nil {
-			respondError(c, err)
+		if postErr != nil {
+			respondError(c, postErr)
 			return
 		}
 		c.JSON(http.StatusCreated, toWireComment(comment))
 		return
 	}
 
-	comment, err := s.comments.PostComment(ctx, threadID, authorName, req.Body, authorID)
+	comment, err := s.comments.PostComment(ctx, threadID, authorName, req.Body, authorID, imageID)
 	if err != nil {
 		respondError(c, err)
 		return

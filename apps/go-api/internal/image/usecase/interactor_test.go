@@ -1,0 +1,321 @@
+package usecase
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/google/uuid"
+
+	"develop-experiments/apps/go-api/internal/apperr"
+	"develop-experiments/apps/go-api/internal/image/domain/model"
+	"develop-experiments/apps/go-api/internal/image/domain/repository"
+)
+
+// ---------------------------------------------------------------------------
+// フェイク
+// ---------------------------------------------------------------------------
+
+// fakeImageRepo と fakeStorage は**呼ばれた順序**を共有の log に記録します。
+// ADR 0007 決定 3 が定めているのは順序そのものなので、
+// 「何が呼ばれたか」だけでは検証になりません。
+type recorder struct{ log []string }
+
+func (r *recorder) add(op string) { r.log = append(r.log, op) }
+
+type fakeImageRepo struct {
+	rec       *recorder
+	stored    map[uuid.UUID]*model.Image
+	createErr error
+	commitErr error
+	findErr   error
+}
+
+var _ repository.ImageRepository = (*fakeImageRepo)(nil)
+
+func newFakeImageRepo(rec *recorder) *fakeImageRepo {
+	return &fakeImageRepo{rec: rec, stored: map[uuid.UUID]*model.Image{}}
+}
+
+func (f *fakeImageRepo) CreatePending(_ context.Context, img *model.Image) (*model.Image, error) {
+	f.rec.add("db:create_pending")
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	cp := *img
+	f.stored[cp.ID] = &cp
+	return &cp, nil
+}
+
+func (f *fakeImageRepo) Commit(_ context.Context, id uuid.UUID) (*model.Image, error) {
+	f.rec.add("db:commit")
+	if f.commitErr != nil {
+		return nil, f.commitErr
+	}
+	img, ok := f.stored[id]
+	if !ok {
+		return nil, apperr.ErrNotFound
+	}
+	img.Status = model.StatusCommitted
+	return img, nil
+}
+
+func (f *fakeImageRepo) FindByID(_ context.Context, id uuid.UUID) (*model.Image, error) {
+	if f.findErr != nil {
+		return nil, f.findErr
+	}
+	img, ok := f.stored[id]
+	if !ok {
+		return nil, apperr.ErrNotFound
+	}
+	return img, nil
+}
+
+type fakeStorage struct {
+	rec    *recorder
+	putErr error
+	// objects は key -> バイト列。
+	objects map[string][]byte
+}
+
+var _ repository.ObjectStorage = (*fakeStorage)(nil)
+
+func newFakeStorage(rec *recorder) *fakeStorage {
+	return &fakeStorage{rec: rec, objects: map[string][]byte{}}
+}
+
+func (f *fakeStorage) Put(_ context.Context, key, _ string, body []byte) error {
+	f.rec.add("storage:put")
+	if f.putErr != nil {
+		return f.putErr
+	}
+	f.objects[key] = body
+	return nil
+}
+
+func (f *fakeStorage) Delete(_ context.Context, key string) error {
+	f.rec.add("storage:delete")
+	delete(f.objects, key)
+	return nil
+}
+
+func (f *fakeStorage) URL(key string) string { return "https://cdn.example.test/" + key }
+
+func newTestInteractor(t *testing.T) (*ImageInteractor, *fakeImageRepo, *fakeStorage, *recorder) {
+	t.Helper()
+
+	rec := &recorder{}
+	repo := newFakeImageRepo(rec)
+	storage := newFakeStorage(rec)
+	return NewImageInteractor(repo, storage, nil), repo, storage, rec
+}
+
+// ---------------------------------------------------------------------------
+// 順序 (ADR 0007 決定 3)
+// ---------------------------------------------------------------------------
+
+// **DB を先に書き、そのあとストレージへ書き、最後に確定させる。**
+//
+// 逆順 (ストレージが先) にすると、DB に記録の無いオブジェクトが残り、
+// 全件リストと突き合わせないと見つけられなくなる。
+func TestUpload_WritesDatabaseBeforeStorage(t *testing.T) {
+	t.Parallel()
+
+	uc, _, _, rec := newTestInteractor(t)
+
+	if _, err := uc.Upload(context.Background(), 42, "comment_attachment", makePNG(t, 64, 64)); err != nil {
+		t.Fatalf("Upload が失敗した: %v", err)
+	}
+
+	want := []string{"db:create_pending", "storage:put", "db:commit"}
+	if len(rec.log) != len(want) {
+		t.Fatalf("呼び出し = %v, want %v", rec.log, want)
+	}
+	for i := range want {
+		if rec.log[i] != want[i] {
+			t.Fatalf("呼び出し = %v, want %v", rec.log, want)
+		}
+	}
+}
+
+// **PUT に失敗しても pending の行を消さない** (ADR 0007 決定 3)。
+//
+// 消すと、PUT が実は成功していた場合に「DB に記録の無いオブジェクト」が残る。
+// 残しておけば回収バッチが両方を消せる。
+func TestUpload_KeepsPendingRowWhenStorageFails(t *testing.T) {
+	t.Parallel()
+
+	uc, repo, storage, rec := newTestInteractor(t)
+	storage.putErr = errors.New("S3 に届かない")
+
+	if _, err := uc.Upload(context.Background(), 42, "comment_attachment", makePNG(t, 64, 64)); err == nil {
+		t.Fatal("PUT が失敗したのに成功が返った")
+	}
+
+	if len(repo.stored) != 1 {
+		t.Fatalf("pending の行が %d 件。1 件残っているべき", len(repo.stored))
+	}
+	for _, img := range repo.stored {
+		if img.Status != model.StatusPending {
+			t.Errorf("status = %q, want pending", img.Status)
+		}
+	}
+	// **後始末で削除を呼ばないこと。**
+	for _, op := range rec.log {
+		if op == "storage:delete" {
+			t.Error("PUT の失敗時に Delete を呼んでいる (回収バッチの仕事)")
+		}
+	}
+}
+
+// 確定に失敗した場合も pending のまま残る。
+// オブジェクトと行が対で残るので、回収バッチが両方を消せる。
+func TestUpload_KeepsPendingRowWhenCommitFails(t *testing.T) {
+	t.Parallel()
+
+	uc, repo, _, _ := newTestInteractor(t)
+	repo.commitErr = errors.New("DB が落ちている")
+
+	if _, err := uc.Upload(context.Background(), 42, "comment_attachment", makePNG(t, 64, 64)); err == nil {
+		t.Fatal("確定が失敗したのに成功が返った")
+	}
+	for _, img := range repo.stored {
+		if img.Status != model.StatusPending {
+			t.Errorf("status = %q, want pending", img.Status)
+		}
+	}
+}
+
+// **DB の書き込みに失敗したら、ストレージには触らない。**
+// 触ると、記録の無いオブジェクトが生まれる。
+func TestUpload_DoesNotTouchStorageWhenDatabaseFails(t *testing.T) {
+	t.Parallel()
+
+	uc, repo, storage, _ := newTestInteractor(t)
+	repo.createErr = errors.New("DB が落ちている")
+
+	if _, err := uc.Upload(context.Background(), 42, "comment_attachment", makePNG(t, 64, 64)); err == nil {
+		t.Fatal("DB が失敗したのに成功が返った")
+	}
+	if len(storage.objects) != 0 {
+		t.Errorf("ストレージに %d 件書かれた。0 件であるべき", len(storage.objects))
+	}
+}
+
+// 成功時は、保存されたバイト列が**再エンコード後のもの**であること。
+func TestUpload_StoresReencodedBytes(t *testing.T) {
+	t.Parallel()
+
+	uc, _, storage, _ := newTestInteractor(t)
+	src := makePNG(t, 64, 64)
+
+	dto, err := uc.Upload(context.Background(), 42, "comment_attachment", src)
+	if err != nil {
+		t.Fatalf("Upload が失敗した: %v", err)
+	}
+
+	if len(storage.objects) != 1 {
+		t.Fatalf("ストレージの件数 = %d, want 1", len(storage.objects))
+	}
+	for key, body := range storage.objects {
+		if string(body) == string(src) {
+			t.Error("入力のバイト列がそのまま保存されている")
+		}
+		// キーは UUID + 拡張子。コメント添付なので .jpg。
+		if want := "images/" + dto.ID.String() + ".jpg"; key != want {
+			t.Errorf("key = %q, want %q", key, want)
+		}
+	}
+	// URL は絶対 URL (ADR 0007 決定 5)。
+	if dto.URL == "" || dto.URL[:5] != "https" {
+		t.Errorf("URL = %q, want 絶対 URL", dto.URL)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 用途の検証
+// ---------------------------------------------------------------------------
+
+func TestParseKind(t *testing.T) {
+	t.Parallel()
+
+	if _, err := ParseKind("comment_attachment"); err != nil {
+		t.Errorf("comment_attachment が拒否された: %v", err)
+	}
+
+	// **まだ開けていない用途を受け付けない。**
+	// 受け付けると、どこからも参照されない画像が作れてしまう。
+	for _, raw := range []string{"avatar", "thread_icon", "", "banner", "COMMENT_ATTACHMENT"} {
+		if _, err := ParseKind(raw); !errors.Is(err, apperr.ErrInvalidArgument) {
+			t.Errorf("kind=%q: err = %v, want apperr.ErrInvalidArgument", raw, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 所有者の確認
+// ---------------------------------------------------------------------------
+
+// **他人の画像は 404。** 403 を返すと「その ID の画像が存在すること」が漏れる
+// (docs/adr/0013-http-defense.md)。
+func TestEnsureOwned(t *testing.T) {
+	t.Parallel()
+
+	uc, repo, _, _ := newTestInteractor(t)
+
+	dto, err := uc.Upload(context.Background(), 42, "comment_attachment", makePNG(t, 32, 32))
+	if err != nil {
+		t.Fatalf("Upload が失敗した: %v", err)
+	}
+
+	t.Run("所有者なら通る", func(t *testing.T) {
+		if err := uc.EnsureOwned(context.Background(), 42, dto.ID); err != nil {
+			t.Errorf("所有者なのに拒否された: %v", err)
+		}
+	})
+
+	t.Run("他人は 404", func(t *testing.T) {
+		if err := uc.EnsureOwned(context.Background(), 99, dto.ID); !errors.Is(err, apperr.ErrNotFound) {
+			t.Errorf("err = %v, want apperr.ErrNotFound", err)
+		}
+	})
+
+	t.Run("存在しない画像も 404", func(t *testing.T) {
+		if err := uc.EnsureOwned(context.Background(), 42, uuid.New()); !errors.Is(err, apperr.ErrNotFound) {
+			t.Errorf("err = %v, want apperr.ErrNotFound", err)
+		}
+	})
+
+	t.Run("確定していない画像は添付できない", func(t *testing.T) {
+		// **ストレージにバイト列が無い可能性がある。**
+		// 添付できてしまうと、表示時に 404 になる画像が投稿に残る。
+		for _, img := range repo.stored {
+			img.Status = model.StatusPending
+		}
+		if err := uc.EnsureOwned(context.Background(), 42, dto.ID); !errors.Is(err, apperr.ErrNotFound) {
+			t.Errorf("err = %v, want apperr.ErrNotFound", err)
+		}
+	})
+}
+
+// 中断されたコンテキストではデコードを始めないこと。
+func TestUpload_RespectsCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	uc, _, _, rec := newTestInteractor(t)
+
+	// スロットを使い切ってから、キャンセル済みの ctx で呼ぶ。
+	for range defaultMaxConcurrentDecodes {
+		uc.decodeSlots <- struct{}{}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := uc.Upload(ctx, 42, "comment_attachment", makePNG(t, 32, 32)); err == nil {
+		t.Fatal("中断済みなのに成功した")
+	}
+	if len(rec.log) != 0 {
+		t.Errorf("中断済みなのに %v が呼ばれた", rec.log)
+	}
+}

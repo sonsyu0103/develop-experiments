@@ -70,12 +70,28 @@ func toWireComment(d commentusecase.CommentDTO) oapigen.Comment {
 			Withdrawn:   d.Author.Withdrawn,
 		}
 	}
+	// **画像の詰め替えを忘れない。**
+	// DTO に載っていても、ここで写さなければ応答に現れない。
+	// 初版はこれを落としており、ユニットテストは
+	// 「リポジトリに image_id が渡ったか」しか見ていなかったので通っていた。
+	// 実 DB を通すスモークで初めて落ちた。
+	var img *oapigen.Image
+	if d.Image != nil {
+		img = &oapigen.Image{
+			Id:     d.Image.ID,
+			Url:    d.Image.URL,
+			Width:  d.Image.Width,
+			Height: d.Image.Height,
+		}
+	}
+
 	return oapigen.Comment{
 		Id:         d.ID,
 		ThreadId:   d.ThreadID,
 		Seq:        d.Seq,
 		AuthorName: d.AuthorName,
 		Author:     author,
+		Image:      img,
 		Body:       d.Body,
 		CreatedAt:  d.CreatedAt,
 	}
