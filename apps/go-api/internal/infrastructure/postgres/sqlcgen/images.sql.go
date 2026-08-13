@@ -282,12 +282,17 @@ WHERE id = $1
   AND object_reclaimed_at IS NULL
 `
 
-// S3 のオブジェクトを消したことを記録する。
+// 回収対象を「確保」する。
 //
-// **DB 行を残す種類 ('deleted') に使う。**
-// これを書かないと、次の周回でも同じ行が対象に残り続け、
-// 回収バッチが毎回すべての削除済み画像へ DELETE を投げ直す
-// (索引も単調増加する。000006 の列コメントを参照)。
+// **status によらず、拾ったすべての行に対して呼ぶ。**
+// 列名は「S3 のオブジェクトを消した時刻」だが、**消す前に**書く。
+//
+//  1. 添付できなくする —— FindOwned は確保済みの画像を返さない。
+//     S3 を消したあとに書くと「実体は消えたのにまだ添付できる」窓が空く
+//  2. 対象から外す —— 'deleted' は DB 行を残すので (ADR 0016 問題 3)、
+//     記録が無いと次の周回でも同じ行が拾われ、
+//     毎回すべての削除済み画像へ DELETE を投げ直すことになる
+//     (索引も単調増加する。000006 の列コメントを参照)
 func (q *Queries) MarkImageReclaimed(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, markImageReclaimed, id)
 	if err != nil {

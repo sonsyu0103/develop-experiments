@@ -225,7 +225,8 @@ func run() error {
 		})
 	}
 
-	scheduler.New(jobs...).Start(ctx)
+	sched := scheduler.New(jobs...)
+	sched.Start(ctx)
 
 	srv := &http.Server{
 		Addr:    cfg.Addr,
@@ -260,6 +261,21 @@ func run() error {
 		if err := srv.Shutdown(shutdownCtx); err != nil {
 			return err
 		}
+
+		// **実行中の定期処理も待つ。**
+		//
+		// 画像の回収は「確保 -> S3 削除 -> 行削除」と進むので、
+		// 確保の直後に打ち切ると**確保済みの行が索引から外れたまま残り、
+		// 二度と拾われません** (S3 の実体ごと漏れる。レビュー指摘)。
+		//
+		// 猶予は HTTP と同じ shutdownCtx から取ります。使い切ったら
+		// 待たずに落ちますが、そのときは記録が残ります ——
+		// **黙って打ち切っていた**のが元の状態でした。
+		if err := sched.Wait(shutdownCtx); err != nil {
+			slog.Warn("定期処理の完了を待てませんでした",
+				slog.String("error", err.Error()))
+		}
+
 		slog.Info("シャットダウンが完了しました")
 		return nil
 	}

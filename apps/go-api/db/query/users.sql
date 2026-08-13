@@ -162,6 +162,12 @@ WITH previous AS (
     SET attached_at = now()
     WHERE images.id = sqlc.narg('avatar_image_id')
       AND images.attached_at IS NULL
+      -- **確保済みの画像は添付済みにしない** (レビュー指摘)。
+      -- EnsureOwned はロックを取らない読み取りなので、
+      -- 「確認したあと・書く前」に回収バッチが確保する窓がある。
+      -- この UPDATE は images の行ロックで待たされてから最新版を読むため、
+      -- ここに条件を置くと確保を追い越せない。
+      AND images.object_reclaimed_at IS NULL
       AND EXISTS (SELECT 1 FROM previous)
 )
 UPDATE users

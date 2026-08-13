@@ -64,6 +64,11 @@ func (r ReclaimResult) Total() int { return r.Deleted + r.Marked + r.Failed }
 // S3 の削除をトランザクションの外へ出すのは、100 件ぶんの往復のあいだ
 // 行ロックと接続を占有しないためです。
 //
+// **2 と 3 は ctx のキャンセルから切り離して走ります。**
+// 1 を終えた時点で「索引から外れた行」ができるため、そこで打ち切ると
+// S3 のオブジェクトごと恒久的に漏れます。呼び出し側は
+// Scheduler.Wait でプロセスの終了を待たせてください。
+//
 // 呼び出し側は「Deleted + Marked が 0 になるまで繰り返す」形で使ってください
 // (Failed は繰り返しても減らないので、終了条件に含めてはいけません)。
 func (i *ImageInteractor) Reclaim(
@@ -107,16 +112,32 @@ func (i *ImageInteractor) Reclaim(
 
 	var result ReclaimResult
 
+	// **確保したあとは、キャンセルから切り離す。**
+	//
+	// ここから先で ctx が切れると、確保済みの行が
+	// 「索引から外れているのに実体が残っている」状態で固定されます ——
+	// 次の周回では拾われないので、S3 のオブジェクトごと恒久的に漏れます。
+	//
+	// 起きるのは SIGTERM です。scheduler の ctx は main の
+	// signal.NotifyContext なので、シャットダウン開始と同時に切れます。
+	// **デプロイのたびに最大 batchSize (100) 件**が漏れていました
+	// (レビュー指摘)。
+	//
+	// 締め切りは足しません。ここに独自のタイムアウトを置くと、
+	// 正常時の長い周回まで途中で切ることになります。
+	// **プロセスが終わるまでの猶予は main が Scheduler.Wait で与えます。**
+	finish := context.WithoutCancel(ctx)
+
 	// 2. **トランザクションの外で S3 を消す。**
 	for _, img := range targets {
-		if err := i.storage.Delete(ctx, img.ObjectKey); err != nil {
+		if err := i.storage.Delete(finish, img.ObjectKey); err != nil {
 			result.Failed++
 			// **確保したまま残る。** 実体が残り、行も残る。
 			// 次の周回では拾われないので、放置すると容量を食う ——
 			// ログに ERROR で出し、運用で気づけるようにする
 			// (ここで確保を戻すと、恒久的に消せないオブジェクトが
 			//  先頭に詰まって後続を止める)。
-			slog.ErrorContext(ctx, "image_reclaim_storage_failed",
+			slog.ErrorContext(finish, "image_reclaim_storage_failed",
 				slog.String("image_id", img.ID.String()),
 				slog.String("object_key", img.ObjectKey),
 				slog.String("status", string(img.Status)),
@@ -137,9 +158,9 @@ func (i *ImageInteractor) Reclaim(
 		// 途中の失敗で「S3 は消えたのに行が残る」件数が増える
 		// (残った行は status が committed のままなので、
 		//  再確保もされず実体だけ無い状態になる)。
-		if err := i.images.Delete(ctx, img.ID); err != nil {
+		if err := i.images.Delete(finish, img.ID); err != nil {
 			result.Failed++
-			slog.ErrorContext(ctx, "image_reclaim_row_delete_failed",
+			slog.ErrorContext(finish, "image_reclaim_row_delete_failed",
 				slog.String("image_id", img.ID.String()),
 				slog.String("error", err.Error()),
 			)
@@ -149,7 +170,7 @@ func (i *ImageInteractor) Reclaim(
 	}
 
 	if result.Total() > 0 {
-		slog.InfoContext(ctx, "image_reclaim",
+		slog.InfoContext(finish, "image_reclaim",
 			slog.Int("deleted", result.Deleted),
 			slog.Int("marked", result.Marked),
 			slog.Int("failed", result.Failed),

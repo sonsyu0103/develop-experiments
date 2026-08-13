@@ -56,13 +56,8 @@ type ImageDTO struct {
 	Height int       `json:"height"`
 }
 
-// ImageResolver は添付画像の解決を担います。
-//
-// **image モジュールを import しません** (docs/adr/0004-modular-monolith.md)。
-// 利用側が必要な操作だけのインターフェースを定義する形は、
-// ThreadExistenceChecker と同じです。
-// 実装は image のユースケースが満たします。
 // imageKindCommentAttachment は EnsureOwned に渡す用途です。
+//
 // **image モジュールの定数を参照しません** (モジュールをまたがないため)。
 // 値がずれると添付が常に 404 になるので、スモークが検出します。
 const imageKindCommentAttachment = "comment_attachment"

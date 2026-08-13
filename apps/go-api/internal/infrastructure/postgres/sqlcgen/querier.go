@@ -186,6 +186,16 @@ type Querier interface {
 	//
 	// 期限切れの行は定期処理が消すが、消える前に引かれても通してはいけない。
 	// 掃除は容量のための処理であり、認可の判定に使うものではない。
+	// **実体が無い画像は結合しない** (レビュー指摘)。
+	//   status = 'deleted'          モデレーターが消した。回収バッチが S3 から実体を消す
+	//   object_reclaimed_at IS NOT NULL  回収済み。実体はもう無い
+	// どちらも URL を返すと、ブラウザには壊れた画像が出る。
+	// **条件は ON に置くこと。** WHERE に置くと LEFT が INNER に化けて、
+	// 画像なしの行 (大多数) が消える。
+	//
+	// ADR 0016 問題 3 は「画像は削除されました」と「元から画像なし」を
+	// 区別するために行を残すと決めているが、**その区別を表す API の項目がまだ無い。**
+	// Phase 10 後半で削除の UI を入れるとき、ここを status の受け渡しに変える。
 	GetLiveSessionWithUser(ctx context.Context, id string) (GetLiveSessionWithUserRow, error)
 	// 一覧と同じ理由で、JOIN + GROUP BY ではなく相関サブクエリで数える。
 	GetThreadWithCommentCount(ctx context.Context, id int64) (GetThreadWithCommentCountRow, error)
@@ -234,6 +244,16 @@ type Querier interface {
 	// 書いている。同じ人が連投すると、同じ投稿者の情報が最大 100 行ぶん
 	// 重複して転送されるため。初手は A で揃え、B (ListAuthorsByIDs) との
 	// 比較は Phase 4 のベンチマークで行う。
+	// **実体が無い画像は結合しない** (レビュー指摘)。
+	//   status = 'deleted'          モデレーターが消した。回収バッチが S3 から実体を消す
+	//   object_reclaimed_at IS NOT NULL  回収済み。実体はもう無い
+	// どちらも URL を返すと、ブラウザには壊れた画像が出る。
+	// **条件は ON に置くこと。** WHERE に置くと LEFT が INNER に化けて、
+	// 画像なしの行 (大多数) が消える。
+	//
+	// ADR 0016 問題 3 は「画像は削除されました」と「元から画像なし」を
+	// 区別するために行を残すと決めているが、**その区別を表す API の項目がまだ無い。**
+	// Phase 10 後半で削除の UI を入れるとき、ここを status の受け渡しに変える。
 	ListCommentsByThreadID(ctx context.Context, arg ListCommentsByThreadIDParams) ([]ListCommentsByThreadIDRow, error)
 	// 回収バッチが拾う行 (ADR 0007 決定 3 / ADR 0016 問題 3)。
 	//
@@ -330,6 +350,16 @@ type Querier interface {
 	//
 	// JOIN は page で 20 件に絞ったあとに掛ける。
 	// 内側の CTE に混ぜると、絞り込む前の全行に対して結合が走る。
+	// **実体が無い画像は結合しない** (レビュー指摘)。
+	//   status = 'deleted'          モデレーターが消した。回収バッチが S3 から実体を消す
+	//   object_reclaimed_at IS NOT NULL  回収済み。実体はもう無い
+	// どちらも URL を返すと、ブラウザには壊れた画像が出る。
+	// **条件は ON に置くこと。** WHERE に置くと LEFT が INNER に化けて、
+	// 画像なしの行 (大多数) が消える。
+	//
+	// ADR 0016 問題 3 は「画像は削除されました」と「元から画像なし」を
+	// 区別するために行を残すと決めているが、**その区別を表す API の項目がまだ無い。**
+	// Phase 10 後半で削除の UI を入れるとき、ここを status の受け渡しに変える。
 	ListThreadsWithCommentCount(ctx context.Context, arg ListThreadsWithCommentCountParams) ([]ListThreadsWithCommentCountRow, error)
 	// スレッド行に行ロックを取る。**pessimistic モードの起点** (ADR 0019 決定 2)。
 	//
@@ -347,12 +377,17 @@ type Querier interface {
 	// SSI (SERIALIZABLE) を使うならこの明示ロックは不要だが、
 	// 悲観ロック版と楽観 (SSI) 版のスループット差を計測するために両方用意している。
 	LockThreadForUpdate(ctx context.Context, id int64) (int64, error)
-	// S3 のオブジェクトを消したことを記録する。
+	// 回収対象を「確保」する。
 	//
-	// **DB 行を残す種類 ('deleted') に使う。**
-	// これを書かないと、次の周回でも同じ行が対象に残り続け、
-	// 回収バッチが毎回すべての削除済み画像へ DELETE を投げ直す
-	// (索引も単調増加する。000006 の列コメントを参照)。
+	// **status によらず、拾ったすべての行に対して呼ぶ。**
+	// 列名は「S3 のオブジェクトを消した時刻」だが、**消す前に**書く。
+	//
+	//   1. 添付できなくする —— FindOwned は確保済みの画像を返さない。
+	//      S3 を消したあとに書くと「実体は消えたのにまだ添付できる」窓が空く
+	//   2. 対象から外す —— 'deleted' は DB 行を残すので (ADR 0016 問題 3)、
+	//      記録が無いと次の周回でも同じ行が拾われ、
+	//      毎回すべての削除済み画像へ DELETE を投げ直すことになる
+	//      (索引も単調増加する。000006 の列コメントを参照)
 	MarkImageReclaimed(ctx context.Context, id uuid.UUID) (int64, error)
 	// スレッド内の次のレス番号を求める。**Phase 2 の題材の中心** (ADR 0019 決定 1)。
 	//

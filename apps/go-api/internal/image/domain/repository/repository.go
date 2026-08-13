@@ -43,10 +43,21 @@ type ImageRepository interface {
 	// 数十秒のあいだ、参照されていない committed は正常な状態だからです。
 	ListReclaimable(ctx context.Context, grace time.Duration, maxRows int32) ([]model.Image, error)
 
-	// MarkReclaimed は S3 のオブジェクトを消したことを記録します。
+	// MarkReclaimed は回収対象を「確保」します。
 	//
-	// **DB 行を残す種類 ('deleted') に使います** (ADR 0016 問題 3)。
-	// 記録しないと、次の周回でも同じ行が対象に残り続けます。
+	// **status によらず、拾ったすべての行に対して呼びます。**
+	// 名前は「S3 のオブジェクトを消した記録」ですが、
+	// 実際には**消す前に**書きます。理由が 2 つあります。
+	//
+	//  1. **添付できなくする。** FindOwned は確保済みの画像を返しません。
+	//     S3 を消したあとに書くと、「実体は消えたのにまだ添付できる」
+	//     窓が空きます (レビュー指摘で実際に踏んだ形)
+	//  2. **対象から外す。** 'deleted' は DB 行を残すので (ADR 0016 問題 3)、
+	//     ここに記録が無いと次の周回でも同じ行が拾われ続けます
+	//
+	// **'deleted' 専用だと読まないでください。** 'pending' と 'committed' で
+	// 呼ばなくすると、1 の窓が開き、同じ行を毎周回で拾い直します
+	// (変異 ② が検出します)。
 	MarkReclaimed(ctx context.Context, id uuid.UUID) error
 
 	// Delete は DB 行ごと消します。

@@ -634,3 +634,121 @@ func seedThread(t *testing.T, pool *pgxpool.Pool, authorID *int64) int64 {
 	})
 	return id
 }
+
+// ---------------------------------------------------------------------------
+// 実体の無い画像を配らないこと (レビュー指摘)
+// ---------------------------------------------------------------------------
+//
+// status = 'deleted' と回収済みの画像は、行こそ残りますが
+// **S3 の実体は消えています。** URL を返すとブラウザには壊れた画像が出ます。
+// 結合の ON に条件を置いて、画像なしとして扱います。
+
+// **削除済みのアイコンはスレッドの応答に出ないこと。**
+func TestGetThread_SkipsDeletedIcon_Live(t *testing.T) {
+	pool := liveDB(t)
+	const ownerID = int64(900314)
+	seedOwner(t, pool, ownerID)
+
+	ctx := t.Context()
+	q := sqlcgen.New(pool)
+
+	id := insertImageOf(t, pool, ownerID, "thread_icon", model.StatusCommitted, 2*time.Hour)
+	author := ownerID
+	row, err := q.CreateThread(ctx, sqlcgen.CreateThreadParams{
+		Title: "アイコン付き", AuthorID: &author, IconImageID: &id,
+	})
+	if err != nil {
+		t.Fatalf("スレッドを作れませんでした: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM threads WHERE id = $1`, row.ID)
+	})
+
+	// 作った直後は出る (前提の確認)。
+	got, err := q.GetThreadWithCommentCount(ctx, row.ID)
+	if err != nil {
+		t.Fatalf("引けませんでした: %v", err)
+	}
+	if got.IconID == nil {
+		t.Fatal("前提が崩れている: 通常はアイコンが出ること")
+	}
+
+	// モデレーターが消すと出なくなる。
+	if _, execErr := pool.Exec(ctx,
+		`UPDATE images SET status = 'deleted' WHERE id = $1`, id); execErr != nil {
+		t.Fatalf("削除済みにできませんでした: %v", execErr)
+	}
+	got, err = q.GetThreadWithCommentCount(ctx, row.ID)
+	if err != nil {
+		t.Fatalf("引けませんでした: %v", err)
+	}
+	if got.IconID != nil {
+		t.Error("削除済みのアイコンが応答に出ている (実体はもう無い)")
+	}
+	// **スレッド自体は消えないこと** (LEFT が INNER に化けていないか)。
+	if got.ID != row.ID {
+		t.Errorf("スレッドが引けなくなっている (ON ではなく WHERE に置いていないか)")
+	}
+}
+
+// **回収済みのアイコンも同じく出ないこと。**
+func TestGetThread_SkipsReclaimedIcon_Live(t *testing.T) {
+	pool := liveDB(t)
+	const ownerID = int64(900315)
+	seedOwner(t, pool, ownerID)
+
+	ctx := t.Context()
+	q := sqlcgen.New(pool)
+
+	id := insertImageOf(t, pool, ownerID, "thread_icon", model.StatusCommitted, 2*time.Hour)
+	author := ownerID
+	row, err := q.CreateThread(ctx, sqlcgen.CreateThreadParams{
+		Title: "アイコン付き", AuthorID: &author, IconImageID: &id,
+	})
+	if err != nil {
+		t.Fatalf("スレッドを作れませんでした: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM threads WHERE id = $1`, row.ID)
+	})
+
+	if _, execErr := pool.Exec(ctx,
+		`UPDATE images SET object_reclaimed_at = now() WHERE id = $1`, id); execErr != nil {
+		t.Fatalf("回収済みにできませんでした: %v", execErr)
+	}
+	got, err := q.GetThreadWithCommentCount(ctx, row.ID)
+	if err != nil {
+		t.Fatalf("引けませんでした: %v", err)
+	}
+	if got.IconID != nil {
+		t.Error("回収済みのアイコンが応答に出ている")
+	}
+}
+
+// **確保済みの画像は添付済みにしないこと** (レビュー指摘)。
+//
+// EnsureOwned はロックを取らない読み取りなので、「確認したあと・書く前」に
+// 回収バッチが確保する窓があります。添付の UPDATE は images の行ロックで
+// 待たされてから最新版を読むため、ここに条件を置くと追い越されません。
+func TestSetAvatarImage_DoesNotAttachReclaimed_Live(t *testing.T) {
+	pool := liveDB(t)
+	const ownerID = int64(900316)
+	seedOwner(t, pool, ownerID)
+
+	ctx := t.Context()
+	sessions := NewSessionRepository(pool)
+
+	id := insertImageOf(t, pool, ownerID, "avatar", model.StatusCommitted, 2*time.Hour)
+	if _, err := pool.Exec(ctx,
+		`UPDATE images SET object_reclaimed_at = now() WHERE id = $1`, id); err != nil {
+		t.Fatalf("確保できませんでした: %v", err)
+	}
+
+	if _, err := sessions.SetAvatarImage(ctx, ownerID, &id); err != nil {
+		t.Fatalf("設定に失敗した: %v", err)
+	}
+
+	if at := attachedAt(t, pool, id); at != nil {
+		t.Errorf("確保済みの画像が添付済みになった (attached_at=%v)", at)
+	}
+}

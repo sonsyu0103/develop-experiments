@@ -63,12 +63,8 @@ type ThreadInteractor struct {
 	images ImageResolver
 }
 
-// ImageResolver はアイコンの解決を担います。
-//
-// **image モジュールを import しません** (ADR 0004)。
-// 利用側が必要な操作だけのインターフェースを定義する形は、
-// comment モジュールと同じです。
 // imageKindThreadIcon は EnsureOwned に渡す用途です。
+//
 // **image モジュールの定数を参照しません** (モジュールをまたがないため)。
 // 値がずれると添付が常に 404 になるので、スモークが検出します。
 const imageKindThreadIcon = "thread_icon"

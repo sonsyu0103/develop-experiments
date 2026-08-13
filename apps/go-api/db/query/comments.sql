@@ -50,7 +50,18 @@ SELECT
     i.height     AS image_height
 FROM page p
 LEFT JOIN users u ON u.id = p.author_id
+-- **実体が無い画像は結合しない** (レビュー指摘)。
+--   status = 'deleted'          モデレーターが消した。回収バッチが S3 から実体を消す
+--   object_reclaimed_at IS NOT NULL  回収済み。実体はもう無い
+-- どちらも URL を返すと、ブラウザには壊れた画像が出る。
+-- **条件は ON に置くこと。** WHERE に置くと LEFT が INNER に化けて、
+-- 画像なしの行 (大多数) が消える。
+--
+-- ADR 0016 問題 3 は「画像は削除されました」と「元から画像なし」を
+-- 区別するために行を残すと決めているが、**その区別を表す API の項目がまだ無い。**
+-- Phase 10 後半で削除の UI を入れるとき、ここを status の受け渡しに変える。
 LEFT JOIN images i ON i.id = p.image_id
+    AND i.status <> 'deleted' AND i.object_reclaimed_at IS NULL
 ORDER BY p.id DESC;
 
 -- name: NextCommentSeq :one
@@ -109,6 +120,12 @@ WITH inserted AS (
     SET attached_at = now()
     WHERE id = (SELECT image_id FROM inserted)
       AND attached_at IS NULL
+      -- **確保済みの画像は添付済みにしない** (レビュー指摘)。
+      -- EnsureOwned はロックを取らない読み取りなので、
+      -- 「確認したあと・書く前」に回収バッチが確保する窓がある。
+      -- この UPDATE は images の行ロックで待たされてから最新版を読むため、
+      -- ここに条件を置くと確保を追い越せない。
+      AND object_reclaimed_at IS NULL
 )
 SELECT
     i.id,
@@ -127,7 +144,8 @@ SELECT
     img.height     AS image_height
 FROM inserted i
 LEFT JOIN users u ON u.id = i.author_id
-LEFT JOIN images img ON img.id = i.image_id;
+LEFT JOIN images img ON img.id = i.image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL;
 
 -- name: CreateCommentAutoSeq :one
 -- 採番と挿入を 1 文で行う。unique モード専用 (ADR 0019 決定 2)。
@@ -180,6 +198,12 @@ WITH inserted AS (
     SET attached_at = now()
     WHERE id = (SELECT image_id FROM inserted)
       AND attached_at IS NULL
+      -- **確保済みの画像は添付済みにしない** (レビュー指摘)。
+      -- EnsureOwned はロックを取らない読み取りなので、
+      -- 「確認したあと・書く前」に回収バッチが確保する窓がある。
+      -- この UPDATE は images の行ロックで待たされてから最新版を読むため、
+      -- ここに条件を置くと確保を追い越せない。
+      AND object_reclaimed_at IS NULL
 )
 SELECT
     i.id,
@@ -198,7 +222,8 @@ SELECT
     img.height     AS image_height
 FROM inserted i
 LEFT JOIN users u ON u.id = i.author_id
-LEFT JOIN images img ON img.id = i.image_id;
+LEFT JOIN images img ON img.id = i.image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL;
 
 -- name: SoftDeleteComment :execrows
 -- 現時点で HTTP エンドポイントからは呼ばれていない。

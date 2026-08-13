@@ -205,3 +205,86 @@ func TestNew_NormalizesNegativeInterval(t *testing.T) {
 		t.Errorf("Interval = %v, want %v", got, DefaultInterval)
 	}
 }
+
+// **Wait は実行中の Job が終わるまで返らないこと。**
+//
+// これが無いと、シャットダウンで実行中の処理がプロセスごと打ち切られます。
+// 画像の回収は「確保 -> S3 削除 -> 行削除」と進むので、
+// 途中で落とすと確保済みの行が恒久的に漏れます (レビュー指摘)。
+func TestScheduler_WaitBlocksUntilRunningJobFinishes(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var finished atomic.Bool
+
+	s := New(Job{
+		Name:     "long",
+		Interval: time.Millisecond,
+		Run: func(context.Context) error {
+			select {
+			case <-started:
+			default:
+				close(started)
+			}
+			<-release
+			finished.Store(true)
+			return nil
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s.Start(ctx)
+	<-started
+
+	// 実行中にシャットダウンが始まる。
+	cancel()
+
+	waited := make(chan error, 1)
+	go func() { waited <- s.Wait(context.Background()) }()
+
+	select {
+	case <-waited:
+		t.Fatal("実行中の Job を待たずに Wait が返った")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-waited; err != nil {
+		t.Errorf("Wait が error を返した: %v", err)
+	}
+	if !finished.Load() {
+		t.Error("Job が最後まで走っていない")
+	}
+}
+
+// **待ち切れなければ ctx の error を返すこと。**
+//
+// 呼び出し側 (main) は猶予を使い切ったら記録を残して落ちます。
+// **黙って打ち切る**のが元の状態でした。
+func TestScheduler_WaitRespectsDeadline(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	defer close(release)
+
+	s := New(Job{
+		Name:     "stuck",
+		Interval: time.Millisecond,
+		Run: func(context.Context) error {
+			<-release
+			return nil
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.Start(ctx)
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer waitCancel()
+
+	if err := s.Wait(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("Wait = %v, want context.DeadlineExceeded", err)
+	}
+}

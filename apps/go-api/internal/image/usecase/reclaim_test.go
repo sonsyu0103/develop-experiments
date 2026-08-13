@@ -319,3 +319,68 @@ func TestReclaimResult_Total(t *testing.T) {
 	}
 	_ = uuid.Nil
 }
+
+// **確保のあとに ctx が切れても、回収を最後までやり切ること。**
+//
+// 定期処理の ctx は main の signal.NotifyContext なので、
+// SIGTERM と同時に切れます。確保 (object_reclaimed_at の書き込み) は
+// commit 済みなので、そこで打ち切ると
+//
+//   - 行は索引の述語から外れている (attached_at / status では拾えない)
+//   - S3 のオブジェクトは残っている
+//
+// という状態で固定され、**次の周回でも二度と拾われません。**
+// デプロイのたびに最大 batchSize 件が漏れていました (レビュー指摘)。
+func TestReclaim_FinishesAfterContextCancel(t *testing.T) {
+	t.Parallel()
+
+	uc, repo, storage, _ := newTestInteractor(t)
+	img := seed(t, repo, storage, model.StatusPending, 2*time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 確保をコミットした直後に SIGTERM が来た状態を作る。
+	repo.afterReserve = cancel
+
+	got, err := uc.Reclaim(ctx, time.Hour, 10)
+	if err != nil {
+		t.Fatalf("Reclaim が失敗した: %v", err)
+	}
+
+	if got.Failed != 0 {
+		t.Errorf("Failed = %d, want 0 (キャンセルで打ち切られている: %+v)", got.Failed, got)
+	}
+	if got.Deleted != 1 {
+		t.Errorf("Deleted = %d, want 1 (%+v)", got.Deleted, got)
+	}
+	if _, ok := storage.objects[img.ObjectKey]; ok {
+		t.Error("実体が残っている (確保だけして S3 を消せていない = 恒久的に漏れる)")
+	}
+	if _, ok := repo.stored[img.ID]; ok {
+		t.Error("DB 行が残っている")
+	}
+}
+
+// **確保する前に ctx が切れたら、何も確保しないこと。**
+//
+// 切り離すのは「確保のあと」だけです。確保そのものまで
+// キャンセルから守ると、シャットダウン中に新しい対象を掴み始めます。
+func TestReclaim_DoesNotReserveAfterContextCancel(t *testing.T) {
+	t.Parallel()
+
+	uc, repo, storage, _ := newTestInteractor(t)
+	img := seed(t, repo, storage, model.StatusPending, 2*time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := uc.Reclaim(ctx, time.Hour, 10); err == nil {
+		t.Fatal("キャンセル済みの ctx で確保が成功した")
+	}
+	if repo.stored[img.ID].ObjectReclaimedAt != nil {
+		t.Error("確保の記録が残っている")
+	}
+	if _, ok := storage.objects[img.ObjectKey]; !ok {
+		t.Error("実体が消えている")
+	}
+}

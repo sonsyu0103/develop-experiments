@@ -31,6 +31,9 @@ type fakeImageRepo struct {
 	commitErr error
 	findErr   error
 	listErr   error
+	// afterReserve は WithinTx が成功して抜けた直後に呼ばれます。
+	// 「確保をコミットした直後に SIGTERM が来た」を作るための穴です。
+	afterReserve func()
 }
 
 var _ repository.ImageRepository = (*fakeImageRepo)(nil)
@@ -76,7 +79,13 @@ func (f *fakeImageRepo) FindByID(_ context.Context, id uuid.UUID) (*model.Image,
 // 回収バッチ用。トランザクションは張らず、そのまま自分を渡します
 // (フェイクなので「同じトランザクション」を再現する必要がない)。
 func (f *fakeImageRepo) WithinTx(_ context.Context, fn func(repository.ImageRepository) error) error {
-	return fn(f)
+	if err := fn(f); err != nil {
+		return err
+	}
+	if f.afterReserve != nil {
+		f.afterReserve()
+	}
+	return nil
 }
 
 func (f *fakeImageRepo) ListReclaimable(
@@ -104,8 +113,11 @@ func (f *fakeImageRepo) ListReclaimable(
 	return out, nil
 }
 
-func (f *fakeImageRepo) MarkReclaimed(_ context.Context, id uuid.UUID) error {
+func (f *fakeImageRepo) MarkReclaimed(ctx context.Context, id uuid.UUID) error {
 	f.rec.add("db:mark_reclaimed")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if img, ok := f.stored[id]; ok {
 		now := time.Now()
 		img.ObjectReclaimedAt = &now
@@ -113,8 +125,14 @@ func (f *fakeImageRepo) MarkReclaimed(_ context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (f *fakeImageRepo) Delete(_ context.Context, id uuid.UUID) error {
+// **ctx を見ます。** pgx はキャンセル済みの ctx で必ず失敗するので、
+// 無視するフェイクだと「シャットダウン中に消せていたつもり」を再現できません
+// (レビュー指摘 —— 実際にそこが穴になっていました)。
+func (f *fakeImageRepo) Delete(ctx context.Context, id uuid.UUID) error {
 	f.rec.add("db:delete")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	delete(f.stored, id)
 	return nil
 }
@@ -142,8 +160,12 @@ func (f *fakeStorage) Put(_ context.Context, key, _ string, body []byte) error {
 	return nil
 }
 
-func (f *fakeStorage) Delete(_ context.Context, key string) error {
+// ctx を見ます (Delete と同じ理由。AWS SDK もキャンセルで失敗します)。
+func (f *fakeStorage) Delete(ctx context.Context, key string) error {
 	f.rec.add("storage:delete")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if f.deleteErr != nil {
 		return f.deleteErr
 	}

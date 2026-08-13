@@ -19,6 +19,7 @@ import (
 	"context"
 	"log/slog"
 	"math/rand/v2"
+	"sync"
 	"time"
 )
 
@@ -39,6 +40,8 @@ type Job struct {
 // Scheduler は登録された Job を回します。
 type Scheduler struct {
 	jobs []Job
+	// inFlight は実行中の Job を数えます。Wait が待ち合わせに使います。
+	inFlight sync.WaitGroup
 }
 
 // DefaultInterval は Interval が指定されなかった場合の間隔です。
@@ -72,12 +75,46 @@ func New(jobs ...Job) *Scheduler {
 
 // Start は各 Job を goroutine で回し始めます。
 //
-// ctx がキャンセルされるまで動き続けます。**戻り値はありません** ——
-// 呼び出し側 (main) は HTTP サーバの終了を待つので、
-// ここで待ち合わせを増やすとシャットダウンの経路が 2 本になります。
+// ctx がキャンセルされるまで動き続けます。
+// **終了は Wait で待ち合わせてください** —— 下の Wait の説明を参照。
 func (s *Scheduler) Start(ctx context.Context) {
 	for _, job := range s.jobs {
-		go s.run(ctx, job)
+		s.inFlight.Go(func() { s.run(ctx, job) })
+	}
+}
+
+// Wait は実行中の Job が終わるまで待ちます。ctx が先に切れたらその error を返します。
+//
+// **初版はこれを持っていませんでした。** Start は起動して返るだけで、
+// main は HTTP サーバの終了しか待っていなかったため、
+// **シャットダウンのたびに実行中の Job がプロセスごと打ち切られていました。**
+//
+// 打ち切りが単に「次の周回に持ち越し」で済む処理ばかりなら害はありません。
+// しかし画像の回収は、
+//
+//  1. 対象を確保する (object_reclaimed_at を書いて commit)
+//  2. S3 のオブジェクトを消す
+//  3. DB 行を消す
+//
+// と進むので、1 の後で打ち切られると**確保済みの行が索引から外れたまま残り、
+// 二度と拾われません** (S3 の実体ごと漏れる)。デプロイのたびに
+// 最大 100 件です (レビュー指摘)。
+//
+// そのため待ち合わせを 1 本足しました。**シャットダウンの経路が 2 本に
+// なるのを避けて省いていた**のですが、避けた結果が「消し損ねが恒久的に
+// 残る」だったので、順番に待つ形に改めます。
+func (s *Scheduler) Wait(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.inFlight.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

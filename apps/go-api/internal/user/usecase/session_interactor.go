@@ -28,11 +28,8 @@ type SessionInteractor struct {
 	images ImageResolver
 }
 
-// ImageResolver はプロフィール画像の解決を担います。
-//
-// **image モジュールを import しません** (ADR 0004)。
-// comment / thread と同じく、利用側が必要な操作だけを宣言します。
 // imageKindAvatar は EnsureOwned に渡す用途です。
+//
 // **image モジュールの定数を参照しません** (モジュールをまたがないため)。
 // 値がずれると添付が常に 404 になるので、スモークが検出します。
 const imageKindAvatar = "avatar"
