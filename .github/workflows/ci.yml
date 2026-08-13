@@ -12,7 +12,19 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: '1.25'
+  # **patch まで固定する。**
+  #
+  # 初版は '1.25' + check-latest だった。しかし check-latest が見るのは
+  # actions/go-versions の manifest であって go.dev ではない。
+  # **Go 側で脆弱性が公表されてから manifest に載るまでに時差があり**、
+  # その間 govulncheck (exit 3) だけが落ちて CI が赤くなる。
+  # 実際に 1.25.13 の公開当日、manifest は 1.25.12 のままだった。
+  #
+  # setup-go は manifest に無いバージョンを go.dev から取りにいくので、
+  # patch まで書けば公表と同時に上げられる。
+  # 他のツール (GOLANGCI_LINT_VERSION など) と同じ扱いになる ——
+  # 更新は「意図した変更」としてコミットに残す。
+  GO_VERSION: '1.25.13'
   NODE_VERSION: '22'
   # バージョンを固定する理由:
   #   @latest だと、リンタ側のルール追加で CI が突然赤くなる。
