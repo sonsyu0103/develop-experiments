@@ -168,6 +168,58 @@ SELECT EXISTS (
     WHERE id = sqlc.arg('id') AND deleted_at IS NULL
 );
 
+-- name: SoftDeleteOwnThread :execrows
+-- 投稿者が自分のスレッドを論理削除する (ADR 0005 の権限モデル / ADR 0003 未決 #7)。
+--
+-- **消えるのは「生きている自分のスレッド」だけ。** 3 つの条件が揃わないと
+-- 0 行になる。0 行だった理由 (無い / 他人のもの / 匿名) は
+-- ThreadOwnership が別に答える。
+--
+-- 【匿名投稿は当たらない】
+-- author_id が NULL のとき `author_id = $2` は NULL (真ではない) になるので、
+-- **明示的な IS NOT NULL は要らない。** 三値論理がそのまま
+-- 「本人であることを示せない」を表している。
+-- 匿名投稿を消せるのはモデレーターだけ (ADR 0011 決定 2)。
+--
+-- 【コメントも添付画像も消さない】
+-- スレッドが論理削除されると一覧・取得のどちらからも消えるため、
+-- コメントを個別に消して回る必要がない (8 パーティションすべてに
+-- UPDATE を投げることにもなる)。画像を実際に消すのはモデレーションの操作
+-- (ADR 0011 決定 5) で、自分の投稿を消しただけで実体まで消すと
+-- 誤操作の巻き戻しができなくなる。
+UPDATE threads
+SET deleted_at = now()
+WHERE id = sqlc.arg('id')
+  AND author_id = sqlc.arg('actor_id')
+  AND deleted_at IS NULL;
+
+-- name: ThreadOwnership :one
+-- 削除が 0 行だったときに、その理由を答える。
+--
+-- **成功したときには引かない。** 呼ぶのは失敗の分類のためだけで、
+-- 常に 2 往復させるためではない。
+--
+-- 行が返らなければ「無い、または既に消えている」= 404。
+-- 返って owned = false なら「他人のもの、または匿名」= 403。
+--
+-- 【1 文にまとめなかった理由】
+-- 判定と更新を CTE 1 本に畳む形も書けるが、**sqlc の解析器が
+-- CTE と更新対象テーブルのスコープを混ぜてしまい、
+-- author_id を ambiguous として生成に失敗する** (PostgreSQL は通る)。
+-- 生成器に通らない形を無理に維持するより、失敗経路でだけ
+-- もう 1 往復するほうが読みやすい。
+--
+-- 分けたことで「消せなかった理由」の判定には競合の余地が残るが、
+-- **削除そのものは 1 文で閉じている**ので、二重削除や
+-- 他人の投稿が消えることは起きない。ずれても
+-- 403 と 404 を取り違えるだけになる。
+-- **::boolean が要る。** 付けないと sqlc が型を推論できず、
+-- 生成される戻り値が interface{} になる (実測)。
+SELECT COALESCE(author_id = sqlc.arg('actor_id'), false)::boolean AS owned
+FROM threads
+WHERE id = sqlc.arg('id')
+  AND deleted_at IS NULL;
+
 -- name: SoftDeleteThread :execrows
 -- スレッドを論理削除する (ADR 0011 決定 2)。
 --

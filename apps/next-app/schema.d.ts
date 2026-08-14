@@ -318,7 +318,84 @@ export interface paths {
         get: operations["getThread"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * 自分のスレッドを削除する
+         * @description **自分が立てたスレッドだけ**を削除できます
+         *     (docs/adr/0005-authentication.md の権限モデル)。
+         *     [ADR 0003](../docs/adr/0003-open-questions.md) の未決 #7
+         *     (コメント削除 API を公開するか) は、認証が入ったこの時点で解けます。
+         *
+         *     論理削除です。行は残り、コメントの参照整合性も保たれます。
+         *
+         *     ### 匿名で立てたスレッドは削除できません
+         *
+         *     `author_id` が NULL のスレッドは、**投稿者を特定する情報がない**ため
+         *     本人であることを示せません。ログイン後に「さっき匿名で書いたやつ」を
+         *     自分のものにする機能も作りません —— 許すと任意の匿名投稿を
+         *     誰でも自分のものだと主張できます
+         *     (docs/adr/0005-authentication.md 決定 2)。
+         *
+         *     荒らしへの対処はモデレーターが行います
+         *     (`POST /moderation/actions`。docs/adr/0011-moderation.md 決定 2)。
+         *
+         *     ### コメントは消えません
+         *
+         *     スレッドが論理削除されると一覧からも取得からも消えるため、
+         *     コメントを個別に消して回る必要がありません
+         *     (8 パーティションすべてに UPDATE を投げることにもなります)。
+         *
+         *     ### 添付画像もストレージに残ります
+         *
+         *     画像を消すのはモデレーションの操作です
+         *     (docs/adr/0011-moderation.md 決定 5)。
+         *     自分のスレッドを消しただけで実体まで消すと、
+         *     誤操作の巻き戻しができなくなります。
+         */
+        delete: operations["deleteThread"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/threads/{threadId}/comments/{commentId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+                /**
+                 * @description コメント ID。
+                 *
+                 *     **レス番号 (`seq`) ではありません。** `seq` はスレッド内の
+                 *     通し番号で、削除で欠番が出ます。API が受け取るのは
+                 *     `Comment.id` のほうです。
+                 */
+                commentId: components["parameters"]["CommentId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 自分のコメントを削除する
+         * @description **自分が書いたコメントだけ**を削除できます。
+         *     条件と理由はスレッドの削除と同じです。
+         *
+         *     ### レス番号は空きます
+         *
+         *     削除しても `seq` は再利用しません
+         *     (docs/adr/0019-comment-concurrency.md 決定 5)。
+         *     再利用すると、過去の `>>5` が別の投稿を指すようになります。
+         *
+         *     ### スレッド ID がパスに要る理由
+         *
+         *     `comments` は `thread_id` による HASH パーティションで、
+         *     主キーが `(thread_id, id)` です。**コメント ID だけでは
+         *     先頭列を絞れず、8 パーティションすべてを走査します。**
+         */
+        delete: operations["deleteComment"];
         options?: never;
         head?: never;
         patch?: never;
@@ -801,6 +878,14 @@ export interface components {
     parameters: {
         /** @description スレッド ID */
         ThreadId: number;
+        /**
+         * @description コメント ID。
+         *
+         *     **レス番号 (`seq`) ではありません。** `seq` はスレッド内の
+         *     通し番号で、削除で欠番が出ます。API が受け取るのは
+         *     `Comment.id` のほうです。
+         */
+        CommentId: number;
         /**
          * @description 二重送信を防ぐためのキー。クライアントが投稿ごとに 1 つ生成します
          *     (UUID v4 など、推測されない値)。
@@ -1298,6 +1383,119 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deleteThread: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 削除した。本文はありません */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。原因は 3 つあります。
+             *
+             *     - **他人のスレッド**
+             *     - **匿名で立てられたスレッド** (`author_id` が NULL)
+             *     - 状態変更メソッドの `Origin` / `Referer` が許可リストに無い
+             *       (docs/adr/0013-http-defense.md 決定 1)
+             *
+             *     **ここでは 404 に隠しません。** スレッドは誰でも
+             *     `GET /threads/{threadId}` で読めるので、存在は公開情報です。
+             *     隠す意味が無いうえ、404 にすると自分の投稿が消せないときに
+             *     「消えたのか、権限が無いのか」を利用者が区別できません。
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description スレッドが存在しないか、既に削除されています。 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deleteComment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+                /**
+                 * @description コメント ID。
+                 *
+                 *     **レス番号 (`seq`) ではありません。** `seq` はスレッド内の
+                 *     通し番号で、削除で欠番が出ます。API が受け取るのは
+                 *     `Comment.id` のほうです。
+                 */
+                commentId: components["parameters"]["CommentId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 削除した。本文はありません */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。
+             *     他人のコメント、匿名のコメント、または `Origin` の検証失敗です
+             *     (スレッドの削除と同じ)。
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description コメントが存在しないか、既に削除されています。
+             *
+             *     **指定したスレッドに属さないコメント ID も 404 です。**
+             *     パーティションキーで絞るため、他スレッドの行には当たりません。
+             */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["InternalError"];
         };
     };

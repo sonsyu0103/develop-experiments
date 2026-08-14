@@ -445,7 +445,13 @@ check("匿名のスレッド作成は 401 にならない", status == 201, f"sta
 
 section("ルーティング")
 check_status("仕様書に無いパスは 404", "GET", "/threads/1/likes", 404, want_code="NOT_FOUND")
-check_status("未定義メソッドは 405", "DELETE", "/threads/1", 405,
+# **DELETE は使えなくなった。** 本人による削除を公開した時点で
+# /threads/{threadId} の DELETE は定義済みになり、この検査は
+# 405 ではなく 401 (未ログイン) を見るようになっていた。
+# **測っているのは「405 を返す経路がある」ことではなく
+# 「仕様書に無いメソッドが弾かれる」こと**なので、
+# 定義されていないメソッドを選び直す。
+check_status("未定義メソッドは 405", "PATCH", "/threads/1", 405,
              want_code="METHOD_NOT_ALLOWED")
 
 section("CSRF (ADR 0013 決定 1)")
@@ -1440,6 +1446,151 @@ if SQL_EXEC:
 else:
     section("モデレーション (ADR 0011)")
     skip("モデレーション", "SQL_EXEC が未設定")
+
+# ---------------------------------------------------------------------------
+# 本人による削除 (docs/adr/0005-authentication.md の権限モデル / ADR 0003 未決 #7)
+# ---------------------------------------------------------------------------
+#
+# **モデレーターの削除とは別の経路**であることを HTTP 越しに確かめる。
+#
+# 403 と 404 の撃ち分けは 2 本のクエリの組み合わせで決まるので、
+# フェイクでは「実装と同じ分岐を書いたか」しか見られない。
+
+if SQL_EXEC:
+    section("本人による削除 (ADR 0005)")
+
+    owner_token = "smoke-owner-" + secrets.token_hex(16)
+    owner_hash = hashlib.sha256(owner_token.encode()).hexdigest()
+    stranger_token = "smoke-stranger-" + secrets.token_hex(16)
+    stranger_hash = hashlib.sha256(stranger_token.encode()).hexdigest()
+
+    owner_cookie = {"Cookie": f"session={owner_token}"}
+    stranger_cookie = {"Cookie": f"session={stranger_token}"}
+
+    try:
+        for uid, sub, sess in [
+            (900040, "smoke-sub-owner", owner_hash),
+            (900041, "smoke-sub-stranger", stranger_hash),
+        ]:
+            sql(f"""
+                INSERT INTO users (id, public_id, google_sub, email, display_name)
+                VALUES ({uid}, '01920000-0000-7000-8000-000000{uid}'::uuid,
+                        '{sub}', '{sub}@example.com', 'スモーク')
+                ON CONFLICT (google_sub) DO NOTHING;
+            """)
+            sql(f"""
+                INSERT INTO sessions (id, user_id, expires_at)
+                VALUES ('{sess}', {uid}, now() + interval '5 minutes');
+            """)
+
+        # **API 経由で作る。** SQL で直接入れると author_id の紐付けが
+        # 「投稿の経路で実際に書かれているか」を検査しないことになる。
+        s, mine, _ = call("POST", "/threads", json.dumps({"title": "スモーク: 自分のスレッド"}),
+                          headers=owner_cookie)
+        my_thread = (mine or {}).get("id") if s == 201 else None
+        check("ログインしてスレッドを作れた", my_thread is not None, f"status={s}")
+
+        s, anon, _ = call("POST", "/threads", json.dumps({"title": "スモーク: 匿名のスレッド"}))
+        anon_thread = (anon or {}).get("id") if s == 201 else None
+        check("匿名でスレッドを作れた", anon_thread is not None, f"status={s}")
+
+        if my_thread and anon_thread:
+            # --- 他人・匿名は消せない ---
+            s, payload, _ = call("DELETE", f"/threads/{my_thread}", headers=stranger_cookie)
+            code = ((payload or {}).get("error") or {}).get("code")
+            check("他人のスレッドは 403 / PERMISSION_DENIED",
+                  s == 403 and code == "PERMISSION_DENIED", f"status={s} code={code}")
+
+            # **匿名投稿は本人でも消せない。** 投稿者を特定する情報が無い
+            # (ADR 0005 決定 2)。三値論理がそのまま効いている。
+            s, _, _ = call("DELETE", f"/threads/{anon_thread}", headers=owner_cookie)
+            check("匿名スレッドはログインしていても 403", s == 403, f"status={s}")
+
+            s, _, _ = call("DELETE", f"/threads/{my_thread}")
+            check("未ログインの削除は 401", s == 401, f"status={s}")
+
+            s, _, _ = call("DELETE", f"/threads/{my_thread}",
+                           headers=owner_cookie, origin="")
+            check("Origin の無い削除は 403", s == 403, f"status={s}")
+
+            # まだ生きていること。ここまでで消えていたら上のどれかが素通しになる。
+            s, _, _ = call("GET", f"/threads/{my_thread}")
+            check("拒否された削除でスレッドが消えていない", s == 200, f"status={s}")
+
+            # --- 自分のものは消せる ---
+            s, _, _ = call("DELETE", f"/threads/{my_thread}", headers=owner_cookie)
+            check("自分のスレッドは 204 で消せる", s == 204, f"status={s}")
+
+            s, _, _ = call("GET", f"/threads/{my_thread}")
+            check("削除したスレッドは 404", s == 404, f"status={s}")
+
+            s, _, _ = call("DELETE", f"/threads/{my_thread}", headers=owner_cookie)
+            check("削除済みスレッドの再削除は 404 (403 ではない)", s == 404, f"status={s}")
+
+            # --- コメント ---
+            s, c1, _ = call("POST", f"/threads/{anon_thread}/comments",
+                            json.dumps({"body": "スモーク: 自分のコメント"}),
+                            headers=owner_cookie)
+            my_comment = (c1 or {}).get("id") if s == 201 else None
+            s, c2, _ = call("POST", f"/threads/{anon_thread}/comments",
+                            json.dumps({"body": "スモーク: 匿名のコメント"}))
+            anon_comment = (c2 or {}).get("id") if s == 201 else None
+
+            if my_comment and anon_comment:
+                s, _, _ = call("DELETE", f"/threads/{anon_thread}/comments/{anon_comment}",
+                               headers=owner_cookie)
+                check("匿名コメントは 403", s == 403, f"status={s}")
+
+                s, _, _ = call("DELETE", f"/threads/{anon_thread}/comments/{my_comment}",
+                               headers=stranger_cookie)
+                check("他人のコメントは 403", s == 403, f"status={s}")
+
+                # **パーティションキーが効いていること。**
+                # 別スレッドの ID を渡すと当たらない (主キーが (thread_id, id))。
+                s, _, _ = call("DELETE", f"/threads/{my_thread}/comments/{my_comment}",
+                               headers=owner_cookie)
+                check("別スレッドを指したコメント削除は 404", s == 404, f"status={s}")
+
+                s, _, _ = call("DELETE", f"/threads/{anon_thread}/comments/{my_comment}",
+                               headers=owner_cookie)
+                check("自分のコメントは 204 で消せる", s == 204, f"status={s}")
+
+                _, payload, _ = call("GET", f"/threads/{anon_thread}/comments")
+                ids = [c["id"] for c in (payload or {}).get("comments", [])]
+                check("削除したコメントは一覧から消える", my_comment not in ids, f"ids={ids}")
+
+                # **レス番号は空いたまま** (ADR 0019 決定 5)。
+                s, c3, _ = call("POST", f"/threads/{anon_thread}/comments",
+                                json.dumps({"body": "スモーク: 欠番の確認"}),
+                                headers=owner_cookie)
+                seqs = [c3.get("seq")] if s == 201 else []
+                check("削除したレス番号は再利用されない",
+                      s == 201 and c3.get("seq") == 3, f"status={s} seq={seqs}")
+            else:
+                check("コメントを用意できた", False,
+                      f"my={my_comment} anon={anon_comment}")
+
+            # --- 本人の削除は監査記録に載せない (ADR 0011 決定 3 の趣旨) ---
+            out = subprocess.run(
+                shlex.split(SQL_EXEC) + [f"""
+                    SELECT count(*)::text || ':ACTIONS' FROM moderation_actions
+                    WHERE actor_id IN (900040, 900041);
+                """], check=True, capture_output=True, text=True).stdout
+            check("本人の削除は moderation_actions に残らない",
+                  "0:ACTIONS" in out, f"got={out.strip()!r}")
+    finally:
+        sql("DELETE FROM moderation_actions WHERE actor_id IN (900040, 900041);")
+        sql("DELETE FROM comments WHERE author_id IN (900040, 900041);")
+        sql("DELETE FROM threads WHERE author_id IN (900040, 900041);")
+        # 匿名で作ったスレッドはタイトルで拾う (author_id が NULL のため)。
+        sql("DELETE FROM comments WHERE thread_id IN "
+            "(SELECT id FROM threads WHERE title LIKE 'スモーク: 匿名のスレッド');")
+        sql("DELETE FROM threads WHERE title LIKE 'スモーク: 匿名のスレッド';")
+        sql("DELETE FROM sessions WHERE user_id IN (900040, 900041);")
+        sql("DELETE FROM users WHERE id IN (900040, 900041);")
+else:
+    section("本人による削除 (ADR 0005)")
+    skip("本人による削除", "SQL_EXEC が未設定")
 
 # ---------------------------------------------------------------------------
 

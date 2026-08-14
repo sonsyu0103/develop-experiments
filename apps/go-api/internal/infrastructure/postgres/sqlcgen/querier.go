@@ -31,6 +31,10 @@ type Querier interface {
 	// 応答 (response_status / response_body) はこの時点では NULL。
 	// 処理が終わってから CompleteIdempotencyKey で埋める。
 	ClaimIdempotencyKey(ctx context.Context, arg ClaimIdempotencyKeyParams) (ClaimIdempotencyKeyRow, error)
+	// 削除が 0 行だったときに、その理由を答える。用途は ThreadOwnership と同じ。
+	// **::boolean が要る。** 付けないと sqlc が型を推論できず、
+	// 生成される戻り値が interface{} になる (実測)。
+	CommentOwnership(ctx context.Context, arg CommentOwnershipParams) (bool, error)
 	// ストレージへの PUT が成功したあとに呼ぶ (ADR 0007 決定 3 の手順 3)。
 	//
 	// **status = 'pending' を条件に含める。** 含めないと、
@@ -501,6 +505,39 @@ type Querier interface {
 	// 現時点で HTTP エンドポイントからは呼ばれていない。
 	// 削除 API を公開するかは未決 (docs/adr/0003-open-questions.md 項目 7)。
 	SoftDeleteComment(ctx context.Context, arg SoftDeleteCommentParams) (int64, error)
+	// 投稿者が自分のコメントを論理削除する (ADR 0005 の権限モデル / ADR 0003 未決 #7)。
+	//
+	// 条件と、0 行だった理由を別に引く事情は
+	// threads.sql の SoftDeleteOwnThread と同じ。
+	//
+	// 【thread_id が要る】
+	// **主キーが (thread_id, id) なので、先頭列が無いと 8 パーティション
+	// すべてを走査する。** 副次的に「他スレッドのコメント ID を渡しても
+	// 当たらない」が成立する。
+	//
+	// 【レス番号は消さない】
+	// 行が残るので seq も残り、次の投稿は削除された番号の次から続く
+	// (ADR 0019 決定 5)。再利用すると過去の >>5 が別の投稿を指す。
+	SoftDeleteOwnComment(ctx context.Context, arg SoftDeleteOwnCommentParams) (int64, error)
+	// 投稿者が自分のスレッドを論理削除する (ADR 0005 の権限モデル / ADR 0003 未決 #7)。
+	//
+	// **消えるのは「生きている自分のスレッド」だけ。** 3 つの条件が揃わないと
+	// 0 行になる。0 行だった理由 (無い / 他人のもの / 匿名) は
+	// ThreadOwnership が別に答える。
+	//
+	// 【匿名投稿は当たらない】
+	// author_id が NULL のとき `author_id = $2` は NULL (真ではない) になるので、
+	// **明示的な IS NOT NULL は要らない。** 三値論理がそのまま
+	// 「本人であることを示せない」を表している。
+	// 匿名投稿を消せるのはモデレーターだけ (ADR 0011 決定 2)。
+	//
+	// 【コメントも添付画像も消さない】
+	// スレッドが論理削除されると一覧・取得のどちらからも消えるため、
+	// コメントを個別に消して回る必要がない (8 パーティションすべてに
+	// UPDATE を投げることにもなる)。画像を実際に消すのはモデレーションの操作
+	// (ADR 0011 決定 5) で、自分の投稿を消しただけで実体まで消すと
+	// 誤操作の巻き戻しができなくなる。
+	SoftDeleteOwnThread(ctx context.Context, arg SoftDeleteOwnThreadParams) (int64, error)
 	// スレッドを論理削除する (ADR 0011 決定 2)。
 	//
 	// **deleted_at IS NULL を条件に含める。** 含めないと 2 回目以降も
@@ -518,6 +555,28 @@ type Querier interface {
 	// delete_image として個別に記録されるべきものになる。
 	SoftDeleteThread(ctx context.Context, id int64) (int64, error)
 	ThreadExists(ctx context.Context, id int64) (bool, error)
+	// 削除が 0 行だったときに、その理由を答える。
+	//
+	// **成功したときには引かない。** 呼ぶのは失敗の分類のためだけで、
+	// 常に 2 往復させるためではない。
+	//
+	// 行が返らなければ「無い、または既に消えている」= 404。
+	// 返って owned = false なら「他人のもの、または匿名」= 403。
+	//
+	// 【1 文にまとめなかった理由】
+	// 判定と更新を CTE 1 本に畳む形も書けるが、**sqlc の解析器が
+	// CTE と更新対象テーブルのスコープを混ぜてしまい、
+	// author_id を ambiguous として生成に失敗する** (PostgreSQL は通る)。
+	// 生成器に通らない形を無理に維持するより、失敗経路でだけ
+	// もう 1 往復するほうが読みやすい。
+	//
+	// 分けたことで「消せなかった理由」の判定には競合の余地が残るが、
+	// **削除そのものは 1 文で閉じている**ので、二重削除や
+	// 他人の投稿が消えることは起きない。ずれても
+	// 403 と 404 を取り違えるだけになる。
+	// **::boolean が要る。** 付けないと sqlc が型を推論できず、
+	// 生成される戻り値が interface{} になる (実測)。
+	ThreadOwnership(ctx context.Context, arg ThreadOwnershipParams) (bool, error)
 	// =============================================================================
 	// 【列の順番をテーブルと揃えること】
 	//

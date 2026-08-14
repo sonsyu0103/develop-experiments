@@ -12,6 +12,30 @@ import (
 	"github.com/google/uuid"
 )
 
+const commentOwnership = `-- name: CommentOwnership :one
+SELECT COALESCE(author_id = $1, false)::boolean AS owned
+FROM comments
+WHERE thread_id = $2
+  AND id = $3
+  AND deleted_at IS NULL
+`
+
+type CommentOwnershipParams struct {
+	ActorID  *int64
+	ThreadID int64
+	ID       int64
+}
+
+// 削除が 0 行だったときに、その理由を答える。用途は ThreadOwnership と同じ。
+// **::boolean が要る。** 付けないと sqlc が型を推論できず、
+// 生成される戻り値が interface{} になる (実測)。
+func (q *Queries) CommentOwnership(ctx context.Context, arg CommentOwnershipParams) (bool, error) {
+	row := q.db.QueryRow(ctx, commentOwnership, arg.ActorID, arg.ThreadID, arg.ID)
+	var owned bool
+	err := row.Scan(&owned)
+	return owned, err
+}
+
 const createCommentAutoSeq = `-- name: CreateCommentAutoSeq :one
 WITH inserted AS (
     INSERT INTO comments (thread_id, seq, author_name, body, author_id, image_id)
@@ -466,6 +490,42 @@ type SoftDeleteCommentParams struct {
 // 削除 API を公開するかは未決 (docs/adr/0003-open-questions.md 項目 7)。
 func (q *Queries) SoftDeleteComment(ctx context.Context, arg SoftDeleteCommentParams) (int64, error) {
 	result, err := q.db.Exec(ctx, softDeleteComment, arg.ThreadID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const softDeleteOwnComment = `-- name: SoftDeleteOwnComment :execrows
+UPDATE comments
+SET deleted_at = now()
+WHERE thread_id = $1
+  AND id = $2
+  AND author_id = $3
+  AND deleted_at IS NULL
+`
+
+type SoftDeleteOwnCommentParams struct {
+	ThreadID int64
+	ID       int64
+	ActorID  *int64
+}
+
+// 投稿者が自分のコメントを論理削除する (ADR 0005 の権限モデル / ADR 0003 未決 #7)。
+//
+// 条件と、0 行だった理由を別に引く事情は
+// threads.sql の SoftDeleteOwnThread と同じ。
+//
+// 【thread_id が要る】
+// **主キーが (thread_id, id) なので、先頭列が無いと 8 パーティション
+// すべてを走査する。** 副次的に「他スレッドのコメント ID を渡しても
+// 当たらない」が成立する。
+//
+// 【レス番号は消さない】
+// 行が残るので seq も残り、次の投稿は削除された番号の次から続く
+// (ADR 0019 決定 5)。再利用すると過去の >>5 が別の投稿を指す。
+func (q *Queries) SoftDeleteOwnComment(ctx context.Context, arg SoftDeleteOwnCommentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, softDeleteOwnComment, arg.ThreadID, arg.ID, arg.ActorID)
 	if err != nil {
 		return 0, err
 	}

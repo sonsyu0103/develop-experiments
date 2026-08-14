@@ -36,12 +36,28 @@ type fakeRepo struct {
 	concurrentPeak   atomic.Int64
 	createdThreadMux sync.Mutex
 	createdThreads   []string
+	// deleteCalls は SoftDeleteOwn に渡された (id, actorID) です。
+	deleteCallMux sync.Mutex
+	deleteCalls   [][2]int64
 }
 
 var (
 	_ repository.ThreadRepository    = (*fakeRepo)(nil)
 	_ repository.BenchmarkRepository = (*fakeRepo)(nil)
 )
+
+// SoftDeleteOwn は呼ばれた引数を記録します。
+//
+// **生存の再現はしません。** 削除の 3 分岐 (204 / 403 / 404) は
+// 永続化層の 1 文が決めるので、フェイクで真似ても
+// 実装を検査したことにならない (実 DB の検査が持ちます)。
+// ここで見たいのは「ログインしていないと呼ばれないこと」だけです。
+func (f *fakeRepo) SoftDeleteOwn(_ context.Context, id, actorID int64) error {
+	f.deleteCallMux.Lock()
+	defer f.deleteCallMux.Unlock()
+	f.deleteCalls = append(f.deleteCalls, [2]int64{id, actorID})
+	return nil
+}
 
 func (f *fakeRepo) summaries(page pagination.Page) []model.Summary {
 	out := make([]model.Summary, 0, len(f.threads))

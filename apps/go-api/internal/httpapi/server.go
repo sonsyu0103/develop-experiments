@@ -288,6 +288,55 @@ func (s *Server) CreateThread(c *gin.Context) {
 	c.JSON(http.StatusCreated, toWireThread(thread))
 }
 
+// DeleteThread は DELETE /threads/{threadId} を処理します。
+//
+// **ログインが必須です** (仕様書の security 宣言が強制します)。
+// 消せるのは自分のスレッドだけで、判定は永続化層の 1 文に寄せてあります。
+//
+// **モデレーターの削除はこの経路ではありません。**
+// 他人・匿名の投稿を消すのは POST /moderation/actions で、
+// そちらは monitoring_actions への記録を伴います (ADR 0011 決定 3)。
+// 分けているのは、本人の削除を監査記録に載せる理由が無いためです ——
+// 載せると、記録の大半が通常の操作で埋まり、モデレーションの調査に使えなくなります。
+func (s *Server) DeleteThread(c *gin.Context, threadID oapigen.ThreadId) {
+	if err := validateThreadID(threadID); err != nil {
+		respondError(c, err)
+		return
+	}
+
+	ctx := c.Request.Context()
+	if err := s.threads.DeleteOwnThread(ctx, threadID, authorIDFromContext(ctx)); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// DeleteComment は DELETE /threads/{threadId}/comments/{commentId} を処理します。
+//
+// **スレッド ID がパスに要ります。** comments は thread_id による
+// HASH パーティションで、主キーが (thread_id, id) です ——
+// コメント ID だけでは先頭列を絞れず、8 パーティションすべてを走査します。
+func (s *Server) DeleteComment(
+	c *gin.Context, threadID oapigen.ThreadId, commentID oapigen.CommentId,
+) {
+	if err := validateThreadID(threadID); err != nil {
+		respondError(c, err)
+		return
+	}
+	if err := validateCommentID(commentID); err != nil {
+		respondError(c, err)
+		return
+	}
+
+	ctx := c.Request.Context()
+	if err := s.comments.DeleteOwnComment(ctx, threadID, commentID, authorIDFromContext(ctx)); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
 // GetThread は GET /threads/{threadId} を処理します。
 func (s *Server) GetThread(c *gin.Context, threadID oapigen.ThreadId) {
 	if err := validateThreadID(threadID); err != nil {

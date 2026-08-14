@@ -100,6 +100,29 @@ func (r *ThreadRepository) Exists(ctx context.Context, id int64) (bool, error) {
 	return ok, nil
 }
 
+// SoftDeleteOwn は投稿者本人がスレッドを論理削除します。
+//
+// **成功したときは 1 往復で終わります。** 2 本目 (ThreadOwnership) を
+// 引くのは 0 行だったときだけで、失敗の理由を撃ち分けるためです。
+func (r *ThreadRepository) SoftDeleteOwn(ctx context.Context, id, actorID int64) error {
+	affected, err := r.q.SoftDeleteOwnThread(ctx, sqlcgen.SoftDeleteOwnThreadParams{
+		ID:      id,
+		ActorID: &actorID,
+	})
+	if err != nil {
+		return translateError("ThreadRepository.SoftDeleteOwn", err)
+	}
+	if affected > 0 {
+		return nil
+	}
+
+	owned, err := r.q.ThreadOwnership(ctx, sqlcgen.ThreadOwnershipParams{
+		ID:      id,
+		ActorID: &actorID,
+	})
+	return classifyDeleteFailure("ThreadRepository.SoftDeleteOwn", owned, err)
+}
+
 // ListThreadsOnly はコメント数を含めずにスレッドだけを取得します (ベンチマーク用)。
 func (r *ThreadRepository) ListThreadsOnly(ctx context.Context, page pagination.Page) ([]model.Thread, error) {
 	rows, err := r.q.ListThreadIDs(ctx, sqlcgen.ListThreadIDsParams{

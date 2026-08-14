@@ -590,3 +590,28 @@ func (r *CommentRepository) SoftDelete(ctx context.Context, threadID, id int64) 
 	}
 	return nil
 }
+
+// SoftDeleteOwn は投稿者本人がコメントを論理削除します。
+//
+// **成功したときは 1 往復で終わります。** 2 本目 (CommentOwnership) を
+// 引くのは 0 行だったときだけです (ThreadRepository.SoftDeleteOwn と同じ形)。
+func (r *CommentRepository) SoftDeleteOwn(ctx context.Context, threadID, id, actorID int64) error {
+	affected, err := r.q.SoftDeleteOwnComment(ctx, sqlcgen.SoftDeleteOwnCommentParams{
+		ThreadID: threadID,
+		ID:       id,
+		ActorID:  &actorID,
+	})
+	if err != nil {
+		return translateError("CommentRepository.SoftDeleteOwn", err)
+	}
+	if affected > 0 {
+		return nil
+	}
+
+	owned, err := r.q.CommentOwnership(ctx, sqlcgen.CommentOwnershipParams{
+		ThreadID: threadID,
+		ID:       id,
+		ActorID:  &actorID,
+	})
+	return classifyDeleteFailure("CommentRepository.SoftDeleteOwn", owned, err)
+}

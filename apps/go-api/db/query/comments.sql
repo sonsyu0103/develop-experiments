@@ -225,6 +225,37 @@ LEFT JOIN users u ON u.id = i.author_id
 LEFT JOIN images img ON img.id = i.image_id
     AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL;
 
+-- name: SoftDeleteOwnComment :execrows
+-- 投稿者が自分のコメントを論理削除する (ADR 0005 の権限モデル / ADR 0003 未決 #7)。
+--
+-- 条件と、0 行だった理由を別に引く事情は
+-- threads.sql の SoftDeleteOwnThread と同じ。
+--
+-- 【thread_id が要る】
+-- **主キーが (thread_id, id) なので、先頭列が無いと 8 パーティション
+-- すべてを走査する。** 副次的に「他スレッドのコメント ID を渡しても
+-- 当たらない」が成立する。
+--
+-- 【レス番号は消さない】
+-- 行が残るので seq も残り、次の投稿は削除された番号の次から続く
+-- (ADR 0019 決定 5)。再利用すると過去の >>5 が別の投稿を指す。
+UPDATE comments
+SET deleted_at = now()
+WHERE thread_id = sqlc.arg('thread_id')
+  AND id = sqlc.arg('id')
+  AND author_id = sqlc.arg('actor_id')
+  AND deleted_at IS NULL;
+
+-- name: CommentOwnership :one
+-- 削除が 0 行だったときに、その理由を答える。用途は ThreadOwnership と同じ。
+-- **::boolean が要る。** 付けないと sqlc が型を推論できず、
+-- 生成される戻り値が interface{} になる (実測)。
+SELECT COALESCE(author_id = sqlc.arg('actor_id'), false)::boolean AS owned
+FROM comments
+WHERE thread_id = sqlc.arg('thread_id')
+  AND id = sqlc.arg('id')
+  AND deleted_at IS NULL;
+
 -- name: SoftDeleteComment :execrows
 -- 現時点で HTTP エンドポイントからは呼ばれていない。
 -- 削除 API を公開するかは未決 (docs/adr/0003-open-questions.md 項目 7)。
