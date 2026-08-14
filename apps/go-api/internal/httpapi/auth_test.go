@@ -216,6 +216,9 @@ func (e *authEnv) do(t *testing.T, method, path string, cookies ...*http.Cookie)
 	t.Helper()
 
 	req := httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(""))
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	for _, c := range cookies {
 		req.AddCookie(c)
 	}
@@ -337,6 +340,9 @@ func TestAuth_AnonymousPostIsStillAllowed(t *testing.T) {
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/threads",
 		strings.NewReader(`{"title":"匿名のスレッド"}`))
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Content-Type", "application/json")
 
 	rec := httptest.NewRecorder()
@@ -668,6 +674,9 @@ func postJSON(t *testing.T, e *authEnv, path, body string, cookies ...*http.Cook
 	t.Helper()
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(body))
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Content-Type", "application/json")
 	for _, c := range cookies {
 		req.AddCookie(c)

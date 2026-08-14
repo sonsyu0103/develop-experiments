@@ -32,6 +32,15 @@ import (
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
 )
 
+// testOrigin は検査用のリクエストに付ける Origin です。
+//
+// **状態変更メソッドには必須になりました** (ADR 0013 決定 1)。
+// csrfGuard は Origin も Referer も無い POST / PUT / PATCH / DELETE を
+// 403 で弾きます。「無ければ通す」にすると、送らないだけで迂回できるためです。
+//
+// 値はテストが組み立てる AllowedOrigins と揃えること。
+const testOrigin = "http://localhost:3000"
+
 func TestMain(m *testing.M) {
 	gin.SetMode(gin.TestMode)
 	os.Exit(m.Run())
@@ -251,6 +260,9 @@ func (e *testEnv) do(t *testing.T, method, path, body string) *httptest.Response
 	t.Helper()
 
 	req := httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body))
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -1086,6 +1098,9 @@ func (e *testEnv) doAs(
 	t.Helper()
 
 	req := httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body))
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}

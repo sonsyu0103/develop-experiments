@@ -177,6 +177,50 @@ r.Use(
 **`securityHeaders` を CORS より前に置く**のは、
 エラー応答やプリフライト応答にもヘッダを付けるため。
 
+## 実装して分かったこと (2026-08-14)
+
+### 1. `securityHeaders` はまだ無い (決定 2 は未実装)
+
+上の順序は決定 2 を含んだ形で書いてあるが、実装済みなのは決定 1 と決定 3 で、
+**セキュリティヘッダはまだ入っていない。** 現在の並びは
+`requestID` → `requestLogger` → `recovery` → `cors` → `csrfGuard` → `bodyLimit`。
+
+`recovery` を `requestLogger` の**内側**に置いている点も上の擬似コードと違う。
+外側に置くとパニックが `requestLogger` の `c.Next()` を巻き戻して抜け、
+`http_request` の行が 1 本も出なかった (実測)。
+
+### 2. `csrfGuard` は `bodyLimit` より前に置く
+
+弾くと決まっている要求の本文を読み始める理由が無い。
+[ADR 0007](0007-image-storage.md) の画像アップロードは最大 5 MiB を受けるので、
+順序が逆だと**拒否する要求のために本文を読み切る**ことになる。
+
+### 3. 「Origin が無ければ通す」にはできない
+
+決定 1 の手順 3 (どちらも無ければ 403) は、実装すると
+**API を叩くものすべてに影響する。** スモークテストと `curl` も含まれる。
+
+一瞬「ブラウザ以外は素通しでよいのでは」と考えたが、**それでは防御にならない。**
+Origin を送らないだけで検証を迂回できる。スモーク側に Origin を付ける
+(`SMOKE_ORIGIN`、既定は `CORS_ALLOWED_ORIGINS` の既定値と同じ) 形にした。
+
+### 4. Referer の照合を前方一致で書いてはいけない
+
+`https://example.com.evil.test/` は `https://example.com` で始まる。
+`url.Parse` して `scheme://host` を組み直してから完全一致で照合する。
+検査を 1 件置いた (`TestCSRF_RejectsPrefixLookalikeReferer`)。
+
+### 5. **Server Components からの書き込みは 403 になる**
+
+現在フロントが叩いているのは `GET /threads` だけなので影響が無いが、
+**Server Actions や Route Handler から書き込みを始めた瞬間に落ちる。**
+サーバ側の `fetch` は `Origin` を送らないためで、ブラウザからの
+リクエストとは扱いが変わる。
+
+書き込みは**ブラウザから直接叩く**か、サーバ側から叩くなら
+`Origin` を明示的に付ける。前者を既定にする —— サーバ側から付けられる
+`Origin` は自己申告であり、検証としての意味が薄い。
+
 ## 引き受けるコスト
 
 - **Origin ヘッダに依存する。** 古いブラウザや一部のプロキシは送らないことがある。

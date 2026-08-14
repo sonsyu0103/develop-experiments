@@ -585,7 +585,7 @@ export interface components {
                  * @example NOT_FOUND
                  * @enum {string}
                  */
-                code: "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "PAYLOAD_TOO_LARGE" | "FAILED_PRECONDITION" | "UNAVAILABLE" | "INTERNAL";
+                code: "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "FORBIDDEN" | "PAYLOAD_TOO_LARGE" | "FAILED_PRECONDITION" | "UNAVAILABLE" | "INTERNAL";
                 /**
                  * @description 人間向けの説明。文言は予告なく変わるため分岐に使わないでください。
                  * @example 対象のリソースが見つかりません
@@ -615,6 +615,23 @@ export interface components {
         };
         /** @description 未ログイン、またはセッションが無効 */
         Unauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /**
+         * @description 状態変更メソッド (POST / PUT / PATCH / DELETE) の `Origin` または
+         *     `Referer` が許可リストに無い、あるいはどちらも付いていない
+         *     (docs/adr/0013-http-defense.md 決定 1 の CSRF 対策)。
+         *
+         *     **ブラウザ以外のクライアントも `Origin` を送る必要があります。**
+         *     `SameSite=Lax` だけではサブドメインを取られた場合に防げないため、
+         *     サーバ側でも検証します。
+         */
+        Forbidden: {
             headers: {
                 [name: string]: unknown;
             };
@@ -776,6 +793,7 @@ export interface operations {
                 content?: never;
             };
             401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             500: components["responses"]["InternalError"];
         };
     };
@@ -831,6 +849,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             /**
              * @description 指定された画像が存在しないか、自分のものではありません。
              *     **403 ではなく 404 を返します** —— 403 だと
@@ -883,6 +902,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
             /**
              * @description サイズまたは画素数の上限を超えました。
              *     縮小すれば通ります (docs/adr/0007-image-storage.md 決定 2)。
@@ -1034,6 +1054,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            403: components["responses"]["Forbidden"];
             /**
              * @description 指定されたアイコンが存在しないか、自分のものではありません。
              *     **403 ではなく 404** です —— 403 だと
@@ -1179,6 +1200,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
             /** @description 親スレッドが存在しない */
             404: {
                 headers: {

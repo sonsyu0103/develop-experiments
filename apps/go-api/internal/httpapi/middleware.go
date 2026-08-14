@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"regexp"
 	"runtime/debug"
 	"slices"
@@ -106,6 +107,99 @@ func cors(allowedOrigins []string) gin.HandlerFunc {
 	}
 }
 
+// csrfGuard は状態変更メソッドの Origin / Referer を検証します
+// (docs/adr/0013-http-defense.md 決定 1)。
+//
+// **CORS では CSRF を防げません。** CORS はブラウザにレスポンスを
+// 読ませない仕組みであり、リクエスト自体は飛びます。しかも
+// multipart/form-data はプリフライトを起こさない (simple request) ので、
+// 画像アップロード (ADR 0007) の経路では CORS が一切効きません。
+//
+// **SameSite=Lax だけにも頼りません。** サブドメインは same-site 扱いなので、
+// api.example.com と並ぶ別のサブドメインを取られると通ります。
+//
+// 検証の順序:
+//
+//  1. Origin がある      -> 許可リストと照合。一致しなければ 403
+//  2. Origin が無い      -> Referer のオリジン部分で照合
+//  3. どちらも無い       -> 403
+//
+// **3 番目が効くので、ブラウザ以外のクライアントも Origin を送る必要があります。**
+// スモークテストと curl は明示的に付けています。ここを「無ければ通す」に
+// すると、Origin を送らないだけで検証を迂回できるため、防御になりません。
+//
+// 許可リストは cors() と同じ設定値 (CORS_ALLOWED_ORIGINS) を共有しますが、
+// 処理は独立させています —— CORS はヘッダを付ける処理、こちらは弾く処理です。
+func csrfGuard(allowedOrigins []string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !isStateChanging(c.Request.Method) {
+			c.Next()
+			return
+		}
+
+		// **GET / HEAD に副作用を持たせないことが前提です** (ADR 0013 決定 1)。
+		// この不変条件が崩れると SameSite=Lax の前提も同時に崩れ、
+		// トークン方式の再検討が要ります。
+		if origin := c.GetHeader("Origin"); origin != "" {
+			if !slices.Contains(allowedOrigins, origin) {
+				rejectCrossOrigin(c, "origin", origin)
+				return
+			}
+			c.Next()
+			return
+		}
+
+		if referer := c.GetHeader("Referer"); referer != "" {
+			origin, ok := originOf(referer)
+			if !ok || !slices.Contains(allowedOrigins, origin) {
+				rejectCrossOrigin(c, "referer", referer)
+				return
+			}
+			c.Next()
+			return
+		}
+
+		rejectCrossOrigin(c, "missing", "")
+	}
+}
+
+// isStateChanging は副作用を持ちうるメソッドかを返します。
+func isStateChanging(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+// originOf は Referer からオリジン部分 (scheme://host[:port]) を取り出します。
+//
+// **文字列の前方一致で判定しません。** "https://example.com.evil.test/" は
+// "https://example.com" で始まるので、前方一致だと通ってしまいます。
+func originOf(referer string) (string, bool) {
+	u, err := url.Parse(referer)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", false
+	}
+	return u.Scheme + "://" + u.Host, true
+}
+
+// rejectCrossOrigin は 403 で打ち切り、判断の材料をログに残します。
+//
+// **理由を本文に書き分けません。** どの条件で落ちたかを返すと、
+// 許可リストの内容を外から探れます。ログには残します。
+func rejectCrossOrigin(c *gin.Context, reason, value string) {
+	slog.WarnContext(c.Request.Context(), "csrf_rejected",
+		slog.String("reason", reason),
+		slog.String("value", value),
+		slog.String("method", c.Request.Method),
+		slog.String("path", c.Request.URL.Path),
+	)
+	c.AbortWithStatusJSON(http.StatusForbidden,
+		newErrorBody(oapigen.FORBIDDEN, "この要求は受け付けられません"))
+}
+
 // recovery はパニックを拾い、構造化ログに残してから 500 を返します。
 //
 // gin.Recovery は stderr へ平文で書くだけで、service / version / request_id が
@@ -141,12 +235,16 @@ func recovery() gin.HandlerFunc {
 //	requestLogger recovery より外。内側だとパニック時に行が出ない
 //	recovery      パニックを ERROR として残す
 //	cors          プリフライトをここで打ち切る
+//	csrfGuard     cors の直後。OPTIONS は既に抜けているので素通しを考えなくてよい
 func middlewares(allowedOrigins []string) []gin.HandlerFunc {
 	return []gin.HandlerFunc{
 		requestID(),
 		requestLogger(),
 		recovery(),
 		cors(allowedOrigins),
+		// **bodyLimit より前に置く。** 弾くと決まっている要求の本文を
+		// 読み始める理由がありません (ADR 0013 決定 1)。
+		csrfGuard(allowedOrigins),
 		// **仕様検証より前に置く。** 検証ミドルウェアは本文を
 		// 丸ごと読むため、ここより後ろでは手遅れになる (bodyLimit を参照)。
 		bodyLimit(),

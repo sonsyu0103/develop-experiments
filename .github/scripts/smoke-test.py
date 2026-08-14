@@ -54,6 +54,19 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8080").rstrip("/")
+
+# **状態変更メソッドには Origin が要る** (docs/adr/0013-http-defense.md 決定 1)。
+#
+# csrfGuard は Origin も Referer も無い POST / PUT / PATCH / DELETE を 403 で弾く。
+# 「無ければ通す」にすると送らないだけで迂回できるため、ブラウザ以外の
+# クライアント (このスクリプトを含む) も付ける必要がある。
+#
+# 既定は config の CORS_ALLOWED_ORIGINS の既定値と同じ。
+# API 側の設定を変えたらここも変える —— 食い違うと全部 403 になる。
+ORIGIN = os.environ.get("SMOKE_ORIGIN", "http://localhost:3000")
+
+# 副作用を持ちうるメソッド。csrfGuard の isStateChanging と揃える。
+STATE_CHANGING = ("POST", "PUT", "PATCH", "DELETE")
 SQL_EXEC = os.environ.get("SQL_EXEC", "")
 
 
@@ -119,9 +132,17 @@ _opener = urllib.request.build_opener(_NoRedirect)
 
 
 def call(method: str, path: str, body: str | None = None,
-         headers: dict[str, str] | None = None):
-    """API を叩き、(ステータス, JSON, ヘッダ) を返す。"""
+         headers: dict[str, str] | None = None, origin: str | None = None):
+    """API を叩き、(ステータス, JSON, ヘッダ) を返す。
+
+    origin を省くと、状態変更メソッドには ORIGIN を自動で付ける。
+    空文字を渡すと**付けない** —— csrfGuard そのものを検査するときに使う。
+    """
     req = urllib.request.Request(BASE_URL + path, method=method)
+    if origin is None:
+        origin = ORIGIN if method in STATE_CHANGING else ""
+    if origin:
+        req.add_header("Origin", origin)
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     data = None
@@ -426,6 +447,43 @@ section("ルーティング")
 check_status("仕様書に無いパスは 404", "GET", "/threads/1/likes", 404, want_code="NOT_FOUND")
 check_status("未定義メソッドは 405", "DELETE", "/threads/1", 405,
              want_code="METHOD_NOT_ALLOWED")
+
+section("CSRF (ADR 0013 決定 1)")
+
+# **CORS では CSRF を防げない。** CORS はブラウザにレスポンスを読ませない
+# 仕組みで、リクエスト自体は飛ぶ。ここで見るのはサーバ側の拒否。
+_s, _p, _ = call("POST", "/threads", json.dumps({"title": "CSRF"}), origin="")
+check("Origin も Referer も無い POST は 403", _s == 403, f"status={_s}")
+check("403 のコードは FORBIDDEN",
+      isinstance(_p, dict) and _p.get("error", {}).get("code") == "FORBIDDEN",
+      f"body={_p}")
+
+_s, _, _ = call("POST", "/threads", json.dumps({"title": "CSRF"}),
+                origin="https://evil.test")
+check("知らない Origin からの POST は 403", _s == 403, f"status={_s}")
+
+# **前方一致で判定していないこと。** 許可値で始まる別ホストを弾く。
+_s, _, _ = call("POST", "/threads", json.dumps({"title": "CSRF"}),
+                origin=ORIGIN + ".evil.test")
+check("許可値で始まる別オリジンは 403", _s == 403, f"status={_s}")
+
+# Origin が無ければ Referer で照合する。
+_s, _, _ = call("POST", "/threads", json.dumps({"title": "CSRF referer"}),
+                headers={"Referer": ORIGIN + "/threads"}, origin="")
+check("許可オリジンの Referer なら通る", _s == 201, f"status={_s}")
+
+_s, _, _ = call("POST", "/threads", json.dumps({"title": "CSRF referer"}),
+                headers={"Referer": "https://evil.test/threads"}, origin="")
+check("知らない Referer は 403", _s == 403, f"status={_s}")
+
+# **GET は素通しすること** (前提: GET に副作用を持たせない)。
+_s, _, _ = call("GET", "/threads", origin="")
+check("GET は Origin が無くても通る", _s == 200, f"status={_s}")
+
+# **multipart はプリフライトが起きない = CORS が効かない経路。**
+# csrfGuard だけが防御になるので、ここは必ず検査する。
+_s, _p, _ = call("POST", "/images", None, origin="")
+check("画像アップロードも Origin 無しは 403", _s == 403, f"status={_s}")
 
 section("CORS")
 req = urllib.request.Request(BASE_URL + "/threads")
@@ -821,6 +879,9 @@ if SQL_EXEC:
         payload, content_type = _multipart(kind, body)
         req = urllib.request.Request(BASE_URL + "/images", method="POST")
         req.add_header("Content-Type", content_type)
+        # multipart/form-data は simple request なのでプリフライトが起きない。
+        # **CORS が効かない経路**なので、csrfGuard だけが防御になる (ADR 0013 決定 1)。
+        req.add_header("Origin", ORIGIN)
         if cookie_token:
             req.add_header("Cookie", f"session={cookie_token}")
         try:

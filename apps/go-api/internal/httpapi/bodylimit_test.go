@@ -48,6 +48,9 @@ func TestBodyLimit_DoesNotBufferHugeBody(t *testing.T) {
 	body := &countingReader{remaining: size}
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/images", body)
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Content-Type", "multipart/form-data; boundary=xyz")
 	req.ContentLength = size
 
@@ -71,6 +74,9 @@ func TestBodyLimit_DoesNotBufferHugeBodyWhenUnauthenticated(t *testing.T) {
 	body := &countingReader{remaining: size}
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/images", body)
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Content-Type", "multipart/form-data; boundary=xyz")
 	req.ContentLength = size
 	// Cookie を付けない
@@ -92,6 +98,9 @@ func TestBodyLimit_StopsChunkedBody(t *testing.T) {
 	body := &countingReader{remaining: size}
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/images", body)
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Content-Type", "multipart/form-data; boundary=xyz")
 	req.ContentLength = -1 // chunked
 	req.AddCookie(sessionCookie(env.token))
