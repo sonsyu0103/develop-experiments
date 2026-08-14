@@ -181,11 +181,11 @@ SELECT id, owner_id, kind, object_key, content_type, width, height, byte_size, s
 FROM images
 WHERE object_reclaimed_at IS NULL
   AND (attached_at IS NULL OR status = 'deleted')
-  AND created_at < now() - $1::interval
   AND (
     status = 'deleted'
     OR (
-      NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
+      created_at < now() - $1::interval
+      AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
       AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id)
       AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.icon_image_id = images.id)
     )
@@ -231,10 +231,22 @@ type ListReclaimableImagesParams struct {
 // 索引で候補を数件に絞ったあと、行を消す種類 (pending / committed) にだけ
 // 確認をかける。deleted は添付されたまま S3 を消すので対象外。
 //
-// 【経過時間で守る】
-// どの種類も created_at で足切りする。**アップロード直後の画像を
-// 消してはいけない** —— 添付するまでの数十秒のあいだ、
+// 【経過時間で守るのは「孤児かどうかが確定しない」種類だけ】
+// pending と committed は created_at で足切りする。**アップロード直後の
+// 画像を消してはいけない** —— 添付するまでの数十秒のあいだ、
 // committed の孤立は正常な状態として存在する。
+// 「まだ添付されていない」と「もう添付されない」は時間でしか区別できない。
+//
+// **deleted には猶予を与えない** (Phase 10 後半で直した)。
+// 初版は 3 種類すべてに猶予をかけていたため、モデレーターが
+// 削除した直後の画像が**作成から 1 時間経つまで S3 に残っていた**。
+// ADR 0011 決定 5 は「不適切な画像は URL を直接叩けば見え続ける」ことを
+// 消す理由に挙げているので、そこに 1 時間の穴が空いていたことになる。
+// 削除は明示的な操作であり、「まだ判断がついていない」状態が無い。
+//
+// 猶予の条件を OR の内側へ移すことで、索引の述語
+// (object_reclaimed_at IS NULL AND (attached_at IS NULL OR status = 'deleted'))
+// は 1 文字も変わらない。**述語はそのまま、絞りだけが変わる。**
 //
 // 【FOR UPDATE SKIP LOCKED】
 // 定期処理を API プロセス内で動かすため (ADR 0003 未決 #9)、
@@ -273,6 +285,43 @@ func (q *Queries) ListReclaimableImages(ctx context.Context, arg ListReclaimable
 		return nil, err
 	}
 	return items, nil
+}
+
+const markImageDeleted = `-- name: MarkImageDeleted :execrows
+UPDATE images
+SET status = 'deleted'
+WHERE id = $1
+  AND status <> 'deleted'
+  AND object_reclaimed_at IS NULL
+`
+
+// モデレーターが画像を削除する (ADR 0011 決定 5)。
+//
+// **status を書き替えるだけで、行も S3 のオブジェクトも消さない。**
+// 実体を消すのは回収バッチで、この UPDATE がその対象に入れる
+// (images_reclaimable_idx の述語が status = 'deleted' を含む)。
+// ここで S3 を叩かないのは、HTTP のリクエスト内で外部システムへの
+// 削除を待たせないため —— 失敗したときに DB だけ巻き戻ると、
+// 「消したはずの画像が誰からも回収されない」状態になる。
+//
+// 【status = 'committed' に限らない】
+// 'pending' の画像も削除できる。アップロード中に通報が入る余地があり、
+// そこで弾くと「まだ確定していないので消せません」という
+// 説明のつかない拒否になる。'pending' はもともと回収対象なので、
+// status を 'deleted' にしても回収バッチの扱いは変わらない
+// (行を残す側に移るだけ)。
+//
+// 【既に 'deleted' なら 0 行】
+// 2 回目の削除を「今回消した」と誤認させないため。
+// object_reclaimed_at も見る —— 回収済みの行を 'deleted' に
+// 書き戻しても、確保済みなので二度と拾われない。
+// 実体は既に無いので、記録だけが増えることになる。
+func (q *Queries) MarkImageDeleted(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, markImageDeleted, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const markImageReclaimed = `-- name: MarkImageReclaimed :execrows

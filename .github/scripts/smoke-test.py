@@ -1131,15 +1131,19 @@ if SQL_EXEC:
                 # 000007 で attached_at を足したとき、写しが古いまま
                 # 通り続けていた (実測)。写しがずれると、
                 # 「本体が壊れているのにスモークは緑」になる。
+                # **猶予は OR の内側にある。** Phase 10 後半で移した ——
+                # 3 種類すべてに created_at の足切りをかけていたため、
+                # モデレーターが削除した直後の画像が「作成から 1 時間」
+                # 経つまで S3 に残っていた (ADR 0011 決定 5 に穴が空いていた)。
                 reclaimable = f"""
                     SELECT CASE WHEN EXISTS (
                         SELECT 1 FROM images
                         WHERE id = '{orphan['id']}'::uuid
                           AND object_reclaimed_at IS NULL
                           AND (attached_at IS NULL OR status = 'deleted')
-                          AND created_at < now() - interval '1 hour'
                           AND (status = 'deleted' OR (
-                            NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
+                            created_at < now() - interval '1 hour'
+                            AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
                             AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id)
                             AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.icon_image_id = images.id)))
                     ) THEN 'RECLAIMABLE' ELSE 'NOT_RECLAIMABLE' END;
@@ -1216,6 +1220,226 @@ if SQL_EXEC:
 else:
     section("画像 (ADR 0007)")
     skip("画像", "SQL_EXEC が未設定")
+
+# ---------------------------------------------------------------------------
+# モデレーション (docs/adr/0011-moderation.md 決定 2・3・5)
+# ---------------------------------------------------------------------------
+#
+# **ここが「モデレーターの削除」の唯一の端から端まで**になる。
+#
+# Phase 6 の時点では `status = 'deleted'` を書く経路が無く、
+# 回収バッチの検査はすべて `UPDATE images SET status='deleted'` を
+# SQL で直接書いて作った状態から始めていた。
+# つまり「HTTP で削除を受ける → アプリのクエリが status を書く →
+# 回収バッチが拾う」が 1 度も通っていなかった。
+#
+# S3 の実体を消すところまでは回さない (定期処理は 10 分間隔 + ばらつきで、
+# スモークの実行時間では発火しない)。**回収対象に入ったこと**を
+# 実 DB で確かめ、そこから先は image/usecase の reclaim_test.go と
+# objectstorage の live テストが受け持つ。
+
+if SQL_EXEC:
+    section("モデレーション (ADR 0011)")
+
+    mod_token = "smoke-mod-" + secrets.token_hex(16)
+    mod_hash = hashlib.sha256(mod_token.encode()).hexdigest()
+    plain_token = "smoke-plain-" + secrets.token_hex(16)
+    plain_hash = hashlib.sha256(plain_token.encode()).hexdigest()
+
+    mod_cookie = {"Cookie": f"session={mod_token}"}
+    plain_cookie = {"Cookie": f"session={plain_token}"}
+
+    def moderate(body: dict, headers: dict):
+        """POST /moderation/actions を叩く。"""
+        return call("POST", "/moderation/actions", json.dumps(body), headers=headers)
+
+    def scalar(statement: str) -> str:
+        """SQL の 1 値を文字列で返す。**合言葉を返させる前提**。"""
+        return subprocess.run(shlex.split(SQL_EXEC) + [statement],
+                              check=True, capture_output=True, text=True).stdout
+
+    try:
+        for uid, sub, sess, role in [
+            (900030, "smoke-sub-mod", mod_hash, "moderator"),
+            (900031, "smoke-sub-plain", plain_hash, "user"),
+        ]:
+            sql(f"""
+                INSERT INTO users (id, public_id, google_sub, email, display_name, role)
+                VALUES ({uid}, '01920000-0000-7000-8000-000000{uid}'::uuid,
+                        '{sub}', '{sub}@example.com', 'スモーク', '{role}')
+                ON CONFLICT (google_sub) DO UPDATE SET role = EXCLUDED.role;
+            """)
+            sql(f"""
+                INSERT INTO sessions (id, user_id, expires_at)
+                VALUES ('{sess}', {uid}, now() + interval '5 minutes');
+            """)
+
+        # 削除される側の投稿。**匿名で作る** ——
+        # ADR 0011 決定 2 が上書きした「匿名投稿は誰も削除できない」を
+        # 実際に覆せることを見る。
+        sql("""
+            INSERT INTO threads (id, title) VALUES (900030, 'スモーク: 削除されるスレッド')
+            ON CONFLICT (id) DO UPDATE SET deleted_at = NULL;
+        """)
+        sql("""
+            INSERT INTO threads (id, title) VALUES (900031, 'スモーク: コメントの親')
+            ON CONFLICT (id) DO UPDATE SET deleted_at = NULL;
+        """)
+        s, comment, _ = call("POST", "/threads/900031/comments",
+                             json.dumps({"body": "スモーク: 削除されるコメント"}))
+        comment_id = (comment or {}).get("id") if s == 201 else None
+
+        # --- 権限 (決定 1) ---
+        #
+        # **対象が存在しない ID でも 403 であること**を併せて見る。
+        # 404 に化けると、権限の無い利用者が 403 と 404 の差で
+        # 「その ID の対象が存在すること」を確かめられる。
+        s, payload, _ = moderate({"action": "delete_thread", "targetId": "900030"}, plain_cookie)
+        code = ((payload or {}).get("error") or {}).get("code")
+        check("一般利用者のモデレーションは 403 / PERMISSION_DENIED",
+              s == 403 and code == "PERMISSION_DENIED", f"status={s} code={code}")
+
+        s, _, _ = moderate({"action": "delete_thread", "targetId": "999999999"}, plain_cookie)
+        check("存在しない対象でも一般利用者には 403 (存在を教えない)",
+              s == 403, f"status={s}")
+
+        s, _, _ = call("POST", "/moderation/actions",
+                       json.dumps({"action": "delete_thread", "targetId": "900030"}))
+        check("未ログインのモデレーションは 401", s == 401, f"status={s}")
+
+        # **Origin が無ければ csrfGuard が先に 403** (ADR 0013 決定 1)。
+        s, _, _ = call("POST", "/moderation/actions",
+                       json.dumps({"action": "delete_thread", "targetId": "900030"}),
+                       headers=mod_cookie, origin="")
+        check("Origin の無いモデレーションは 403", s == 403, f"status={s}")
+
+        # --- スレッドの削除 (決定 2・3) ---
+        s, payload, _ = moderate(
+            {"action": "delete_thread", "targetId": "900030", "reason": "スモークの検証"},
+            mod_cookie)
+        check("モデレーターは匿名スレッドを削除できる", s == 201, f"status={s} payload={payload}")
+        # **対象種別はリクエストではなく操作から導く。**
+        check("応答の targetType が action から導かれる",
+              (payload or {}).get("targetType") == "thread", f"payload={payload}")
+
+        s, _, _ = call("GET", "/threads/900030")
+        check("削除したスレッドは 404 になる", s == 404, f"status={s}")
+
+        out = scalar("""
+            SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM moderation_actions
+                WHERE actor_id = 900030 AND action = 'delete_thread'
+                  AND target_type = 'thread' AND target_id = '900030'
+                  AND reason = 'スモークの検証'
+            ) THEN 'RECORDED' ELSE 'MISSING' END;
+        """)
+        check("削除が moderation_actions に記録される",
+              "RECORDED" in out and "MISSING" not in out, f"got={out.strip()!r}")
+
+        # **2 回目は 404 で、記録も増えないこと。**
+        # 増えると「1 回しか起きていない削除」が 2 件の監査記録になる。
+        s, _, _ = moderate({"action": "delete_thread", "targetId": "900030"}, mod_cookie)
+        check("削除済みスレッドの再削除は 404", s == 404, f"status={s}")
+        out = scalar("""
+            SELECT count(*)::text || ':COUNT' FROM moderation_actions
+            WHERE actor_id = 900030 AND target_type = 'thread' AND target_id = '900030';
+        """)
+        check("再削除で記録が増えない", "1:COUNT" in out, f"got={out.strip()!r}")
+
+        # --- コメントの削除 (パーティションキー) ---
+        if comment_id is not None:
+            s, _, _ = moderate({"action": "delete_comment", "targetId": str(comment_id)},
+                               mod_cookie)
+            check("スレッド ID の無いコメント削除は 400", s == 400, f"status={s}")
+
+            s, _, _ = moderate({"action": "delete_comment", "targetId": str(comment_id),
+                                "threadId": 900031}, mod_cookie)
+            check("モデレーターはコメントを削除できる", s == 201, f"status={s}")
+
+            _, payload, _ = call("GET", "/threads/900031/comments")
+            ids = [c["id"] for c in (payload or {}).get("comments", [])]
+            check("削除したコメントは一覧から消える", comment_id not in ids, f"ids={ids}")
+        else:
+            check("コメントを用意できた", False, "投稿に失敗した")
+
+        # --- ID の形式 ---
+        s, _, _ = moderate({"action": "delete_thread", "targetId": "not-a-number"}, mod_cookie)
+        check("整数でない targetId は 400 (404 に化けない)", s == 400, f"status={s}")
+
+        s, _, _ = moderate({"action": "change_role", "targetId": "900031"}, mod_cookie)
+        check("削除以外の操作は受け付けない (400)", s == 400, f"status={s}")
+
+        # --- 画像の削除 (決定 5) ---
+        #
+        # **ここが Phase 6 から繋がっていなかった継ぎ目**になる。
+        s, img = upload("comment_attachment", _png(24, 24), mod_token)
+        if s == 201:
+            image_id = img["id"]
+            # 添付する。**添付済みでも消せる**ことを見る ——
+            # 回収の索引は「未添付 または deleted」で拾うので、
+            # 添付済みの deleted が拾えないと不適切な画像が残り続ける。
+            call("POST", "/threads/900031/comments",
+                 json.dumps({"body": "画像つき", "imageId": image_id}),
+                 headers=mod_cookie)
+
+            s, _, _ = moderate({"action": "delete_image", "targetId": image_id}, mod_cookie)
+            check("モデレーターは画像を削除できる", s == 201, f"status={s}")
+
+            out = scalar(f"""
+                SELECT status || ':STATUS' FROM images WHERE id = '{image_id}'::uuid;
+            """)
+            check("画像の status が deleted になる", "deleted:STATUS" in out, f"got={out.strip()!r}")
+
+            # **回収対象に入ること。しかも猶予を待たずに。**
+            #
+            # 述語は db/query/images.sql の ListReclaimableImages の写し。
+            # 本体を直したらここも直すこと。
+            out = scalar(f"""
+                SELECT CASE WHEN EXISTS (
+                    SELECT 1 FROM images
+                    WHERE id = '{image_id}'::uuid
+                      AND object_reclaimed_at IS NULL
+                      AND (attached_at IS NULL OR status = 'deleted')
+                      AND (status = 'deleted' OR (
+                        created_at < now() - interval '1 hour'
+                        AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
+                        AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id)
+                        AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.icon_image_id = images.id)))
+                ) THEN 'RECLAIMABLE' ELSE 'NOT_RECLAIMABLE' END;
+            """)
+            check("削除した画像が即座に回収対象になる (猶予を待たない)",
+                  "NOT_RECLAIMABLE" not in out and "RECLAIMABLE" in out,
+                  f"got={out.strip()!r}")
+
+            # **DB 行は残る** (ADR 0016 問題 3)。
+            # 消すと外部キー違反になり、「画像は削除されました」と
+            # 「元から画像なし」も区別できなくなる。
+            out = scalar(f"""
+                SELECT count(*)::text || ':ROWS' FROM images WHERE id = '{image_id}'::uuid;
+            """)
+            check("削除しても images の行は残る", "1:ROWS" in out, f"got={out.strip()!r}")
+
+            s, _, _ = moderate({"action": "delete_image", "targetId": image_id}, mod_cookie)
+            check("削除済み画像の再削除は 404", s == 404, f"status={s}")
+        else:
+            # **skip にしない。** ここは節ごと落ちたわけではなく、
+            # 前提のアップロードが失敗しただけ。skip に倒すと
+            # 「画像の削除を検査していない」ことが 1 行の警告に紛れる。
+            check("モデレーション用の画像をアップロードできた", False, f"status={s}")
+    finally:
+        sql("DELETE FROM moderation_actions WHERE actor_id IN (900030, 900031);")
+        # 参照を外すのが先 (画像の節と同じ理由)。
+        sql("DELETE FROM comments WHERE thread_id IN (900030, 900031);")
+        sql("DELETE FROM threads WHERE icon_image_id IN "
+            "(SELECT id FROM images WHERE owner_id IN (900030, 900031));")
+        sql("DELETE FROM threads WHERE id IN (900030, 900031);")
+        sql("UPDATE users SET avatar_image_id = NULL WHERE id IN (900030, 900031);")
+        sql("DELETE FROM images WHERE owner_id IN (900030, 900031);")
+        sql("DELETE FROM sessions WHERE user_id IN (900030, 900031);")
+        sql("DELETE FROM users WHERE id IN (900030, 900031);")
+else:
+    section("モデレーション (ADR 0011)")
+    skip("モデレーション", "SQL_EXEC が未設定")
 
 # ---------------------------------------------------------------------------
 

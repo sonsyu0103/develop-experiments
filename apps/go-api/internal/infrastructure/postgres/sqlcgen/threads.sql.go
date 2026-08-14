@@ -367,6 +367,36 @@ func (q *Queries) ListThreadsWithCommentCount(ctx context.Context, arg ListThrea
 	return items, nil
 }
 
+const softDeleteThread = `-- name: SoftDeleteThread :execrows
+UPDATE threads
+SET deleted_at = now()
+WHERE id = $1
+  AND deleted_at IS NULL
+`
+
+// スレッドを論理削除する (ADR 0011 決定 2)。
+//
+// **deleted_at IS NULL を条件に含める。** 含めないと 2 回目以降も
+// 1 行を返し、呼び出し側が「今回消した」と判断してしまう。
+// モデレーション記録は「実際に起きた変化」に対してだけ書きたい。
+// 副次的に、消した時刻が後から呼ばれた削除で上書きされるのも防ぐ。
+//
+// **コメントは消さない。** スレッドが論理削除されると一覧・取得の
+// どちらからも消えるため、コメントを個別に消して回る必要がない。
+// 8 パーティションすべてに UPDATE を投げることにもなる。
+//
+// **添付画像も消さない。** アイコンやコメントの画像を
+// ストレージから消すかはモデレーターの別の判断であり
+// (スレッドの主題が不適切でも画像は問題ないことがある)、
+// delete_image として個別に記録されるべきものになる。
+func (q *Queries) SoftDeleteThread(ctx context.Context, id int64) (int64, error) {
+	result, err := q.db.Exec(ctx, softDeleteThread, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const threadExists = `-- name: ThreadExists :one
 SELECT EXISTS (
     SELECT 1 FROM threads

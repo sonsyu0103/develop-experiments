@@ -15,6 +15,7 @@ import (
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
 	imageusecase "develop-experiments/apps/go-api/internal/image/usecase"
+	moderationusecase "develop-experiments/apps/go-api/internal/moderation/usecase"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
@@ -41,8 +42,12 @@ type Server struct {
 	login *userusecase.LoginInteractor
 	// images はストレージの設定が無い場合 nil になります。
 	// そのとき**画像の経路だけ**が 503 を返します (ADR 0005 決定 4 と同じ形)。
-	images  *imageusecase.ImageInteractor
-	authCfg config.AuthConfig
+	images *imageusecase.ImageInteractor
+	// moderation は**必ず存在します**。DB があれば動くためで、
+	// login / images のような設定依存の 503 経路はありません
+	// (削除と記録は外部サービスを必要としない)。
+	moderation *moderationusecase.Interactor
+	authCfg    config.AuthConfig
 }
 
 var _ oapigen.ServerInterface = (*Server)(nil)
@@ -61,19 +66,27 @@ func NewServer(
 	sessions *userusecase.SessionInteractor,
 	login *userusecase.LoginInteractor,
 	images *imageusecase.ImageInteractor,
+	moderation *moderationusecase.Interactor,
 	authCfg config.AuthConfig,
 ) *Server {
 	if sessions == nil {
 		panic("httpapi: SessionInteractor は必須です (nil だとセッションが解決されません)")
 	}
+	// **nil を許さない。** 許すと、権限つきの経路が結線漏れのまま
+	// 500 を返す状態で起動します。設定ではなく結線の誤りなので、
+	// 起動時に落とします (sessions と同じ理由)。
+	if moderation == nil {
+		panic("httpapi: moderation.Interactor は必須です (nil だと削除の経路が落ちます)")
+	}
 	return &Server{
-		threads:  threads,
-		comments: comments,
-		db:       db,
-		sessions: sessions,
-		login:    login,
-		images:   images,
-		authCfg:  authCfg,
+		threads:    threads,
+		comments:   comments,
+		db:         db,
+		sessions:   sessions,
+		login:      login,
+		images:     images,
+		moderation: moderation,
+		authCfg:    authCfg,
 	}
 }
 

@@ -24,6 +24,7 @@ import (
 	imagemodel "develop-experiments/apps/go-api/internal/image/domain/model"
 	imagerepo "develop-experiments/apps/go-api/internal/image/domain/repository"
 	imageusecase "develop-experiments/apps/go-api/internal/image/usecase"
+	moderationusecase "develop-experiments/apps/go-api/internal/moderation/usecase"
 	threadmodel "develop-experiments/apps/go-api/internal/thread/domain/model"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
@@ -141,6 +142,7 @@ func newImageEnv(t *testing.T) *imageEnv {
 			userusecase.NewSessionInteractor(sessions, nil),
 			nil,
 			imageInteractor,
+			moderationusecase.NewInteractor(newFakeModerationRepo()),
 			config.AuthConfig{FrontendURL: "http://localhost:3000"},
 		),
 		AllowedOrigins: []string{"http://localhost:3000"},

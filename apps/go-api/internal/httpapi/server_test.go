@@ -25,6 +25,7 @@ import (
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
 	"develop-experiments/apps/go-api/internal/idempotency"
 	"develop-experiments/apps/go-api/internal/logging"
+	moderationusecase "develop-experiments/apps/go-api/internal/moderation/usecase"
 	"develop-experiments/apps/go-api/internal/pagination"
 	threadmodel "develop-experiments/apps/go-api/internal/thread/domain/model"
 	threadrepo "develop-experiments/apps/go-api/internal/thread/domain/repository"
@@ -245,6 +246,8 @@ func newTestEnv(t *testing.T) *testEnv {
 			nil,
 			// 画像も未設定 (= POST /images が 503)。
 			nil,
+			// モデレーションは設定に依存しないので、ここでも結線する。
+			moderationusecase.NewInteractor(newFakeModerationRepo()),
 			config.AuthConfig{},
 		),
 		AllowedOrigins: []string{"http://localhost:3000"},

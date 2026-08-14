@@ -105,6 +105,16 @@ components:
   user-usecase:
     in: internal/user/usecase
 
+  # モデレーション (docs/adr/0011-moderation.md)。
+  # 通報とモデレーション記録は thread / comment / image のいずれにも属さない
+  # 横断的な関心事で、どれかに寄せると他の 2 つへの参照が要る
+  moderation-model:
+    in: internal/moderation/domain/model
+  moderation-repository:
+    in: internal/moderation/domain/repository
+  moderation-usecase:
+    in: internal/moderation/usecase
+
   httpapi:
     in: internal/httpapi
   httpapi-oapigen:
@@ -205,6 +215,30 @@ deps:
       - user-model
       - user-repository
 
+  # モデレーション (docs/adr/0011-moderation.md)。
+  # **他モジュールのドメイン型を知らない。** 削除の口は
+  # 「int64 / uuid.UUID を受け取るインターフェース」として
+  # moderation 側で定義し、postgres が実装する。
+  # thread / comment / image を mayDependOn に足すと、
+  # 横断的な関心事として切り出した意味が無くなる
+  # **deps を宣言しない。** import するのは apperr (commonComponents) と
+  # 標準ライブラリだけで、許可すべきものが 1 つも無い。
+  # 空の mayDependOn は go-arch-lint がエラーにする
+  # 画像の ID が UUID なので uuid が要る。他は int64
+  moderation-repository:
+    canUse:
+      - uuid
+    mayDependOn:
+      - moderation-model
+  moderation-usecase:
+    canUse:
+      # 画像 ID の解釈 (uuid.Parse)。**正規化した表現を記録に書く**ため、
+      # 文字列のまま扱うわけにはいかない
+      - uuid
+    mayDependOn:
+      - moderation-model
+      - moderation-repository
+
   # 外側のアダプタ。image モジュールが定義した ObjectStorage を実装する。
   # **SDK を知ってよいのはここだけ** (ADR 0007 のモジュール構成)
   object-storage:
@@ -236,6 +270,10 @@ deps:
       - user-usecase
       - user-model
       - image-usecase
+      # モデレーション。ハンドラは Actor を組み立て、操作の種類を解釈するため
+      # usecase だけでなく model も見る (ロールの判定は user-model 側)
+      - moderation-usecase
+      - moderation-model
       - httpapi-oapigen
       - shared-config
 
@@ -253,6 +291,11 @@ deps:
       - user-repository
       - image-model
       - image-repository
+      # 削除の口と記録をまとめて実装する (ModerationRepository)。
+      # 削除と記録を同じトランザクションに収めるため、1 つの実体が
+      # 4 つのインターフェースを満たす
+      - moderation-model
+      - moderation-repository
       - postgres-sqlcgen
       - shared-config
 
