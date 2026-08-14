@@ -197,6 +197,9 @@ func uploadRequest(t *testing.T, kind string, body []byte, cookies ...*http.Cook
 	}
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/images", &buf)
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	for _, c := range cookies {
 		req.AddCookie(c)
@@ -359,6 +362,9 @@ func TestCreateComment_AttachesImage(t *testing.T) {
 	body := `{"body":"画像つきの投稿","imageId":"` + uploaded.Id.String() + `"}`
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/threads/1/comments",
 		strings.NewReader(body))
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(sessionCookie(env.token))
 
@@ -413,6 +419,9 @@ func TestCreateComment_RejectsOthersImage(t *testing.T) {
 	body := `{"body":"他人の画像を添付","imageId":"` + other.ID.String() + `"}`
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/threads/1/comments",
 		strings.NewReader(body))
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Content-Type", "application/json")
 	req.AddCookie(sessionCookie(env.token))
 
@@ -437,6 +446,9 @@ func TestCreateComment_AnonymousCannotAttachImage(t *testing.T) {
 	body := `{"body":"匿名で画像を添付","imageId":"` + uploaded.Id.String() + `"}`
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/threads/1/comments",
 		strings.NewReader(body))
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Content-Type", "application/json")
 	// Cookie を付けない = 匿名
 
@@ -455,6 +467,9 @@ func TestCreateComment_WithoutImageStillWorks(t *testing.T) {
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/threads/1/comments",
 		strings.NewReader(`{"body":"画像なし"}`))
+	// **Origin が要る** (ADR 0013 決定 1 の CSRF 対策)。
+	// 付けないと csrfGuard が 403 で打ち切り、ここから先を検査できない。
+	req.Header.Set("Origin", testOrigin)
 	req.Header.Set("Content-Type", "application/json")
 
 	rec := env.do(req)

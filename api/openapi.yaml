@@ -157,6 +157,8 @@ paths:
               description: 空値・有効期限切れの Cookie
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -225,6 +227,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: |
             指定された画像が存在しないか、自分のものではありません。
@@ -304,6 +308,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '413':
           description: |
             サイズまたは画素数の上限を超えました。
@@ -413,6 +419,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: |
             指定されたアイコンが存在しないか、自分のものではありません。
@@ -503,6 +511,8 @@ paths:
                 $ref: '#/components/schemas/Comment'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: 親スレッドが存在しない
           content:
@@ -647,6 +657,22 @@ components:
 
     Unauthorized:
       description: 未ログイン、またはセッションが無効
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+    Forbidden:
+      description: |
+        `code` は `PERMISSION_DENIED` です。
+
+        状態変更メソッド (POST / PUT / PATCH / DELETE) の `Origin` または
+        `Referer` が許可リストに無い、あるいはどちらも付いていない
+        (docs/adr/0013-http-defense.md 決定 1 の CSRF 対策)。
+
+        **ブラウザ以外のクライアントも `Origin` を送る必要があります。**
+        `SameSite=Lax` だけではサブドメインを取られた場合に防げないため、
+        サーバ側でも検証します。
       content:
         application/json:
           schema:
@@ -1022,6 +1048,16 @@ components:
                 - NOT_FOUND
                 - METHOD_NOT_ALLOWED
                 - CONFLICT
+                # 403。権限が無い、または状態変更メソッドの Origin / Referer が
+                # 許可リストに無い (docs/adr/0013-http-defense.md 決定 1 / 決定 3)。
+                #
+                # **名前は gRPC の体系に合わせます** (決定 3)。
+                # FORBIDDEN にしかけたが、決定 3 の表が PERMISSION_DENIED と
+                # 用途 (「権限がない / Origin 検証の失敗」) まで決めていた。
+                #
+                # **存在を隠したい対象には使いません** —— 他人の画像などは
+                # 404 で返します (決定 3「存在を隠すべき場合は 404」)
+                - PERMISSION_DENIED
                 # 413。画像のサイズ・画素数の上限を超えた
                 # (docs/adr/0007-image-storage.md 決定 2 / ADR 0013 決定 3)
                 - PAYLOAD_TOO_LARGE
