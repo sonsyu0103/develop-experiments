@@ -199,7 +199,15 @@ func parseTarget(cmd DeleteCommand) (target, error) {
 		}
 		threadID := *cmd.ThreadID
 		return target{
-			id: strconv.FormatInt(id, 10),
+			// **記録にはスレッド ID も残す** (レビュー指摘)。
+			//
+			// コメント ID だけを書くと、moderation_actions_target_idx から
+			// 辿った先で**この経路が避けたはずの 8 パーティション全走査**が
+			// 必要になる。「削除するときは thread_id が要る」と言いながら、
+			// 「何を削除したかの記録」からは落ちている状態だった。
+			//
+			// 復活や調査は記録を起点に始まるので、そこで毎回起きる。
+			id: formatCommentTarget(threadID, id),
 			delete: func(ctx context.Context, tx repository.Repository) error {
 				return tx.SoftDeleteComment(ctx, threadID, id)
 			},
@@ -224,6 +232,28 @@ func parseTarget(cmd DeleteCommand) (target, error) {
 		// IsDelete() を通っていれば到達しません。
 		return target{}, fmt.Errorf("この操作は削除ではありません: %w", apperr.ErrInvalidArgument)
 	}
+}
+
+// CommentTargetSeparator は、コメントの記録で
+// スレッド ID とコメント ID を区切る文字です。
+//
+// **`:` を選んでいます。** 10 進の整数にも UUID にも現れないため、
+// 他の対象種別の target_id と取り違えようがありません。
+const CommentTargetSeparator = ":"
+
+// formatCommentTarget はコメントの target_id を組み立てます。
+//
+//	"{thread_id}:{comment_id}"
+//
+// **パーティションキーを記録に残すためです。** コメント ID だけでは
+// 記録から対象を引くときに 8 パーティションすべてを走査することになり、
+// この経路が API の形まで曲げて避けたものが、そのまま戻ってきます。
+//
+// BIGINT は最大 19 桁なので、区切りを含めても 39 文字。
+// DB の CHECK 制約 (moderation_target_id_length、上限 64) に収まります。
+func formatCommentTarget(threadID, commentID int64) string {
+	return strconv.FormatInt(threadID, 10) + CommentTargetSeparator +
+		strconv.FormatInt(commentID, 10)
 }
 
 // parseID は 10 進の整数 ID を解釈します。

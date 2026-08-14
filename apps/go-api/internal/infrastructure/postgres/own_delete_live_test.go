@@ -3,10 +3,12 @@ package postgres
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"develop-experiments/apps/go-api/internal/apperr"
+	commentmodel "develop-experiments/apps/go-api/internal/comment/domain/model"
 )
 
 // ---------------------------------------------------------------------------
@@ -136,9 +138,12 @@ func TestCommentRepository_SoftDeleteOwn_Live(t *testing.T) {
 
 	repo := NewCommentRepository(pool, "")
 
-	mine := seedCommentBy(t, pool, threadID, &owner, 1)
-	theirs := seedCommentBy(t, pool, threadID, &other, 2)
-	anon := seedCommentBy(t, pool, threadID, nil, 3)
+	// **消すのは最大のレス番号にする。** 途中の番号を消しても
+	// MAX(seq) が動かないため、「削除された番号を再利用しない」を
+	// 検査できない (レビュー指摘と同じ形の穴になる)。
+	theirs := seedCommentBy(t, pool, threadID, &other, 1)
+	anon := seedCommentBy(t, pool, threadID, nil, 2)
+	mine := seedCommentBy(t, pool, threadID, &owner, 3)
 
 	alive := func(id int64) bool {
 		var ok bool
@@ -193,13 +198,22 @@ func TestCommentRepository_SoftDeleteOwn_Live(t *testing.T) {
 
 	// **レス番号は空いたまま** (ADR 0019 決定 5)。
 	// 再利用すると、過去の >>1 が別の投稿を指すようになる。
-	next := seedCommentBy(t, pool, threadID, &owner, 4)
-	var seq int32
-	if err := pool.QueryRow(t.Context(),
-		`SELECT seq FROM comments WHERE thread_id = $1 AND id = $2`, threadID, next).Scan(&seq); err != nil {
-		t.Fatalf("seq を読めませんでした: %v", err)
+	//
+	// **採番経路を実際に通すこと** (レビュー指摘)。
+	// 初版は seedCommentBy で seq を明示指定して INSERT していたため、
+	// 「1 にならないこと」がどんな実装でも真になり、
+	// **決定 5 が壊れても緑のままだった。**
+	// seq を決めるのは CreateCommentAutoSeq なので、そちらを通す。
+	created, err := repo.Create(t.Context(), commentmodel.Reconstruct(
+		0, threadID, 0, "名無しさん", nil, nil, "live: 欠番の確認", time.Time{}))
+	if err != nil {
+		t.Fatalf("採番経路でコメントを作れませんでした: %v", err)
 	}
-	if seq == 1 {
-		t.Error("削除したレス番号が再利用されている")
+	// **消したのは最大の seq = 3。** 生きているのは 1 と 2 だけになる。
+	//   再利用しない (正しい) : MAX(seq) = 3 -> 4
+	//   再利用する   (誤り)   : 生存だけを見て MAX = 2 -> 3
+	// この差が出るのは、消した番号が最大のときだけになる。
+	if created.Seq != 4 {
+		t.Errorf("採番された seq = %d, want 4 (削除した番号を再利用している)", created.Seq)
 	}
 }

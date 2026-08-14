@@ -1260,7 +1260,18 @@ if SQL_EXEC:
         return call("POST", "/moderation/actions", json.dumps(body), headers=headers)
 
     def scalar(statement: str) -> str:
-        """SQL の 1 値を文字列で返す。**合言葉を返させる前提**。"""
+        """SQL の 1 値を文字列で返す。**合言葉を返させる前提**。
+
+        【数値は `<>` で括らせること】
+        初版は `count(*) || ':COUNT'` の形にして `"1:COUNT" in out` で
+        見ていたが、**部分一致なので 11 件でも 21 件でも通る**
+        (レビュー指摘)。監査記録の件数を見る検査がこれだと、
+        本人の削除が誤って監査経路へ流れ込んでも件数次第で緑になる。
+
+        `'<' || count(*)::text || '>'` にすれば `"<1>"` は
+        `"<11>"` の部分文字列にならない。psql の整形済み出力を
+        行番号で切り出す (壊れやすい) 必要もない。
+        """
         return subprocess.run(shlex.split(SQL_EXEC) + [statement],
                               check=True, capture_output=True, text=True).stdout
 
@@ -1347,10 +1358,10 @@ if SQL_EXEC:
         s, _, _ = moderate({"action": "delete_thread", "targetId": "900030"}, mod_cookie)
         check("削除済みスレッドの再削除は 404", s == 404, f"status={s}")
         out = scalar("""
-            SELECT count(*)::text || ':COUNT' FROM moderation_actions
+            SELECT '<' || count(*)::text || '>' FROM moderation_actions
             WHERE actor_id = 900030 AND target_type = 'thread' AND target_id = '900030';
         """)
-        check("再削除で記録が増えない", "1:COUNT" in out, f"got={out.strip()!r}")
+        check("再削除で記録が増えない", "<1>" in out, f"got={out.strip()!r}")
 
         # --- コメントの削除 (パーティションキー) ---
         if comment_id is not None:
@@ -1392,9 +1403,9 @@ if SQL_EXEC:
             check("モデレーターは画像を削除できる", s == 201, f"status={s}")
 
             out = scalar(f"""
-                SELECT status || ':STATUS' FROM images WHERE id = '{image_id}'::uuid;
+                SELECT '<' || status || '>' FROM images WHERE id = '{image_id}'::uuid;
             """)
-            check("画像の status が deleted になる", "deleted:STATUS" in out, f"got={out.strip()!r}")
+            check("画像の status が deleted になる", "<deleted>" in out, f"got={out.strip()!r}")
 
             # **回収対象に入ること。しかも猶予を待たずに。**
             #
@@ -1421,9 +1432,9 @@ if SQL_EXEC:
             # 消すと外部キー違反になり、「画像は削除されました」と
             # 「元から画像なし」も区別できなくなる。
             out = scalar(f"""
-                SELECT count(*)::text || ':ROWS' FROM images WHERE id = '{image_id}'::uuid;
+                SELECT '<' || count(*)::text || '>' FROM images WHERE id = '{image_id}'::uuid;
             """)
-            check("削除しても images の行は残る", "1:ROWS" in out, f"got={out.strip()!r}")
+            check("削除しても images の行は残る", "<1>" in out, f"got={out.strip()!r}")
 
             s, _, _ = moderate({"action": "delete_image", "targetId": image_id}, mod_cookie)
             check("削除済み画像の再削除は 404", s == 404, f"status={s}")
@@ -1573,11 +1584,11 @@ if SQL_EXEC:
             # --- 本人の削除は監査記録に載せない (ADR 0011 決定 3 の趣旨) ---
             out = subprocess.run(
                 shlex.split(SQL_EXEC) + [f"""
-                    SELECT count(*)::text || ':ACTIONS' FROM moderation_actions
+                    SELECT '<' || count(*)::text || '>' FROM moderation_actions
                     WHERE actor_id IN (900040, 900041);
                 """], check=True, capture_output=True, text=True).stdout
             check("本人の削除は moderation_actions に残らない",
-                  "0:ACTIONS" in out, f"got={out.strip()!r}")
+                  "<0>" in out, f"got={out.strip()!r}")
     finally:
         sql("DELETE FROM moderation_actions WHERE actor_id IN (900040, 900041);")
         sql("DELETE FROM comments WHERE author_id IN (900040, 900041);")

@@ -319,6 +319,22 @@ func TestCreateModerationAction_CommentRequiresThreadID(t *testing.T) {
 	if env.repo.aliveComments[[2]int64{1, 10}] {
 		t.Error("コメントが論理削除されていない")
 	}
+
+	// **記録にもスレッド ID が残ること** (レビュー指摘)。
+	//
+	// コメント ID だけだと、moderation_actions_target_idx から辿った先で
+	// 8 パーティション全走査になる —— この経路が API の形まで曲げて
+	// 避けたものが、記録の側から戻ってくる。
+	if got := env.repo.actions[0].TargetID; got != "1:10" {
+		t.Errorf("target_id = %q, want \"1:10\" (パーティションキーが落ちている)", got)
+	}
+	var body oapigen.ModerationAction
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("レスポンスの解析に失敗した: %v", err)
+	}
+	if body.TargetId != "1:10" {
+		t.Errorf("レスポンスの targetId = %q, want \"1:10\"", body.TargetId)
+	}
 }
 
 // **一般利用者は 403** (ADR 0011 決定 1)。

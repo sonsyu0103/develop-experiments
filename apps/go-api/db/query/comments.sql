@@ -257,8 +257,12 @@ WHERE thread_id = sqlc.arg('thread_id')
   AND deleted_at IS NULL;
 
 -- name: SoftDeleteComment :execrows
--- 現時点で HTTP エンドポイントからは呼ばれていない。
--- 削除 API を公開するかは未決 (docs/adr/0003-open-questions.md 項目 7)。
+-- **投稿者を見ない削除。** モデレーターの経路
+-- (POST /moderation/actions) がこれを使う ——
+-- 匿名投稿も消せる必要があるため (ADR 0011 決定 2)。
+--
+-- 本人による削除は SoftDeleteOwnComment のほう。
+-- ADR 0003 の未決 #7 は Phase 10 後半で解決済み。
 UPDATE comments
 SET deleted_at = now()
 WHERE thread_id = sqlc.arg('thread_id')

@@ -429,9 +429,27 @@ type Querier interface {
 	// 【status = 'committed' に限らない】
 	// 'pending' の画像も削除できる。アップロード中に通報が入る余地があり、
 	// そこで弾くと「まだ確定していないので消せません」という
-	// 説明のつかない拒否になる。'pending' はもともと回収対象なので、
-	// status を 'deleted' にしても回収バッチの扱いは変わらない
-	// (行を残す側に移るだけ)。
+	// 説明のつかない拒否になる。
+	//
+	// **ただし「扱いは変わらない」わけではない** (レビュー指摘)。
+	// 'pending' は本来 created_at < now() - grace に守られているが、
+	// 'deleted' にした瞬間その保護が外れる (猶予は孤児にしか掛からない)。
+	//
+	//   1. モデレーターが 'pending' の画像を消す
+	//   2. 回収バッチが即座に拾い、S3 の DELETE を投げる
+	//   3. **そのあとアップロードの PUT が着地する**
+	//   4. object_reclaimed_at が入っているので二度と拾われない
+	//
+	// 結果、DB から辿れない S3 オブジェクトが 1 つ残る。
+	// **窓は 1 リクエストの内側**にある —— PUT はアップロードの HTTP 処理が
+	// 自分で投げるので (ADR 0007 決定 3)、外から割り込む余地はほぼ無い。
+	// しかも 'pending' の ID は確定するまで応答に出ないため、
+	// モデレーターがその ID を知る手段が無い。
+	//
+	// そのうえで残しているのは、閉じる手段が
+	// 「'pending' を消せなくする」か「猶予を戻す」しかなく、
+	// どちらも決定 5 の目的 (不適切な画像を即座に消す) を損なうため。
+	// 起きたときの被害は S3 の容量だけになる。
 	//
 	// 【既に 'deleted' なら 0 行】
 	// 2 回目の削除を「今回消した」と誤認させないため。
@@ -502,8 +520,12 @@ type Querier interface {
 	// どちらにも id 列がある。修飾しないと sqlc の解析が
 	// "column reference \"id\" is ambiguous" で止まる (実測)。
 	SetUserAvatarImage(ctx context.Context, arg SetUserAvatarImageParams) (User, error)
-	// 現時点で HTTP エンドポイントからは呼ばれていない。
-	// 削除 API を公開するかは未決 (docs/adr/0003-open-questions.md 項目 7)。
+	// **投稿者を見ない削除。** モデレーターの経路
+	// (POST /moderation/actions) がこれを使う ——
+	// 匿名投稿も消せる必要があるため (ADR 0011 決定 2)。
+	//
+	// 本人による削除は SoftDeleteOwnComment のほう。
+	// ADR 0003 の未決 #7 は Phase 10 後半で解決済み。
 	SoftDeleteComment(ctx context.Context, arg SoftDeleteCommentParams) (int64, error)
 	// 投稿者が自分のコメントを論理削除する (ADR 0005 の権限モデル / ADR 0003 未決 #7)。
 	//

@@ -295,7 +295,7 @@ func (s *Server) CreateThread(c *gin.Context) {
 //
 // **モデレーターの削除はこの経路ではありません。**
 // 他人・匿名の投稿を消すのは POST /moderation/actions で、
-// そちらは monitoring_actions への記録を伴います (ADR 0011 決定 3)。
+// そちらは moderation_actions への記録を伴います (ADR 0011 決定 3)。
 // 分けているのは、本人の削除を監査記録に載せる理由が無いためです ——
 // 載せると、記録の大半が通常の操作で埋まり、モデレーションの調査に使えなくなります。
 func (s *Server) DeleteThread(c *gin.Context, threadID oapigen.ThreadId) {

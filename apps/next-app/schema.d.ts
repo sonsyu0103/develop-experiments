@@ -776,7 +776,17 @@ export interface components {
             id: number;
             action: components["schemas"]["ModerationActionType"];
             targetType: components["schemas"]["ModerationTargetType"];
-            /** @example 10 */
+            /**
+             * @description 記録された対象の ID。**リクエストで送った値とは限りません。**
+             *
+             *     - `delete_thread` — スレッド ID (`"7"`)
+             *     - `delete_comment` — **`"{threadId}:{commentId}"`**
+             *       (`"1:10"`)。パーティションキーを含めます ——
+             *       コメント ID だけだと、この記録から対象を引くときに
+             *       8 パーティションすべてを走査することになります
+             *     - `delete_image` — 正規化した UUID (小文字・ハイフンあり)
+             * @example 1:10
+             */
             targetId: string;
             /**
              * @description 指定されなかった場合は `null` です。
