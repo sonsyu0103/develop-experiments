@@ -454,8 +454,8 @@ section("CSRF (ADR 0013 決定 1)")
 # 仕組みで、リクエスト自体は飛ぶ。ここで見るのはサーバ側の拒否。
 _s, _p, _ = call("POST", "/threads", json.dumps({"title": "CSRF"}), origin="")
 check("Origin も Referer も無い POST は 403", _s == 403, f"status={_s}")
-check("403 のコードは FORBIDDEN",
-      isinstance(_p, dict) and _p.get("error", {}).get("code") == "FORBIDDEN",
+check("403 のコードは PERMISSION_DENIED",
+      isinstance(_p, dict) and _p.get("error", {}).get("code") == "PERMISSION_DENIED",
       f"body={_p}")
 
 _s, _, _ = call("POST", "/threads", json.dumps({"title": "CSRF"}),

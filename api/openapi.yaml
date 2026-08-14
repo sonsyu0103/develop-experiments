@@ -664,6 +664,8 @@ components:
 
     Forbidden:
       description: |
+        `code` は `PERMISSION_DENIED` です。
+
         状態変更メソッド (POST / PUT / PATCH / DELETE) の `Origin` または
         `Referer` が許可リストに無い、あるいはどちらも付いていない
         (docs/adr/0013-http-defense.md 決定 1 の CSRF 対策)。
@@ -1046,10 +1048,16 @@ components:
                 - NOT_FOUND
                 - METHOD_NOT_ALLOWED
                 - CONFLICT
-                # 403。状態変更メソッドの Origin / Referer が許可リストに無い
-                # (docs/adr/0013-http-defense.md 決定 1 の CSRF 対策)。
-                # **権限不足では使いません** —— 他人の資源は 404 で隠します
-                - FORBIDDEN
+                # 403。権限が無い、または状態変更メソッドの Origin / Referer が
+                # 許可リストに無い (docs/adr/0013-http-defense.md 決定 1 / 決定 3)。
+                #
+                # **名前は gRPC の体系に合わせます** (決定 3)。
+                # FORBIDDEN にしかけたが、決定 3 の表が PERMISSION_DENIED と
+                # 用途 (「権限がない / Origin 検証の失敗」) まで決めていた。
+                #
+                # **存在を隠したい対象には使いません** —— 他人の画像などは
+                # 404 で返します (決定 3「存在を隠すべき場合は 404」)
+                - PERMISSION_DENIED
                 # 413。画像のサイズ・画素数の上限を超えた
                 # (docs/adr/0007-image-storage.md 決定 2 / ADR 0013 決定 3)
                 - PAYLOAD_TOO_LARGE

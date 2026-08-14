@@ -585,7 +585,7 @@ export interface components {
                  * @example NOT_FOUND
                  * @enum {string}
                  */
-                code: "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "FORBIDDEN" | "PAYLOAD_TOO_LARGE" | "FAILED_PRECONDITION" | "UNAVAILABLE" | "INTERNAL";
+                code: "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "PERMISSION_DENIED" | "PAYLOAD_TOO_LARGE" | "FAILED_PRECONDITION" | "UNAVAILABLE" | "INTERNAL";
                 /**
                  * @description 人間向けの説明。文言は予告なく変わるため分岐に使わないでください。
                  * @example 対象のリソースが見つかりません
@@ -623,7 +623,9 @@ export interface components {
             };
         };
         /**
-         * @description 状態変更メソッド (POST / PUT / PATCH / DELETE) の `Origin` または
+         * @description `code` は `PERMISSION_DENIED` です。
+         *
+         *     状態変更メソッド (POST / PUT / PATCH / DELETE) の `Origin` または
          *     `Referer` が許可リストに無い、あるいはどちらも付いていない
          *     (docs/adr/0013-http-defense.md 決定 1 の CSRF 対策)。
          *

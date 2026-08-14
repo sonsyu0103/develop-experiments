@@ -197,7 +197,7 @@ func rejectCrossOrigin(c *gin.Context, reason, value string) {
 		slog.String("path", c.Request.URL.Path),
 	)
 	c.AbortWithStatusJSON(http.StatusForbidden,
-		newErrorBody(oapigen.FORBIDDEN, "この要求は受け付けられません"))
+		newErrorBody(oapigen.PERMISSIONDENIED, "この要求は受け付けられません"))
 }
 
 // recovery はパニックを拾い、構造化ログに残してから 500 を返します。
