@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -22,6 +23,13 @@ import (
 // requestIDHeader は相関 ID を運ぶヘッダです。
 // 受信したものを尊重し、無ければ生成します (docs/adr/0010-log-pipeline.md 4-1)。
 const requestIDHeader = "X-Request-Id"
+
+// idempotencyKeyHeader は二重送信を防ぐキーを運ぶヘッダです (ADR 0015)。
+//
+// **仕様書 (api/openapi.yaml の components/parameters/IdempotencyKey) と
+// 同じ値であること。** cors() の Allow-Headers に挙げるために要ります ——
+// 挙げないとブラウザが preflight の段階で送信を諦めます。
+const idempotencyKeyHeader = "Idempotency-Key"
 
 // requestIDPattern は受信したリクエスト ID に許す書式です。
 //
@@ -79,11 +87,20 @@ func cors(allowedOrigins []string) gin.HandlerFunc {
 		origin := c.GetHeader("Origin")
 		if origin != "" && slices.Contains(allowedOrigins, origin) {
 			h.Set("Access-Control-Allow-Origin", origin)
-			h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			// **仕様書のメソッドと揃えること。**
+			// PUT が抜けていたため、PUT /me/avatar は preflight で
+			// ブラウザに弾かれ、**フロントから一度も呼べなかった**
+			// (レビュー指摘)。仕様に 403 を宣言したのに到達できない状態。
+			h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
 			// X-Request-Id は送る側にも許す。ALB やフロントが既に採番している
 			// 場合に前後をつなぐため (requestID のコメントを参照)。
 			// ここに無いと preflight で弾かれ、リクエスト自体が失敗する。
-			h.Set("Access-Control-Allow-Headers", "Content-Type, "+requestIDHeader)
+			//
+			// **Idempotency-Key も同じ。** 仕様書が受け付けると書いている
+			// ヘッダ (api/openapi.yaml の components/parameters) は、
+			// ここに挙げないとブラウザから送れない (ADR 0015)。
+			h.Set("Access-Control-Allow-Headers",
+				"Content-Type, "+requestIDHeader+", "+idempotencyKeyHeader)
 			// **返すだけでは JavaScript から読めない。**
 			// 既定で読めるのは限られたヘッダだけで、独自ヘッダは
 			// Expose-Headers に挙げないと fetch の res.headers から消える。
@@ -141,7 +158,7 @@ func csrfGuard(allowedOrigins []string) gin.HandlerFunc {
 		// この不変条件が崩れると SameSite=Lax の前提も同時に崩れ、
 		// トークン方式の再検討が要ります。
 		if origin := c.GetHeader("Origin"); origin != "" {
-			if !slices.Contains(allowedOrigins, origin) {
+			if !isAllowedOrigin(c, allowedOrigins, origin) {
 				rejectCrossOrigin(c, "origin", origin)
 				return
 			}
@@ -151,7 +168,7 @@ func csrfGuard(allowedOrigins []string) gin.HandlerFunc {
 
 		if referer := c.GetHeader("Referer"); referer != "" {
 			origin, ok := originOf(referer)
-			if !ok || !slices.Contains(allowedOrigins, origin) {
+			if !ok || !isAllowedOrigin(c, allowedOrigins, origin) {
 				rejectCrossOrigin(c, "referer", referer)
 				return
 			}
@@ -161,6 +178,51 @@ func csrfGuard(allowedOrigins []string) gin.HandlerFunc {
 
 		rejectCrossOrigin(c, "missing", "")
 	}
+}
+
+// isAllowedOrigin は許可リスト、または**自分自身のオリジン**かを返します。
+//
+// **同一オリジン構成を落とさないために自分自身を足しています** (レビュー指摘)。
+// フロントと API を 1 つのホストに置く構成 (https://example.com と
+// https://example.com/api) では CORS が本当に不要なので、運用者が
+// CORS_ALLOWED_ORIGINS を設定する理由がありません。既定値は開発用の
+// http://localhost:3000 なので、**そのまま本番へ出すと書き込みが全滅します。**
+// この PR より前は「レスポンスヘッダが付かないだけ」で済んでいた設定漏れが、
+// 初回デプロイでの全面停止に変わってしまいます。
+//
+// **Host を信用してよいのか** —— この検査が守る相手はブラウザだけです。
+// ブラウザが送る Host は「利用者が開いた URL」であって攻撃者は変えられません
+// (evil.test のページから example.com へ投げても Host は example.com、
+// Origin は evil.test になる)。ブラウザ以外は Origin を自由に詐称できるので、
+// そもそもこの検査の射程外です。
+//
+// scheme は X-Forwarded-Proto (ALB がある構成) を見て、無ければ
+// TLS の有無で判断します。**逆プロキシの内側でしか正しくありません** ——
+// インターネットに直接晒す構成では、手前でこのヘッダを剥がしてください
+// (requestID が受信ヘッダを尊重するのと同じ前提になります)。
+func isAllowedOrigin(c *gin.Context, allowedOrigins []string, origin string) bool {
+	if slices.Contains(allowedOrigins, origin) {
+		return true
+	}
+	return origin == selfOrigin(c)
+}
+
+// selfOrigin はこの要求が向けられたオリジンを組み立てます。
+func selfOrigin(c *gin.Context) string {
+	host := c.Request.Host
+	if host == "" {
+		return ""
+	}
+
+	scheme := "http"
+	if proto := c.GetHeader("X-Forwarded-Proto"); proto != "" {
+		// 複数段のプロキシではカンマ区切りで積まれる。手前のものを使う。
+		scheme, _, _ = strings.Cut(proto, ",")
+		scheme = strings.TrimSpace(scheme)
+	} else if c.Request.TLS != nil {
+		scheme = "https"
+	}
+	return scheme + "://" + host
 }
 
 // isStateChanging は副作用を持ちうるメソッドかを返します。
@@ -185,6 +247,25 @@ func originOf(referer string) (string, bool) {
 	return u.Scheme + "://" + u.Host, true
 }
 
+// maxLoggedHeaderBytes はログに残すヘッダ値の上限です。
+//
+// **利用者の入力を無制限にログへ流さないこと** (requestIDPattern と同じ理由)。
+// ログは S3 に長期保管され Athena から検索されます。Referer は完全に
+// 相手が決める値で、長さは Go の MaxHeaderBytes (既定 1 MiB) までしか
+// 縛られていません。未認証の POST 1 本ごとに WARN が 1 行出るので、
+// 大きな Referer を撒かれると保管コストがそのまま膨らみます (レビュー指摘)。
+const maxLoggedHeaderBytes = 256
+
+// truncateForLog はログに載せる値を丸めます。
+func truncateForLog(v string) string {
+	if len(v) <= maxLoggedHeaderBytes {
+		return v
+	}
+	// 丸めたことが分かる形にする。切れているのか元から短いのかを
+	// 区別できないと、調査で「値が変」と「ログが変」を取り違える。
+	return v[:maxLoggedHeaderBytes] + "...(truncated)"
+}
+
 // rejectCrossOrigin は 403 で打ち切り、判断の材料をログに残します。
 //
 // **理由を本文に書き分けません。** どの条件で落ちたかを返すと、
@@ -192,7 +273,7 @@ func originOf(referer string) (string, bool) {
 func rejectCrossOrigin(c *gin.Context, reason, value string) {
 	slog.WarnContext(c.Request.Context(), "csrf_rejected",
 		slog.String("reason", reason),
-		slog.String("value", value),
+		slog.String("value", truncateForLog(value)),
 		slog.String("method", c.Request.Method),
 		slog.String("path", c.Request.URL.Path),
 	)

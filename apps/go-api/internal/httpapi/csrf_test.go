@@ -168,3 +168,110 @@ func TestOriginOf(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 同一オリジン構成 (レビュー指摘)
+// ---------------------------------------------------------------------------
+//
+// フロントと API を 1 つのホストに置く構成では CORS が本当に不要なので、
+// 運用者が CORS_ALLOWED_ORIGINS を設定する理由がありません。
+// 既定は開発用の http://localhost:3000 なので、**設定漏れのまま本番へ出すと
+// 書き込みが全滅します。** 自分自身のオリジンは常に許します。
+
+// csrfRequestTo は Host を指定して 1 本投げます。
+func csrfRequestTo(t *testing.T, host string, headers map[string]string) int {
+	t.Helper()
+
+	env := newTestEnv(t)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/threads",
+		strings.NewReader(`{"title":"テスト"}`))
+	req.Host = host
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// **許可リストに無くても、自分自身のオリジンなら通ること。**
+func TestCSRF_AllowsSameOrigin(t *testing.T) {
+	t.Parallel()
+
+	got := csrfRequestTo(t, "app.example.com",
+		map[string]string{"Origin": "http://app.example.com"})
+	if got == http.StatusForbidden {
+		t.Error("同一オリジンからの POST が 403 になった (設定漏れで全滅する)")
+	}
+}
+
+// X-Forwarded-Proto があれば scheme をそちらから取ること。
+func TestCSRF_AllowsSameOriginBehindProxy(t *testing.T) {
+	t.Parallel()
+
+	got := csrfRequestTo(t, "app.example.com", map[string]string{
+		"Origin":            "https://app.example.com",
+		"X-Forwarded-Proto": "https",
+	})
+	if got == http.StatusForbidden {
+		t.Error("ALB の内側で同一オリジンが 403 になった")
+	}
+}
+
+// 多段プロキシではカンマ区切りで積まれるので、手前のものを使うこと。
+func TestCSRF_UsesFirstForwardedProto(t *testing.T) {
+	t.Parallel()
+
+	got := csrfRequestTo(t, "app.example.com", map[string]string{
+		"Origin":            "https://app.example.com",
+		"X-Forwarded-Proto": "https, http",
+	})
+	if got == http.StatusForbidden {
+		t.Error("X-Forwarded-Proto が複数あると 403 になった")
+	}
+}
+
+// **別ホストは自分自身にならないこと。**
+// ここが緩むと「Origin さえ付いていれば通る」になり、防御が消える。
+func TestCSRF_SameOriginDoesNotAllowOtherHosts(t *testing.T) {
+	t.Parallel()
+
+	for _, origin := range []string{
+		"http://evil.test",
+		"https://app.example.com",     // scheme 違い (X-Forwarded-Proto なし = http)
+		"http://app.example.com:8443", // port 違い
+		"http://app.example.com.evil.test",
+	} {
+		if got := csrfRequestTo(t, "app.example.com",
+			map[string]string{"Origin": origin}); got != http.StatusForbidden {
+			t.Errorf("Origin=%q で status = %d, want 403", origin, got)
+		}
+	}
+}
+
+// **ログに残すヘッダ値を丸めること。**
+//
+// Referer は完全に相手が決める値で、長さは MaxHeaderBytes までしか
+// 縛られていない。未認証の POST 1 本ごとに WARN が 1 行出るので、
+// 大きな値を撒かれると S3 の保管コストがそのまま膨らむ。
+func TestTruncateForLog(t *testing.T) {
+	t.Parallel()
+
+	short := strings.Repeat("a", maxLoggedHeaderBytes)
+	if got := truncateForLog(short); got != short {
+		t.Error("上限ちょうどの値が丸められた")
+	}
+
+	// **上限のすぐ上では、印のぶん元より長くなりうる。**
+	// 見たいのは「入力に比例して伸びないこと」なので、長さで測る。
+	long := strings.Repeat("a", 100_000)
+	got := truncateForLog(long)
+	if len(got) > maxLoggedHeaderBytes+32 {
+		t.Errorf("入力に比例して伸びている (len=%d)", len(got))
+	}
+	if !strings.HasSuffix(got, "...(truncated)") {
+		t.Errorf("丸めた印が無い: %q", got[max(0, len(got)-20):])
+	}
+}

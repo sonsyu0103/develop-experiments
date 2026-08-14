@@ -179,50 +179,6 @@ r.Use(
 
 ## 実装して分かったこと (2026-08-14)
 
-### 1. `securityHeaders` はまだ無い (決定 2 は未実装)
-
-上の順序は決定 2 を含んだ形で書いてあるが、実装済みなのは決定 1 と決定 3 で、
-**セキュリティヘッダはまだ入っていない。** 現在の並びは
-`requestID` → `requestLogger` → `recovery` → `cors` → `csrfGuard` → `bodyLimit`。
-
-`recovery` を `requestLogger` の**内側**に置いている点も上の擬似コードと違う。
-外側に置くとパニックが `requestLogger` の `c.Next()` を巻き戻して抜け、
-`http_request` の行が 1 本も出なかった (実測)。
-
-### 2. `csrfGuard` は `bodyLimit` より前に置く
-
-弾くと決まっている要求の本文を読み始める理由が無い。
-[ADR 0007](0007-image-storage.md) の画像アップロードは最大 5 MiB を受けるので、
-順序が逆だと**拒否する要求のために本文を読み切る**ことになる。
-
-### 3. 「Origin が無ければ通す」にはできない
-
-決定 1 の手順 3 (どちらも無ければ 403) は、実装すると
-**API を叩くものすべてに影響する。** スモークテストと `curl` も含まれる。
-
-一瞬「ブラウザ以外は素通しでよいのでは」と考えたが、**それでは防御にならない。**
-Origin を送らないだけで検証を迂回できる。スモーク側に Origin を付ける
-(`SMOKE_ORIGIN`、既定は `CORS_ALLOWED_ORIGINS` の既定値と同じ) 形にした。
-
-### 4. Referer の照合を前方一致で書いてはいけない
-
-`https://example.com.evil.test/` は `https://example.com` で始まる。
-`url.Parse` して `scheme://host` を組み直してから完全一致で照合する。
-検査を 1 件置いた (`TestCSRF_RejectsPrefixLookalikeReferer`)。
-
-### 5. **Server Components からの書き込みは 403 になる**
-
-現在フロントが叩いているのは `GET /threads` だけなので影響が無いが、
-**Server Actions や Route Handler から書き込みを始めた瞬間に落ちる。**
-サーバ側の `fetch` は `Origin` を送らないためで、ブラウザからの
-リクエストとは扱いが変わる。
-
-書き込みは**ブラウザから直接叩く**か、サーバ側から叩くなら
-`Origin` を明示的に付ける。前者を既定にする —— サーバ側から付けられる
-`Origin` は自己申告であり、検証としての意味が薄い。
-
-## 実装して分かったこと (2026-08-14)
-
 決定 1 と決定 3 を実装した。決定 2 (セキュリティヘッダ) はまだ入っていない。
 
 ### 1. **決定 1 だけ読んで実装すると、エラーコードを間違える**
@@ -268,7 +224,43 @@ Origin を送らないだけで検証を迂回できる。スモーク側に Ori
 `https://example.com.evil.test/` は `https://example.com` で始まる。
 `url.Parse` して `scheme://host` を組み直してから完全一致で照合する。
 
-### 5. **Server Components からの書き込みは 403 になる**
+### 5. **設定漏れが「全書き込み停止」に変わる**
+
+`csrfGuard` は `CORS_ALLOWED_ORIGINS` を共有する。既定値は開発用の
+`http://localhost:3000` なので、**設定せずに本番へ出すと書き込みが全滅する。**
+
+この決定より前は、同じ設定漏れが「レスポンスヘッダが付かないだけ」で済んでいた。
+しかもフロントと API を 1 つのホストに置く構成では CORS が本当に不要なので、
+**運用者にはこの変数を設定する理由が無い。**
+
+`csrfGuard` は**自分自身のオリジンを常に許す**ようにした。
+`Origin` が要求先の `scheme://host` と一致すれば通す。
+
+**`Host` を信用してよいのか** —— この検査が守る相手はブラウザだけになる。
+ブラウザが送る `Host` は「利用者が開いた URL」であり、攻撃者は変えられない
+(`evil.test` のページから `example.com` へ投げても `Host` は `example.com`、
+`Origin` は `evil.test`)。ブラウザ以外は `Origin` を自由に詐称できるので、
+そもそもこの検査の射程外になる。
+
+scheme は `X-Forwarded-Proto` を見て、無ければ TLS の有無で決める。
+**逆プロキシの内側でしか正しくない** —— 直接晒す構成では手前で剥がすこと
+(`X-Request-Id` を尊重しているのと同じ前提)。
+
+### 6. `cors()` の許可メソッド・許可ヘッダが仕様書と揃っていなかった
+
+`Access-Control-Allow-Methods` は `GET, POST, OPTIONS` のままで、
+**`PUT` が入っていなかった。** `PUT /me/avatar` は preflight でブラウザに
+弾かれるので、**フロントから一度も呼べない。** 仕様書に 403 を宣言したのに
+到達できない状態になっていた。
+
+`Idempotency-Key` も `Access-Control-Allow-Headers` に無く、
+[ADR 0015](0015-idempotency.md) の冪等キーをブラウザから送れなかった。
+
+決定 1 が「書き込みはブラウザから直接叩く」を既定にしたことで、
+**それまで潜んでいた穴が確実な故障に変わった。**
+仕様書にメソッドやヘッダを足したら `cors()` も見ること。
+
+### 7. **Server Components からの書き込みは 403 になる**
 
 現在フロントが叩いているのは `GET /threads` だけなので影響が無いが、
 **Server Actions や Route Handler から書き込みを始めた瞬間に落ちる。**
