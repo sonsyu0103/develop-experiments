@@ -75,6 +75,13 @@ type SessionOwner struct {
 	// Role は権限判定に使います。毎リクエストの経路で必要になるため、
 	// セッションの検証と同じクエリで引いています (db/query/sessions.sql)。
 	Role Role
+	// AvatarObjectKey はアップロードしたプロフィール画像のキーです。
+	// 設定していなければ nil で、そのとき AvatarURL (Google のもの) を使います
+	// (docs/adr/0007-image-storage.md のスキーマ)。
+	//
+	// **URL ではなくキーを持ちます。** 組み立ては環境ごとの設定を要するため、
+	// ドメインの外 (ユースケース層) で行います。
+	AvatarObjectKey *string
 }
 
 // NewUser は永続化前の新しい利用者を組み立てます。

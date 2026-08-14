@@ -94,13 +94,14 @@ type Querier interface {
 	// 過不足なく一致していれば、sqlc は共通の行型 (sqlcgen.Image) を再利用する。
 	// ずれるとクエリごとに別の行型が生成され、詰め替えが増える。
 	//
-	// object_reclaimed_at は**まだ誰も読み書きしない**が、列一覧には並べる。
 	// 揃える条件は「テーブルの全列と過不足なく一致する」であり、
 	// 1 つ抜けるだけで共通行型が消える (users.sql で実際に踏んだ)。
 	//
-	// 【回収バッチのクエリはここに無い】
-	// Phase 6 の後半 (プロフィール画像 / スレッドアイコンと同時) で足す。
-	// 先に書くと「実装していないクエリ」が残る。
+	// 【attached_at はここから書かない】
+	// 添付先から参照された時刻 (000007) は、**添付する側のクエリが
+	// 同じ 1 文の中で更新する** —— comments.sql / threads.sql / users.sql を参照。
+	// 別の文に分けると「コメントは作られたが添付の記録が無い」状態が作れ、
+	// 回収バッチが参照済みの画像を消しにいく。
 	// =============================================================================
 	// ストレージへ書く前に呼ぶ (ADR 0007 決定 3 の手順 1)。
 	//
@@ -145,6 +146,12 @@ type Querier interface {
 	//
 	// sessions (expires_at) の索引で引く。
 	DeleteExpiredSessions(ctx context.Context, maxRows int32) (int64, error)
+	// DB 行ごと消す。
+	//
+	// **参照されていない画像にだけ使う。** 参照があれば外部キーが拒否するので、
+	// 誤って呼んでも壊れはしないが、エラーとして表に出る。
+	// 'deleted' の画像に使ってはいけない (ADR 0016 問題 3 が行を残すと決めている)。
+	DeleteImage(ctx context.Context, id uuid.UUID) (int64, error)
 	// ログアウト。0 行なら「既に無い」なので、呼び出し側で 404 にするかは任意。
 	DeleteSession(ctx context.Context, id string) (int64, error)
 	// 「全端末からログアウト」。パスワード変更に相当する操作や、
@@ -179,6 +186,16 @@ type Querier interface {
 	//
 	// 期限切れの行は定期処理が消すが、消える前に引かれても通してはいけない。
 	// 掃除は容量のための処理であり、認可の判定に使うものではない。
+	// **実体が無い画像は結合しない** (レビュー指摘)。
+	//   status = 'deleted'          モデレーターが消した。回収バッチが S3 から実体を消す
+	//   object_reclaimed_at IS NOT NULL  回収済み。実体はもう無い
+	// どちらも URL を返すと、ブラウザには壊れた画像が出る。
+	// **条件は ON に置くこと。** WHERE に置くと LEFT が INNER に化けて、
+	// 画像なしの行 (大多数) が消える。
+	//
+	// ADR 0016 問題 3 は「画像は削除されました」と「元から画像なし」を
+	// 区別するために行を残すと決めているが、**その区別を表す API の項目がまだ無い。**
+	// Phase 10 後半で削除の UI を入れるとき、ここを status の受け渡しに変える。
 	GetLiveSessionWithUser(ctx context.Context, id string) (GetLiveSessionWithUserRow, error)
 	// 一覧と同じ理由で、JOIN + GROUP BY ではなく相関サブクエリで数える。
 	GetThreadWithCommentCount(ctx context.Context, id int64) (GetThreadWithCommentCountRow, error)
@@ -227,7 +244,59 @@ type Querier interface {
 	// 書いている。同じ人が連投すると、同じ投稿者の情報が最大 100 行ぶん
 	// 重複して転送されるため。初手は A で揃え、B (ListAuthorsByIDs) との
 	// 比較は Phase 4 のベンチマークで行う。
+	// **実体が無い画像は結合しない** (レビュー指摘)。
+	//   status = 'deleted'          モデレーターが消した。回収バッチが S3 から実体を消す
+	//   object_reclaimed_at IS NOT NULL  回収済み。実体はもう無い
+	// どちらも URL を返すと、ブラウザには壊れた画像が出る。
+	// **条件は ON に置くこと。** WHERE に置くと LEFT が INNER に化けて、
+	// 画像なしの行 (大多数) が消える。
+	//
+	// ADR 0016 問題 3 は「画像は削除されました」と「元から画像なし」を
+	// 区別するために行を残すと決めているが、**その区別を表す API の項目がまだ無い。**
+	// Phase 10 後半で削除の UI を入れるとき、ここを status の受け渡しに変える。
 	ListCommentsByThreadID(ctx context.Context, arg ListCommentsByThreadIDParams) ([]ListCommentsByThreadIDRow, error)
+	// 回収バッチが拾う行 (ADR 0007 決定 3 / ADR 0016 問題 3)。
+	//
+	// 対象は 3 種類ある。**扱いが status で分かれる**ので、
+	// どれに当たるかを呼び出し側が判断できるよう status ごと返す。
+	//
+	//   pending の孤児   確定しなかった。DB 行も S3 オブジェクトも消す
+	//   deleted          モデレーターが消した。S3 だけ消し、DB 行は残す
+	//   committed の孤立 アップロードしたが添付されなかった。両方消す
+	//
+	// **committed の孤立を含めるのが Phase 6 後半で足した点になる。**
+	// アップロードと添付を分けた結果 (ADR 0007 の実装して分かったこと 1)、
+	// 「アップロードしたが投稿をやめた」画像がどこからも参照されないまま残る。
+	//
+	// 【絞りは attached_at、確認は NOT EXISTS】
+	// 初版は committed の孤立を NOT EXISTS x3 だけで判定していた。
+	// **索引が効かない。** 部分索引の述語は他テーブルを見られないので、
+	// images_reclaimable_idx (000006) の述語に committed の行が入らず、
+	// プランナが索引を選べない —— 10 分ごと・レプリカごとに images の
+	// 全表走査 + created_at のソートになっていた。
+	//
+	// 000007 で attached_at 列を足し、述語を
+	// 「object_reclaimed_at IS NULL AND (attached_at IS NULL OR status = 'deleted')」
+	// に張り替えた。**下の WHERE はこの式をそのまま書いている** ——
+	// 部分索引が使われるのは索引の述語がクエリの制約から導けるときだけで、
+	// OR を含む式は同じ式が書かれている形でしか一致しない。並べ替えないこと。
+	//
+	// そのうえで NOT EXISTS x3 は残す。attached_at はアプリが書く値なので、
+	// **新しい添付経路を足した人が書き忘れると参照中の画像を消しにいく**。
+	// 索引で候補を数件に絞ったあと、行を消す種類 (pending / committed) にだけ
+	// 確認をかける。deleted は添付されたまま S3 を消すので対象外。
+	//
+	// 【経過時間で守る】
+	// どの種類も created_at で足切りする。**アップロード直後の画像を
+	// 消してはいけない** —— 添付するまでの数十秒のあいだ、
+	// committed の孤立は正常な状態として存在する。
+	//
+	// 【FOR UPDATE SKIP LOCKED】
+	// 定期処理を API プロセス内で動かすため (ADR 0003 未決 #9)、
+	// **レプリカの数だけ同時に走る**。ロックを取り、取れなかった行は
+	// 飛ばすことで、同じ画像を 2 つのプロセスが二重に処理しない。
+	// 待たせるのではなく飛ばすのは、次の周回で拾えば十分だから。
+	ListReclaimableImages(ctx context.Context, arg ListReclaimableImagesParams) ([]Image, error)
 	// -----------------------------------------------------------------------------
 	// 以下 2 つは Phase 4 のベンチマーク専用 (N+1 実装の再現用)。
 	// 本番経路では使わない。
@@ -281,6 +350,16 @@ type Querier interface {
 	//
 	// JOIN は page で 20 件に絞ったあとに掛ける。
 	// 内側の CTE に混ぜると、絞り込む前の全行に対して結合が走る。
+	// **実体が無い画像は結合しない** (レビュー指摘)。
+	//   status = 'deleted'          モデレーターが消した。回収バッチが S3 から実体を消す
+	//   object_reclaimed_at IS NOT NULL  回収済み。実体はもう無い
+	// どちらも URL を返すと、ブラウザには壊れた画像が出る。
+	// **条件は ON に置くこと。** WHERE に置くと LEFT が INNER に化けて、
+	// 画像なしの行 (大多数) が消える。
+	//
+	// ADR 0016 問題 3 は「画像は削除されました」と「元から画像なし」を
+	// 区別するために行を残すと決めているが、**その区別を表す API の項目がまだ無い。**
+	// Phase 10 後半で削除の UI を入れるとき、ここを status の受け渡しに変える。
 	ListThreadsWithCommentCount(ctx context.Context, arg ListThreadsWithCommentCountParams) ([]ListThreadsWithCommentCountRow, error)
 	// スレッド行に行ロックを取る。**pessimistic モードの起点** (ADR 0019 決定 2)。
 	//
@@ -298,6 +377,18 @@ type Querier interface {
 	// SSI (SERIALIZABLE) を使うならこの明示ロックは不要だが、
 	// 悲観ロック版と楽観 (SSI) 版のスループット差を計測するために両方用意している。
 	LockThreadForUpdate(ctx context.Context, id int64) (int64, error)
+	// 回収対象を「確保」する。
+	//
+	// **status によらず、拾ったすべての行に対して呼ぶ。**
+	// 列名は「S3 のオブジェクトを消した時刻」だが、**消す前に**書く。
+	//
+	//   1. 添付できなくする —— FindOwned は確保済みの画像を返さない。
+	//      S3 を消したあとに書くと「実体は消えたのにまだ添付できる」窓が空く
+	//   2. 対象から外す —— 'deleted' は DB 行を残すので (ADR 0016 問題 3)、
+	//      記録が無いと次の周回でも同じ行が拾われ、
+	//      毎回すべての削除済み画像へ DELETE を投げ直すことになる
+	//      (索引も単調増加する。000006 の列コメントを参照)
+	MarkImageReclaimed(ctx context.Context, id uuid.UUID) (int64, error)
 	// スレッド内の次のレス番号を求める。**Phase 2 の題材の中心** (ADR 0019 決定 1)。
 	//
 	// この 1 文は comments_thread_id_seq_idx の逆順スキャン 1 回で終わる。
@@ -327,6 +418,28 @@ type Querier interface {
 	// 毎ログインで UPDATE を撃つと、更新日時だけが動いて監査の邪魔になる。
 	// 該当が無ければ 0 行が返るので、呼び出し側は「昇格したか」を判定できる。
 	PromoteToAdmin(ctx context.Context, googleSub string) (User, error)
+	// プロフィール画像を設定する / 外す (ADR 0007)。
+	//
+	// **所有者の確認はここで行わない。** 画像が自分のものかは
+	// ユースケース層が先に確かめる (他人の画像は 404 にする必要があり、
+	// ここで弾くと外部キー違反として 400 になってしまう)。
+	//
+	// NULL を渡すと解除になり、Google のプロフィール画像に戻る。
+	//
+	// 【添付先 3 つのうち、ここだけ「解除」がある】
+	// コメントとスレッドは作成時にしか画像を指定できないので、
+	// 一度 attached_at を書いたら戻すことはない。アバターは付け替えられる。
+	// **旧画像の attached_at を NULL に戻さないと、差し替えた画像が
+	// どこからも参照されないまま永久に回収されない** (000007)。
+	//
+	// previous は主文と同じ条件 (id と deleted_at IS NULL) で引く。
+	// 退会済みの利用者を指定した場合、主文は 0 行になるので
+	// **画像側も何も触らない**必要がある —— previous が空になることで揃う。
+	//
+	// **列は表名で修飾する。** この 1 文には users と images の 2 つが登場し、
+	// どちらにも id 列がある。修飾しないと sqlc の解析が
+	// "column reference \"id\" is ambiguous" で止まる (実測)。
+	SetUserAvatarImage(ctx context.Context, arg SetUserAvatarImageParams) (User, error)
 	// 現時点で HTTP エンドポイントからは呼ばれていない。
 	// 削除 API を公開するかは未決 (docs/adr/0003-open-questions.md 項目 7)。
 	SoftDeleteComment(ctx context.Context, arg SoftDeleteCommentParams) (int64, error)

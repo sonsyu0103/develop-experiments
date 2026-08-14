@@ -48,7 +48,7 @@
 -- JOIN は page で 20 件に絞ったあとに掛ける。
 -- 内側の CTE に混ぜると、絞り込む前の全行に対して結合が走る。
 WITH page AS (
-    SELECT id, title, created_at, author_id
+    SELECT id, title, created_at, author_id, icon_image_id
     FROM threads
     WHERE deleted_at IS NULL
       AND (sqlc.narg('cursor_id')::bigint IS NULL OR id < sqlc.narg('cursor_id')::bigint)
@@ -68,9 +68,25 @@ SELECT
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
-    u.deleted_at   AS author_deleted_at
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
 FROM page p
 LEFT JOIN users u ON u.id = p.author_id
+-- **実体が無い画像は結合しない** (レビュー指摘)。
+--   status = 'deleted'          モデレーターが消した。回収バッチが S3 から実体を消す
+--   object_reclaimed_at IS NOT NULL  回収済み。実体はもう無い
+-- どちらも URL を返すと、ブラウザには壊れた画像が出る。
+-- **条件は ON に置くこと。** WHERE に置くと LEFT が INNER に化けて、
+-- 画像なしの行 (大多数) が消える。
+--
+-- ADR 0016 問題 3 は「画像は削除されました」と「元から画像なし」を
+-- 区別するために行を残すと決めているが、**その区別を表す API の項目がまだ無い。**
+-- Phase 10 後半で削除の UI を入れるとき、ここを status の受け渡しに変える。
+LEFT JOIN images img ON img.id = p.icon_image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL
 ORDER BY p.id DESC;
 
 -- name: GetThreadWithCommentCount :one
@@ -88,9 +104,15 @@ SELECT
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
-    u.deleted_at   AS author_deleted_at
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
 FROM threads t
 LEFT JOIN users u ON u.id = t.author_id
+LEFT JOIN images img ON img.id = t.icon_image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL
 WHERE t.id = sqlc.arg('id')
   AND t.deleted_at IS NULL;
 
@@ -106,9 +128,22 @@ WHERE t.id = sqlc.arg('id')
 --
 -- author_id は NULL 許容。NULL が匿名を意味する (ADR 0005 決定 2)。
 WITH inserted AS (
-    INSERT INTO threads (title, author_id)
-    VALUES (sqlc.arg('title'), sqlc.narg('author_id'))
-    RETURNING id, title, created_at, author_id
+    INSERT INTO threads (title, author_id, icon_image_id)
+    VALUES (sqlc.arg('title'), sqlc.narg('author_id'), sqlc.narg('icon_image_id'))
+    RETURNING id, title, created_at, author_id, icon_image_id
+), attached AS (
+    -- アイコンを「添付済み」にする (000007)。理由は comments.sql と同じ。
+    -- スレッドのアイコンは作成時にしか指定できないので、解除の経路は無い。
+    UPDATE images
+    SET attached_at = now()
+    WHERE id = (SELECT icon_image_id FROM inserted)
+      AND attached_at IS NULL
+      -- **確保済みの画像は添付済みにしない** (レビュー指摘)。
+      -- EnsureOwned はロックを取らない読み取りなので、
+      -- 「確認したあと・書く前」に回収バッチが確保する窓がある。
+      -- この UPDATE は images の行ロックで待たされてから最新版を読むため、
+      -- ここに条件を置くと確保を追い越せない。
+      AND object_reclaimed_at IS NULL
 )
 SELECT
     i.id,
@@ -117,9 +152,15 @@ SELECT
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
-    u.deleted_at   AS author_deleted_at
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
 FROM inserted i
-LEFT JOIN users u ON u.id = i.author_id;
+LEFT JOIN users u ON u.id = i.author_id
+LEFT JOIN images img ON img.id = i.icon_image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL;
 
 -- name: ThreadExists :one
 SELECT EXISTS (

@@ -75,9 +75,14 @@ func (f *fakeThreadRepo) Create(_ context.Context, th *threadmodel.Thread) (*thr
 		return nil, f.err
 	}
 	f.created = th
-	// 実装では LEFT JOIN users が投稿者を解決する。
-	// フェイクでも同じ形にしないと、作成レスポンスの詰め替えを検証できない。
-	return threadmodel.Reconstruct(99, th.Title, fakeAuthorFor(th.AuthorID), time.Unix(0, 0).UTC()), nil
+	// 実装では LEFT JOIN users が投稿者を、LEFT JOIN images がアイコンを解決する。
+	// フェイクでも同じ形にしないと、作成レスポンスの詰め替えを検証できない
+	// (コメントの画像で一度、詰め替えの書き忘れを見逃した)。
+	var icon *threadmodel.Image
+	if th.IconImageID != nil {
+		icon = threadmodel.NewImage(*th.IconImageID, "images/"+th.IconImageID.String()+".webp", 64, 64)
+	}
+	return threadmodel.Reconstruct(99, th.Title, fakeAuthorFor(th.AuthorID), icon, time.Unix(0, 0).UTC()), nil
 }
 
 // fakeAuthorFor は author_id から投稿者を解決する DB 側の振る舞いを真似ます。
@@ -208,8 +213,8 @@ func newTestEnv(t *testing.T) *testEnv {
 
 	threads := &fakeThreadRepo{
 		summaries: []threadmodel.Summary{
-			{Thread: *threadmodel.Reconstruct(2, "2 番目のスレッド", nil, time.Unix(2, 0).UTC()), CommentCount: 5},
-			{Thread: *threadmodel.Reconstruct(1, "1 番目のスレッド", nil, time.Unix(1, 0).UTC()), CommentCount: 0},
+			{Thread: *threadmodel.Reconstruct(2, "2 番目のスレッド", nil, nil, time.Unix(2, 0).UTC()), CommentCount: 5},
+			{Thread: *threadmodel.Reconstruct(1, "1 番目のスレッド", nil, nil, time.Unix(1, 0).UTC()), CommentCount: 0},
 		},
 	}
 	comments := &fakeCommentRepo{
@@ -221,12 +226,12 @@ func newTestEnv(t *testing.T) *testEnv {
 
 	router, err := NewRouter(Deps{
 		Server: NewServer(
-			threadusecase.NewThreadInteractor(threads),
+			threadusecase.NewThreadInteractor(threads, nil),
 			commentusecase.NewCommentInteractor(comments, threads, nil),
 			pinger,
 			// セッションの解決は認証の設定に依らず常に結線する (ADR 0005 決定 4)。
 			// このテスト環境は Cookie を送らないので、生きたセッションは持たせない。
-			userusecase.NewSessionInteractor(&fakeSessionRepo{}),
+			userusecase.NewSessionInteractor(&fakeSessionRepo{}, nil),
 			// ログインは未設定 (= /auth/google が 503) の状態。
 			nil,
 			// 画像も未設定 (= POST /images が 503)。
@@ -831,9 +836,9 @@ func TestListThreads_WithdrawnAuthor(t *testing.T) {
 	withdrawn := threadmodel.NewAuthor(fakeAuthorPublicID, "やめた人", &avatar, &deletedAt)
 
 	env.threads.summaries = []threadmodel.Summary{
-		{Thread: *threadmodel.Reconstruct(3, "退会者のスレッド", withdrawn, time.Unix(3, 0).UTC())},
-		{Thread: *threadmodel.Reconstruct(2, "在籍者のスレッド", active, time.Unix(2, 0).UTC())},
-		{Thread: *threadmodel.Reconstruct(1, "匿名のスレッド", nil, time.Unix(1, 0).UTC())},
+		{Thread: *threadmodel.Reconstruct(3, "退会者のスレッド", withdrawn, nil, time.Unix(3, 0).UTC())},
+		{Thread: *threadmodel.Reconstruct(2, "在籍者のスレッド", active, nil, time.Unix(2, 0).UTC())},
+		{Thread: *threadmodel.Reconstruct(1, "匿名のスレッド", nil, nil, time.Unix(1, 0).UTC())},
 	}
 
 	rec := env.do(t, http.MethodGet, "/threads", "")

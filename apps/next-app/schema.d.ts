@@ -105,6 +105,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/me/avatar": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * プロフィール画像を設定する
+         * @description `POST /images` で `kind=avatar` として上げた画像を、
+         *     自分のプロフィール画像にします。
+         *
+         *     **自分がアップロードした画像だけ**を指定できます。
+         *     他人の画像 ID を指定すると 404 になります (存在を隠すため)。
+         *
+         *     `imageId` を `null` にすると設定を外します。
+         *     外すと Google のプロフィール画像 (`users.avatar_url`) に戻ります
+         *     (docs/adr/0007-image-storage.md のスキーマ)。
+         */
+        put: operations["setMyAvatar"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/images": {
         parameters: {
             query?: never;
@@ -294,6 +322,8 @@ export interface components {
              */
             commentCount: number;
             author: components["schemas"]["Author"];
+            /** @description スレッドアイコン。**設定されていなければ `null`** です。 */
+            icon: components["schemas"]["Image"] | null;
             /**
              * Format: date-time
              * @example 2026-08-02T12:00:00Z
@@ -371,6 +401,18 @@ export interface components {
              * @example 新しいスレッド
              */
             title: string;
+            /**
+             * Format: uuid
+             * @description スレッドアイコンの画像 ID。`POST /images` で
+             *     `kind=thread_icon` として上げたものを渡します。
+             *
+             *     - **省略できます。** アイコンの無いスレッドが既定です
+             *     - **自分がアップロードした画像だけ**を指定できます
+             *       (他人の画像 ID は 404)
+             *     - **未ログインでは指定できません** (画像の投稿にログインが要るため)
+             * @example 018f2c00-0000-7000-8000-000000000001
+             */
+            iconImageId?: string;
         };
         /**
          * @description 投稿者。**匿名投稿では `null` になります**
@@ -456,7 +498,16 @@ export interface components {
              *     誰がモデレーターかを一覧で晒す必要がないためです
              */
             role: components["schemas"]["Role"];
-            /** @example https://lh3.googleusercontent.com/a/xxxx */
+            /**
+             * @description プロフィール画像の URL。
+             *
+             *     **アップロードした画像があればそちら**を返し、
+             *     無ければ Google のプロフィール画像を返します
+             *     (docs/adr/0007-image-storage.md のスキーマ)。
+             *     クライアントはこの 1 つだけを見れば済みます ——
+             *     どちらから来たかは表示の関心事ではありません。
+             * @example https://lh3.googleusercontent.com/a/xxxx
+             */
             avatarUrl?: string | null;
         };
         CreateCommentRequest: {
@@ -496,7 +547,7 @@ export interface components {
          * @example comment_attachment
          * @enum {string}
          */
-        ImageKind: "comment_attachment";
+        ImageKind: "comment_attachment" | "avatar" | "thread_icon";
         Image: {
             /**
              * Format: uuid
@@ -750,6 +801,53 @@ export interface operations {
             500: components["responses"]["InternalError"];
         };
     };
+    setMyAvatar: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Format: uuid
+                     * @description 設定する画像の ID。`null` で解除します。
+                     */
+                    imageId: string | null;
+                };
+            };
+        };
+        responses: {
+            /** @description 設定した */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description 指定された画像が存在しないか、自分のものではありません。
+             *     **403 ではなく 404 を返します** —— 403 だと
+             *     「その ID の画像が存在すること」自体が漏れます
+             *     (docs/adr/0013-http-defense.md)。
+             */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
     uploadImage: {
         parameters: {
             query?: never;
@@ -923,7 +1021,45 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            /**
+             * @description アイコンを指定したが未ログインです。
+             *     **画像の投稿にはログインが要ります**
+             *     (docs/adr/0007-image-storage.md の背景)。
+             */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description 指定されたアイコンが存在しないか、自分のものではありません。
+             *     **403 ではなく 404** です —— 403 だと
+             *     「その ID の画像が存在すること」自体が漏れます。
+             */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["InternalError"];
+            /**
+             * @description ストレージの設定が入っていないため、アイコンを指定できません。
+             *     アイコンなしのスレッド作成は影響を受けません。
+             */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     getThread: {

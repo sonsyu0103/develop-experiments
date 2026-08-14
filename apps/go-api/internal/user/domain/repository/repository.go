@@ -87,6 +87,14 @@ type SessionRepository interface {
 	// この判定は SQL 側に置いてあり、アプリ側では行いません。
 	FindLive(ctx context.Context, token model.SessionToken) (*model.AuthenticatedSession, error)
 
+	// SetAvatarImage はプロフィール画像を設定します。
+	//
+	// imageID が nil なら解除します (Google のプロフィール画像に戻ります)。
+	// **所有者の確認は行いません** —— 他人の画像を 404 として扱う必要があり、
+	// ここで外部キーに弾かせると 400 になってしまうためです。
+	// 確認はユースケース層が先に行います。
+	SetAvatarImage(ctx context.Context, userID int64, imageID *uuid.UUID) (*model.SessionOwner, error)
+
 	// Delete は 1 件のセッションを削除します (ログアウト)。
 	// FindLive と同じく生のトークンを受け取ります。
 	//

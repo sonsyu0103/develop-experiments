@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/google/uuid"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"develop-experiments/apps/go-api/internal/infrastructure/postgres/sqlcgen"
@@ -60,12 +62,13 @@ func (r *SessionRepository) FindLive(ctx context.Context, token model.SessionTok
 	return &model.AuthenticatedSession{
 		Session: *model.ReconstructSession(row.ID, row.UserID, row.ExpiresAt, row.CreatedAt),
 		Owner: model.SessionOwner{
-			ID:          row.UserID,
-			PublicID:    row.PublicID,
-			Email:       row.Email,
-			DisplayName: row.DisplayName,
-			AvatarURL:   row.AvatarUrl,
-			Role:        role,
+			ID:              row.UserID,
+			PublicID:        row.PublicID,
+			Email:           row.Email,
+			DisplayName:     row.DisplayName,
+			AvatarURL:       row.AvatarUrl,
+			Role:            role,
+			AvatarObjectKey: row.AvatarObjectKey,
 		},
 	}, nil
 }
@@ -115,4 +118,47 @@ func clampMaxRows(maxRows int32) int32 {
 		return defaultDeleteExpiredMaxRows
 	}
 	return maxRows
+}
+
+// SetAvatarImage はプロフィール画像を設定します。
+//
+// **所有者の確認はユースケース層が済ませています** (repository.go の doc を参照)。
+func (r *SessionRepository) SetAvatarImage(
+	ctx context.Context, userID int64, imageID *uuid.UUID,
+) (*model.SessionOwner, error) {
+	row, err := r.q.SetUserAvatarImage(ctx, sqlcgen.SetUserAvatarImageParams{
+		ID:            userID,
+		AvatarImageID: imageID,
+	})
+	if err != nil {
+		return nil, translateError("SessionRepository.SetAvatarImage", err)
+	}
+
+	role, err := model.ParseRole(row.Role)
+	if err != nil {
+		slog.ErrorContext(ctx, "ロールを解釈できません",
+			slog.Int64("owner_id", row.ID), slog.String("role", row.Role))
+		role = model.RoleUser
+	}
+
+	owner := &model.SessionOwner{
+		ID:          row.ID,
+		PublicID:    row.PublicID,
+		Email:       row.Email,
+		DisplayName: row.DisplayName,
+		AvatarURL:   row.AvatarUrl,
+		Role:        role,
+	}
+
+	// **設定した画像のキーを引き直す。** UPDATE の RETURNING は
+	// images を結合できないため、URL の組み立てに要るキーが手に入らない。
+	// 解除 (nil) のときは引かない。
+	if imageID != nil {
+		img, findErr := r.q.GetImageByID(ctx, *imageID)
+		if findErr != nil {
+			return nil, translateError("SessionRepository.SetAvatarImage", findErr)
+		}
+		owner.AvatarObjectKey = &img.ObjectKey
+	}
+	return owner, nil
 }

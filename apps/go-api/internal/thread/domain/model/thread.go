@@ -7,6 +7,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
+
 	"develop-experiments/apps/go-api/internal/apperr"
 )
 
@@ -30,8 +32,36 @@ type Thread struct {
 	AuthorID *int64
 	// Author は表示用の投稿者情報です。読み出し時に解決されます。
 	// 匿名投稿では nil になります。
-	Author    *Author
+	Author *Author
+	// IconImageID はスレッドアイコンの画像 ID です。**nil が「なし」を意味します**。
+	// 書き込み時に使う値で、読み出し経路では埋まりません (AuthorID と同じ)。
+	IconImageID *uuid.UUID
+	// Icon は表示用のアイコンです。設定されていなければ nil になります。
+	//
+	// **image モジュールの型は使いません** (ADR 0004 / ADR 0014 の Author と同じ形)。
+	Icon      *Image
 	CreatedAt time.Time
+}
+
+// Image は表示用のスレッドアイコンです。
+//
+// **URL ではなくオブジェクトキーを持ちます。** URL の組み立ては
+// 環境ごとの設定を要するため、ドメインの外で行います
+// (docs/adr/0007-image-storage.md 決定 5)。
+type Image struct {
+	ID        uuid.UUID
+	ObjectKey string
+	Width     int
+	Height    int
+}
+
+// NewImage は永続化層が読み出した行からアイコンを組み立てます。
+// id がゼロ値なら nil を返します (LEFT JOIN が成立しなかった場合)。
+func NewImage(id uuid.UUID, objectKey string, width, height int) *Image {
+	if id == uuid.Nil {
+		return nil
+	}
+	return &Image{ID: id, ObjectKey: objectKey, Width: width, Height: height}
 }
 
 // Summary は一覧表示用に、スレッドとそのコメント数を組にした値です。
@@ -45,7 +75,11 @@ type Summary struct {
 //
 // authorID が nil なら匿名投稿になります。匿名投稿を残すのは決定事項です
 // (docs/adr/0005-authentication.md 決定 2)。
-func NewThread(title string, authorID *int64) (*Thread, error) {
+//
+// **アイコンは認証済みでなければ設定できません** (ADR 0007 の背景)。
+// 匿名の作成に iconImageId が付いていたら、無視ではなくエラーにします ——
+// 利用者からは「設定したのに消えた」としか見えないためです。
+func NewThread(title string, authorID *int64, iconImageID *uuid.UUID) (*Thread, error) {
 	title = strings.TrimSpace(title)
 
 	if title == "" {
@@ -59,16 +93,24 @@ func NewThread(title string, authorID *int64) (*Thread, error) {
 		)
 	}
 
-	return &Thread{Title: title, AuthorID: authorID}, nil
+	if iconImageID != nil && authorID == nil {
+		return nil, fmt.Errorf(
+			"アイコンを設定するにはログインが必要です: %w", apperr.ErrUnauthenticated)
+	}
+
+	return &Thread{Title: title, AuthorID: authorID, IconImageID: iconImageID}, nil
 }
 
 // Reconstruct は永続化層から読み出した値でスレッドを復元します。
 // 保存済みのデータが対象なので、検証は行いません。
-func Reconstruct(id int64, title string, author *Author, createdAt time.Time) *Thread {
+func Reconstruct(
+	id int64, title string, author *Author, icon *Image, createdAt time.Time,
+) *Thread {
 	return &Thread{
 		ID:        id,
 		Title:     title,
 		Author:    author,
+		Icon:      icon,
 		CreatedAt: createdAt,
 	}
 }

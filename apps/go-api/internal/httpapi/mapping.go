@@ -24,11 +24,23 @@ func toWireThread(d threadusecase.ThreadDTO) oapigen.Thread {
 			Withdrawn:   d.Author.Withdrawn,
 		}
 	}
+	// **アイコンの詰め替えを忘れない** (コメントの画像で一度落とした)。
+	var icon *oapigen.Image
+	if d.Icon != nil {
+		icon = &oapigen.Image{
+			Id:     d.Icon.ID,
+			Url:    d.Icon.URL,
+			Width:  d.Icon.Width,
+			Height: d.Icon.Height,
+		}
+	}
+
 	return oapigen.Thread{
 		Id:           d.ID,
 		Title:        d.Title,
 		CommentCount: d.CommentCount,
 		Author:       author,
+		Icon:         icon,
 		CreatedAt:    d.CreatedAt,
 	}
 }

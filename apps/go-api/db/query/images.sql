@@ -6,13 +6,14 @@
 -- 過不足なく一致していれば、sqlc は共通の行型 (sqlcgen.Image) を再利用する。
 -- ずれるとクエリごとに別の行型が生成され、詰め替えが増える。
 --
--- object_reclaimed_at は**まだ誰も読み書きしない**が、列一覧には並べる。
 -- 揃える条件は「テーブルの全列と過不足なく一致する」であり、
 -- 1 つ抜けるだけで共通行型が消える (users.sql で実際に踏んだ)。
 --
--- 【回収バッチのクエリはここに無い】
--- Phase 6 の後半 (プロフィール画像 / スレッドアイコンと同時) で足す。
--- 先に書くと「実装していないクエリ」が残る。
+-- 【attached_at はここから書かない】
+-- 添付先から参照された時刻 (000007) は、**添付する側のクエリが
+-- 同じ 1 文の中で更新する** —— comments.sql / threads.sql / users.sql を参照。
+-- 別の文に分けると「コメントは作られたが添付の記録が無い」状態が作れ、
+-- 回収バッチが参照済みの画像を消しにいく。
 -- =============================================================================
 
 -- name: CreatePendingImage :one
@@ -28,7 +29,7 @@ INSERT INTO images (
     id, owner_id, kind, object_key, content_type, width, height, byte_size, status
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
-RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at;
+RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at, attached_at;
 
 -- name: CommitImage :one
 -- ストレージへの PUT が成功したあとに呼ぶ (ADR 0007 決定 3 の手順 3)。
@@ -45,7 +46,7 @@ SET status = 'committed',
     committed_at = now()
 WHERE id = $1
   AND status = 'pending'
-RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at;
+RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at, attached_at;
 
 -- name: GetImageByID :one
 -- 1 件取得。
@@ -54,6 +55,90 @@ RETURNING id, owner_id, kind, object_key, content_type, width, height, byte_size
 -- 呼び出し側が「確定していない」「削除された」を区別する必要があり、
 -- ここで隠すと「元から存在しない」と同じに見えてしまう
 -- (ADR 0016 問題 3 が DB 行を残す理由と同じ話)。
-SELECT id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at
+SELECT id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at, attached_at
 FROM images
 WHERE id = $1;
+
+-- name: ListReclaimableImages :many
+-- 回収バッチが拾う行 (ADR 0007 決定 3 / ADR 0016 問題 3)。
+--
+-- 対象は 3 種類ある。**扱いが status で分かれる**ので、
+-- どれに当たるかを呼び出し側が判断できるよう status ごと返す。
+--
+--   pending の孤児   確定しなかった。DB 行も S3 オブジェクトも消す
+--   deleted          モデレーターが消した。S3 だけ消し、DB 行は残す
+--   committed の孤立 アップロードしたが添付されなかった。両方消す
+--
+-- **committed の孤立を含めるのが Phase 6 後半で足した点になる。**
+-- アップロードと添付を分けた結果 (ADR 0007 の実装して分かったこと 1)、
+-- 「アップロードしたが投稿をやめた」画像がどこからも参照されないまま残る。
+--
+-- 【絞りは attached_at、確認は NOT EXISTS】
+-- 初版は committed の孤立を NOT EXISTS x3 だけで判定していた。
+-- **索引が効かない。** 部分索引の述語は他テーブルを見られないので、
+-- images_reclaimable_idx (000006) の述語に committed の行が入らず、
+-- プランナが索引を選べない —— 10 分ごと・レプリカごとに images の
+-- 全表走査 + created_at のソートになっていた。
+--
+-- 000007 で attached_at 列を足し、述語を
+-- 「object_reclaimed_at IS NULL AND (attached_at IS NULL OR status = 'deleted')」
+-- に張り替えた。**下の WHERE はこの式をそのまま書いている** ——
+-- 部分索引が使われるのは索引の述語がクエリの制約から導けるときだけで、
+-- OR を含む式は同じ式が書かれている形でしか一致しない。並べ替えないこと。
+--
+-- そのうえで NOT EXISTS x3 は残す。attached_at はアプリが書く値なので、
+-- **新しい添付経路を足した人が書き忘れると参照中の画像を消しにいく**。
+-- 索引で候補を数件に絞ったあと、行を消す種類 (pending / committed) にだけ
+-- 確認をかける。deleted は添付されたまま S3 を消すので対象外。
+--
+-- 【経過時間で守る】
+-- どの種類も created_at で足切りする。**アップロード直後の画像を
+-- 消してはいけない** —— 添付するまでの数十秒のあいだ、
+-- committed の孤立は正常な状態として存在する。
+--
+-- 【FOR UPDATE SKIP LOCKED】
+-- 定期処理を API プロセス内で動かすため (ADR 0003 未決 #9)、
+-- **レプリカの数だけ同時に走る**。ロックを取り、取れなかった行は
+-- 飛ばすことで、同じ画像を 2 つのプロセスが二重に処理しない。
+-- 待たせるのではなく飛ばすのは、次の周回で拾えば十分だから。
+SELECT id, owner_id, kind, object_key, content_type, width, height, byte_size, status, created_at, committed_at, object_reclaimed_at, attached_at
+FROM images
+WHERE object_reclaimed_at IS NULL
+  AND (attached_at IS NULL OR status = 'deleted')
+  AND created_at < now() - sqlc.arg('grace')::interval
+  AND (
+    status = 'deleted'
+    OR (
+      NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
+      AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id)
+      AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.icon_image_id = images.id)
+    )
+  )
+ORDER BY created_at
+LIMIT sqlc.arg('max_rows')
+FOR UPDATE SKIP LOCKED;
+
+-- name: MarkImageReclaimed :execrows
+-- 回収対象を「確保」する。
+--
+-- **status によらず、拾ったすべての行に対して呼ぶ。**
+-- 列名は「S3 のオブジェクトを消した時刻」だが、**消す前に**書く。
+--
+--   1. 添付できなくする —— FindOwned は確保済みの画像を返さない。
+--      S3 を消したあとに書くと「実体は消えたのにまだ添付できる」窓が空く
+--   2. 対象から外す —— 'deleted' は DB 行を残すので (ADR 0016 問題 3)、
+--      記録が無いと次の周回でも同じ行が拾われ、
+--      毎回すべての削除済み画像へ DELETE を投げ直すことになる
+--      (索引も単調増加する。000006 の列コメントを参照)
+UPDATE images
+SET object_reclaimed_at = now()
+WHERE id = $1
+  AND object_reclaimed_at IS NULL;
+
+-- name: DeleteImage :execrows
+-- DB 行ごと消す。
+--
+-- **参照されていない画像にだけ使う。** 参照があれば外部キーが拒否するので、
+-- 誤って呼んでも壊れはしないが、エラーとして表に出る。
+-- 'deleted' の画像に使ってはいけない (ADR 0016 問題 3 が行を残すと決めている)。
+DELETE FROM images WHERE id = $1;

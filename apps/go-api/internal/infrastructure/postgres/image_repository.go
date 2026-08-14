@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"develop-experiments/apps/go-api/internal/apperr"
@@ -18,13 +20,77 @@ import (
 // ImageRepository は repository.ImageRepository の PostgreSQL 実装です。
 type ImageRepository struct {
 	q *sqlcgen.Queries
+	// pool はトランザクションを開始するために持ちます。
+	// **トランザクションの中で作った実体では nil になります**
+	// (入れ子のトランザクションを作らせないため)。
+	pool *pgxpool.Pool
 }
 
 var _ repository.ImageRepository = (*ImageRepository)(nil)
 
 // NewImageRepository は接続プールからリポジトリを生成します。
 func NewImageRepository(pool *pgxpool.Pool) *ImageRepository {
-	return &ImageRepository{q: sqlcgen.New(pool)}
+	return &ImageRepository{q: sqlcgen.New(pool), pool: pool}
+}
+
+// WithinTx は 1 つのトランザクションの中でリポジトリを使います。
+//
+// **回収バッチが要求します。** ListReclaimable が取る行ロック
+// (FOR UPDATE SKIP LOCKED) はトランザクションの終わりまでしか持たないため、
+// 取得と削除が別トランザクションだとロックの意味が無くなります。
+func (r *ImageRepository) WithinTx(
+	ctx context.Context, fn func(repository.ImageRepository) error,
+) error {
+	if r.pool == nil {
+		return fmt.Errorf("ImageRepository.WithinTx: トランザクションの入れ子は作れません")
+	}
+	// READ COMMITTED でよい。守りたいのは「同じ行を 2 つのプロセスが
+	// 処理しない」ことで、それは行ロックが担う。
+	return runInTx(ctx, "ImageRepository.WithinTx", r.pool, pgx.ReadCommitted,
+		func(_ pgx.Tx, q *sqlcgen.Queries) error {
+			// pool を渡さない = この中でさらに WithinTx は呼べない。
+			return fn(&ImageRepository{q: q})
+		})
+}
+
+// ListReclaimable は回収対象の画像を取得します。
+//
+// **行ロックを取ります。** WithinTx の中で呼び、同じトランザクションで
+// 後続の削除まで済ませてください。
+func (r *ImageRepository) ListReclaimable(
+	ctx context.Context, grace time.Duration, maxRows int32,
+) ([]model.Image, error) {
+	rows, err := r.q.ListReclaimableImages(ctx, sqlcgen.ListReclaimableImagesParams{
+		Grace:   toInterval(grace),
+		MaxRows: clampMaxRows(maxRows),
+	})
+	if err != nil {
+		return nil, translateError("ImageRepository.ListReclaimable", err)
+	}
+
+	images := make([]model.Image, 0, len(rows))
+	for _, row := range rows {
+		images = append(images, *toImage(row))
+	}
+	return images, nil
+}
+
+// MarkReclaimed は S3 のオブジェクトを消したことを記録します。
+func (r *ImageRepository) MarkReclaimed(ctx context.Context, id uuid.UUID) error {
+	if _, err := r.q.MarkImageReclaimed(ctx, id); err != nil {
+		return translateError("ImageRepository.MarkReclaimed", err)
+	}
+	// **0 行でもエラーにしません。** 別のプロセスが先に記録した場合が
+	// これに当たります (行ロックで防いでいますが、周回をまたぐと起こりえます)。
+	return nil
+}
+
+// Delete は DB 行ごと消します。
+func (r *ImageRepository) Delete(ctx context.Context, id uuid.UUID) error {
+	if _, err := r.q.DeleteImage(ctx, id); err != nil {
+		return translateError("ImageRepository.Delete", err)
+	}
+	return nil
 }
 
 // CreatePending は status = 'pending' の行を作ります (ADR 0007 決定 3 の手順 1)。
@@ -122,6 +188,8 @@ func toImage(row sqlcgen.Image) *model.Image {
 		model.Status(row.Status),
 		row.CreatedAt,
 		row.CommittedAt,
+		row.ObjectReclaimedAt,
+		row.AttachedAt,
 	)
 }
 

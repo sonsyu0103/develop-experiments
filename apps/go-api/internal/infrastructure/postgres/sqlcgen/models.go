@@ -34,6 +34,7 @@ type Image struct {
 	CreatedAt         time.Time
 	CommittedAt       *time.Time
 	ObjectReclaimedAt *time.Time
+	AttachedAt        *time.Time
 }
 
 type Session struct {

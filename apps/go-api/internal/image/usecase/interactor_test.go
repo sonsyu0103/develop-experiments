@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -29,6 +30,10 @@ type fakeImageRepo struct {
 	createErr error
 	commitErr error
 	findErr   error
+	listErr   error
+	// afterReserve は WithinTx が成功して抜けた直後に呼ばれます。
+	// 「確保をコミットした直後に SIGTERM が来た」を作るための穴です。
+	afterReserve func()
 }
 
 var _ repository.ImageRepository = (*fakeImageRepo)(nil)
@@ -71,9 +76,71 @@ func (f *fakeImageRepo) FindByID(_ context.Context, id uuid.UUID) (*model.Image,
 	return img, nil
 }
 
+// 回収バッチ用。トランザクションは張らず、そのまま自分を渡します
+// (フェイクなので「同じトランザクション」を再現する必要がない)。
+func (f *fakeImageRepo) WithinTx(_ context.Context, fn func(repository.ImageRepository) error) error {
+	if err := fn(f); err != nil {
+		return err
+	}
+	if f.afterReserve != nil {
+		f.afterReserve()
+	}
+	return nil
+}
+
+func (f *fakeImageRepo) ListReclaimable(
+	_ context.Context, grace time.Duration, maxRows int32,
+) ([]model.Image, error) {
+	f.rec.add("db:list_reclaimable")
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var out []model.Image
+	for _, img := range f.stored {
+		if len(out) >= int(maxRows) {
+			break
+		}
+		if img.ObjectReclaimedAt != nil {
+			continue
+		}
+		// grace は「作られてからの経過」。フェイクでは createdAt を
+		// 明示的に古くした行だけを対象にする。
+		if !img.CreatedAt.Before(time.Now().Add(-grace)) {
+			continue
+		}
+		out = append(out, *img)
+	}
+	return out, nil
+}
+
+func (f *fakeImageRepo) MarkReclaimed(ctx context.Context, id uuid.UUID) error {
+	f.rec.add("db:mark_reclaimed")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if img, ok := f.stored[id]; ok {
+		now := time.Now()
+		img.ObjectReclaimedAt = &now
+	}
+	return nil
+}
+
+// **ctx を見ます。** pgx はキャンセル済みの ctx で必ず失敗するので、
+// 無視するフェイクだと「シャットダウン中に消せていたつもり」を再現できません
+// (レビュー指摘 —— 実際にそこが穴になっていました)。
+func (f *fakeImageRepo) Delete(ctx context.Context, id uuid.UUID) error {
+	f.rec.add("db:delete")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	delete(f.stored, id)
+	return nil
+}
+
 type fakeStorage struct {
-	rec    *recorder
-	putErr error
+	rec       *recorder
+	putErr    error
+	deleteErr error
 	// objects は key -> バイト列。
 	objects map[string][]byte
 }
@@ -93,8 +160,15 @@ func (f *fakeStorage) Put(_ context.Context, key, _ string, body []byte) error {
 	return nil
 }
 
-func (f *fakeStorage) Delete(_ context.Context, key string) error {
+// ctx を見ます (Delete と同じ理由。AWS SDK もキャンセルで失敗します)。
+func (f *fakeStorage) Delete(ctx context.Context, key string) error {
 	f.rec.add("storage:delete")
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	delete(f.objects, key)
 	return nil
 }
@@ -239,13 +313,15 @@ func TestUpload_StoresReencodedBytes(t *testing.T) {
 func TestParseKind(t *testing.T) {
 	t.Parallel()
 
-	if _, err := ParseKind("comment_attachment"); err != nil {
-		t.Errorf("comment_attachment が拒否された: %v", err)
+	// **3 つの用途をすべて受け付ける** (PR 4 で開けた)。
+	for _, raw := range []string{"comment_attachment", "avatar", "thread_icon"} {
+		if _, err := ParseKind(raw); err != nil {
+			t.Errorf("kind=%q が拒否された: %v", raw, err)
+		}
 	}
 
-	// **まだ開けていない用途を受け付けない。**
-	// 受け付けると、どこからも参照されない画像が作れてしまう。
-	for _, raw := range []string{"avatar", "thread_icon", "", "banner", "COMMENT_ATTACHMENT"} {
+	// 未知の値は受け付けない。
+	for _, raw := range []string{"", "banner", "COMMENT_ATTACHMENT", " avatar"} {
 		if _, err := ParseKind(raw); !errors.Is(err, apperr.ErrInvalidArgument) {
 			t.Errorf("kind=%q: err = %v, want apperr.ErrInvalidArgument", raw, err)
 		}
@@ -269,20 +345,45 @@ func TestEnsureOwned(t *testing.T) {
 	}
 
 	t.Run("所有者なら通る", func(t *testing.T) {
-		if err := uc.EnsureOwned(context.Background(), 42, dto.ID); err != nil {
+		if err := uc.EnsureOwned(context.Background(), 42, dto.ID, "comment_attachment"); err != nil {
 			t.Errorf("所有者なのに拒否された: %v", err)
 		}
 	})
 
 	t.Run("他人は 404", func(t *testing.T) {
-		if err := uc.EnsureOwned(context.Background(), 99, dto.ID); !errors.Is(err, apperr.ErrNotFound) {
+		if err := uc.EnsureOwned(context.Background(), 99, dto.ID, "comment_attachment"); !errors.Is(err, apperr.ErrNotFound) {
 			t.Errorf("err = %v, want apperr.ErrNotFound", err)
 		}
 	})
 
 	t.Run("存在しない画像も 404", func(t *testing.T) {
-		if err := uc.EnsureOwned(context.Background(), 42, uuid.New()); !errors.Is(err, apperr.ErrNotFound) {
+		if err := uc.EnsureOwned(context.Background(), 42, uuid.New(), "comment_attachment"); !errors.Is(err, apperr.ErrNotFound) {
 			t.Errorf("err = %v, want apperr.ErrNotFound", err)
+		}
+	})
+
+	// **用途が違う画像は添付できない** (ADR 0007 決定 6)。
+	// コメント添付として上げた JPEG をアバターに使えると、
+	// 仕様書の説明と実装が食い違う。
+	t.Run("用途が違うと 404", func(t *testing.T) {
+		if err := uc.EnsureOwned(context.Background(), 42, dto.ID, "avatar"); !errors.Is(err, apperr.ErrNotFound) {
+			t.Errorf("err = %v, want apperr.ErrNotFound", err)
+		}
+	})
+
+	// **回収が始まった画像は添付できない。**
+	// 確保のあとは実体が消えている可能性がある。
+	t.Run("回収済みは 404", func(t *testing.T) {
+		for _, img := range repo.stored {
+			now := time.Now()
+			img.ObjectReclaimedAt = &now
+		}
+		err := uc.EnsureOwned(context.Background(), 42, dto.ID, "comment_attachment")
+		if !errors.Is(err, apperr.ErrNotFound) {
+			t.Errorf("err = %v, want apperr.ErrNotFound", err)
+		}
+		for _, img := range repo.stored {
+			img.ObjectReclaimedAt = nil
 		}
 	})
 
@@ -292,7 +393,7 @@ func TestEnsureOwned(t *testing.T) {
 		for _, img := range repo.stored {
 			img.Status = model.StatusPending
 		}
-		if err := uc.EnsureOwned(context.Background(), 42, dto.ID); !errors.Is(err, apperr.ErrNotFound) {
+		if err := uc.EnsureOwned(context.Background(), 42, dto.ID, "comment_attachment"); !errors.Is(err, apperr.ErrNotFound) {
 			t.Errorf("err = %v, want apperr.ErrNotFound", err)
 		}
 	})

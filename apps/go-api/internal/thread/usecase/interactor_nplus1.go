@@ -85,5 +85,8 @@ func (i *NPlusOneInteractor) FetchThreadListNPlusOne(
 		return ThreadListResult{}, err
 	}
 
-	return buildListResult(summaries, page.Size)
+	// **アイコンの URL は組み立てない。** このインタラクタは Phase 4 の
+	// ベンチマーク専用で、本番経路から外れている (ADR 0014)。
+	// ImageResolver を持たせると、比較したい N+1 の形に無関係な依存が増える。
+	return (&ThreadInteractor{}).buildListResult(summaries, page.Size)
 }

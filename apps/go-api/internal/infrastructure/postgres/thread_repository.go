@@ -43,6 +43,7 @@ func (r *ThreadRepository) ListSummaries(ctx context.Context, page pagination.Pa
 			Thread: *model.Reconstruct(row.ID, row.Title,
 				toThreadAuthor(row.AuthorPublicID, row.AuthorDisplayName,
 					row.AuthorAvatarUrl, row.AuthorDeletedAt),
+				toThreadIcon(row.IconID, row.IconObjectKey, row.IconWidth, row.IconHeight),
 				row.CreatedAt),
 			CommentCount: row.CommentCount,
 		})
@@ -61,6 +62,7 @@ func (r *ThreadRepository) FindSummaryByID(ctx context.Context, id int64) (*mode
 		Thread: *model.Reconstruct(row.ID, row.Title,
 			toThreadAuthor(row.AuthorPublicID, row.AuthorDisplayName,
 				row.AuthorAvatarUrl, row.AuthorDeletedAt),
+			toThreadIcon(row.IconID, row.IconObjectKey, row.IconWidth, row.IconHeight),
 			row.CreatedAt),
 		CommentCount: row.CommentCount,
 	}, nil
@@ -69,8 +71,9 @@ func (r *ThreadRepository) FindSummaryByID(ctx context.Context, id int64) (*mode
 // Create はスレッドを保存し、採番済みの値を返します。
 func (r *ThreadRepository) Create(ctx context.Context, thread *model.Thread) (*model.Thread, error) {
 	row, err := r.q.CreateThread(ctx, sqlcgen.CreateThreadParams{
-		Title:    thread.Title,
-		AuthorID: thread.AuthorID,
+		Title:       thread.Title,
+		AuthorID:    thread.AuthorID,
+		IconImageID: thread.IconImageID,
 	})
 	if err != nil {
 		return nil, translateError("ThreadRepository.Create", err)
@@ -78,6 +81,7 @@ func (r *ThreadRepository) Create(ctx context.Context, thread *model.Thread) (*m
 	created := model.Reconstruct(row.ID, row.Title,
 		toThreadAuthor(row.AuthorPublicID, row.AuthorDisplayName,
 			row.AuthorAvatarUrl, row.AuthorDeletedAt),
+		toThreadIcon(row.IconID, row.IconObjectKey, row.IconWidth, row.IconHeight),
 		row.CreatedAt)
 	// 書き込み経路の戻り値は、書いた内容を反映させる。
 	// Reconstruct は読み出し用で AuthorID を持たないため、ここで補う。
@@ -109,7 +113,7 @@ func (r *ThreadRepository) ListThreadsOnly(ctx context.Context, page pagination.
 	threads := make([]model.Thread, 0, len(rows))
 	for _, row := range rows {
 		// ベンチマーク専用の経路。投稿者は引かないので nil のままにする。
-		threads = append(threads, *model.Reconstruct(row.ID, row.Title, nil, row.CreatedAt))
+		threads = append(threads, *model.Reconstruct(row.ID, row.Title, nil, nil, row.CreatedAt))
 	}
 	return threads, nil
 }

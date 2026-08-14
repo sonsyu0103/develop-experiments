@@ -12,7 +12,19 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: '1.25'
+  # **patch まで固定する。**
+  #
+  # 初版は '1.25' + check-latest だった。しかし check-latest が見るのは
+  # actions/go-versions の manifest であって go.dev ではない。
+  # **Go 側で脆弱性が公表されてから manifest に載るまでに時差があり**、
+  # その間 govulncheck (exit 3) だけが落ちて CI が赤くなる。
+  # 実際に 1.25.13 の公開当日、manifest は 1.25.12 のままだった。
+  #
+  # setup-go は manifest に無いバージョンを go.dev から取りにいくので、
+  # patch まで書けば公表と同時に上げられる。
+  # 他のツール (GOLANGCI_LINT_VERSION など) と同じ扱いになる ——
+  # 更新は「意図した変更」としてコミットに残す。
+  GO_VERSION: '1.25.13'
   NODE_VERSION: '22'
   # バージョンを固定する理由:
   #   @latest だと、リンタ側のルール追加で CI が突然赤くなる。
@@ -374,6 +386,21 @@ jobs:
           S3_TEST_BUCKET: bbs-images
           S3_TEST_PUBLIC_BASE_URL: http://localhost:9000/bbs-images
         run: go test -v -run 'TestS3Storage|TestNew_' ./internal/infrastructure/objectstorage/
+
+      # **実 DB に対する検証** (回収バッチの経路)。
+      #
+      # ここでしか実 DB を通らない。ユニットはフェイクで動き、
+      # スモークは HTTP 越しなので回収を叩く口が無く、
+      # 定期処理は 10 分間隔 + ばらつきなので CI の実行時間では発火しない。
+      #
+      # **この 2 つは対で置く。** URL だけ消えると REQUIRE が残って
+      # t.Fatal になり、静かなスキップにはならない (objectstorage と同じ形)。
+      - name: Verify the image repository against the real database
+        working-directory: ./apps/go-api
+        env:
+          DB_TEST_REQUIRE: "1"
+          DATABASE_TEST_URL: postgres://app:password@localhost:5432/bbs?sslmode=disable
+        run: go test -v -run '_Live$' ./internal/infrastructure/postgres/
 
       - name: Run smoke test against the real database
         env:

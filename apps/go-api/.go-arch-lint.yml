@@ -72,6 +72,10 @@ components:
   # どの層からもログを出すため、下地として扱う
   shared-logging:
     in: internal/logging
+  # 定期処理 (docs/adr/0003-open-questions.md 未決 #9 の決定: API プロセス内)。
+  # **Job の中身は知らない。** 束ねて回すだけで、実処理は main が渡す
+  shared-scheduler:
+    in: internal/scheduler
 
   thread-model:
     in: internal/thread/domain/model
@@ -141,7 +145,7 @@ deps:
     canUse:
       # N+1 比較実装 (interactor_nplus1.go) が errgroup を使う
       - errgroup
-      # AuthorDTO が公開 ID を持つ
+      # AuthorDTO が公開 ID を持つ。アイコンの ID も uuid
       - uuid
     mayDependOn:
       - thread-model

@@ -256,9 +256,17 @@ func (s *Server) CreateThread(c *gin.Context) {
 		return
 	}
 
+	// スレッドアイコン。所有者の確認はユースケース層が行う
+	// (他人の画像を指定されたら 404。存在を隠すため)。
+	iconID, err := parseImageID(req.IconImageId)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
 	// ログイン中なら投稿者を紐付ける。未ログインなら nil = 匿名投稿。
 	thread, err := s.threads.CreateThread(c.Request.Context(), req.Title,
-		authorIDFromContext(c.Request.Context()))
+		authorIDFromContext(c.Request.Context()), iconID)
 	if err != nil {
 		respondError(c, err)
 		return

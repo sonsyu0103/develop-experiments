@@ -167,3 +167,36 @@ func parseImageID(raw *openapi_types.UUID) (*uuid.UUID, error) {
 	}
 	return &id, nil
 }
+
+// SetMyAvatar は PUT /me/avatar を処理します。
+//
+// **ログインが必須です** (仕様書の security 宣言が強制します)。
+func (s *Server) SetMyAvatar(c *gin.Context) {
+	ctx := c.Request.Context()
+	userID := authorIDFromContext(ctx)
+	if userID == nil {
+		respondError(c, fmt.Errorf("ログインが必要です: %w", apperr.ErrUnauthenticated))
+		return
+	}
+
+	var req oapigen.SetMyAvatarJSONRequestBody
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondBadRequest(c, "リクエストボディが不正です: "+err.Error())
+		return
+	}
+
+	// **null は「解除」を意味します。** 省略と区別する必要はありません
+	// (仕様書で imageId を required にしてあるため)。
+	imageID, err := parseImageID(req.ImageId)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	me, err := s.sessions.SetAvatar(ctx, *userID, imageID)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, toWireMe(*me))
+}

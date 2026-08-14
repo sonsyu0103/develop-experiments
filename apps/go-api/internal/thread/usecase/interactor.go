@@ -3,10 +3,12 @@ package usecase
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 
+	"develop-experiments/apps/go-api/internal/apperr"
 	"develop-experiments/apps/go-api/internal/pagination"
 	"develop-experiments/apps/go-api/internal/thread/domain/model"
 	"develop-experiments/apps/go-api/internal/thread/domain/repository"
@@ -28,8 +30,19 @@ type ThreadDTO struct {
 	Title        string `json:"title"`
 	CommentCount int64  `json:"commentCount"`
 	// Author は匿名投稿では nil になります。
-	Author    *AuthorDTO `json:"author"`
-	CreatedAt time.Time  `json:"createdAt"`
+	Author *AuthorDTO `json:"author"`
+	// Icon はスレッドアイコンです。設定されていなければ nil になります。
+	Icon      *ImageDTO `json:"icon"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// ImageDTO はスレッドアイコンです。URL を組み立てて返します
+// (docs/adr/0007-image-storage.md 決定 5)。
+type ImageDTO struct {
+	ID     uuid.UUID `json:"id"`
+	URL    string    `json:"url"`
+	Width  int       `json:"width"`
+	Height int       `json:"height"`
 }
 
 // ThreadListResult はスレッド一覧と、次ページ取得用のカーソルです。
@@ -46,11 +59,36 @@ type ThreadListResult struct {
 // ThreadInteractor は「スレッドを取得・作成する」ユースケースを担当します。
 type ThreadInteractor struct {
 	repo repository.ThreadRepository
+	// images はストレージの設定が無い環境では nil になります。
+	images ImageResolver
+}
+
+// imageKindThreadIcon は EnsureOwned に渡す用途です。
+//
+// **image モジュールの定数を参照しません** (モジュールをまたがないため)。
+// 値がずれると添付が常に 404 になるので、スモークが検出します。
+const imageKindThreadIcon = "thread_icon"
+
+// ImageResolver は画像の解決を担います。
+//
+// **image モジュールを import しません** (docs/adr/0004-modular-monolith.md)。
+// 利用側が必要な操作だけのインターフェースを定義する形は、
+// ThreadExistenceChecker と同じです。実装は image のユースケースが満たします。
+type ImageResolver interface {
+	// EnsureOwned は「その利用者が所有する確定済みの画像か」を確認します。
+	// kind は用途 ("comment_attachment" / "avatar" / "thread_icon")。
+	// **文字列で渡します。** image モジュールの型を知らないためです。
+	EnsureOwned(ctx context.Context, ownerID int64, imageID uuid.UUID, kind string) error
+	// URL はオブジェクトキーから配信用の絶対 URL を組み立てます。
+	URL(objectKey string) string
 }
 
 // NewThreadInteractor はリポジトリを注入してインタラクターを生成します。
-func NewThreadInteractor(repo repository.ThreadRepository) *ThreadInteractor {
-	return &ThreadInteractor{repo: repo}
+// images は nil を許します (ストレージの設定が無い環境)。
+func NewThreadInteractor(
+	repo repository.ThreadRepository, images ImageResolver,
+) *ThreadInteractor {
+	return &ThreadInteractor{repo: repo, images: images}
 }
 
 // FetchThreadList はスレッド一覧をコメント数つきで取得します。
@@ -68,7 +106,7 @@ func (i *ThreadInteractor) FetchThreadList(ctx context.Context, page pagination.
 	if err != nil {
 		return ThreadListResult{}, err
 	}
-	return buildListResult(summaries, page.Size)
+	return i.buildListResult(summaries, page.Size)
 }
 
 // FetchThread は 1 件のスレッドをコメント数つきで取得します。
@@ -78,16 +116,27 @@ func (i *ThreadInteractor) FetchThread(ctx context.Context, id int64) (ThreadDTO
 	if err != nil {
 		return ThreadDTO{}, err
 	}
-	return toDTO(*summary), nil
+	return i.toDTO(*summary), nil
 }
 
 // CreateThread は新しいスレッドを作成します。
 func (i *ThreadInteractor) CreateThread(
-	ctx context.Context, title string, authorID *int64,
+	ctx context.Context, title string, authorID *int64, iconImageID *uuid.UUID,
 ) (ThreadDTO, error) {
-	thread, err := model.NewThread(title, authorID)
+	thread, err := model.NewThread(title, authorID, iconImageID)
 	if err != nil {
 		return ThreadDTO{}, err
+	}
+
+	// **アイコンは投稿する前に確かめる。** 作ってから気づくと、
+	// 「スレッドはできたがアイコンだけ付かない」状態になる。
+	if iconImageID != nil {
+		if i.images == nil {
+			return ThreadDTO{}, fmt.Errorf("画像は現在利用できません: %w", apperr.ErrUnavailable)
+		}
+		if iconErr := i.images.EnsureOwned(ctx, *authorID, *iconImageID, imageKindThreadIcon); iconErr != nil {
+			return ThreadDTO{}, iconErr
+		}
 	}
 
 	created, err := i.repo.Create(ctx, thread)
@@ -95,15 +144,16 @@ func (i *ThreadInteractor) CreateThread(
 		return ThreadDTO{}, err
 	}
 
-	return toDTO(model.Summary{Thread: *created, CommentCount: 0}), nil
+	return i.toDTO(model.Summary{Thread: *created, CommentCount: 0}), nil
 }
 
-func toDTO(s model.Summary) ThreadDTO {
+func (i *ThreadInteractor) toDTO(s model.Summary) ThreadDTO {
 	return ThreadDTO{
 		ID:           s.ID,
 		Title:        s.Title,
 		CommentCount: s.CommentCount,
 		Author:       toAuthorDTO(s.Author),
+		Icon:         i.toImageDTO(s.Icon),
 		CreatedAt:    s.CreatedAt,
 	}
 }
@@ -126,10 +176,10 @@ func toAuthorDTO(a *model.Author) *AuthorDTO {
 
 // buildListResult は取得結果を DTO に詰め替え、次ページ用のカーソルを決めます。
 // 次ページの有無の判定は pagination.NextToken にまとめてあります。
-func buildListResult(summaries []model.Summary, size int32) (ThreadListResult, error) {
+func (i *ThreadInteractor) buildListResult(summaries []model.Summary, size int32) (ThreadListResult, error) {
 	dtos := make([]ThreadDTO, 0, len(summaries))
 	for _, s := range summaries {
-		dtos = append(dtos, toDTO(s))
+		dtos = append(dtos, i.toDTO(s))
 	}
 
 	var lastID int64
@@ -143,4 +193,19 @@ func buildListResult(summaries []model.Summary, size int32) (ThreadListResult, e
 	}
 
 	return ThreadListResult{Threads: dtos, NextCursor: next}, nil
+}
+
+// toImageDTO はアイコンを詰め替えます。URL の組み立てはここで行います。
+func (i *ThreadInteractor) toImageDTO(img *model.Image) *ImageDTO {
+	if img == nil {
+		return nil
+	}
+	// **resolver が無い環境でも一覧を壊さない。**
+	// 設定を外した環境では URL を組み立てられないが、
+	// 500 になるよりは URL が空のほうが被害が小さい。
+	var url string
+	if i.images != nil {
+		url = i.images.URL(img.ObjectKey)
+	}
+	return &ImageDTO{ID: img.ID, URL: url, Width: img.Width, Height: img.Height}
 }

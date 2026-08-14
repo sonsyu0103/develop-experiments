@@ -167,6 +167,23 @@ type Image struct {
 	Status      Status
 	CreatedAt   time.Time
 	CommittedAt *time.Time
+	// ObjectReclaimedAt は回収バッチが S3 のオブジェクトを消した時刻です。
+	//
+	// **'deleted' の行を回収対象から外すために要ります** ——
+	// DB 行を残す種類なので、消したことを記録しないと
+	// 毎周回で同じ行へ DELETE を投げ直すことになります
+	// (000006 の列コメントを参照)。
+	ObjectReclaimedAt *time.Time
+	// AttachedAt は添付先から参照された時刻です (000007)。
+	//
+	// **回収バッチの索引を成立させるためだけに在ります。**
+	// 「どこからも参照されていない」は本来 3 つの添付先を NOT EXISTS で
+	// 見れば分かりますが、部分索引の述語は他テーブルを見られないため、
+	// images 自身の列に落とさないと索引で絞れません。
+	//
+	// 書くのは添付する側のクエリ (comments / threads / users) で、
+	// このパッケージからは読むだけです。
+	AttachedAt *time.Time
 }
 
 // NewPending は再エンコード済みの画像から pending の行を組み立てます。
@@ -234,19 +251,21 @@ func (i *Image) Commit(at time.Time) {
 func Reconstruct(
 	id uuid.UUID, ownerID int64, kind Kind, objectKey, contentType string,
 	width, height int, byteSize int64, status Status,
-	createdAt time.Time, committedAt *time.Time,
+	createdAt time.Time, committedAt, objectReclaimedAt, attachedAt *time.Time,
 ) *Image {
 	return &Image{
-		ID:          id,
-		OwnerID:     ownerID,
-		Kind:        kind,
-		ObjectKey:   objectKey,
-		ContentType: contentType,
-		Width:       width,
-		Height:      height,
-		ByteSize:    byteSize,
-		Status:      status,
-		CreatedAt:   createdAt,
-		CommittedAt: committedAt,
+		ID:                id,
+		OwnerID:           ownerID,
+		Kind:              kind,
+		ObjectKey:         objectKey,
+		ContentType:       contentType,
+		Width:             width,
+		Height:            height,
+		ByteSize:          byteSize,
+		Status:            status,
+		CreatedAt:         createdAt,
+		CommittedAt:       committedAt,
+		ObjectReclaimedAt: objectReclaimedAt,
+		AttachedAt:        attachedAt,
 	}
 }

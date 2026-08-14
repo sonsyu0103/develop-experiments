@@ -36,9 +36,28 @@ SELECT
     -- 権限判定は毎リクエスト必要になる (ADR 0011 決定 1)。
     -- ここで一緒に引かないと、削除やモデレーションのたびに
     -- users をもう一度引くことになり、1 往復に畳んだ意味が薄れる。
-    u.role
+    u.role,
+    -- アップロードしたプロフィール画像 (ADR 0007)。
+    -- **LEFT であることが必須** —— INNER にすると、画像を設定していない
+    -- 利用者のセッションが 1 件も引けなくなる (= 全員ログアウト)。
+    --
+    -- ここで一緒に引くのは、/me が毎回返す値だからになる。
+    -- 別途引くと、認証つきリクエストのたびに 1 往復増える。
+    img.object_key AS avatar_object_key
 FROM sessions s
 JOIN users u ON u.id = s.user_id
+-- **実体が無い画像は結合しない** (レビュー指摘)。
+--   status = 'deleted'          モデレーターが消した。回収バッチが S3 から実体を消す
+--   object_reclaimed_at IS NOT NULL  回収済み。実体はもう無い
+-- どちらも URL を返すと、ブラウザには壊れた画像が出る。
+-- **条件は ON に置くこと。** WHERE に置くと LEFT が INNER に化けて、
+-- 画像なしの行 (大多数) が消える。
+--
+-- ADR 0016 問題 3 は「画像は削除されました」と「元から画像なし」を
+-- 区別するために行を残すと決めているが、**その区別を表す API の項目がまだ無い。**
+-- Phase 10 後半で削除の UI を入れるとき、ここを status の受け渡しに変える。
+LEFT JOIN images img ON img.id = u.avatar_image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL
 WHERE s.id = sqlc.arg('id')
   AND s.expires_at > now()
   AND u.deleted_at IS NULL;

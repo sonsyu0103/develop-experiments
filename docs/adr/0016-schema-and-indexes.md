@@ -360,8 +360,36 @@ Phase 4 の測定対象に加える。
 | --- | --- | --- |
 | `PRIMARY KEY (id)` | A | 表示 |
 | `UNIQUE (object_key)` | A | キーの衝突検出 |
-| `(created_at) WHERE status IN ('pending','deleted')` | A | 回収バッチ ([ADR 0007](0007-image-storage.md)) |
+| `(created_at) WHERE object_reclaimed_at IS NULL AND (attached_at IS NULL OR status = 'deleted')` | A | 回収バッチ ([ADR 0007](0007-image-storage.md)) |
 | `(owner_id, created_at DESC)` | C | マイページ + 外部キー |
+
+> **回収バッチの索引は述語を 1 度書き直している** (`000006` → `000007`)。
+>
+> 初版は `WHERE status IN ('pending','deleted') AND object_reclaimed_at IS NULL`
+> だった。回収の対象が「放置された `pending`」と「モデレーターが消した
+> `deleted`」の 2 種類しかなかった頃の述語になる。
+>
+> Phase 6 後半で 3 種類目 —— **`committed` の孤立**
+> (アップロードしたが投稿をやめた画像) が増えた時点で成立しなくなった。
+> 判定は「3 つの添付先のどれからも参照されていない」であり、
+> **これは部分索引の述語に書けない**。述語はその行だけで判定できる式に
+> 限られ、他テーブルを見る副問い合わせは使えないため。
+> 結果、対象行の一部が索引に載らず、プランナが部分索引を選べなくなった。
+>
+> `attached_at`（添付先から参照された時刻）を `images` 自身に持たせて、
+> 「参照されていないこと」を行の中で判定できるようにした。実測 (5 万件):
+>
+> | | `000006` の述語 + 初版クエリ | `000007` |
+> | --- | --- | --- |
+> | プラン | `Seq Scan` + `quicksort` | `Index Scan using images_reclaimable_idx` |
+> | 走査して捨てた行 | 50,000 | 0 |
+> | 実行時間 | 382.6 ms | 0.31 ms |
+>
+> **列を足したので、書き忘れという新しい失敗の形が増える。**
+> 添付する側の SQL が `attached_at` を書き損ねると、参照中の画像が
+> 索引の述語を通ってしまう。そのため回収クエリからは `NOT EXISTS` 3 本を
+> 消していない —— 索引で候補を数件に絞ったあと、行を消す直前に確かめる。
+> **列は速さのため、`NOT EXISTS` は正しさのため**と役割を分けている。
 
 ### `contact_messages` / `reports` / `moderation_actions` / `idempotency_keys`
 
@@ -398,10 +426,11 @@ Phase 番号の昇順ではない。
 | `000004` | **`comments.seq` と `UNIQUE (thread_id, seq)`** | **2** | 2 |
 | `000005` | `idempotency_keys` | 2 | 2 |
 | `000006` | `images`、添付列 3 つ | 6 | 3 |
-| `000007` | `reports` / `moderation_actions` | 10 後半 | 4 |
-| `000008` | `pg_trgm` の索引 | 11 | 5 |
-| `000009` | `threads.view_count` と人気順索引 | 7 | 6 |
-| `000010` | `contact_messages` | 8 | 7 |
+| `000007` | **`images.attached_at` と回収索引の張り直し** | **6** | 3 |
+| `000008` | `reports` / `moderation_actions` | 10 後半 | 4 |
+| `000009` | `pg_trgm` の索引 | 11 | 5 |
+| `000010` | `threads.view_count` と人気順索引 | 7 | 6 |
+| `000011` | `contact_messages` | 8 | 7 |
 
 使わないテーブルを先に作ると、
 **「設計したが実装していない」がスキーマに残る**。
@@ -419,6 +448,13 @@ Phase 番号の昇順ではない。
 >
 > **Phase 番号の昇順で並べようとすると、毎回同じ間違いをする。**
 > 着手順の列を足したのはそのためになる。
+>
+> **3 度目の繰り下げは理由が違う** —— Phase 6 が 2 本目のマイグレーションを
+> 要求した (`000007` = `images.attached_at`)。上の索引の節に書いたとおり、
+> 述語を決めた時点では対象が 2 種類しか無く、3 種類目が増えて破綻した。
+> 「1 Phase = 1 マイグレーション」を前提に番号を予約すると、
+> **予約した番号が後続の Phase のものと衝突する**。
+> 番号は着手順を表すだけで、本数を保証しない。
 
 ### `000004` は Phase 2 が題材のために足す列
 

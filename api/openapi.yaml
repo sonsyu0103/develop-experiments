@@ -184,6 +184,60 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /me/avatar:
+    put:
+      operationId: setMyAvatar
+      tags: [auth]
+      summary: プロフィール画像を設定する
+      description: |
+        `POST /images` で `kind=avatar` として上げた画像を、
+        自分のプロフィール画像にします。
+
+        **自分がアップロードした画像だけ**を指定できます。
+        他人の画像 ID を指定すると 404 になります (存在を隠すため)。
+
+        `imageId` を `null` にすると設定を外します。
+        外すと Google のプロフィール画像 (`users.avatar_url`) に戻ります
+        (docs/adr/0007-image-storage.md のスキーマ)。
+      security:
+        - sessionCookie: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [imageId]
+              properties:
+                imageId:
+                  type: string
+                  format: uuid
+                  nullable: true
+                  description: 設定する画像の ID。`null` で解除します。
+      responses:
+        '200':
+          description: 設定した
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: |
+            指定された画像が存在しないか、自分のものではありません。
+            **403 ではなく 404 を返します** —— 403 だと
+            「その ID の画像が存在すること」自体が漏れます
+            (docs/adr/0013-http-defense.md)。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /images:
     post:
       operationId: uploadImage
@@ -350,6 +404,32 @@ paths:
                 $ref: '#/components/schemas/Thread'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '401':
+          description: |
+            アイコンを指定したが未ログインです。
+            **画像の投稿にはログインが要ります**
+            (docs/adr/0007-image-storage.md の背景)。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: |
+            指定されたアイコンが存在しないか、自分のものではありません。
+            **403 ではなく 404** です —— 403 だと
+            「その ID の画像が存在すること」自体が漏れます。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: |
+            ストレージの設定が入っていないため、アイコンを指定できません。
+            アイコンなしのスレッド作成は影響を受けません。
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -604,7 +684,7 @@ components:
 
     Thread:
       type: object
-      required: [id, title, commentCount, author, createdAt]
+      required: [id, title, commentCount, author, icon, createdAt]
       properties:
         id:
           type: integer
@@ -620,6 +700,12 @@ components:
           example: 7
         author:
           $ref: '#/components/schemas/Author'
+        icon:
+          allOf:
+            - $ref: '#/components/schemas/Image'
+          nullable: true
+          description: |
+            スレッドアイコン。**設定されていなければ `null`** です。
         createdAt:
           type: string
           format: date-time
@@ -725,6 +811,18 @@ components:
           maxLength: 200
           description: DB 側の CHECK 制約 threads_title_length と同じ上限です
           example: 新しいスレッド
+        iconImageId:
+          type: string
+          format: uuid
+          description: |
+            スレッドアイコンの画像 ID。`POST /images` で
+            `kind=thread_icon` として上げたものを渡します。
+
+            - **省略できます。** アイコンの無いスレッドが既定です
+            - **自分がアップロードした画像だけ**を指定できます
+              (他人の画像 ID は 404)
+            - **未ログインでは指定できません** (画像の投稿にログインが要るため)
+          example: 018f2c00-0000-7000-8000-000000000001
 
     Author:
       type: object
@@ -818,6 +916,14 @@ components:
         avatarUrl:
           type: string
           nullable: true
+          description: |
+            プロフィール画像の URL。
+
+            **アップロードした画像があればそちら**を返し、
+            無ければ Google のプロフィール画像を返します
+            (docs/adr/0007-image-storage.md のスキーマ)。
+            クライアントはこの 1 つだけを見れば済みます ——
+            どちらから来たかは表示の関心事ではありません。
           example: https://lh3.googleusercontent.com/a/xxxx
 
     CreateCommentRequest:
@@ -864,12 +970,9 @@ components:
         コメント添付は写真が主なので JPEG、小さい正方形になる
         プロフィール画像とスレッドアイコンは可逆の WebP で保存します。
       enum:
-        # **いまはコメント添付だけです。**
-        # プロフィール画像とスレッドアイコンは、添付する経路
-        # (どこから参照させるか) と同時に足します。
-        # 先に受け付けると、アップロードできるのに
-        # どこからも参照されない画像が作れてしまいます。
         - comment_attachment
+        - avatar
+        - thread_icon
       example: comment_attachment
 
     Image:
