@@ -897,8 +897,13 @@ func TestCORS(t *testing.T) {
 		if rec.Code != http.StatusNoContent {
 			t.Errorf("status = %d, want 204 (body=%s)", rec.Code, rec.Body.String())
 		}
-		if got := rec.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, "POST") {
-			t.Errorf("Access-Control-Allow-Methods = %q, want POST を含む", got)
+		// **定数と完全一致で見る** (レビュー指摘)。
+		// 「POST を含む」だけだと、`h.Set(..., "GET, POST")` と直接
+		// 書き換えても緑のままになる —— TestCORSAllowedMethods_AgreesWithSpec は
+		// 定数と仕様書しか見ないので、**定数と Set の間にドリフトが開く。**
+		// この PR が塞いだのと同じ穴が、1 段ずれた場所にもう一度できる。
+		if got := rec.Header().Get("Access-Control-Allow-Methods"); got != corsAllowedMethods {
+			t.Errorf("Access-Control-Allow-Methods = %q, want %q", got, corsAllowedMethods)
 		}
 	})
 }

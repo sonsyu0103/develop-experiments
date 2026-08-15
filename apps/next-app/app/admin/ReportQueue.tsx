@@ -56,7 +56,7 @@ function threadIdOf(r: Report): number | undefined {
   return r.targetType === 'thread' ? r.targetId : r.threadId;
 }
 
-type ThreadState = Thread | 'missing';
+type ThreadState = Thread | 'missing' | 'failed';
 
 export function ReportQueue() {
   const [status, setStatus] = useState<ReportStatus>('open');
@@ -69,7 +69,20 @@ export function ReportQueue() {
   // 一覧を引き直さずに伝えるために持ちます。
   const [results, setResults] = useState<Record<number, string>>({});
   const [reasons, setReasons] = useState<Record<number, string>>({});
-  const [busy, setBusy] = useState<number | null>(null);
+
+  // **処理中の行は 1 つとは限りません** (レビュー指摘)。
+  // 単一の ID で持つと、A の処理中に B を押した時点で A が上書きされ、
+  // A が先に終わった `finally` が **B のボタンを押せる状態に戻します。**
+  // 削除で二重送信が通る導線になるので、集合で持ちます。
+  const [busy, setBusy] = useState<ReadonlySet<number>>(new Set());
+
+  const setRowBusy = (id: number, on: boolean) =>
+    setBusy((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
 
   // 対象のスレッド。**通報は ID しか持っていない**ので、
   // これが無いとモデレーターは数字だけを見て判断することになります。
@@ -77,6 +90,17 @@ export function ReportQueue() {
   // 取得済みのスレッド ID。同じスレッドへの通報が並ぶと
   // (荒らしでは実際に並びます) 同じ GET を何度も投げるため。
   const fetched = useRef(new Set<number>());
+
+  // **取得の世代** (レビュー指摘)。
+  //
+  // 読み込み中でも絞り込みは操作できるので、
+  // 「次のページ」の直後に絞り込みを変えると、**遅れて返った古い応答が
+  // 新しい一覧に追記されます** —— 見出しは「対処した」なのに
+  // 未処理の行が並び、カーソルまで古いクエリのもので上書きされる。
+  //
+  // 開始時に採番し、**自分が最新でなければ何も書きません。**
+  // 画面を離れるときも進めるので、外れたあとの更新も止まります。
+  const generation = useRef(0);
 
   const hydrateThreads = useCallback(async (rs: Report[]) => {
     const ids = [...new Set(rs.map(threadIdOf))]
@@ -95,9 +119,16 @@ export function ReportQueue() {
             setThreads((prev) => ({ ...prev, [id]: 'missing' }));
             return;
           }
-          // それ以外は「まだ分からない」。タイトルは補助情報なので
-          // キュー全体を失敗させず、次の機会に引き直せるようにします。
+          // **それ以外は「取得できなかった」と出します** (レビュー指摘)。
+          // 何も入れないと `undefined` のままになり、行は
+          // 「取得しています...」を出し続けます。再取得を起こす導線は
+          // 次のページか絞り込みの変更しかないので、**実際には
+          // 永久に読み込み中に見えます。**
+          //
+          // `fetched` から外すのは、次に引くときに再試行するためです
+          // (成功すればこの状態は上書きされます)。
           fetched.current.delete(id);
+          setThreads((prev) => ({ ...prev, [id]: 'failed' }));
         }
       }),
     );
@@ -105,6 +136,9 @@ export function ReportQueue() {
 
   const load = useCallback(
     async (opts: { cursor?: string; reset: boolean }) => {
+      const gen = ++generation.current;
+      const latest = () => gen === generation.current;
+
       setLoading(true);
       setError(null);
       try {
@@ -113,11 +147,17 @@ export function ReportQueue() {
           cursor: opts.cursor,
           size: pageSize,
         });
+        // **追い越されていたら 1 つも書きません。**
+        // 一覧・カーソル・loading のどれか 1 つでも書くと、
+        // 新しい取得の結果と混ざります。
+        if (!latest()) return;
+
         setReports((prev) => (opts.reset ? list.reports : [...prev, ...list.reports]));
         setCursor(list.nextCursor);
         if (opts.reset) setResults({});
         await hydrateThreads(list.reports);
       } catch (e) {
+        if (!latest()) return;
         setError(describe(e));
         // **失敗したら古い一覧を残しません。**
         // 絞り込みを変えた直後に失敗すると、見出しと中身が食い違います。
@@ -126,7 +166,8 @@ export function ReportQueue() {
           setCursor(null);
         }
       } finally {
-        setLoading(false);
+        // 追い越されている場合、loading を落とすのは新しい取得の役目です。
+        if (latest()) setLoading(false);
       }
     },
     [status, hydrateThreads],
@@ -142,8 +183,10 @@ export function ReportQueue() {
   // 効果の**同期部分では state を触りません** (react-hooks/set-state-in-effect)。
   // 1 回待ってから呼ぶことで、更新が描画の確定後になります ——
   // **描画の回数が減るわけではなく**、確定前の巻き戻しが無くなるだけです。
-  // 片付けの `alive` は、画面を離れたあとの更新を止めるために要ります
-  // (開発時の Strict Mode では効果が 2 回走ります)。
+  // 片付けの `alive` は、待っている間に外れた場合に**開始そのもの**を
+  // 止めます (開発時の Strict Mode では効果が 2 回走ります)。
+  // 世代を進めるのは、**既に走っている取得**を無効にするためです ——
+  // こちらが無いと、外れたあとに返った応答が書き込みます。
   useEffect(() => {
     let alive = true;
     void (async () => {
@@ -152,12 +195,13 @@ export function ReportQueue() {
     })();
     return () => {
       alive = false;
+      generation.current += 1;
     };
   }, [load]);
 
   /** 通報の状態だけを変えます。**投稿には触れません。** */
   async function onResolve(report: Report, next: 'resolved' | 'rejected') {
-    setBusy(report.id);
+    setRowBusy(report.id, true);
     try {
       const updated = await resolveReport(report.id, next);
       // 一覧から消さずに、その場で書き換えます ——
@@ -171,7 +215,7 @@ export function ReportQueue() {
           : describe(e);
       setResults((prev) => ({ ...prev, [report.id]: msg }));
     } finally {
-      setBusy(null);
+      setRowBusy(report.id, false);
     }
   }
 
@@ -190,7 +234,7 @@ export function ReportQueue() {
       return;
     }
 
-    setBusy(report.id);
+    setRowBusy(report.id, true);
     try {
       const reason = reasons[report.id]?.trim();
       const recorded = await createModerationAction({
@@ -215,7 +259,7 @@ export function ReportQueue() {
           : describe(e);
       setResults((prev) => ({ ...prev, [report.id]: msg }));
     } finally {
-      setBusy(null);
+      setRowBusy(report.id, false);
     }
   }
 
@@ -248,7 +292,13 @@ export function ReportQueue() {
 
       {error !== null && <p style={{ color: colors.danger }}>{error}</p>}
 
-      {reports.length === 0 && !loading && (
+      {/*
+        **失敗しているときは出しません** (レビュー指摘)。
+        取得に失敗すると一覧を空にするので、赤いエラーの直下に
+        「通報はありません」が並び、**API が落ちているのに
+        「未処理は無い」と読める**表示になります。
+      */}
+      {reports.length === 0 && !loading && error === null && (
         <p style={{ color: colors.dim }}>この状態の通報はありません。</p>
       )}
 
@@ -276,7 +326,8 @@ export function ReportQueue() {
               <p style={{ color: colors.dim, margin: '0.3rem 0' }}>
                 {thread === undefined && '対象のスレッドを取得しています...'}
                 {thread === 'missing' && '対象のスレッドは既に削除されています'}
-                {thread !== undefined && thread !== 'missing' && (
+                {thread === 'failed' && '対象のスレッドを取得できませんでした'}
+                {thread !== undefined && thread !== 'missing' && thread !== 'failed' && (
                   <>
                     スレッド: {thread.title}
                     {/*
@@ -304,7 +355,7 @@ export function ReportQueue() {
                 <button
                   type="button"
                   style={dangerButton}
-                  disabled={busy === r.id}
+                  disabled={busy.has(r.id)}
                   onClick={() => void onDelete(r)}
                 >
                   対象を削除
@@ -312,7 +363,7 @@ export function ReportQueue() {
                 <button
                   type="button"
                   style={button}
-                  disabled={busy === r.id || r.status !== 'open'}
+                  disabled={busy.has(r.id) || r.status !== 'open'}
                   onClick={() => void onResolve(r, 'resolved')}
                 >
                   対処した
@@ -320,7 +371,7 @@ export function ReportQueue() {
                 <button
                   type="button"
                   style={button}
-                  disabled={busy === r.id || r.status !== 'open'}
+                  disabled={busy.has(r.id) || r.status !== 'open'}
                   onClick={() => void onResolve(r, 'rejected')}
                 >
                   対処不要

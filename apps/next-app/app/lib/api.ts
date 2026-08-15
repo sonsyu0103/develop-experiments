@@ -47,6 +47,19 @@ export type ErrorCode = Schemas['Error']['error']['code'];
 
 // **ブラウザから叩くので NEXT_PUBLIC_ が要ります。**
 // サーバ間通信用の API_URL (コンテナ名で解決する) はブラウザから引けません。
+//
+// 【**ビルド時に焼き込まれます。** 実行時に読めません】
+// `NEXT_PUBLIC_*` は `next build` の時点で定数へ置換されるので、
+// **`page.tsx` とは挙動が違います** —— あちらは Server Component なので
+// `process.env` を実行時に読み、コンテナの環境変数がそのまま効きます。
+//
+// つまり `NEXT_PUBLIC_API_URL` を渡さずに本番ビルドすると、
+// この既定値がバンドルに焼き付き、**管理画面だけが利用者自身の PC を
+// 叩きます** (`http://localhost:8080`)。しかもビルドは成功し、
+// 壊れていることが分かるのはブラウザで開いたときになる。
+//
+// 現状は Dockerfile が `npm run dev` しか使わないので踏んでいません。
+// **本番のイメージを作る段になったら、ビルド引数として渡すこと。**
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8080';
 
 /**
