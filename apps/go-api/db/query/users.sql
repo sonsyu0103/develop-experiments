@@ -201,3 +201,42 @@ SET role = sqlc.arg('role'), updated_at = now()
 WHERE public_id = sqlc.arg('public_id')
   AND deleted_at IS NULL
 RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id;
+
+-- name: LockAdminsAndCount :one
+-- admin の行をロックして数える。
+--
+-- **降格が admin を 0 人にしないことを確かめるために要る** (レビュー指摘)。
+--
+-- 【自分自身を弾くだけでは足りない】
+-- admin が 2 人いるとき、互いを同時に降格させると
+-- 両方が「対象は自分ではない」を通り、更新する行も別なので
+-- ロックも衝突せず、**両方コミットして admin が 0 人になる。**
+--
+-- 【なぜ FOR UPDATE が要るのか】
+-- 単に数えるだけでは、2 つのトランザクションが同じスナップショットで
+-- 「2 人いる」を読み、どちらも自分の対象を降格させてしまう。
+-- **admin の行をすべてロックすると、この 2 つが直列化される** ——
+-- 後から来たほうは、先のコミット後に数え直して 1 人だと分かる。
+--
+-- 【集約に FOR UPDATE は付けられない】
+-- PostgreSQL は集約を含む問い合わせに FOR UPDATE を許さないため、
+-- 副問い合わせでロックしてから外側で数える。
+--
+-- 対象は多くない (users_privileged_idx が role <> 'user' の部分索引)。
+SELECT count(*)::bigint AS admins
+FROM (
+    SELECT id FROM users
+    WHERE role = 'admin' AND deleted_at IS NULL
+    FOR UPDATE
+) locked;
+
+-- name: FindRoleByPublicID :one
+-- 公開 ID から内部 ID と現在のロールを引く。
+--
+-- **LockAdminsAndCount のあとに呼ぶ。** 降格の判定は
+-- 「対象が今 admin か」と「他に admin が残るか」の 2 つで決まるため、
+-- ロックを取ったあとの値を読む必要がある。
+SELECT id, role
+FROM users
+WHERE public_id = sqlc.arg('public_id')
+  AND deleted_at IS NULL;

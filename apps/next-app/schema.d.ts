@@ -269,6 +269,19 @@ export interface paths {
          *     クライアントはどちらでも「通報しました」と表示して構いません。
          *     区別したい場合はステータスコードを見てください。
          *
+         *     **一度処理された通報も重複として扱われます。** 一意制約に
+         *     `status` を含めていないため、モデレーターが `resolved` /
+         *     `rejected` にしたあとでも、同じ利用者の同じ対象への通報は
+         *     200 で最初の通報 (処理済み) を返します ——
+         *     **キューには何も積まれません。**
+         *
+         *     再申し立てが必要かどうかを判断できるよう、応答の `status` を
+         *     見てください。`open` でなければ、その通報は既に処理済みです。
+         *
+         *     これは [ADR 0011](../docs/adr/0011-moderation.md) 決定 4 の
+         *     一意制約をそのまま採ったことによる制限で、
+         *     「同じ人が同じ対象を何度も積む」ことを防ぐ側を優先しています。
+         *
          *     ### 通報が集まっても自動では消えません
          *
          *     「N 件で自動非表示」は実装が簡単で、しかも危険です ——
@@ -410,11 +423,18 @@ export interface paths {
          *     復旧には DB を直接触るか、`BOOTSTRAP_ADMIN_GOOGLE_SUB` を
          *     設定し直して再ログインするしかありません。
          *
-         *     「admin が何人いるか」を数えて最後の 1 人だけ止める形にはしていません
-         *     —— 数えた直後に他の admin が降格する競合があり、
-         *     **自分を触らせない**ほうが単純で確実です。
-         *
          *     他の admin を降格させることはできます。
+         *
+         *     ### ただし、最後の admin は降格させられません
+         *
+         *     **自分を触らせないだけでは足りません。** admin が 2 人いるとき、
+         *     互いを同時に降格させると両方が「自分ではない」を通り、
+         *     **admin が 0 人になります** (レビュー指摘)。
+         *
+         *     そのため、admin を降格させる変更では
+         *     **他に admin が残ることを同じトランザクションで確かめます。**
+         *     確認は admin の行をロックして行うので、
+         *     同時に走った 2 つの降格は直列化され、後から来たほうが 422 になります。
          */
         patch: operations["changeUserRole"];
         trace?: never;
@@ -986,7 +1006,7 @@ export interface components {
              * @description 未処理の場合は `null` です。
              * @example 2026-08-15T13:00:00Z
              */
-            resolvedAt?: string | null;
+            resolvedAt: string | null;
         };
         ReportList: {
             reports: components["schemas"]["Report"][];
@@ -1708,7 +1728,17 @@ export interface operations {
             };
         };
         responses: {
-            /** @description 変更した */
+            /**
+             * @description 変更した。記録された操作を返します。
+             *
+             *     **`targetId` は対象の `publicId`** です。
+             *     `moderation_actions` テーブルには内部 ID (`users.id`) を
+             *     書いていますが (監査記録から `users` を辿るため)、
+             *     **API が内部 ID を出さない方針**に従って詰め替えます
+             *     (docs/adr/0003-open-questions.md 未決 #11)。
+             *
+             *     返ってきた `targetId` はそのまま他の API へ渡せます。
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1738,6 +1768,23 @@ export interface operations {
             };
             /** @description 利用者が存在しないか、退会しています。 */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description `code` は `FAILED_PRECONDITION` です。
+             *
+             *     **最後の admin を降格させようとしました。**
+             *     誰もロールを配れない状態にはできません。
+             *
+             *     先に別の利用者を admin にしてから降格させてください
+             *     —— 再試行しても解決しません。
+             */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

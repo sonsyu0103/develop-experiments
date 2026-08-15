@@ -58,9 +58,10 @@ func (i *Interactor) ChangeRole(
 	//    復旧には DB を直接触るか BOOTSTRAP_ADMIN_GOOGLE_SUB を
 	//    設定し直して再ログインするしかありません。
 	//
-	//    「admin が何人いるか」を数えて最後の 1 人だけ止める形にはしません ——
-	//    数えた直後に他の admin が降格する競合があり、
-	//    **自分を触らせない**ほうが単純で確実です。
+	//    **これだけでは足りません** (レビュー指摘)。admin が 2 人いるとき、
+	//    互いを同時に降格させると両方が「対象は自分ではない」を通り、
+	//    更新する行も別なのでロックも衝突せず、**両方コミットして
+	//    admin が 0 人になります。** 残りは 4 で塞ぎます。
 	if cmd.TargetPublicID == cmd.ActorPublicID {
 		return nil, fmt.Errorf("自分のロールは変更できません: %w", apperr.ErrPermissionDenied)
 	}
@@ -77,6 +78,18 @@ func (i *Interactor) ChangeRole(
 	//    分けると「権限が変わったのに誰がやったか分からない」状態が作れます。
 	var recorded *model.Action
 	if err := i.repo.WithinTx(ctx, func(tx repository.Repository) error {
+		// 4. **admin を 0 人にしない。**
+		//
+		//    admin の行をロックしてから数えるので、同時に走った降格は
+		//    直列化されます —— 後から来たほうは、先のコミット後に
+		//    数え直して 1 人だと分かります。
+		//
+		//    ロックを取るのは降格のときだけ。昇格 (admin にする) では
+		//    admin が減らないので、admin 全体を待たせる理由がありません。
+		if err := ensureAdminRemains(ctx, tx, cmd); err != nil {
+			return err
+		}
+
 		userID, changeErr := tx.ChangeRole(ctx, cmd.TargetPublicID, cmd.Role)
 		if changeErr != nil {
 			return changeErr
@@ -105,4 +118,54 @@ func (i *Interactor) ChangeRole(
 		slog.String("new_role", cmd.Role),
 	)
 	return recorded, nil
+}
+
+// roleAdmin は「権限を配れる」ロールの値です。
+//
+// **user モジュールの定数は使いません** (ADR 0011 のモジュール構成)。
+// moderation はロールを文字列として運ぶだけで、
+// 「ロールとは何か」を知る立場にありません。
+//
+// 突き合わせは role_test.go が users.role の CHECK 制約を読んで行います。
+const roleAdmin = "admin"
+
+// ensureAdminRemains は、この変更のあとも admin が 1 人以上残ることを確かめます。
+//
+// **降格のときだけ効きます。** admin にする変更では admin が減りません。
+//
+// 順序に意味があります。
+//
+//  1. admin の行をロックして数える —— 同時降格を直列化する
+//  2. 対象の現在のロールを読む      —— ロック後の値でないと意味がない
+//  3. 対象が admin で、他に居なければ弾く
+//
+// 1 と 2 を入れ替えると、読んだ直後に他の admin が降格する窓が開きます。
+func ensureAdminRemains(
+	ctx context.Context, tx repository.Repository, cmd ChangeRoleCommand,
+) error {
+	if cmd.Role == roleAdmin {
+		return nil
+	}
+
+	admins, err := tx.LockAdminsAndCount(ctx)
+	if err != nil {
+		return err
+	}
+	_, current, err := tx.FindRole(ctx, cmd.TargetPublicID)
+	if err != nil {
+		return err
+	}
+	if current != roleAdmin {
+		return nil
+	}
+
+	// 対象を含めて 1 人 = 降格すると 0 人になる。
+	if admins <= 1 {
+		// **422 にします。** 入力の形は正しく、現在の状態と噛み合わないだけで、
+		// 再試行しても解決しません (先に別の admin を作る必要がある)。
+		return fmt.Errorf(
+			"最後の管理者は降格できません。先に別の管理者を作ってください: %w",
+			apperr.ErrFailedPrecondition)
+	}
+	return nil
 }

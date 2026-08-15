@@ -115,6 +115,28 @@ type RoleChanger interface {
 	//
 	// 対象が存在しない、または退会済みの場合は apperr.ErrNotFound です。
 	ChangeRole(ctx context.Context, publicID uuid.UUID, role string) (userID int64, err error)
+
+	// LockAdminsAndCount は admin の行をロックして数えます。
+	//
+	// **降格が admin を 0 人にしないことを確かめるために要ります。**
+	// 自分自身を弾くだけでは、admin 2 人が互いを同時に降格させたときに
+	// 両方が通ってしまいます (更新する行が別なのでロックも衝突しない)。
+	//
+	// 行をロックするので、同時に走った降格は直列化されます ——
+	// 後から来たほうは、先のコミット後に数え直して 1 人だと分かります。
+	//
+	// **トランザクションの中で呼んでください。** 外で呼ぶと、
+	// ロックが文の終わりで解けて意味がなくなります。
+	LockAdminsAndCount(ctx context.Context) (int64, error)
+
+	// FindRole は公開 ID から内部 ID と現在のロールを引きます。
+	//
+	// **LockAdminsAndCount のあとに呼びます。** 降格の判定は
+	// 「対象が今 admin か」と「他に admin が残るか」の 2 つで決まるため、
+	// ロックを取ったあとの値を読む必要があります。
+	//
+	// 対象が存在しない、または退会済みの場合は apperr.ErrNotFound です。
+	FindRole(ctx context.Context, publicID uuid.UUID) (userID int64, role string, err error)
 }
 
 // Repository はモデレーション 1 操作ぶんに必要なものをまとめたものです。

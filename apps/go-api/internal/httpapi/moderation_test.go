@@ -51,6 +51,8 @@ type fakeModerationRepo struct {
 
 	// users は公開 ID -> 内部 ID。ロール変更の対象になります。
 	users map[uuid.UUID]int64
+	// roleOf は公開 ID -> 現在のロール。**最後の admin を守る判定に要ります。**
+	roleOf map[uuid.UUID]string
 	// roles は変更後のロール。**書かれたことを検査する**ために持ちます。
 	roles map[uuid.UUID]string
 }
@@ -63,6 +65,7 @@ func newFakeModerationRepo() *fakeModerationRepo {
 		aliveComments: map[[2]int64]bool{},
 		aliveImages:   map[uuid.UUID]bool{},
 		users:         map[uuid.UUID]int64{},
+		roleOf:        map[uuid.UUID]string{},
 		roles:         map[uuid.UUID]string{},
 	}
 }
@@ -167,7 +170,34 @@ func (f *fakeModerationRepo) ChangeRole(
 		f.roles = map[uuid.UUID]string{}
 	}
 	f.roles[publicID] = role
+	f.roleOf[publicID] = role
 	return id, nil
+}
+
+// LockAdminsAndCount は admin の人数を返します。
+//
+// **ロックは再現できません** (フェイクに並行性が無い)。
+// 直列化そのものは実 DB の検査が持ち、ここでは
+// 「数えた結果で弾くか」だけを見ます。
+func (f *fakeModerationRepo) LockAdminsAndCount(context.Context) (int64, error) {
+	var n int64
+	for _, r := range f.roleOf {
+		if r == "admin" {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// FindRole は対象の内部 ID と現在のロールを返します。
+func (f *fakeModerationRepo) FindRole(
+	_ context.Context, publicID uuid.UUID,
+) (int64, string, error) {
+	id, ok := f.users[publicID]
+	if !ok {
+		return 0, "", apperr.ErrNotFound
+	}
+	return id, f.roleOf[publicID], nil
 }
 
 func (f *fakeModerationRepo) MarkImageDeleted(_ context.Context, id uuid.UUID) error {

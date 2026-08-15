@@ -173,6 +173,15 @@ func (i *ReportInteractor) ListQueue(
 
 	// **1 件多く取って「次がある」を判定する。** 件数を数える問い合わせを
 	// 足すと 1 往復増えるうえ、境界で数がずれる (他の一覧と同じ形)。
+	//
+	// **Size が 0 以下で来ないことを、ここでも確かめる** (レビュー指摘)。
+	// pagination.NewPage が既定値へ丸めるので HTTP からは 0 が来ないが、
+	// ユースケースを直接呼ぶ経路が 1 つ増えると
+	// limit = 0 になり、下の reports[len(reports)-1] が
+	// **空スライスへの添字で panic** する。
+	if page.Size < 1 {
+		page.Size = pagination.DefaultSize
+	}
 	page.Size++
 	reports, err := i.reports.List(ctx, status, page)
 	if err != nil {
@@ -181,7 +190,7 @@ func (i *ReportInteractor) ListQueue(
 
 	limit := int(page.Size) - 1
 	var next *string
-	if len(reports) > limit {
+	if limit > 0 && len(reports) > limit {
 		reports = reports[:limit]
 		token, encErr := pagination.NewCursor(reports[len(reports)-1].ID).Encode()
 		if encErr != nil {

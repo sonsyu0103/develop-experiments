@@ -1779,14 +1779,54 @@ if SQL_EXEC:
         check("自分のロールは変更できない (403)", s == 403, f"status={s}")
         out = scalar("SELECT '<' || role || '>' FROM users WHERE id = 900052;")
         check("自分のロールが変わっていない", "<admin>" in out, f"got={out.strip()!r}")
+
+        # **応答は公開 ID を返す** (レビュー指摘)。
+        # 記録は内部 ID だが、API は内部 ID を出さない (ADR 0003 未決 #11)。
+        # ここが内部 ID だと、管理画面は受け取った値を他の API へ渡せない。
+        check("ロール変更の応答は公開 ID を返す",
+              (action or {}).get("targetId") == target_public,
+              f"targetId={(action or {}).get('targetId')} want={target_public}")
+
+        # **最後の admin は降格させられない** (レビュー指摘)。
+        # 自分自身を弾くだけでは、admin 2 人が互いを同時に降格させたときに
+        # 両方が通って admin が 0 人になる。
+        #
+        # ここでは別の admin (900053) を作り、それを降格させようとする。
+        # シードに admin が居ないので、900052 と 900053 の 2 人だけになる。
+        sql("""
+            INSERT INTO users (id, public_id, google_sub, email, display_name, role)
+            VALUES (900053, '01920000-0000-7000-8000-000000900053'::uuid,
+                    'smoke-sub-admin2', 'smoke-sub-admin2@example.com', 'スモーク', 'admin')
+            ON CONFLICT (google_sub) DO UPDATE SET role = 'admin';
+        """)
+        other_admin = "01920000-0000-7000-8000-000000900053"
+        s, _, _ = call("PATCH", f"/users/{other_admin}/role",
+                       json.dumps({"role": "user"}), headers=ad_cookie)
+        check("他に admin が居れば降格できる", s == 200, f"status={s}")
+
+        # **422 (最後の admin の降格) はここでは追わない。**
+        # admin を 3 人以上並べたうえで「自分ではない最後の admin」を
+        # 作る必要があり、シードの前提を大きく崩す。
+        # 判定そのものは usecase と httpapi の検査が持ち、
+        # **行ロックによる直列化は実 DB の検査**が持つ
+        # (TestModerationRepository_LockAdminsAndCount_Serializes_Live)。
+        sql("UPDATE users SET role = 'user' WHERE id = 900053;")
+        sql("UPDATE users SET role = 'admin' WHERE id = 900053;")
+        sql("UPDATE users SET role = 'user' WHERE id = 900052;")
+        # いま admin は 900053 だけ。900052 (user) では権限が無いので、
+        # 900053 自身から見た「最後の admin」の降格は自分自身 = 403。
+        # **422 の経路は httpapi と usecase の検査が持つ** ——
+        # スモークで作るには admin を 3 人以上並べる必要があり、
+        # シードの前提を大きく崩すため、ここでは追わない。
+        sql("UPDATE users SET role = 'admin' WHERE id = 900052;")
     finally:
-        sql("DELETE FROM moderation_actions WHERE actor_id IN (900050, 900051, 900052);")
+        sql("DELETE FROM moderation_actions WHERE actor_id IN (900050, 900051, 900052, 900053);")
         sql("DELETE FROM reports WHERE reporter_id IN (900050, 900051, 900052) "
             "OR resolved_by IN (900050, 900051, 900052);")
         sql("DELETE FROM comments WHERE thread_id = 900050;")
         sql("DELETE FROM threads WHERE id = 900050;")
-        sql("DELETE FROM sessions WHERE user_id IN (900050, 900051, 900052);")
-        sql("DELETE FROM users WHERE id IN (900050, 900051, 900052);")
+        sql("DELETE FROM sessions WHERE user_id IN (900050, 900051, 900052, 900053);")
+        sql("DELETE FROM users WHERE id IN (900050, 900051, 900052, 900053);")
 else:
     section("通報とロール変更 (ADR 0011)")
     skip("通報とロール変更", "SQL_EXEC が未設定")

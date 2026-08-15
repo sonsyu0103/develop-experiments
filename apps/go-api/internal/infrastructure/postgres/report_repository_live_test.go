@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"develop-experiments/apps/go-api/internal/apperr"
 	"develop-experiments/apps/go-api/internal/moderation/domain/model"
+	moderationrepo "develop-experiments/apps/go-api/internal/moderation/domain/repository"
 	"develop-experiments/apps/go-api/internal/pagination"
 )
 
@@ -362,5 +364,81 @@ func TestModerationRepository_ChangeRole_Live(t *testing.T) {
 	}
 	if _, err := repo.ChangeRole(t.Context(), parsed, "admin"); !errors.Is(err, apperr.ErrNotFound) {
 		t.Errorf("退会済みの err = %v, want ErrNotFound", err)
+	}
+}
+
+// **admin の同時降格が直列化されること** (レビュー指摘)。
+//
+// **フェイクでは測れません。** 並行性そのものが検査対象で、
+// 「両方が通って admin が 0 人になる」は行ロックの有無で決まります。
+//
+// 2 つのトランザクションが同時に admin を降格させようとすると、
+// LockAdminsAndCount が admin の行をすべてロックするため直列化され、
+// 後から来たほうは先のコミット後に数え直して 1 人だと分かります。
+func TestModerationRepository_LockAdminsAndCount_Serializes_Live(t *testing.T) {
+	pool := liveDB(t)
+	const (
+		adminA = int64(900610)
+		adminB = int64(900611)
+	)
+	seedOwner(t, pool, adminA)
+	seedOwner(t, pool, adminB)
+
+	for _, id := range []int64{adminA, adminB} {
+		if _, err := pool.Exec(t.Context(),
+			`UPDATE users SET role = 'admin' WHERE id = $1`, id); err != nil {
+			t.Fatalf("admin にできなかった: %v", err)
+		}
+	}
+
+	repo := NewModerationRepository(pool)
+
+	// 前提: この 2 人ぶんは数に入る。
+	// **他の検証が admin を残していないこと**もここで効く。
+	var total int64
+	if err := pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM users WHERE role = 'admin' AND deleted_at IS NULL`).
+		Scan(&total); err != nil {
+		t.Fatalf("admin を数えられなかった: %v", err)
+	}
+	if total < 2 {
+		t.Fatalf("前提が壊れている: admin = %d 人", total)
+	}
+
+	// 1 つ目のトランザクションでロックを取り、握ったままにする。
+	held := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- repo.WithinTx(t.Context(), func(tx moderationrepo.Repository) error {
+			if _, err := tx.LockAdminsAndCount(t.Context()); err != nil {
+				return err
+			}
+			close(held)
+			// **握ったまま少し待つ。** この間に 2 つ目が来る。
+			time.Sleep(300 * time.Millisecond)
+			return nil
+		})
+	}()
+	<-held
+
+	// 2 つ目は待たされる。**待たされること自体が検査**になる ——
+	// ロックが効いていなければ即座に返る。
+	start := time.Now()
+	if err := repo.WithinTx(t.Context(), func(tx moderationrepo.Repository) error {
+		_, err := tx.LockAdminsAndCount(t.Context())
+		return err
+	}); err != nil {
+		t.Fatalf("2 つ目のトランザクションが失敗した: %v", err)
+	}
+	waited := time.Since(start)
+
+	if err := <-done; err != nil {
+		t.Fatalf("1 つ目のトランザクションが失敗した: %v", err)
+	}
+
+	// **100ms 以上待っていれば直列化されている。**
+	// 閾値を 300ms ちょうどにしないのは、スケジューリングの揺れを見込むため。
+	if waited < 100*time.Millisecond {
+		t.Errorf("2 つ目が %v で返った。admin の行がロックされていない", waited)
 	}
 }

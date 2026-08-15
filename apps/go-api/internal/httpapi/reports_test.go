@@ -377,6 +377,51 @@ func TestChangeUserRole_AdminChangesAndRecords(t *testing.T) {
 	if body.Action != oapigen.ModerationActionTypeChangeRole {
 		t.Errorf("レスポンスの action = %q, want change_role", body.Action)
 	}
+	// **応答は公開 ID を返す** (レビュー指摘)。記録は内部 ID (123) だが、
+	// API は内部 ID を出さない (ADR 0003 未決 #11)。
+	// ここが内部 ID だと、管理画面は受け取った値を他の API へ渡せない。
+	if body.TargetId != roleTargetPublicID {
+		t.Errorf("レスポンスの targetId = %q, want %q (公開 ID)",
+			body.TargetId, roleTargetPublicID)
+	}
+	if body.TargetId == "123" {
+		t.Error("内部 ID が API に漏れている")
+	}
+}
+
+// **最後の admin は降格させられないこと** (レビュー指摘)。
+//
+// 自分自身を弾くだけでは、admin 2 人が互いを同時に降格させたときに
+// 両方が通って admin が 0 人になります。
+func TestChangeUserRole_KeepsAtLeastOneAdmin(t *testing.T) {
+	env := newModerationEnv(t, usermodel.RoleAdmin)
+	target := uuid.MustParse(roleTargetPublicID)
+	env.repo.users[target] = 123
+	// **対象が唯一の admin。** 降格させると 0 人になる。
+	env.repo.roleOf[target] = "admin"
+
+	rec := env.do(t, http.MethodPatch, "/users/"+roleTargetPublicID+"/role",
+		`{"role":"user"}`, true)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if code := decodeError(t, rec).Error.Code; code != oapigen.FAILEDPRECONDITION {
+		t.Errorf("code = %q, want FAILED_PRECONDITION", code)
+	}
+	if len(env.repo.roles) != 0 {
+		t.Error("弾いたのにロールが変わっている")
+	}
+
+	// もう 1 人 admin が居れば通る。
+	other := uuid.MustParse("01920000-0000-7000-8000-000000000456")
+	env.repo.users[other] = 456
+	env.repo.roleOf[other] = "admin"
+
+	rec = env.do(t, http.MethodPatch, "/users/"+roleTargetPublicID+"/role",
+		`{"role":"user"}`, true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
 }
 
 // **自分のロールは変更できないこと。**

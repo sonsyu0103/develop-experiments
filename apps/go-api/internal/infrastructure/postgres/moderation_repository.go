@@ -161,3 +161,27 @@ func requireAffected(op string, affected int64) error {
 	}
 	return nil
 }
+
+// LockAdminsAndCount は admin の行をロックして数えます。
+//
+// **トランザクションの中で呼んでください。** 外で呼ぶと
+// ロックが文の終わりで解け、同時降格を直列化できません。
+func (r *ModerationRepository) LockAdminsAndCount(ctx context.Context) (int64, error) {
+	n, err := r.q.LockAdminsAndCount(ctx)
+	if err != nil {
+		return 0, translateError("ModerationRepository.LockAdminsAndCount", err)
+	}
+	return n, nil
+}
+
+// FindRole は公開 ID から内部 ID と現在のロールを引きます。
+func (r *ModerationRepository) FindRole(
+	ctx context.Context, publicID uuid.UUID,
+) (int64, string, error) {
+	row, err := r.q.FindRoleByPublicID(ctx, publicID)
+	if err != nil {
+		// 0 行は「居ない、または退会済み」。translateError が 404 にする。
+		return 0, "", translateError("ModerationRepository.FindRole", err)
+	}
+	return row.ID, row.Role, nil
+}

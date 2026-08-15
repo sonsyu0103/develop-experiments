@@ -121,5 +121,16 @@ func (s *Server) ChangeUserRole(c *gin.Context, publicID openapi_types.UUID) {
 		respondError(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, toWireModerationAction(*recorded))
+	// **記録の target_id は内部 ID なので、そのまま返さない** (レビュー指摘)。
+	//
+	// 監査記録に内部 ID を書くのは正しい (moderation_actions から
+	// users を辿るため) が、**API は内部 ID を出さない**
+	// (ADR 0003 未決 #11)。この PR 自身が reporter_id を隠して
+	// 守っている方針に、ここだけ穴が空いていた。
+	//
+	// 実害もある: 管理画面は受け取った targetId を他の API へ渡せない
+	// —— API が受け付けるのは publicId だけになる。
+	wire := toWireModerationAction(*recorded)
+	wire.TargetId = publicID.String()
+	c.JSON(http.StatusOK, wire)
 }
