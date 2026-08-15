@@ -31,6 +31,10 @@ type Querier interface {
 	// 応答 (response_status / response_body) はこの時点では NULL。
 	// 処理が終わってから CompleteIdempotencyKey で埋める。
 	ClaimIdempotencyKey(ctx context.Context, arg ClaimIdempotencyKeyParams) (ClaimIdempotencyKeyRow, error)
+	// 削除が 0 行だったときに、その理由を答える。用途は ThreadOwnership と同じ。
+	// **::boolean が要る。** 付けないと sqlc が型を推論できず、
+	// 生成される戻り値が interface{} になる (実測)。
+	CommentOwnership(ctx context.Context, arg CommentOwnershipParams) (bool, error)
 	// ストレージへの PUT が成功したあとに呼ぶ (ADR 0007 決定 3 の手順 3)。
 	//
 	// **status = 'pending' を条件に含める。** 含めないと、
@@ -86,6 +90,30 @@ type Querier interface {
 	// 投稿者の解決は 1 往復に含める。RETURNING は挿入行しか返せないので
 	// CTE で包んで LEFT JOIN する (threads.sql の CreateThread と同じ理由)。
 	CreateCommentWithSeq(ctx context.Context, arg CreateCommentWithSeqParams) (CreateCommentWithSeqRow, error)
+	// =============================================================================
+	// モデレーション (docs/adr/0011-moderation.md)
+	//
+	// 【削除そのものは各テーブルのクエリが行う】
+	// ここにあるのは「記録」と、記録と同じトランザクションで走る削除の入口だけ。
+	// スレッドは threads.sql、コメントは comments.sql、画像は images.sql に
+	// 対応する UPDATE がある。
+	//
+	// 【削除と記録は必ず同じトランザクションで行う】
+	// 別トランザクションにすると、片方だけ成功した状態が作れる。
+	//   記録だけ成功 → 消えていないのに「消した」記録が残る
+	//   削除だけ成功 → 誰が消したか分からない (ADR 0010 の理由でログでは代替できない)
+	// どちらも監査記録としては破綻している。
+	// =============================================================================
+	// モデレーション操作を記録する (ADR 0011 決定 3)。
+	//
+	// **対象が実際に変化したことを確認してから呼ぶこと。**
+	// 論理削除は deleted_at IS NULL を条件にしているので、
+	// 2 回目の削除は 0 行になる。そこで記録まで書くと、
+	// 「1 回しか起きていない削除」が 2 件の記録として残る。
+	//
+	// target_id は TEXT。型が混在するため (ADR 0011 の引き受けるコスト)。
+	// 呼び出し側が 10 進の整数 / UUID の文字列表現に揃えて渡す。
+	CreateModerationAction(ctx context.Context, arg CreateModerationActionParams) (ModerationAction, error)
 	// =============================================================================
 	// 画像 (docs/adr/0007-image-storage.md)
 	//
@@ -286,10 +314,22 @@ type Querier interface {
 	// 索引で候補を数件に絞ったあと、行を消す種類 (pending / committed) にだけ
 	// 確認をかける。deleted は添付されたまま S3 を消すので対象外。
 	//
-	// 【経過時間で守る】
-	// どの種類も created_at で足切りする。**アップロード直後の画像を
-	// 消してはいけない** —— 添付するまでの数十秒のあいだ、
+	// 【経過時間で守るのは「孤児かどうかが確定しない」種類だけ】
+	// pending と committed は created_at で足切りする。**アップロード直後の
+	// 画像を消してはいけない** —— 添付するまでの数十秒のあいだ、
 	// committed の孤立は正常な状態として存在する。
+	// 「まだ添付されていない」と「もう添付されない」は時間でしか区別できない。
+	//
+	// **deleted には猶予を与えない** (Phase 10 後半で直した)。
+	// 初版は 3 種類すべてに猶予をかけていたため、モデレーターが
+	// 削除した直後の画像が**作成から 1 時間経つまで S3 に残っていた**。
+	// ADR 0011 決定 5 は「不適切な画像は URL を直接叩けば見え続ける」ことを
+	// 消す理由に挙げているので、そこに 1 時間の穴が空いていたことになる。
+	// 削除は明示的な操作であり、「まだ判断がついていない」状態が無い。
+	//
+	// 猶予の条件を OR の内側へ移すことで、索引の述語
+	// (object_reclaimed_at IS NULL AND (attached_at IS NULL OR status = 'deleted'))
+	// は 1 文字も変わらない。**述語はそのまま、絞りだけが変わる。**
 	//
 	// 【FOR UPDATE SKIP LOCKED】
 	// 定期処理を API プロセス内で動かすため (ADR 0003 未決 #9)、
@@ -377,6 +417,46 @@ type Querier interface {
 	// SSI (SERIALIZABLE) を使うならこの明示ロックは不要だが、
 	// 悲観ロック版と楽観 (SSI) 版のスループット差を計測するために両方用意している。
 	LockThreadForUpdate(ctx context.Context, id int64) (int64, error)
+	// モデレーターが画像を削除する (ADR 0011 決定 5)。
+	//
+	// **status を書き替えるだけで、行も S3 のオブジェクトも消さない。**
+	// 実体を消すのは回収バッチで、この UPDATE がその対象に入れる
+	// (images_reclaimable_idx の述語が status = 'deleted' を含む)。
+	// ここで S3 を叩かないのは、HTTP のリクエスト内で外部システムへの
+	// 削除を待たせないため —— 失敗したときに DB だけ巻き戻ると、
+	// 「消したはずの画像が誰からも回収されない」状態になる。
+	//
+	// 【status = 'committed' に限らない】
+	// 'pending' の画像も削除できる。アップロード中に通報が入る余地があり、
+	// そこで弾くと「まだ確定していないので消せません」という
+	// 説明のつかない拒否になる。
+	//
+	// **ただし「扱いは変わらない」わけではない** (レビュー指摘)。
+	// 'pending' は本来 created_at < now() - grace に守られているが、
+	// 'deleted' にした瞬間その保護が外れる (猶予は孤児にしか掛からない)。
+	//
+	//   1. モデレーターが 'pending' の画像を消す
+	//   2. 回収バッチが即座に拾い、S3 の DELETE を投げる
+	//   3. **そのあとアップロードの PUT が着地する**
+	//   4. object_reclaimed_at が入っているので二度と拾われない
+	//
+	// 結果、DB から辿れない S3 オブジェクトが 1 つ残る。
+	// **窓は 1 リクエストの内側**にある —— PUT はアップロードの HTTP 処理が
+	// 自分で投げるので (ADR 0007 決定 3)、外から割り込む余地はほぼ無い。
+	// しかも 'pending' の ID は確定するまで応答に出ないため、
+	// モデレーターがその ID を知る手段が無い。
+	//
+	// そのうえで残しているのは、閉じる手段が
+	// 「'pending' を消せなくする」か「猶予を戻す」しかなく、
+	// どちらも決定 5 の目的 (不適切な画像を即座に消す) を損なうため。
+	// 起きたときの被害は S3 の容量だけになる。
+	//
+	// 【既に 'deleted' なら 0 行】
+	// 2 回目の削除を「今回消した」と誤認させないため。
+	// object_reclaimed_at も見る —— 回収済みの行を 'deleted' に
+	// 書き戻しても、確保済みなので二度と拾われない。
+	// 実体は既に無いので、記録だけが増えることになる。
+	MarkImageDeleted(ctx context.Context, id uuid.UUID) (int64, error)
 	// 回収対象を「確保」する。
 	//
 	// **status によらず、拾ったすべての行に対して呼ぶ。**
@@ -440,10 +520,85 @@ type Querier interface {
 	// どちらにも id 列がある。修飾しないと sqlc の解析が
 	// "column reference \"id\" is ambiguous" で止まる (実測)。
 	SetUserAvatarImage(ctx context.Context, arg SetUserAvatarImageParams) (User, error)
-	// 現時点で HTTP エンドポイントからは呼ばれていない。
-	// 削除 API を公開するかは未決 (docs/adr/0003-open-questions.md 項目 7)。
+	// **投稿者を見ない削除。** モデレーターの経路
+	// (POST /moderation/actions) がこれを使う ——
+	// 匿名投稿も消せる必要があるため (ADR 0011 決定 2)。
+	//
+	// 本人による削除は SoftDeleteOwnComment のほう。
+	// ADR 0003 の未決 #7 は Phase 10 後半で解決済み。
 	SoftDeleteComment(ctx context.Context, arg SoftDeleteCommentParams) (int64, error)
+	// 投稿者が自分のコメントを論理削除する (ADR 0005 の権限モデル / ADR 0003 未決 #7)。
+	//
+	// 条件と、0 行だった理由を別に引く事情は
+	// threads.sql の SoftDeleteOwnThread と同じ。
+	//
+	// 【thread_id が要る】
+	// **主キーが (thread_id, id) なので、先頭列が無いと 8 パーティション
+	// すべてを走査する。** 副次的に「他スレッドのコメント ID を渡しても
+	// 当たらない」が成立する。
+	//
+	// 【レス番号は消さない】
+	// 行が残るので seq も残り、次の投稿は削除された番号の次から続く
+	// (ADR 0019 決定 5)。再利用すると過去の >>5 が別の投稿を指す。
+	SoftDeleteOwnComment(ctx context.Context, arg SoftDeleteOwnCommentParams) (int64, error)
+	// 投稿者が自分のスレッドを論理削除する (ADR 0005 の権限モデル / ADR 0003 未決 #7)。
+	//
+	// **消えるのは「生きている自分のスレッド」だけ。** 3 つの条件が揃わないと
+	// 0 行になる。0 行だった理由 (無い / 他人のもの / 匿名) は
+	// ThreadOwnership が別に答える。
+	//
+	// 【匿名投稿は当たらない】
+	// author_id が NULL のとき `author_id = $2` は NULL (真ではない) になるので、
+	// **明示的な IS NOT NULL は要らない。** 三値論理がそのまま
+	// 「本人であることを示せない」を表している。
+	// 匿名投稿を消せるのはモデレーターだけ (ADR 0011 決定 2)。
+	//
+	// 【コメントも添付画像も消さない】
+	// スレッドが論理削除されると一覧・取得のどちらからも消えるため、
+	// コメントを個別に消して回る必要がない (8 パーティションすべてに
+	// UPDATE を投げることにもなる)。画像を実際に消すのはモデレーションの操作
+	// (ADR 0011 決定 5) で、自分の投稿を消しただけで実体まで消すと
+	// 誤操作の巻き戻しができなくなる。
+	SoftDeleteOwnThread(ctx context.Context, arg SoftDeleteOwnThreadParams) (int64, error)
+	// スレッドを論理削除する (ADR 0011 決定 2)。
+	//
+	// **deleted_at IS NULL を条件に含める。** 含めないと 2 回目以降も
+	// 1 行を返し、呼び出し側が「今回消した」と判断してしまう。
+	// モデレーション記録は「実際に起きた変化」に対してだけ書きたい。
+	// 副次的に、消した時刻が後から呼ばれた削除で上書きされるのも防ぐ。
+	//
+	// **コメントは消さない。** スレッドが論理削除されると一覧・取得の
+	// どちらからも消えるため、コメントを個別に消して回る必要がない。
+	// 8 パーティションすべてに UPDATE を投げることにもなる。
+	//
+	// **添付画像も消さない。** アイコンやコメントの画像を
+	// ストレージから消すかはモデレーターの別の判断であり
+	// (スレッドの主題が不適切でも画像は問題ないことがある)、
+	// delete_image として個別に記録されるべきものになる。
+	SoftDeleteThread(ctx context.Context, id int64) (int64, error)
 	ThreadExists(ctx context.Context, id int64) (bool, error)
+	// 削除が 0 行だったときに、その理由を答える。
+	//
+	// **成功したときには引かない。** 呼ぶのは失敗の分類のためだけで、
+	// 常に 2 往復させるためではない。
+	//
+	// 行が返らなければ「無い、または既に消えている」= 404。
+	// 返って owned = false なら「他人のもの、または匿名」= 403。
+	//
+	// 【1 文にまとめなかった理由】
+	// 判定と更新を CTE 1 本に畳む形も書けるが、**sqlc の解析器が
+	// CTE と更新対象テーブルのスコープを混ぜてしまい、
+	// author_id を ambiguous として生成に失敗する** (PostgreSQL は通る)。
+	// 生成器に通らない形を無理に維持するより、失敗経路でだけ
+	// もう 1 往復するほうが読みやすい。
+	//
+	// 分けたことで「消せなかった理由」の判定には競合の余地が残るが、
+	// **削除そのものは 1 文で閉じている**ので、二重削除や
+	// 他人の投稿が消えることは起きない。ずれても
+	// 403 と 404 を取り違えるだけになる。
+	// **::boolean が要る。** 付けないと sqlc が型を推論できず、
+	// 生成される戻り値が interface{} になる (実測)。
+	ThreadOwnership(ctx context.Context, arg ThreadOwnershipParams) (bool, error)
 	// =============================================================================
 	// 【列の順番をテーブルと揃えること】
 	//

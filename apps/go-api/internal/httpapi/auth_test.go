@@ -17,6 +17,7 @@ import (
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
+	moderationusecase "develop-experiments/apps/go-api/internal/moderation/usecase"
 	threadmodel "develop-experiments/apps/go-api/internal/thread/domain/model"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
@@ -198,6 +199,9 @@ func newAuthEnv(t *testing.T, loginEnabled bool) *authEnv {
 			// 画像は結線しない。**この環境では POST /images が 503 になる。**
 			// 画像を通す検査は images_test.go が別に組み立てる。
 			nil,
+			// モデレーションは常に結線する (nil は NewServer が拒否する)。
+			// 削除の検査は moderation_test.go が別に組み立てる。
+			moderationusecase.NewInteractor(newFakeModerationRepo()),
 			config.AuthConfig{FrontendURL: "http://localhost:3000"},
 		),
 		AllowedOrigins: []string{"http://localhost:3000"},
@@ -322,7 +326,10 @@ func TestAuth_ValidCookieReturnsMe(t *testing.T) {
 	}
 	// 自分のロールは返す (フロントが管理用の導線を出し分けるため)。
 	// 空文字は仕様書の enum に無いので、そのまま返してはいけない。
-	if got.Role != oapigen.User {
+	// **定数名は oapigen.User ではなくなった。** ModerationTargetType に
+	// 'user' を足した時点で値が衝突し、生成器が型名を前置きする形へ切り替えた
+	// (docs/adr/0011-moderation.md の実装して分かったこと)。
+	if got.Role != oapigen.RoleUser {
 		t.Errorf("role = %q, want user", got.Role)
 	}
 	// 内部 ID (users.id = 1) が漏れていないこと。

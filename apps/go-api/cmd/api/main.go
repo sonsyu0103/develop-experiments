@@ -22,6 +22,7 @@ import (
 	oidcprovider "develop-experiments/apps/go-api/internal/infrastructure/oidc"
 	"develop-experiments/apps/go-api/internal/infrastructure/postgres"
 	"develop-experiments/apps/go-api/internal/logging"
+	moderationusecase "develop-experiments/apps/go-api/internal/moderation/usecase"
 	"develop-experiments/apps/go-api/internal/scheduler"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
@@ -140,6 +141,10 @@ func run() error {
 		sessionInteractor,
 		loginInteractor,
 		imageInteractor,
+		// **設定で分岐させない。** 削除と記録は DB だけで完結するので、
+		// login / images のように「設定が無ければ 503」にする理由がない
+		// (ADR 0011 決定 3 の記録は外部サービスに依存しない)。
+		moderationusecase.NewInteractor(postgres.NewModerationRepository(pool)),
 		cfg.Auth,
 	)
 

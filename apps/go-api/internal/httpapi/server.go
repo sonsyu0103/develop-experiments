@@ -15,6 +15,7 @@ import (
 	"develop-experiments/apps/go-api/internal/config"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
 	imageusecase "develop-experiments/apps/go-api/internal/image/usecase"
+	moderationusecase "develop-experiments/apps/go-api/internal/moderation/usecase"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
@@ -41,8 +42,12 @@ type Server struct {
 	login *userusecase.LoginInteractor
 	// images はストレージの設定が無い場合 nil になります。
 	// そのとき**画像の経路だけ**が 503 を返します (ADR 0005 決定 4 と同じ形)。
-	images  *imageusecase.ImageInteractor
-	authCfg config.AuthConfig
+	images *imageusecase.ImageInteractor
+	// moderation は**必ず存在します**。DB があれば動くためで、
+	// login / images のような設定依存の 503 経路はありません
+	// (削除と記録は外部サービスを必要としない)。
+	moderation *moderationusecase.Interactor
+	authCfg    config.AuthConfig
 }
 
 var _ oapigen.ServerInterface = (*Server)(nil)
@@ -61,19 +66,27 @@ func NewServer(
 	sessions *userusecase.SessionInteractor,
 	login *userusecase.LoginInteractor,
 	images *imageusecase.ImageInteractor,
+	moderation *moderationusecase.Interactor,
 	authCfg config.AuthConfig,
 ) *Server {
 	if sessions == nil {
 		panic("httpapi: SessionInteractor は必須です (nil だとセッションが解決されません)")
 	}
+	// **nil を許さない。** 許すと、権限つきの経路が結線漏れのまま
+	// 500 を返す状態で起動します。設定ではなく結線の誤りなので、
+	// 起動時に落とします (sessions と同じ理由)。
+	if moderation == nil {
+		panic("httpapi: moderation.Interactor は必須です (nil だと削除の経路が落ちます)")
+	}
 	return &Server{
-		threads:  threads,
-		comments: comments,
-		db:       db,
-		sessions: sessions,
-		login:    login,
-		images:   images,
-		authCfg:  authCfg,
+		threads:    threads,
+		comments:   comments,
+		db:         db,
+		sessions:   sessions,
+		login:      login,
+		images:     images,
+		moderation: moderation,
+		authCfg:    authCfg,
 	}
 }
 
@@ -273,6 +286,55 @@ func (s *Server) CreateThread(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, toWireThread(thread))
+}
+
+// DeleteThread は DELETE /threads/{threadId} を処理します。
+//
+// **ログインが必須です** (仕様書の security 宣言が強制します)。
+// 消せるのは自分のスレッドだけで、判定は永続化層の 1 文に寄せてあります。
+//
+// **モデレーターの削除はこの経路ではありません。**
+// 他人・匿名の投稿を消すのは POST /moderation/actions で、
+// そちらは moderation_actions への記録を伴います (ADR 0011 決定 3)。
+// 分けているのは、本人の削除を監査記録に載せる理由が無いためです ——
+// 載せると、記録の大半が通常の操作で埋まり、モデレーションの調査に使えなくなります。
+func (s *Server) DeleteThread(c *gin.Context, threadID oapigen.ThreadId) {
+	if err := validateThreadID(threadID); err != nil {
+		respondError(c, err)
+		return
+	}
+
+	ctx := c.Request.Context()
+	if err := s.threads.DeleteOwnThread(ctx, threadID, authorIDFromContext(ctx)); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// DeleteComment は DELETE /threads/{threadId}/comments/{commentId} を処理します。
+//
+// **スレッド ID がパスに要ります。** comments は thread_id による
+// HASH パーティションで、主キーが (thread_id, id) です ——
+// コメント ID だけでは先頭列を絞れず、8 パーティションすべてを走査します。
+func (s *Server) DeleteComment(
+	c *gin.Context, threadID oapigen.ThreadId, commentID oapigen.CommentId,
+) {
+	if err := validateThreadID(threadID); err != nil {
+		respondError(c, err)
+		return
+	}
+	if err := validateCommentID(commentID); err != nil {
+		respondError(c, err)
+		return
+	}
+
+	ctx := c.Request.Context()
+	if err := s.comments.DeleteOwnComment(ctx, threadID, commentID, authorIDFromContext(ctx)); err != nil {
+		respondError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 // GetThread は GET /threads/{threadId} を処理します。

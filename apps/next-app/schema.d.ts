@@ -180,6 +180,64 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/moderation/actions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * モデレーション操作を実行し、記録する
+         * @description 投稿や画像をモデレーターとして削除し、**その事実を DB に記録します**
+         *     (docs/adr/0011-moderation.md 決定 2・3・5)。
+         *
+         *     **moderator または admin だけが呼べます。** それ以外は 403 です。
+         *
+         *     ### 削除と記録は同じトランザクションで行われます
+         *
+         *     [ADR 0010](../docs/adr/0010-log-pipeline.md) が
+         *     「ログは at-most-once であり欠落しうる」と決めているため、
+         *     監査に使う記録をログの件数から数えることはできません。
+         *     `moderation_actions` テーブルが正になります。
+         *
+         *     ログにも出しますが、**正はテーブル側**です。
+         *
+         *     ### 削除はすべて論理削除です
+         *
+         *     行は残ります。モデレーションは判断を伴うので必ず誤操作が起き、
+         *     戻せない削除は運用できません。コメントの参照整合性も保たれます。
+         *
+         *     **匿名投稿 (`author_id IS NULL`) も削除できます。**
+         *     [ADR 0005](../docs/adr/0005-authentication.md) の
+         *     「匿名投稿は誰も削除できない」は ADR 0011 が上書きしています。
+         *
+         *     ### 画像はストレージからも消えます
+         *
+         *     `delete_image` は `images.status` を `'deleted'` にします。
+         *     論理削除だけでは S3 のオブジェクトが残り、
+         *     **URL を直接叩けば見え続ける**ためです。
+         *     実体は回収バッチが消します (ADR 0011 決定 5)。
+         *
+         *     **即時ではありません。** 回収バッチの周回間隔ぶん
+         *     (既定 10 分) の遅れがあります。
+         *     CloudFront のキャッシュはさらに残ります。
+         *
+         *     ### 同じ対象を 2 回削除すると 404 です
+         *
+         *     論理削除は `deleted_at IS NULL` を条件にしているため、
+         *     2 回目は 0 行になります。**記録も残りません** ——
+         *     実際には何も起きていないためです。
+         */
+        post: operations["createModerationAction"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -260,7 +318,84 @@ export interface paths {
         get: operations["getThread"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * 自分のスレッドを削除する
+         * @description **自分が立てたスレッドだけ**を削除できます
+         *     (docs/adr/0005-authentication.md の権限モデル)。
+         *     [ADR 0003](../docs/adr/0003-open-questions.md) の未決 #7
+         *     (コメント削除 API を公開するか) は、認証が入ったこの時点で解けます。
+         *
+         *     論理削除です。行は残り、コメントの参照整合性も保たれます。
+         *
+         *     ### 匿名で立てたスレッドは削除できません
+         *
+         *     `author_id` が NULL のスレッドは、**投稿者を特定する情報がない**ため
+         *     本人であることを示せません。ログイン後に「さっき匿名で書いたやつ」を
+         *     自分のものにする機能も作りません —— 許すと任意の匿名投稿を
+         *     誰でも自分のものだと主張できます
+         *     (docs/adr/0005-authentication.md 決定 2)。
+         *
+         *     荒らしへの対処はモデレーターが行います
+         *     (`POST /moderation/actions`。docs/adr/0011-moderation.md 決定 2)。
+         *
+         *     ### コメントは消えません
+         *
+         *     スレッドが論理削除されると一覧からも取得からも消えるため、
+         *     コメントを個別に消して回る必要がありません
+         *     (8 パーティションすべてに UPDATE を投げることにもなります)。
+         *
+         *     ### 添付画像もストレージに残ります
+         *
+         *     画像を消すのはモデレーションの操作です
+         *     (docs/adr/0011-moderation.md 決定 5)。
+         *     自分のスレッドを消しただけで実体まで消すと、
+         *     誤操作の巻き戻しができなくなります。
+         */
+        delete: operations["deleteThread"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/threads/{threadId}/comments/{commentId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+                /**
+                 * @description コメント ID。
+                 *
+                 *     **レス番号 (`seq`) ではありません。** `seq` はスレッド内の
+                 *     通し番号で、削除で欠番が出ます。API が受け取るのは
+                 *     `Comment.id` のほうです。
+                 */
+                commentId: components["parameters"]["CommentId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 自分のコメントを削除する
+         * @description **自分が書いたコメントだけ**を削除できます。
+         *     条件と理由はスレッドの削除と同じです。
+         *
+         *     ### レス番号は空きます
+         *
+         *     削除しても `seq` は再利用しません
+         *     (docs/adr/0019-comment-concurrency.md 決定 5)。
+         *     再利用すると、過去の `>>5` が別の投稿を指すようになります。
+         *
+         *     ### スレッド ID がパスに要る理由
+         *
+         *     `comments` は `thread_id` による HASH パーティションで、
+         *     主キーが `(thread_id, id)` です。**コメント ID だけでは
+         *     先頭列を絞れず、8 パーティションすべてを走査します。**
+         */
+        delete: operations["deleteComment"];
         options?: never;
         head?: never;
         patch?: never;
@@ -578,6 +713,92 @@ export interface components {
              */
             height: number;
         };
+        /**
+         * @description モデレーション操作の種類 (docs/adr/0011-moderation.md 決定 3)。
+         *
+         *     DB 側の CHECK 制約 `moderation_action_valid` には `change_role` も
+         *     含まれますが、**このエンドポイントでは受け付けません。**
+         *     ロール変更は対象と入力の形が違う (新しいロールが要る) ため、
+         *     専用のエンドポイントが書きます。記録先のテーブルは同じです。
+         * @example delete_comment
+         * @enum {string}
+         */
+        ModerationActionType: "delete_thread" | "delete_comment" | "delete_image";
+        /**
+         * @description 操作の対象種別。**`action` から一意に決まります**
+         *     (`delete_thread` なら `thread`)。
+         *     リクエストでは受け取らず、レスポンスにだけ現れます ——
+         *     受け取ると `delete_thread` と `image` のように
+         *     食い違う組み合わせを表現できてしまいます。
+         * @example comment
+         * @enum {string}
+         */
+        ModerationTargetType: "thread" | "comment" | "image" | "user";
+        CreateModerationActionRequest: {
+            action: components["schemas"]["ModerationActionType"];
+            /**
+             * @description 対象の ID。**型が混在するため文字列です**
+             *     (`threads` / `comments` は BIGINT、`images` は UUID)。
+             *     [ADR 0003](../docs/adr/0003-open-questions.md) の未決 #11 は
+             *     「用途ごとに使い分ける (統一しない)」決定になったため、
+             *     この混在は解消されません。
+             *
+             *     `delete_thread` / `delete_comment` では 10 進の整数、
+             *     `delete_image` では UUID を渡してください。
+             *     形式が合わなければ 400 です。
+             * @example 10
+             */
+            targetId: string;
+            /**
+             * Format: int64
+             * @description **`delete_comment` のときだけ必須**です。他の操作では無視されます。
+             *
+             *     `comments` は `thread_id` による HASH パーティションで、
+             *     主キーが `(thread_id, id)` です。**コメント ID だけでは
+             *     先頭列を絞れず、8 パーティションすべてを走査します。**
+             *     スレッド ID を一緒に受け取ることで partition pruning が効きます。
+             * @example 1
+             */
+            threadId?: number;
+            /**
+             * @description 削除の理由。**任意です**が、記録の価値はここに集まります。
+             *
+             *     DB 側は NULL 可です。省略すると `null` で記録されます。
+             * @example 誹謗中傷のため
+             */
+            reason?: string;
+        };
+        ModerationAction: {
+            /**
+             * Format: int64
+             * @example 1
+             */
+            id: number;
+            action: components["schemas"]["ModerationActionType"];
+            targetType: components["schemas"]["ModerationTargetType"];
+            /**
+             * @description 記録された対象の ID。**リクエストで送った値とは限りません。**
+             *
+             *     - `delete_thread` — スレッド ID (`"7"`)
+             *     - `delete_comment` — **`"{threadId}:{commentId}"`**
+             *       (`"1:10"`)。パーティションキーを含めます ——
+             *       コメント ID だけだと、この記録から対象を引くときに
+             *       8 パーティションすべてを走査することになります
+             *     - `delete_image` — 正規化した UUID (小文字・ハイフンあり)
+             * @example 1:10
+             */
+            targetId: string;
+            /**
+             * @description 指定されなかった場合は `null` です。
+             * @example 誹謗中傷のため
+             */
+            reason: string | null;
+            /**
+             * Format: date-time
+             * @example 2026-08-14T12:00:00Z
+             */
+            createdAt: string;
+        };
         Error: {
             error: {
                 /**
@@ -667,6 +888,14 @@ export interface components {
     parameters: {
         /** @description スレッド ID */
         ThreadId: number;
+        /**
+         * @description コメント ID。
+         *
+         *     **レス番号 (`seq`) ではありません。** `seq` はスレッド内の
+         *     通し番号で、削除で欠番が出ます。API が受け取るのは
+         *     `Comment.id` のほうです。
+         */
+        CommentId: number;
         /**
          * @description 二重送信を防ぐためのキー。クライアントが投稿ごとに 1 つ生成します
          *     (UUID v4 など、推測されない値)。
@@ -932,6 +1161,62 @@ export interface operations {
             };
         };
     };
+    createModerationAction: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateModerationActionRequest"];
+            };
+        };
+        responses: {
+            /** @description 削除し、記録した */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModerationAction"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。原因は 2 つあります。
+             *
+             *     - **ロールが `moderator` / `admin` ではない**
+             *       (docs/adr/0011-moderation.md 決定 1)
+             *     - 状態変更メソッドの `Origin` / `Referer` が許可リストに無い
+             *       (docs/adr/0013-http-defense.md 決定 1)
+             *
+             *     **ロールの検査は対象を探す前に行います。** 逆にすると、
+             *     権限の無い利用者が 403 と 404 の差で
+             *     「その ID の対象が存在すること」を確かめられます。
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description 対象が存在しないか、既に削除されています。 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
     getHealthz: {
         parameters: {
             query?: never;
@@ -1108,6 +1393,119 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deleteThread: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 削除した。本文はありません */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。原因は 3 つあります。
+             *
+             *     - **他人のスレッド**
+             *     - **匿名で立てられたスレッド** (`author_id` が NULL)
+             *     - 状態変更メソッドの `Origin` / `Referer` が許可リストに無い
+             *       (docs/adr/0013-http-defense.md 決定 1)
+             *
+             *     **ここでは 404 に隠しません。** スレッドは誰でも
+             *     `GET /threads/{threadId}` で読めるので、存在は公開情報です。
+             *     隠す意味が無いうえ、404 にすると自分の投稿が消せないときに
+             *     「消えたのか、権限が無いのか」を利用者が区別できません。
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description スレッドが存在しないか、既に削除されています。 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deleteComment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+                /**
+                 * @description コメント ID。
+                 *
+                 *     **レス番号 (`seq`) ではありません。** `seq` はスレッド内の
+                 *     通し番号で、削除で欠番が出ます。API が受け取るのは
+                 *     `Comment.id` のほうです。
+                 */
+                commentId: components["parameters"]["CommentId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 削除した。本文はありません */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。
+             *     他人のコメント、匿名のコメント、または `Origin` の検証失敗です
+             *     (スレッドの削除と同じ)。
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description コメントが存在しないか、既に削除されています。
+             *
+             *     **指定したスレッドに属さないコメント ID も 404 です。**
+             *     パーティションキーで絞るため、他スレッドの行には当たりません。
+             */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["InternalError"];
         };
     };

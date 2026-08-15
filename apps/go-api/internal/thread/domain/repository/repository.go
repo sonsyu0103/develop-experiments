@@ -27,6 +27,23 @@ type ThreadRepository interface {
 
 	// Exists はスレッドが存在する (かつ削除されていない) かを返します。
 	Exists(ctx context.Context, id int64) (bool, error)
+
+	// SoftDeleteOwn は投稿者本人がスレッドを論理削除します
+	// (docs/adr/0005-authentication.md の権限モデル / ADR 0003 未決 #7)。
+	//
+	// **消せるのは自分のスレッドだけです。** 匿名で立てられたスレッド
+	// (author_id が NULL) は本人であることを示せないため消せません ——
+	// 消せるのはモデレーターだけです (ADR 0011 決定 2)。
+	//
+	// 失敗の理由を撃ち分けます。
+	//
+	//	apperr.ErrNotFound         無い、または既に削除済み
+	//	apperr.ErrPermissionDenied 他人のもの、または匿名投稿
+	//
+	// **403 に隠しません。** スレッドは誰でも読めるので存在は公開情報であり、
+	// 404 にすると自分の投稿が消せないときに
+	// 「消えたのか、権限が無いのか」を利用者が区別できません。
+	SoftDeleteOwn(ctx context.Context, id, actorID int64) error
 }
 
 // BenchmarkRepository は Phase 4 のベンチマークで、

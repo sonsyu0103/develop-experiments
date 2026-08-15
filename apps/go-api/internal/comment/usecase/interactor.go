@@ -259,6 +259,23 @@ func (i *CommentInteractor) PostCommentIdempotent(
 	return i.toDTO(*created), nil
 }
 
+// DeleteOwnComment は投稿者本人がコメントを論理削除します
+// (docs/adr/0005-authentication.md の権限モデル / ADR 0003 未決 #7)。
+//
+// 条件と理由は ThreadInteractor.DeleteOwnThread と同じです。
+//
+// **親スレッドの存在は確認しません。** コメントが生きているなら
+// 親も生きており、親が論理削除されていればコメントは一覧にも出ません。
+// 確認を足すと 1 往復増えるだけで、防げる事故がありません。
+func (i *CommentInteractor) DeleteOwnComment(
+	ctx context.Context, threadID, id int64, actorID *int64,
+) error {
+	if actorID == nil {
+		return fmt.Errorf("削除にはログインが必要です: %w", apperr.ErrUnauthenticated)
+	}
+	return i.repo.SoftDeleteOwn(ctx, threadID, id, *actorID)
+}
+
 func (i *CommentInteractor) toDTO(c model.Comment) CommentDTO {
 	return CommentDTO{
 		ID:         c.ID,

@@ -33,6 +33,33 @@ const (
 	codeDeadlockDetected = "40P01"
 )
 
+// classifyDeleteFailure は「本人による削除」が 0 行だった理由を撃ち分けます。
+//
+// 削除の 1 文が 0 行を返したあと、所有を問い合わせた結果を渡してください。
+// 引数の owned / err は、その問い合わせの戻り値をそのまま渡します。
+//
+//	行が無い        apperr.ErrNotFound         無い、または既に削除済み
+//	owned = false   apperr.ErrPermissionDenied 他人のもの、または匿名投稿
+//	owned = true    apperr.ErrNotFound         削除との競合 (直前に消えた)
+//
+// **最後の 1 つが 404 になるのは意図どおりです。** 自分のものだと
+// 分かっているのに消せないのは「既に消えている」場合しかありません
+// (モデレーターの削除と競合したか、自分で 2 回押したか)。
+//
+// 403 に隠さないのは、スレッドもコメントも誰でも読めるためです。
+// 存在は公開情報なので、404 にしても何も守れないうえ、
+// 利用者が「消えたのか、権限が無いのか」を区別できなくなります。
+func classifyDeleteFailure(op string, owned bool, err error) error {
+	if err != nil {
+		// pgx.ErrNoRows は translateError が ErrNotFound へ翻訳します。
+		return translateError(op, err)
+	}
+	if owned {
+		return fmt.Errorf("%s: %w", op, apperr.ErrNotFound)
+	}
+	return fmt.Errorf("%s: %w", op, apperr.ErrPermissionDenied)
+}
+
 // translateError は pgx / PostgreSQL のエラーを、層をまたげる apperr に翻訳します。
 // これにより上位層が pgx や SQLSTATE を知らずに済みます。
 func translateError(op string, err error) error {

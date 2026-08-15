@@ -35,3 +35,17 @@ func validateThreadID(id int64) error {
 	}
 	return nil
 }
+
+// validateCommentID はコメント ID を検査します。
+//
+// **仕様書の minimum: 1 が既に弾きますが、ここでも見ます。**
+// 検証ミドルウェアを外した経路や、ハンドラを直接呼ぶテストから
+// 0 や負数が入ると、DB を引いたうえで 404 になるだけになります
+// (threadId と同じ扱い)。
+func validateCommentID(id int64) error {
+	if id <= 0 {
+		return fmt.Errorf("commentId は正の整数である必要があります (got %d): %w",
+			id, apperr.ErrInvalidArgument)
+	}
+	return nil
+}

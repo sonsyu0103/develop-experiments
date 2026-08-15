@@ -37,6 +37,16 @@ type Image struct {
 	AttachedAt        *time.Time
 }
 
+type ModerationAction struct {
+	ID         int64
+	ActorID    int64
+	Action     string
+	TargetType string
+	TargetID   string
+	Reason     *string
+	CreatedAt  time.Time
+}
+
 type Session struct {
 	ID        string
 	UserID    int64

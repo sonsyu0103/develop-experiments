@@ -23,8 +23,10 @@ import (
 // fakeCommentRepo は id 降順で並んだコメントを保持し、
 // ListByThreadID でカーソルと件数の絞り込みだけを再現します。
 type fakeCommentRepo struct {
-	comments []model.Comment
-	listErr  error
+	// deleteCalls は SoftDeleteOwn に渡された (threadID, id, actorID) です。
+	deleteCalls [][3]int64
+	comments    []model.Comment
+	listErr     error
 
 	// 受け取ったページ指定。カーソルが永続化層まで届いたかの確認に使う。
 	gotPage pagination.Page
@@ -130,6 +132,16 @@ type recordedResponse struct {
 }
 
 func (f *fakeCommentRepo) SoftDelete(context.Context, int64, int64) error { return nil }
+
+// SoftDeleteOwn は呼ばれた引数を記録します。
+//
+// **ここで見たいのは「ログインしていないと呼ばれないこと」と
+// 「パーティションキーがそのまま届くこと」**なので、
+// 生存の再現はしません (それは httpapi と実 DB の検査が持ちます)。
+func (f *fakeCommentRepo) SoftDeleteOwn(_ context.Context, threadID, id, actorID int64) error {
+	f.deleteCalls = append(f.deleteCalls, [3]int64{threadID, id, actorID})
+	return nil
+}
 
 type fakeThreadChecker struct {
 	exists bool
@@ -640,5 +652,35 @@ func TestPostCommentIdempotent_InvalidKeyIsRejected(t *testing.T) {
 	}
 	if repo.createCalls != 0 {
 		t.Errorf("キーが不正なのに投稿された (%d 回)", repo.createCalls)
+	}
+}
+
+// **未ログインを usecase 側でも弾くこと** (thread 側と同じ理由)。
+func TestDeleteOwnComment_RequiresActor(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	err := NewCommentInteractor(repo, &fakeThreadChecker{exists: true}, nil).
+		DeleteOwnComment(t.Context(), 1, 10, nil)
+	if !errors.Is(err, apperr.ErrUnauthenticated) {
+		t.Fatalf("err = %v, want ErrUnauthenticated", err)
+	}
+	if len(repo.deleteCalls) != 0 {
+		t.Error("未ログインなのに永続化層まで届いている")
+	}
+}
+
+// **パーティションキーと内部 ID がそのまま渡ること。**
+func TestDeleteOwnComment_PassesKeys(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	actor := int64(42)
+	if err := NewCommentInteractor(repo, &fakeThreadChecker{exists: true}, nil).
+		DeleteOwnComment(t.Context(), 1, 10, &actor); err != nil {
+		t.Fatalf("DeleteOwnComment が失敗した: %v", err)
+	}
+	if len(repo.deleteCalls) != 1 || repo.deleteCalls[0] != [3]int64{1, 10, 42} {
+		t.Errorf("渡された値 = %v, want [{1 10 42}]", repo.deleteCalls)
 	}
 }

@@ -147,6 +147,23 @@ func (i *ThreadInteractor) CreateThread(
 	return i.toDTO(model.Summary{Thread: *created, CommentCount: 0}), nil
 }
 
+// DeleteOwnThread は投稿者本人がスレッドを論理削除します
+// (docs/adr/0005-authentication.md の権限モデル / ADR 0003 未決 #7)。
+//
+// **ログインが必須です。** 匿名で立てたスレッドを匿名のまま消す手段は
+// ありません —— 投稿者を特定する情報が無く、本人であることを示せないためです
+// (ADR 0005 決定 2)。荒らしへの対処はモデレーターが行います
+// (ADR 0011 決定 2)。
+//
+// 判定はすべて永続化層の 1 文に寄せてあります。ここで「読んでから消す」と、
+// 確認と削除の間にモデレーターの削除が入る窓ができます。
+func (i *ThreadInteractor) DeleteOwnThread(ctx context.Context, id int64, actorID *int64) error {
+	if actorID == nil {
+		return fmt.Errorf("削除にはログインが必要です: %w", apperr.ErrUnauthenticated)
+	}
+	return i.repo.SoftDeleteOwn(ctx, id, *actorID)
+}
+
 func (i *ThreadInteractor) toDTO(s model.Summary) ThreadDTO {
 	return ThreadDTO{
 		ID:           s.ID,

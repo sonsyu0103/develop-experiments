@@ -55,10 +55,21 @@ type CommentRepository interface {
 	// SoftDelete はコメントを論理削除します。
 	// 対象が存在しない (すでに削除済みを含む) 場合は apperr.ErrNotFound を返します。
 	//
-	// 【現時点で HTTP エンドポイントからは呼ばれていません】
-	// 削除 API を公開するかは未決です (docs/adr/0003-open-questions.md の項目 7)。
-	// 認証が無い現状で公開すると誰でも他人のコメントを消せてしまうため、
-	// 認証の方針 (同 項目 6) とセットで決める必要があります。
-	// 決まるまでは永続化層のみを用意した状態で保留します。
+	// **投稿者を見ません。** モデレーターの削除 (ADR 0011 決定 2) が
+	// この形を必要とします —— 匿名投稿も消せる必要があるためです。
+	// 本人による削除には SoftDeleteOwn を使ってください。
 	SoftDelete(ctx context.Context, threadID, id int64) error
+
+	// SoftDeleteOwn は投稿者本人がコメントを論理削除します
+	// (docs/adr/0005-authentication.md の権限モデル)。
+	//
+	// **ADR 0003 の未決 #7 (コメント削除 API を公開するか) は、
+	// 認証が入ったこの時点で解けます。** 未決だったのは
+	// 「認証が無い状態で公開すると誰でも他人のコメントを消せる」ためでした。
+	//
+	// threadID はパーティションキーです。省くと 8 パーティションすべてを
+	// 走査します (主キーが (thread_id, id) のため)。
+	//
+	// 失敗の理由の撃ち分けは ThreadRepository.SoftDeleteOwn と同じです。
+	SoftDeleteOwn(ctx context.Context, threadID, id, actorID int64) error
 }

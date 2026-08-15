@@ -43,6 +43,19 @@ func respondError(c *gin.Context, err error) {
 	case errors.Is(err, apperr.ErrUnauthenticated):
 		c.JSON(http.StatusUnauthorized, newErrorBody(oapigen.UNAUTHENTICATED, "ログインが必要です"))
 
+	// 403。**固定文言で返す。**
+	//
+	// err.Error() を返すと、ユースケース側が理由を書き足したときに
+	// 「どの条件で弾かれたか」が外に出る。権限の検査は
+	// 「通ったか通らなかったか」以上を教える必要がない
+	// (ADR 0013 決定 3 の、存在や内部構造を漏らさない方針と同じ)。
+	//
+	// CSRF の 403 は csrfGuard がミドルウェアで直接返すため、ここには来ない。
+	// 同じコードを返すが、経路は 2 つある (仕様書の 403 の説明を参照)。
+	case errors.Is(err, apperr.ErrPermissionDenied):
+		c.JSON(http.StatusForbidden, newErrorBody(oapigen.PERMISSIONDENIED,
+			"この操作を行う権限がありません"))
+
 	case errors.Is(err, apperr.ErrUnavailable):
 		c.JSON(http.StatusServiceUnavailable, newErrorBody(oapigen.UNAVAILABLE, err.Error()))
 

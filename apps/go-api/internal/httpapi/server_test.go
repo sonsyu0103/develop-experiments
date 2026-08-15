@@ -25,6 +25,7 @@ import (
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
 	"develop-experiments/apps/go-api/internal/idempotency"
 	"develop-experiments/apps/go-api/internal/logging"
+	moderationusecase "develop-experiments/apps/go-api/internal/moderation/usecase"
 	"develop-experiments/apps/go-api/internal/pagination"
 	threadmodel "develop-experiments/apps/go-api/internal/thread/domain/model"
 	threadrepo "develop-experiments/apps/go-api/internal/thread/domain/repository"
@@ -56,6 +57,10 @@ type fakeThreadRepo struct {
 	// created は Create に渡された値です。
 	// 「投稿者が実際に紐付いたか」は、返り値ではなく渡された値で見ます。
 	created *threadmodel.Thread
+
+	// deletedThreads は論理削除済みのスレッド ID です。
+	// 二重削除が 404 になることを見るために持ちます。
+	deletedThreads map[int64]bool
 }
 
 var _ threadrepo.ThreadRepository = (*fakeThreadRepo)(nil)
@@ -107,6 +112,30 @@ var fakeAuthorPublicID = uuid.MustParse("01920000-0000-7000-8000-000000000001")
 
 // Exists は summaries に含まれるスレッドだけを「生存している」とみなす。
 // 論理削除されたスレッドは summaries から除かれる想定。
+// SoftDeleteOwn は「生きている自分のスレッド」だけを消します。
+//
+// **実装と同じ 3 分岐を再現します** (fakeCommentRepo と同じ理由)。
+func (f *fakeThreadRepo) SoftDeleteOwn(_ context.Context, id, actorID int64) error {
+	if f.err != nil {
+		return f.err
+	}
+	for _, s := range f.summaries {
+		if s.ID != id || f.deletedThreads[id] {
+			continue
+		}
+		// 匿名スレッド (AuthorID == nil) は本人でも消せない。
+		if s.AuthorID == nil || *s.AuthorID != actorID {
+			return fmt.Errorf("fake: %w", apperr.ErrPermissionDenied)
+		}
+		if f.deletedThreads == nil {
+			f.deletedThreads = map[int64]bool{}
+		}
+		f.deletedThreads[id] = true
+		return nil
+	}
+	return fmt.Errorf("fake: %w", apperr.ErrNotFound)
+}
+
 func (f *fakeThreadRepo) Exists(_ context.Context, id int64) (bool, error) {
 	if f.err != nil {
 		return false, f.err
@@ -133,6 +162,10 @@ type fakeCommentRepo struct {
 	// gotIdempotency は永続化層まで届いたキーの情報です。
 	// **nil のままなら、ヘッダが握りつぶされている**ことになります。
 	gotIdempotency *idempotency.Request
+
+	// deletedComments は論理削除済みのコメント ID です。
+	// 二重削除が 404 になることを見るために持ちます。
+	deletedComments map[int64]bool
 }
 
 var _ commentrepo.CommentRepository = (*fakeCommentRepo)(nil)
@@ -202,6 +235,32 @@ func (f *fakeCommentRepo) CreateIdempotent(
 
 func (f *fakeCommentRepo) SoftDelete(context.Context, int64, int64) error { return f.err }
 
+// SoftDeleteOwn は「生きている自分のコメント」だけを消します。
+//
+// **実装と同じ 3 分岐を再現します。** 成功だけを返すフェイクにすると、
+// 403 と 404 の撃ち分けを検査したつもりで何も見ていないことになります。
+func (f *fakeCommentRepo) SoftDeleteOwn(_ context.Context, threadID, id, actorID int64) error {
+	if f.err != nil {
+		return f.err
+	}
+	for i := range f.comments {
+		c := &f.comments[i]
+		if c.ThreadID != threadID || c.ID != id || f.deletedComments[id] {
+			continue
+		}
+		// 匿名コメント (AuthorID == nil) は本人でも消せない。
+		if c.AuthorID == nil || *c.AuthorID != actorID {
+			return fmt.Errorf("fake: %w", apperr.ErrPermissionDenied)
+		}
+		if f.deletedComments == nil {
+			f.deletedComments = map[int64]bool{}
+		}
+		f.deletedComments[id] = true
+		return nil
+	}
+	return fmt.Errorf("fake: %w", apperr.ErrNotFound)
+}
+
 type fakePinger struct{ err error }
 
 func (f fakePinger) Ping(context.Context) error { return f.err }
@@ -245,6 +304,8 @@ func newTestEnv(t *testing.T) *testEnv {
 			nil,
 			// 画像も未設定 (= POST /images が 503)。
 			nil,
+			// モデレーションは設定に依存しないので、ここでも結線する。
+			moderationusecase.NewInteractor(newFakeModerationRepo()),
 			config.AuthConfig{},
 		),
 		AllowedOrigins: []string{"http://localhost:3000"},
@@ -595,7 +656,12 @@ func TestSpecValidation_UnknownPathIs404(t *testing.T) {
 func TestSpecValidation_UndefinedMethodIs405(t *testing.T) {
 	env := newTestEnv(t)
 
-	rec := env.do(t, http.MethodDelete, "/threads/2", "")
+	// **DELETE は使えなくなった。** 本人による削除を公開した時点で
+	// /threads/{threadId} の DELETE は定義済みになり、
+	// この検査は 405 ではなく 401 (未ログイン) を見るようになっていた。
+	// 仕様に無いメソッドを選び直すこと ——
+	// **「405 を返す経路」ではなく「定義されていないこと」を測っている。**
+	rec := env.do(t, http.MethodPatch, "/threads/2", "")
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405 (body=%s)", rec.Code, rec.Body.String())
 	}

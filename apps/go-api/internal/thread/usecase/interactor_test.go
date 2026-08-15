@@ -317,3 +317,36 @@ func TestCreateThread_WithIcon(t *testing.T) {
 		}
 	})
 }
+
+// **未ログインを usecase 側でも弾くこと。**
+//
+// 仕様書の security 宣言が先に 401 を返すので、HTTP 越しの検査では
+// **ここが外れていても気づけません** (変異プローブで実測した)。
+// 検証ミドルウェアを外した経路やハンドラの直呼びでは、
+// actorID = 0 として DB を引くことになります。防御は 2 枚あるべきです。
+func TestDeleteOwnThread_RequiresActor(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepo(1)
+	err := NewThreadInteractor(repo, nil).DeleteOwnThread(t.Context(), 1, nil)
+	if !errors.Is(err, apperr.ErrUnauthenticated) {
+		t.Fatalf("err = %v, want ErrUnauthenticated", err)
+	}
+	if len(repo.deleteCalls) != 0 {
+		t.Error("未ログインなのに永続化層まで届いている")
+	}
+}
+
+// **ログインしていれば内部 ID がそのまま渡ること。**
+func TestDeleteOwnThread_PassesActorID(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepo(1)
+	actor := int64(42)
+	if err := NewThreadInteractor(repo, nil).DeleteOwnThread(t.Context(), 7, &actor); err != nil {
+		t.Fatalf("DeleteOwnThread が失敗した: %v", err)
+	}
+	if len(repo.deleteCalls) != 1 || repo.deleteCalls[0] != [2]int64{7, 42} {
+		t.Errorf("渡された値 = %v, want [{7 42}]", repo.deleteCalls)
+	}
+}
