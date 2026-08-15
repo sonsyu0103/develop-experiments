@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -900,6 +901,58 @@ func TestCORS(t *testing.T) {
 			t.Errorf("Access-Control-Allow-Methods = %q, want POST を含む", got)
 		}
 	})
+}
+
+// **preflight で許すメソッドが、仕様書の使うメソッドと一致すること。**
+//
+// 足りないと、ブラウザは preflight の段階で送信を諦めます。
+// **サーバ側には要求が届かない**ので、ログにも痕跡が残らず、
+// API 単体の検査は全部通ったまま「フロントからだけ呼べない」状態になります。
+//
+// 目視で揃え続けるのは無理があり、実際に 2 度ずれました ——
+// `PUT` の欠落で `PUT /me/avatar` が呼べず (ADR 0013 の 6)、
+// `PATCH` / `DELETE` の欠落で通報の処理・ロール変更・本人削除が
+// まとめて呼べませんでした。どちらも**仕様書には足りていた**ので、
+// 仕様書そのものを読んで突き合わせます。
+func TestCORSAllowedMethods_AgreesWithSpec(t *testing.T) {
+	t.Parallel()
+
+	spec, err := oapigen.GetSwagger()
+	if err != nil {
+		t.Fatalf("仕様書を読めない: %v", err)
+	}
+
+	allowed := map[string]bool{}
+	for m := range strings.SplitSeq(corsAllowedMethods, ",") {
+		allowed[strings.TrimSpace(m)] = true
+	}
+
+	// **どのパスで使われているかも集める。** 落ちたときに
+	// 「何が呼べなくなるか」がそのまま出ないと、直す動機が伝わりません。
+	used := map[string][]string{}
+	for path, item := range spec.Paths.Map() {
+		for method := range item.Operations() {
+			used[method] = append(used[method], path)
+		}
+	}
+
+	for method, paths := range used {
+		if !allowed[method] {
+			slices.Sort(paths)
+			t.Errorf("%s が Access-Control-Allow-Methods に無い —— %v をブラウザから呼べない",
+				method, paths)
+		}
+		delete(allowed, method)
+	}
+
+	// **preflight 自身のメソッド。** 仕様書には現れません。
+	delete(allowed, http.MethodOptions)
+
+	// 余っているものも落とします。仕様書が使わなくなったメソッドを
+	// 許し続けるのは、狭めそこねているだけです。
+	for method := range allowed {
+		t.Errorf("%s は仕様書のどのパスも使っていないのに許可されている", method)
+	}
 }
 
 // **退会した投稿者は、一覧で公開 ID が出ない。**

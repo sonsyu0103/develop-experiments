@@ -31,6 +31,28 @@ const requestIDHeader = "X-Request-Id"
 // 挙げないとブラウザが preflight の段階で送信を諦めます。
 const idempotencyKeyHeader = "Idempotency-Key"
 
+// corsAllowedMethods は preflight で許すメソッドです。
+//
+// **仕様書が使うメソッドをすべて含む必要があります。**
+// 足りないメソッドはブラウザが preflight の段階で諦めるため、
+// **フロントから一度も呼べないエンドポイント**になります ——
+// サーバ側には要求が届かないので、ログにも痕跡が残りません。
+//
+// これは 2 度踏んでいます。
+//
+//   - `PUT` の欠落で `PUT /me/avatar` が呼べなかった
+//     (ADR 0013 の「実装して分かったこと 6」)
+//   - `PATCH` / `DELETE` の欠落で、通報の処理・ロール変更・本人削除が
+//     まとめて呼べなかった。**エンドポイントを足した PR は
+//     ここを見ていない** —— 管理画面を書き始めて初めて分かった
+//
+// 2 度とも「仕様書に足りているのに、ここに無い」形です。
+// 揃っていることは `TestCORSAllowedMethods_AgreesWithSpec` が
+// 仕様書そのものから検査します (目視で揃え続けるのは無理があるため)。
+//
+// `OPTIONS` は preflight 自身のメソッドで、仕様書には現れません。
+const corsAllowedMethods = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+
 // requestIDPattern は受信したリクエスト ID に許す書式です。
 //
 // **受け取った値をそのままログへ流さないこと。** ログは S3 に長期保管され、
@@ -87,11 +109,7 @@ func cors(allowedOrigins []string) gin.HandlerFunc {
 		origin := c.GetHeader("Origin")
 		if origin != "" && slices.Contains(allowedOrigins, origin) {
 			h.Set("Access-Control-Allow-Origin", origin)
-			// **仕様書のメソッドと揃えること。**
-			// PUT が抜けていたため、PUT /me/avatar は preflight で
-			// ブラウザに弾かれ、**フロントから一度も呼べなかった**
-			// (レビュー指摘)。仕様に 403 を宣言したのに到達できない状態。
-			h.Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+			h.Set("Access-Control-Allow-Methods", corsAllowedMethods)
 			// X-Request-Id は送る側にも許す。ALB やフロントが既に採番している
 			// 場合に前後をつなぐため (requestID のコメントを参照)。
 			// ここに無いと preflight で弾かれ、リクエスト自体が失敗する。

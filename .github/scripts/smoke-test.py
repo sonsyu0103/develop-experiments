@@ -497,6 +497,27 @@ with urllib.request.urlopen(req, timeout=10) as res:
     vary = res.headers.get("Vary", "")
 check("Origin ヘッダが無くても Vary: Origin が付く", "Origin" in vary, f"Vary={vary!r}")
 
+# **プリフライトで許すメソッドが足りないと、ブラウザからだけ呼べなくなる。**
+# ブラウザはこの応答を見て本リクエストを諦めるので、**サーバには何も届かない**
+# —— API 側の検査は全部通ったまま、フロントからだけ故障する。
+#
+# 実際に 2 度踏んでいる。PUT の欠落で PUT /me/avatar が呼べず、
+# PATCH / DELETE の欠落で通報の処理・ロール変更・本人削除がまとめて呼べなかった。
+# どちらも**仕様書には足りていて、cors() にだけ無い**形だった。
+status, _, headers = call("OPTIONS", "/moderation/reports/1", origin=ORIGIN,
+                          headers={"Access-Control-Request-Method": "PATCH"})
+check("プリフライトは 204", status == 204, f"status={status}")
+allow = headers.get("Access-Control-Allow-Methods", "")
+for method in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+    check(f"プリフライトが {method} を許す", method in allow, f"allow={allow!r}")
+
+# 許可オリジンでなければ、プリフライトにも許可ヘッダを付けない。
+_s, _, _h = call("OPTIONS", "/moderation/reports/1", origin="https://evil.test",
+                 headers={"Access-Control-Request-Method": "PATCH"})
+check("未許可オリジンのプリフライトには許可メソッドを返さない",
+      _h.get("Access-Control-Allow-Methods") is None,
+      f"allow={_h.get('Access-Control-Allow-Methods')!r}")
+
 section("エラー応答が内部構造を漏らさない")
 _, payload, _ = call("GET", "/threads/9999")
 leaked = [w for w in ("Repository", "sqlc", "SELECT", "pgx", "threads.")
