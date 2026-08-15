@@ -12,6 +12,56 @@ import (
 	"github.com/google/uuid"
 )
 
+const changeUserRole = `-- name: ChangeUserRole :one
+UPDATE users
+SET role = $1, updated_at = now()
+WHERE public_id = $2
+  AND deleted_at IS NULL
+RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id
+`
+
+type ChangeUserRoleParams struct {
+	Role     string
+	PublicID uuid.UUID
+}
+
+// 利用者のロールを変更する (ADR 0011 決定 1)。
+//
+// **呼べるのは admin だけ**だが、その判定はここではなくユースケース側にある
+// (SQL は「誰が呼んだか」を知らない)。
+//
+// 【PromoteToAdmin と分けている理由】
+// あちらは google_sub を鍵にした「最初の 1 人」専用の経路で、
+// **UI から到達できないことに意味がある。**
+// こちらは public_id を鍵にした通常の管理操作になる。
+// 1 つにまとめると、UI から google_sub を指定する形が生まれうる。
+//
+// 【role <> 'admin' のような条件は付けない】
+// PromoteToAdmin は「毎ログインで撃たれる」ので冪等性のために絞っているが、
+// こちらは明示的な操作なので、同じロールへの変更も 1 行として扱う。
+// **記録には残る** —— 「変えようとした」ことも監査の対象になる。
+//
+// 退会済み (deleted_at IS NOT NULL) は対象外。
+// 0 行なら「居ない、または退会済み」で、呼び出し側は 404 にする。
+func (q *Queries) ChangeUserRole(ctx context.Context, arg ChangeUserRoleParams) (User, error) {
+	row := q.db.QueryRow(ctx, changeUserRole, arg.Role, arg.PublicID)
+	var i User
+	err := row.Scan(
+		&i.ID,
+		&i.PublicID,
+		&i.GoogleSub,
+		&i.Email,
+		&i.DisplayName,
+		&i.AvatarUrl,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+		&i.Role,
+		&i.AvatarImageID,
+	)
+	return i, err
+}
+
 const getUserByID = `-- name: GetUserByID :one
 SELECT id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id
 FROM users

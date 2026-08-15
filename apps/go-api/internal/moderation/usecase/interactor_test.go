@@ -38,6 +38,11 @@ type fakeRepo struct {
 
 	recorded  *model.Action
 	deleteErr error
+
+	// ロール変更で渡された値。**何が書かれたか**を見るために持ちます。
+	changedTo       *string
+	changedPublicID *uuid.UUID
+	changeErr       error
 }
 
 var _ repository.Repository = (*fakeRepo)(nil)
@@ -72,7 +77,19 @@ func (f *fakeRepo) MarkImageDeleted(_ context.Context, id uuid.UUID) error {
 	return f.deleteErr
 }
 
+// ChangeRole は呼ばれた引数を記録します。
+func (f *fakeRepo) ChangeRole(_ context.Context, publicID uuid.UUID, role string) (int64, error) {
+	f.changedTo = &role
+	f.changedPublicID = &publicID
+	return 4242, f.changeErr
+}
+
 func moderator() model.Actor { return model.Actor{UserID: 42, CanModerate: true} }
+
+// admin は「権限を配れる」実行者です。
+func admin() model.Actor {
+	return model.Actor{UserID: 42, CanModerate: true, CanChangeRoles: true}
+}
 
 // ---------------------------------------------------------------------------
 // 検査

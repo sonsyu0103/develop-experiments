@@ -122,18 +122,25 @@ func TestActionType_DefinitionsAgreeAcrossSources(t *testing.T) {
 	assertSameSet(t, "DB の CHECK 制約 (moderation_action_valid)",
 		registered, valuesFromMigration(t, `CHECK \(\s*action IN \(([^)]+)\)`))
 
-	// 仕様書は change_role を持たない。**それが期待値**なので、
-	// 「アプリ側 − change_role」と突き合わせます。
-	// ここを registered と比べてしまうと、仕様書に change_role を
-	// 足させる方向に誘導することになります。
+	// **仕様書には 2 つの enum があります。**
+	//
+	//	ModerationActionType   記録として現れうるもの (4 値)
+	//	ModerationDeleteAction 削除 API が受け付けるもの (3 値)
+	//
+	// 前者は Go / DB と完全に一致し、後者はそこから change_role を除いた集合。
+	// **この非対称が意図どおりであることを、両方見て確かめます。**
+	// 片方だけ見ていると、change_role を受け付ける形に広がっても気づけません。
+	assertSameSet(t, "仕様書の ModerationActionType",
+		registered, valuesFromOpenAPIEnum(t, "ModerationActionType"))
+
 	exposed := map[string]bool{}
 	for v := range registered {
 		if v != string(ActionChangeRole) {
 			exposed[v] = true
 		}
 	}
-	assertSameSet(t, "仕様書の ModerationActionType",
-		exposed, valuesFromOpenAPIEnum(t, "ModerationActionType"))
+	assertSameSet(t, "仕様書の ModerationDeleteAction",
+		exposed, valuesFromOpenAPIEnum(t, "ModerationDeleteAction"))
 }
 
 // **対象種別も 3 か所で揃っていること。**

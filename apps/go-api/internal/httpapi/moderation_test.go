@@ -19,6 +19,7 @@ import (
 	moderationmodel "develop-experiments/apps/go-api/internal/moderation/domain/model"
 	moderationrepo "develop-experiments/apps/go-api/internal/moderation/domain/repository"
 	moderationusecase "develop-experiments/apps/go-api/internal/moderation/usecase"
+	"develop-experiments/apps/go-api/internal/pagination"
 	threadmodel "develop-experiments/apps/go-api/internal/thread/domain/model"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
@@ -47,6 +48,11 @@ type fakeModerationRepo struct {
 	// recordErr が非 nil なら RecordAction がそれを返します。
 	// **記録の失敗で削除まで巻き戻ることを検査する**ために使います。
 	recordErr error
+
+	// users は公開 ID -> 内部 ID。ロール変更の対象になります。
+	users map[uuid.UUID]int64
+	// roles は変更後のロール。**書かれたことを検査する**ために持ちます。
+	roles map[uuid.UUID]string
 }
 
 var _ moderationrepo.Repository = (*fakeModerationRepo)(nil)
@@ -56,6 +62,8 @@ func newFakeModerationRepo() *fakeModerationRepo {
 		aliveThreads:  map[int64]bool{},
 		aliveComments: map[[2]int64]bool{},
 		aliveImages:   map[uuid.UUID]bool{},
+		users:         map[uuid.UUID]int64{},
+		roles:         map[uuid.UUID]string{},
 	}
 }
 
@@ -144,6 +152,24 @@ func (f *fakeModerationRepo) SoftDeleteComment(_ context.Context, threadID, id i
 	return nil
 }
 
+// ChangeRole はロール変更を記録します。
+//
+// **対象の生存を再現します。** 常に成功するフェイクにすると、
+// 404 の経路が「実装したつもり」で通ってしまいます。
+func (f *fakeModerationRepo) ChangeRole(
+	_ context.Context, publicID uuid.UUID, role string,
+) (int64, error) {
+	id, ok := f.users[publicID]
+	if !ok {
+		return 0, apperr.ErrNotFound
+	}
+	if f.roles == nil {
+		f.roles = map[uuid.UUID]string{}
+	}
+	f.roles[publicID] = role
+	return id, nil
+}
+
 func (f *fakeModerationRepo) MarkImageDeleted(_ context.Context, id uuid.UUID) error {
 	if !f.aliveImages[id] {
 		return apperr.ErrNotFound
@@ -153,13 +179,110 @@ func (f *fakeModerationRepo) MarkImageDeleted(_ context.Context, id uuid.UUID) e
 }
 
 // ---------------------------------------------------------------------------
+// 通報のフェイク
+// ---------------------------------------------------------------------------
+
+// fakeReportRepo は積まれた通報を覚えます。
+//
+// **一意制約を再現します。** 同じ (reporter, target) の 2 回目は
+// created = false になる —— ここを常に true にすると、
+// 「重複通報が 200 になる」検査が何も見ていないことになります。
+type fakeReportRepo struct {
+	reports []moderationmodel.Report
+	nextID  int64
+
+	// aliveThreads / aliveComments は通報対象の生存です。
+	aliveThreads  map[int64]bool
+	aliveComments map[[2]int64]bool
+}
+
+var (
+	_ moderationrepo.ReportRepository       = (*fakeReportRepo)(nil)
+	_ moderationrepo.TargetExistenceChecker = (*fakeReportRepo)(nil)
+)
+
+func newFakeReportRepo() *fakeReportRepo {
+	return &fakeReportRepo{
+		aliveThreads:  map[int64]bool{},
+		aliveComments: map[[2]int64]bool{},
+	}
+}
+
+func (f *fakeReportRepo) Create(
+	_ context.Context, r *moderationmodel.Report,
+) (*moderationmodel.Report, bool, error) {
+	for i := range f.reports {
+		e := &f.reports[i]
+		if e.ReporterID == r.ReporterID && e.Target == r.Target && e.TargetID == r.TargetID {
+			cp := *e
+			return &cp, false, nil
+		}
+	}
+	f.nextID++
+	saved := *r
+	saved.ID = f.nextID
+	saved.Status = moderationmodel.ReportOpen
+	saved.CreatedAt = time.Unix(1_700_000_000, 0).UTC()
+	f.reports = append(f.reports, saved)
+	cp := saved
+	return &cp, true, nil
+}
+
+func (f *fakeReportRepo) List(
+	_ context.Context, status moderationmodel.ReportStatus, page pagination.Page,
+) ([]moderationmodel.Report, error) {
+	out := make([]moderationmodel.Report, 0, len(f.reports))
+	for _, r := range f.reports {
+		if r.Status != status {
+			continue
+		}
+		// **古い順 (id 昇順) で、カーソルより大きい id。**
+		// 他の一覧と向きが逆なので、ここを取り違えると
+		// 「次ページが常に空」になる。
+		if c := page.CursorID(); c != nil && r.ID <= *c {
+			continue
+		}
+		out = append(out, r)
+		if int32(len(out)) == page.Size {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeReportRepo) Resolve(
+	_ context.Context, id int64, status moderationmodel.ReportStatus, actorID int64,
+) (*moderationmodel.Report, error) {
+	for i := range f.reports {
+		r := &f.reports[i]
+		if r.ID != id || r.Status != moderationmodel.ReportOpen {
+			continue
+		}
+		at := time.Unix(1_700_000_100, 0).UTC()
+		r.Status, r.ResolvedAt, r.ResolvedBy = status, &at, &actorID
+		cp := *r
+		return &cp, nil
+	}
+	return nil, apperr.ErrNotFound
+}
+
+func (f *fakeReportRepo) ThreadExists(_ context.Context, id int64) (bool, error) {
+	return f.aliveThreads[id], nil
+}
+
+func (f *fakeReportRepo) CommentExists(_ context.Context, threadID, id int64) (bool, error) {
+	return f.aliveComments[[2]int64{threadID, id}], nil
+}
+
+// ---------------------------------------------------------------------------
 // テスト環境
 // ---------------------------------------------------------------------------
 
 type moderationEnv struct {
-	router http.Handler
-	repo   *fakeModerationRepo
-	token  usermodel.SessionToken
+	router  http.Handler
+	repo    *fakeModerationRepo
+	reports *fakeReportRepo
+	token   usermodel.SessionToken
 }
 
 // newModerationEnv は指定したロールでログイン済みのルータを組み立てます。
@@ -176,6 +299,7 @@ func newModerationEnv(t *testing.T, role usermodel.Role) *moderationEnv {
 	}
 
 	repo := newFakeModerationRepo()
+	reports := newFakeReportRepo()
 	threads := &fakeThreadRepo{
 		summaries: []threadmodel.Summary{
 			{Thread: *threadmodel.Reconstruct(1, "スレッド", nil, nil, time.Unix(1, 0).UTC())},
@@ -192,6 +316,7 @@ func newModerationEnv(t *testing.T, role usermodel.Role) *moderationEnv {
 			nil,
 			nil,
 			moderationusecase.NewInteractor(repo),
+			moderationusecase.NewReportInteractor(reports, reports),
 			config.AuthConfig{FrontendURL: "http://localhost:3000"},
 		),
 		AllowedOrigins: []string{testOrigin},
@@ -199,7 +324,7 @@ func newModerationEnv(t *testing.T, role usermodel.Role) *moderationEnv {
 	if err != nil {
 		t.Fatalf("NewRouter が失敗した: %v", err)
 	}
-	return &moderationEnv{router: router, repo: repo, token: token}
+	return &moderationEnv{router: router, repo: repo, reports: reports, token: token}
 }
 
 // post は POST /moderation/actions を叩きます。

@@ -290,3 +290,19 @@ FROM threads
 WHERE id = sqlc.arg('id')
   AND deleted_at IS NULL
 FOR UPDATE;
+
+-- name: CommentExists :one
+-- コメントが存在し、論理削除されていないかを返す。
+--
+-- **通報の対象を確かめるために要る** (ADR 0011 決定 4)。
+-- 確かめずに積むと、存在しない ID の通報でキューを埋められる。
+--
+-- thread_id が要るのは主キーが (thread_id, id) だから ——
+-- 無いと 8 パーティションすべてを走査する。
+-- 通報のリクエストが threadId を受け取るのは、この検査のためでもある。
+SELECT EXISTS (
+    SELECT 1 FROM comments
+    WHERE thread_id = sqlc.arg('thread_id')
+      AND id = sqlc.arg('id')
+      AND deleted_at IS NULL
+);

@@ -5,11 +5,13 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	openapi_types "github.com/oapi-codegen/runtime/types"
 
 	"develop-experiments/apps/go-api/internal/apperr"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
 	moderationmodel "develop-experiments/apps/go-api/internal/moderation/domain/model"
 	moderationusecase "develop-experiments/apps/go-api/internal/moderation/usecase"
+	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
 )
 
 // CreateModerationAction は POST /moderation/actions を処理します。
@@ -45,13 +47,8 @@ func (s *Server) CreateModerationAction(c *gin.Context) {
 	}
 
 	recorded, err := s.moderation.Delete(ctx, moderationusecase.DeleteCommand{
-		Actor: moderationmodel.Actor{
-			UserID: principal.UserID,
-			// **判定は user モジュールが持ちます。** ここで
-			// `Role == "moderator" || Role == "admin"` と書くと、
-			// ロールが増えたときに直す場所が 2 か所になります。
-			CanModerate: principal.Role.CanModerate(),
-		},
+		// 判定は user モジュールが持ちます (toModerationActor を参照)。
+		Actor:    toModerationActor(principal.Role, principal.UserID),
 		Action:   action,
 		TargetID: req.TargetId,
 		ThreadID: req.ThreadId,
@@ -79,4 +76,50 @@ func toWireModerationAction(a moderationmodel.Action) oapigen.ModerationAction {
 		Reason:     a.Reason,
 		CreatedAt:  a.CreatedAt,
 	}
+}
+
+// ChangeUserRole は PATCH /users/{publicId}/role を処理します。
+//
+// **admin だけが呼べます** (ADR 0011 決定 1)。
+// モデレーターでは足りません —— 投稿を消せる権限と、
+// 権限を配れる権限を分離するのがこの決定の趣旨です。
+//
+// 変更は moderation_actions に change_role として記録されます。
+func (s *Server) ChangeUserRole(c *gin.Context, publicID openapi_types.UUID) {
+	ctx := c.Request.Context()
+	principal := principalFromContext(ctx)
+	if principal == nil {
+		respondError(c, fmt.Errorf("ログインが必要です: %w", apperr.ErrUnauthenticated))
+		return
+	}
+
+	var req oapigen.ChangeUserRoleJSONRequestBody
+	if err := c.ShouldBindJSON(&req); err != nil {
+		respondBadRequest(c, "リクエストボディが不正です: "+err.Error())
+		return
+	}
+
+	// **user モジュールに解釈させます。** 「ロールとは何か」は
+	// あちらの関心事で、moderation は値を運ぶだけです。
+	role, err := usermodel.ParseRole(string(req.Role))
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	recorded, err := s.moderation.ChangeRole(ctx, moderationusecase.ChangeRoleCommand{
+		Actor: toModerationActor(principal.Role, principal.UserID),
+		// **自分自身かの判定は公開 ID で行います。**
+		// 内部 ID は対象の指定に使えない (API が受け取らない) ため、
+		// 突き合わせる側も公開 ID に揃えます。
+		ActorPublicID:  principal.Me.PublicID,
+		TargetPublicID: publicID,
+		Role:           string(role),
+		Reason:         req.Reason,
+	})
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, toWireModerationAction(*recorded))
 }

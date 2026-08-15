@@ -11,6 +11,25 @@ import (
 )
 
 type Querier interface {
+	// 利用者のロールを変更する (ADR 0011 決定 1)。
+	//
+	// **呼べるのは admin だけ**だが、その判定はここではなくユースケース側にある
+	// (SQL は「誰が呼んだか」を知らない)。
+	//
+	// 【PromoteToAdmin と分けている理由】
+	// あちらは google_sub を鍵にした「最初の 1 人」専用の経路で、
+	// **UI から到達できないことに意味がある。**
+	// こちらは public_id を鍵にした通常の管理操作になる。
+	// 1 つにまとめると、UI から google_sub を指定する形が生まれうる。
+	//
+	// 【role <> 'admin' のような条件は付けない】
+	// PromoteToAdmin は「毎ログインで撃たれる」ので冪等性のために絞っているが、
+	// こちらは明示的な操作なので、同じロールへの変更も 1 行として扱う。
+	// **記録には残る** —— 「変えようとした」ことも監査の対象になる。
+	//
+	// 退会済み (deleted_at IS NOT NULL) は対象外。
+	// 0 行なら「居ない、または退会済み」で、呼び出し側は 404 にする。
+	ChangeUserRole(ctx context.Context, arg ChangeUserRoleParams) (User, error)
 	// 冪等キー (docs/adr/0015-idempotency.md)。
 	//
 	// **ここのクエリはすべて主トランザクションの中で実行される** (ADR 0015 決定 3)。
@@ -31,6 +50,15 @@ type Querier interface {
 	// 応答 (response_status / response_body) はこの時点では NULL。
 	// 処理が終わってから CompleteIdempotencyKey で埋める。
 	ClaimIdempotencyKey(ctx context.Context, arg ClaimIdempotencyKeyParams) (ClaimIdempotencyKeyRow, error)
+	// コメントが存在し、論理削除されていないかを返す。
+	//
+	// **通報の対象を確かめるために要る** (ADR 0011 決定 4)。
+	// 確かめずに積むと、存在しない ID の通報でキューを埋められる。
+	//
+	// thread_id が要るのは主キーが (thread_id, id) だから ——
+	// 無いと 8 パーティションすべてを走査する。
+	// 通報のリクエストが threadId を受け取るのは、この検査のためでもある。
+	CommentExists(ctx context.Context, arg CommentExistsParams) (bool, error)
 	// 削除が 0 行だったときに、その理由を答える。用途は ThreadOwnership と同じ。
 	// **::boolean が要る。** 付けないと sqlc が型を推論できず、
 	// 生成される戻り値が interface{} になる (実測)。
@@ -140,6 +168,31 @@ type Querier interface {
 	// committed_at を渡さないのは CHECK 制約 (images_committed_at_matches_status)
 	// がそれを要求するため。
 	CreatePendingImage(ctx context.Context, arg CreatePendingImageParams) (Image, error)
+	// =============================================================================
+	// 通報 (docs/adr/0011-moderation.md 決定 4)
+	//
+	// 【匿名通報を許さない】
+	// reporter_id が NOT NULL なのがその表現になる。通報を匿名で受け付けると、
+	// 通報そのものが荒らしの手段になる (無限に投げてキューを埋められる)。
+	//
+	// 【閾値で自動削除しない】
+	// ここには「同じ対象への通報を数えて閾値と比べる」クエリを置かない。
+	// 置いた時点で、それを使う実装への距離がゼロになる。
+	// 決定 4 は通報爆撃と少数意見の構造的な排除を理由に、これを明確に避けている。
+	// =============================================================================
+	// 通報を 1 件積む。
+	//
+	// **重複はエラーにしない** (ADR 0011 の引き受けるコスト)。
+	// 一意制約 reports_unique_per_user に当たった場合は 0 行を返し、
+	// 呼び出し側が「既に通報済み」として最初の通報を読み直す。
+	//
+	// ON CONFLICT DO NOTHING にしているのは、**更新もしたくない**ため。
+	// 2 回目の理由で上書きすると、最初の通報の内容が消える。
+	//
+	// 【target_thread_id は comment のときだけ入る】
+	// CHECK 制約 reports_thread_id_matches_target が、
+	// 「どちらの通報か」と「スレッド ID を持つか」のずれを拒否する (000009)。
+	CreateReport(ctx context.Context, arg CreateReportParams) (CreateReportRow, error)
 	// セッション ID は Go 側で生成した暗号論的乱数を渡す。
 	// DB 側で採番しないのは、連番や推測可能な値になると
 	// 総当たりで他人のセッションを引けてしまうため。
@@ -185,6 +238,11 @@ type Querier interface {
 	// 「全端末からログアウト」。パスワード変更に相当する操作や、
 	// 権限剥奪の直後に呼ぶ。sessions (user_id) の索引で引く。
 	DeleteSessionsByUserID(ctx context.Context, userID int64) (int64, error)
+	// 既に積まれている通報を読む。**重複通報のときだけ呼ぶ。**
+	//
+	// CreateReport が 0 行だったあとに引くので、必ず 1 行見つかる想定。
+	// 見つからなければ、その間に通報が消えたということになる (行を消す経路は無い)。
+	FindReportByTarget(ctx context.Context, arg FindReportByTargetParams) (FindReportByTargetRow, error)
 	// 確保できなかったときに、既存の記録を読む。
 	//
 	// request_hash が違えば「同じキーで別の内容」なので 422 にする。
@@ -337,6 +395,25 @@ type Querier interface {
 	// 飛ばすことで、同じ画像を 2 つのプロセスが二重に処理しない。
 	// 待たせるのではなく飛ばすのは、次の周回で拾えば十分だから。
 	ListReclaimableImages(ctx context.Context, arg ListReclaimableImagesParams) ([]Image, error)
+	// 通報キュー。**古い順** (id 昇順) に返す。
+	//
+	// 【なぜ created_at ではなく id で並べるか】
+	// **created_at は一意ではない。** キーセットページネーションの境界に
+	// 一意でない列を使うと、同じ時刻の行が複数あるページ境界で
+	// 取りこぼしと重複が起きる。通報は荒らしへの対応という性質上、
+	// 短時間に集中して届くので、これは実際に起きる。
+	//
+	// id は IDENTITY なので一意かつ単調増加で、created_at の既定は now()。
+	// 順序は実質同じで、一意性だけが得られる (000009 で索引も張り替えた)。
+	//
+	// 【カーソルの向きが他の一覧と逆】
+	// スレッド / コメントは新しい順 (id < cursor) だが、キューは古い順なので
+	// id > cursor になる。**同じ Cursor 型を使い回すが、比較の向きが違う。**
+	//
+	// 【status で絞る】
+	// 既定の 'open' のときだけ部分索引 reports_open_idx が効く。
+	// 解決済みを引く場合は全体の走査になる (件数が増え続けるので調査用と割り切る)。
+	ListReports(ctx context.Context, arg ListReportsParams) ([]ListReportsRow, error)
 	// -----------------------------------------------------------------------------
 	// 以下 2 つは Phase 4 のベンチマーク専用 (N+1 実装の再現用)。
 	// 本番経路では使わない。
@@ -498,6 +575,22 @@ type Querier interface {
 	// 毎ログインで UPDATE を撃つと、更新日時だけが動いて監査の邪魔になる。
 	// 該当が無ければ 0 行が返るので、呼び出し側は「昇格したか」を判定できる。
 	PromoteToAdmin(ctx context.Context, googleSub string) (User, error)
+	// 通報を処理済みにする。
+	//
+	// **status = 'open' を条件に含める。** 含めないと、
+	// 既に処理済みの通報の resolved_by が後から来た操作で上書きされる。
+	// 0 行なら「無い、または既に処理済み」で、呼び出し側は 404 にする。
+	//
+	// **resolved_at と resolved_by を必ず一緒に書く。**
+	// CHECK 制約 reports_resolution_complete がそれを要求する ——
+	// 片方だけ入った行は「誰が解決したか分からない解決済み通報」になり、
+	// moderation_actions と同じ理由で許容できない。
+	//
+	// **投稿には触れない。** 通報の状態を変えるだけ。
+	// 削除は POST /moderation/actions が別に行う ——
+	// 「通報を却下する」と「投稿を消す」は別の判断であり、
+	// まとめるとキューを片付ける操作がそのまま削除になる。
+	ResolveReport(ctx context.Context, arg ResolveReportParams) (ResolveReportRow, error)
 	// プロフィール画像を設定する / 外す (ADR 0007)。
 	//
 	// **所有者の確認はここで行わない。** 画像が自分のものかは

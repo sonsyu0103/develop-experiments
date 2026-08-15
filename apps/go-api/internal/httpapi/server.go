@@ -47,7 +47,9 @@ type Server struct {
 	// login / images のような設定依存の 503 経路はありません
 	// (削除と記録は外部サービスを必要としない)。
 	moderation *moderationusecase.Interactor
-	authCfg    config.AuthConfig
+	// reports も**必ず存在します**。moderation と同じく DB だけで動きます。
+	reports *moderationusecase.ReportInteractor
+	authCfg config.AuthConfig
 }
 
 var _ oapigen.ServerInterface = (*Server)(nil)
@@ -67,6 +69,7 @@ func NewServer(
 	login *userusecase.LoginInteractor,
 	images *imageusecase.ImageInteractor,
 	moderation *moderationusecase.Interactor,
+	reports *moderationusecase.ReportInteractor,
 	authCfg config.AuthConfig,
 ) *Server {
 	if sessions == nil {
@@ -78,6 +81,9 @@ func NewServer(
 	if moderation == nil {
 		panic("httpapi: moderation.Interactor は必須です (nil だと削除の経路が落ちます)")
 	}
+	if reports == nil {
+		panic("httpapi: moderation.ReportInteractor は必須です (nil だと通報の経路が落ちます)")
+	}
 	return &Server{
 		threads:    threads,
 		comments:   comments,
@@ -86,6 +92,7 @@ func NewServer(
 		login:      login,
 		images:     images,
 		moderation: moderation,
+		reports:    reports,
 		authCfg:    authCfg,
 	}
 }
