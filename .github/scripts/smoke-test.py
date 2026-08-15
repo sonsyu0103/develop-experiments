@@ -1604,6 +1604,234 @@ else:
     skip("本人による削除", "SQL_EXEC が未設定")
 
 # ---------------------------------------------------------------------------
+# 通報とロール変更 (docs/adr/0011-moderation.md 決定 4 / 決定 1)
+# ---------------------------------------------------------------------------
+#
+# **HTTP 越しでしか見られないもの。**
+#   - 重複通報が 200 (エラーではない) になること
+#   - キューが moderator 以上に閉じていること
+#   - キューの並びが古い順で、カーソルが前へ進むこと
+#   - ロール変更が admin だけで、自分自身を弾くこと
+
+if SQL_EXEC:
+    section("通報とロール変更 (ADR 0011)")
+
+    rp_token = "smoke-reporter-" + secrets.token_hex(16)
+    rp_hash = hashlib.sha256(rp_token.encode()).hexdigest()
+    md_token = "smoke-modq-" + secrets.token_hex(16)
+    md_hash = hashlib.sha256(md_token.encode()).hexdigest()
+    ad_token = "smoke-admin-" + secrets.token_hex(16)
+    ad_hash = hashlib.sha256(ad_token.encode()).hexdigest()
+
+    rp_cookie = {"Cookie": f"session={rp_token}"}
+    md_cookie = {"Cookie": f"session={md_token}"}
+    ad_cookie = {"Cookie": f"session={ad_token}"}
+
+    try:
+        for uid, sub, sess, role in [
+            (900050, "smoke-sub-reporter", rp_hash, "user"),
+            (900051, "smoke-sub-modq", md_hash, "moderator"),
+            (900052, "smoke-sub-admin", ad_hash, "admin"),
+        ]:
+            sql(f"""
+                INSERT INTO users (id, public_id, google_sub, email, display_name, role)
+                VALUES ({uid}, '01920000-0000-7000-8000-000000{uid}'::uuid,
+                        '{sub}', '{sub}@example.com', 'スモーク', '{role}')
+                ON CONFLICT (google_sub) DO UPDATE SET role = EXCLUDED.role;
+            """)
+            sql(f"""
+                INSERT INTO sessions (id, user_id, expires_at)
+                VALUES ('{sess}', {uid}, now() + interval '5 minutes');
+            """)
+
+        sql("""
+            INSERT INTO threads (id, title) VALUES (900050, 'スモーク: 通報される投稿')
+            ON CONFLICT (id) DO UPDATE SET deleted_at = NULL;
+        """)
+        s, c, _ = call("POST", "/threads/900050/comments",
+                       json.dumps({"body": "スモーク: 通報されるコメント"}))
+        reported_comment = (c or {}).get("id") if s == 201 else None
+
+        # --- 通報 (決定 4) ---
+        s, _, _ = call("POST", "/reports",
+                       json.dumps({"targetType": "thread", "targetId": 900050,
+                                   "reason": "spam"}))
+        check("未ログインの通報は 401", s == 401, f"status={s}")
+
+        s, first, _ = call("POST", "/reports",
+                           json.dumps({"targetType": "thread", "targetId": 900050,
+                                       "reason": "abuse", "note": "スモーク"}),
+                           headers=rp_cookie)
+        check("一般利用者が通報できる (201)", s == 201, f"status={s} payload={first}")
+        check("通報者は応答に出ない",
+              isinstance(first, dict) and "reporter" not in json.dumps(first),
+              f"payload={first}")
+
+        # **重複はエラーにしない** (ADR 0011 の引き受けるコスト)。
+        s, again, _ = call("POST", "/reports",
+                           json.dumps({"targetType": "thread", "targetId": 900050,
+                                       "reason": "spam"}),
+                           headers=rp_cookie)
+        check("同じ対象への 2 回目は 200", s == 200, f"status={s}")
+        check("2 回目は最初の通報を返す",
+              (again or {}).get("id") == (first or {}).get("id"),
+              f"first={first} again={again}")
+
+        out = scalar("""
+            SELECT '<' || count(*)::text || '>' FROM reports
+            WHERE reporter_id = 900050 AND target_type = 'thread' AND target_id = 900050;
+        """)
+        check("重複通報で行が増えない", "<1>" in out, f"got={out.strip()!r}")
+
+        s, _, _ = call("POST", "/reports",
+                       json.dumps({"targetType": "thread", "targetId": 99999999,
+                                   "reason": "spam"}), headers=rp_cookie)
+        check("存在しない対象の通報は 404", s == 404, f"status={s}")
+
+        if reported_comment is not None:
+            s, _, _ = call("POST", "/reports",
+                           json.dumps({"targetType": "comment",
+                                       "targetId": reported_comment, "reason": "spam"}),
+                           headers=rp_cookie)
+            check("スレッド ID の無いコメント通報は 400", s == 400, f"status={s}")
+
+            s, cr, _ = call("POST", "/reports",
+                            json.dumps({"targetType": "comment",
+                                        "targetId": reported_comment,
+                                        "threadId": 900050, "reason": "spam"}),
+                            headers=rp_cookie)
+            check("コメントを通報できる", s == 201, f"status={s}")
+            check("コメントの通報にスレッド ID が残る",
+                  (cr or {}).get("threadId") == 900050, f"payload={cr}")
+
+        # --- キュー (決定 1 の権限) ---
+        s, _, _ = call("GET", "/moderation/reports", headers=rp_cookie)
+        check("一般利用者はキューを読めない (403)", s == 403, f"status={s}")
+
+        s, queue, _ = call("GET", "/moderation/reports", headers=md_cookie)
+        check("モデレーターはキューを読める", s == 200, f"status={s}")
+        ids = [r["id"] for r in (queue or {}).get("reports", [])]
+        check("キューは古い順 (id 昇順)", ids == sorted(ids), f"ids={ids}")
+
+        # **カーソルの向きが他の一覧と逆。** 取り違えると次ページが常に空になる。
+        s, page1, _ = call("GET", "/moderation/reports?size=1", headers=md_cookie)
+        if s == 200 and page1.get("nextCursor"):
+            s, page2, _ = call(
+                "GET", f"/moderation/reports?size=1&cursor={page1['nextCursor']}",
+                headers=md_cookie)
+            first_id = page1["reports"][0]["id"]
+            next_ids = [r["id"] for r in (page2 or {}).get("reports", [])]
+            check("カーソルは前へ進む (次ページが空にならない)",
+                  s == 200 and next_ids and next_ids[0] > first_id,
+                  f"first={first_id} next={next_ids}")
+        else:
+            check("キューが 2 ページぶんある", False, f"status={s} page1={page1}")
+
+        # --- 処理 ---
+        target_report = (first or {}).get("id")
+        if target_report:
+            s, _, _ = call("PATCH", f"/moderation/reports/{target_report}",
+                           json.dumps({"status": "open"}), headers=md_cookie)
+            check("未処理へ戻す指定は 400", s == 400, f"status={s}")
+
+            s, resolved, _ = call("PATCH", f"/moderation/reports/{target_report}",
+                                  json.dumps({"status": "rejected"}), headers=md_cookie)
+            check("通報を却下できる", s == 200 and (resolved or {}).get("status") == "rejected",
+                  f"status={s} payload={resolved}")
+
+            s, _, _ = call("PATCH", f"/moderation/reports/{target_report}",
+                           json.dumps({"status": "resolved"}), headers=md_cookie)
+            check("処理済みの再処理は 404", s == 404, f"status={s}")
+
+            # **通報を閉じても投稿は消えない。** 別の判断なので分けてある。
+            s, _, _ = call("GET", "/threads/900050")
+            check("通報の処理でスレッドは消えない", s == 200, f"status={s}")
+
+        # --- ロール変更 (決定 1) ---
+        target_public = "01920000-0000-7000-8000-000000900050"
+        s, _, _ = call("PATCH", f"/users/{target_public}/role",
+                       json.dumps({"role": "moderator"}), headers=md_cookie)
+        check("モデレーターはロールを変更できない (403)", s == 403, f"status={s}")
+
+        s, action, _ = call("PATCH", f"/users/{target_public}/role",
+                            json.dumps({"role": "moderator", "reason": "スモーク"}),
+                            headers=ad_cookie)
+        check("admin はロールを変更できる", s == 200, f"status={s} payload={action}")
+        check("応答は change_role の記録",
+              (action or {}).get("action") == "change_role"
+              and (action or {}).get("targetType") == "user",
+              f"payload={action}")
+
+        out = scalar("SELECT '<' || role || '>' FROM users WHERE id = 900050;")
+        check("ロールが実際に変わる", "<moderator>" in out, f"got={out.strip()!r}")
+
+        out = scalar("""
+            SELECT '<' || count(*)::text || '>' FROM moderation_actions
+            WHERE actor_id = 900052 AND action = 'change_role'
+              AND target_type = 'user' AND target_id = '900050';
+        """)
+        check("ロール変更が moderation_actions に記録される", "<1>" in out, f"got={out.strip()!r}")
+
+        # **自分自身は変更できない。** 最後の admin が自分を降格させると詰む。
+        self_public = "01920000-0000-7000-8000-000000900052"
+        s, _, _ = call("PATCH", f"/users/{self_public}/role",
+                       json.dumps({"role": "user"}), headers=ad_cookie)
+        check("自分のロールは変更できない (403)", s == 403, f"status={s}")
+        out = scalar("SELECT '<' || role || '>' FROM users WHERE id = 900052;")
+        check("自分のロールが変わっていない", "<admin>" in out, f"got={out.strip()!r}")
+
+        # **応答は公開 ID を返す** (レビュー指摘)。
+        # 記録は内部 ID だが、API は内部 ID を出さない (ADR 0003 未決 #11)。
+        # ここが内部 ID だと、管理画面は受け取った値を他の API へ渡せない。
+        check("ロール変更の応答は公開 ID を返す",
+              (action or {}).get("targetId") == target_public,
+              f"targetId={(action or {}).get('targetId')} want={target_public}")
+
+        # **最後の admin は降格させられない** (レビュー指摘)。
+        # 自分自身を弾くだけでは、admin 2 人が互いを同時に降格させたときに
+        # 両方が通って admin が 0 人になる。
+        #
+        # ここでは別の admin (900053) を作り、それを降格させようとする。
+        # シードに admin が居ないので、900052 と 900053 の 2 人だけになる。
+        sql("""
+            INSERT INTO users (id, public_id, google_sub, email, display_name, role)
+            VALUES (900053, '01920000-0000-7000-8000-000000900053'::uuid,
+                    'smoke-sub-admin2', 'smoke-sub-admin2@example.com', 'スモーク', 'admin')
+            ON CONFLICT (google_sub) DO UPDATE SET role = 'admin';
+        """)
+        other_admin = "01920000-0000-7000-8000-000000900053"
+        s, _, _ = call("PATCH", f"/users/{other_admin}/role",
+                       json.dumps({"role": "user"}), headers=ad_cookie)
+        check("他に admin が居れば降格できる", s == 200, f"status={s}")
+
+        # **422 (最後の admin の降格) はここでは追わない。**
+        # admin を 3 人以上並べたうえで「自分ではない最後の admin」を
+        # 作る必要があり、シードの前提を大きく崩す。
+        # 判定そのものは usecase と httpapi の検査が持ち、
+        # **行ロックによる直列化は実 DB の検査**が持つ
+        # (TestModerationRepository_LockAdminsAndCount_Serializes_Live)。
+        sql("UPDATE users SET role = 'user' WHERE id = 900053;")
+        sql("UPDATE users SET role = 'admin' WHERE id = 900053;")
+        sql("UPDATE users SET role = 'user' WHERE id = 900052;")
+        # いま admin は 900053 だけ。900052 (user) では権限が無いので、
+        # 900053 自身から見た「最後の admin」の降格は自分自身 = 403。
+        # **422 の経路は httpapi と usecase の検査が持つ** ——
+        # スモークで作るには admin を 3 人以上並べる必要があり、
+        # シードの前提を大きく崩すため、ここでは追わない。
+        sql("UPDATE users SET role = 'admin' WHERE id = 900052;")
+    finally:
+        sql("DELETE FROM moderation_actions WHERE actor_id IN (900050, 900051, 900052, 900053);")
+        sql("DELETE FROM reports WHERE reporter_id IN (900050, 900051, 900052) "
+            "OR resolved_by IN (900050, 900051, 900052);")
+        sql("DELETE FROM comments WHERE thread_id = 900050;")
+        sql("DELETE FROM threads WHERE id = 900050;")
+        sql("DELETE FROM sessions WHERE user_id IN (900050, 900051, 900052, 900053);")
+        sql("DELETE FROM users WHERE id IN (900050, 900051, 900052, 900053);")
+else:
+    section("通報とロール変更 (ADR 0011)")
+    skip("通報とロール変更", "SQL_EXEC が未設定")
+
+# ---------------------------------------------------------------------------
 
 print()
 

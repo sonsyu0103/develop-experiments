@@ -134,11 +134,19 @@ func (i *Interactor) Delete(ctx context.Context, cmd DeleteCommand) (*model.Acti
 }
 
 // normalizeReason は理由を整えます。
+func normalizeReason(raw *string) (*string, error) {
+	return normalizeText(raw, maxReasonLength, "理由")
+}
+
+// normalizeText は任意入力の自由記述を整えます。
 //
 // 空白だけの文字列を nil に丸めるのは、UI の入力欄が
 // 「未入力」を空文字として送ってくるためです。そのまま保存すると、
-// 記録上は「理由あり」なのに中身が無い行になります。
-func normalizeReason(raw *string) (*string, error) {
+// 記録上は「値あり」なのに中身が無い行になります。
+//
+// **文字数で数えます。** バイト数だと日本語が 1/3 の長さで弾かれます。
+// DB の CHECK 制約は char_length なので、そちらと同じ数え方に揃えます。
+func normalizeText(raw *string, maxLength int, label string) (*string, error) {
 	if raw == nil {
 		return nil, nil
 	}
@@ -146,10 +154,8 @@ func normalizeReason(raw *string) (*string, error) {
 	if trimmed == "" {
 		return nil, nil
 	}
-	// **文字数で数える。** バイト数だと日本語の理由が 1/3 の長さで弾かれます。
-	// DB の CHECK 制約は char_length なので、そちらと同じ数え方に揃えます。
-	if len([]rune(trimmed)) > maxReasonLength {
-		return nil, fmt.Errorf("理由が長すぎます: %w", apperr.ErrInvalidArgument)
+	if len([]rune(trimmed)) > maxLength {
+		return nil, fmt.Errorf("%sが長すぎます: %w", label, apperr.ErrInvalidArgument)
 	}
 	return &trimmed, nil
 }

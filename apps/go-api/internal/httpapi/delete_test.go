@@ -89,6 +89,7 @@ func newDeleteEnv(t *testing.T) *deleteEnv {
 			nil,
 			nil,
 			moderationusecase.NewInteractor(newFakeModerationRepo()),
+			moderationusecase.NewReportInteractor(newFakeReportRepo(), newFakeReportRepo()),
 			config.AuthConfig{FrontendURL: "http://localhost:3000"},
 		),
 		AllowedOrigins: []string{testOrigin},

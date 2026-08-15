@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"develop-experiments/apps/go-api/internal/moderation/domain/model"
+	"develop-experiments/apps/go-api/internal/pagination"
 )
 
 // ThreadSoftDeleter はスレッドを論理削除します。
@@ -64,6 +65,80 @@ type ActionRecorder interface {
 	RecordAction(ctx context.Context, a *model.Action) (*model.Action, error)
 }
 
+// TargetExistenceChecker は通報の対象が生きているかを確かめます。
+//
+// **通報を積む前に確かめます** (ADR 0011 決定 4)。確かめないと、
+// 存在しない ID の通報でキューを埋められます。
+//
+// thread / comment のどちらのモジュールにも属さないので、
+// 削除の口と同じく moderation 側で定義します。
+type TargetExistenceChecker interface {
+	// ThreadExists はスレッドが生きているかを返します。
+	ThreadExists(ctx context.Context, id int64) (bool, error)
+	// CommentExists はコメントが生きているかを返します。
+	//
+	// **threadID が要ります。** 主キーが (thread_id, id) なので、
+	// 無いと 8 パーティションすべてを走査します。
+	CommentExists(ctx context.Context, threadID, id int64) (bool, error)
+}
+
+// ReportRepository は通報の読み書きです。
+type ReportRepository interface {
+	// Create は通報を 1 件積みます。
+	//
+	// **重複はエラーにしません** (ADR 0011 の引き受けるコスト)。
+	// 同じ人が同じ対象を既に通報している場合は
+	// created = false で、既存の通報を返します。
+	// 呼び出し側は「既に通報済み」として正常に扱ってください。
+	Create(ctx context.Context, r *model.Report) (report *model.Report, created bool, err error)
+
+	// List は通報キューを古い順に返します。
+	//
+	// **id 昇順です。** created_at は一意ではないため、
+	// キーセットの境界に使うと取りこぼしと重複が起きます。
+	List(ctx context.Context, status model.ReportStatus, page pagination.Page) ([]model.Report, error)
+
+	// Resolve は通報を処理済みにします。
+	//
+	// 既に処理済み、または存在しない場合は apperr.ErrNotFound です。
+	// **投稿には触れません** —— 削除は別の操作になります。
+	Resolve(ctx context.Context, id int64, status model.ReportStatus, actorID int64) (*model.Report, error)
+}
+
+// RoleChanger は利用者のロールを変更します。
+//
+// **user モジュールの型は現れません。** ロールは文字列として渡します ——
+// 「ロールとは何か」は user モジュールの関心事で、
+// こちらは記録と権限判定のためにその値を運ぶだけです。
+type RoleChanger interface {
+	// ChangeRole はロールを変更し、変更後の内部 ID を返します。
+	//
+	// 対象が存在しない、または退会済みの場合は apperr.ErrNotFound です。
+	ChangeRole(ctx context.Context, publicID uuid.UUID, role string) (userID int64, err error)
+
+	// LockAdminsAndCount は admin の行をロックして数えます。
+	//
+	// **降格が admin を 0 人にしないことを確かめるために要ります。**
+	// 自分自身を弾くだけでは、admin 2 人が互いを同時に降格させたときに
+	// 両方が通ってしまいます (更新する行が別なのでロックも衝突しない)。
+	//
+	// 行をロックするので、同時に走った降格は直列化されます ——
+	// 後から来たほうは、先のコミット後に数え直して 1 人だと分かります。
+	//
+	// **トランザクションの中で呼んでください。** 外で呼ぶと、
+	// ロックが文の終わりで解けて意味がなくなります。
+	LockAdminsAndCount(ctx context.Context) (int64, error)
+
+	// FindRole は公開 ID から内部 ID と現在のロールを引きます。
+	//
+	// **LockAdminsAndCount のあとに呼びます。** 降格の判定は
+	// 「対象が今 admin か」と「他に admin が残るか」の 2 つで決まるため、
+	// ロックを取ったあとの値を読む必要があります。
+	//
+	// 対象が存在しない、または退会済みの場合は apperr.ErrNotFound です。
+	FindRole(ctx context.Context, publicID uuid.UUID) (userID int64, role string, err error)
+}
+
 // Repository はモデレーション 1 操作ぶんに必要なものをまとめたものです。
 //
 // 【なぜ 1 つに束ねるのか】
@@ -73,13 +148,18 @@ type ActionRecorder interface {
 // トランザクションを 1 つにするには、その中で使う口が同じ実体から
 // 出ている必要があるため、ここで合成します。
 //
-// 上の 4 つを分けて定義しているのは、**利用者に見せる契約を最小にする**ためです。
-// 記録だけを行う経路 (ロール変更) は ActionRecorder だけを受け取れます。
+// **ロール変更も同じ理由でここに入ります** (ADR 0011 決定 1
+// 「変更は監査記録に残す」)。変更と記録が分かれると、
+// 「権限が変わったのに誰がやったか分からない」状態が作れます。
+//
+// 分けて定義しているのは、**利用者に見せる契約を最小にする**ためです。
+// 通報キューのように記録を伴わない経路は ReportRepository だけを受け取れます。
 type Repository interface {
 	ActionRecorder
 	ThreadSoftDeleter
 	CommentSoftDeleter
 	ImageDeleter
+	RoleChanger
 
 	// WithinTx は 1 つのトランザクションの中でリポジトリを使います。
 	//

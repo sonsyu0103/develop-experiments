@@ -238,6 +238,207 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/reports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 投稿を通報する
+         * @description スレッドまたはコメントをモデレーターのキューに積みます
+         *     (docs/adr/0011-moderation.md 決定 4)。
+         *
+         *     ### ログインが必要です
+         *
+         *     **投稿は匿名を許しますが、通報は許しません。** 非対称ですが、
+         *     投稿は表現、通報は他人への申し立てであり、後者には責任の所在が要ります。
+         *
+         *     匿名で受け付けると、**通報そのものが荒らしの手段**になります ——
+         *     無限に投げてキューを埋められます。
+         *
+         *     ### 同じ対象への 2 回目は 200 です
+         *
+         *     1 人が同じ対象を何度も通報して、キューの優先度を操作できないように
+         *     一意制約を張っています。2 回目は**エラーにせず、
+         *     最初の通報をそのまま返します** (`201` ではなく `200`)。
+         *
+         *     クライアントはどちらでも「通報しました」と表示して構いません。
+         *     区別したい場合はステータスコードを見てください。
+         *
+         *     **一度処理された通報も重複として扱われます。** 一意制約に
+         *     `status` を含めていないため、モデレーターが `resolved` /
+         *     `rejected` にしたあとでも、同じ利用者の同じ対象への通報は
+         *     200 で最初の通報 (処理済み) を返します ——
+         *     **キューには何も積まれません。**
+         *
+         *     再申し立てが必要かどうかを判断できるよう、応答の `status` を
+         *     見てください。`open` でなければ、その通報は既に処理済みです。
+         *
+         *     これは [ADR 0011](../docs/adr/0011-moderation.md) 決定 4 の
+         *     一意制約をそのまま採ったことによる制限で、
+         *     「同じ人が同じ対象を何度も積む」ことを防ぐ側を優先しています。
+         *
+         *     ### 通報が集まっても自動では消えません
+         *
+         *     「N 件で自動非表示」は実装が簡単で、しかも危険です ——
+         *     組織的に通報を集めれば正常な投稿を消せますし
+         *     (通報爆撃)、少数派の意見が構造的に消えやすくなります。
+         *
+         *     通報はキューに積むだけで、判断は必ず人間が行い、
+         *     その結果が `moderation_actions` に残ります。
+         */
+        post: operations["createReport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/moderation/reports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 通報キューを取得する
+         * @description **moderator または admin だけが読めます** (ADR 0011 決定 1)。
+         *
+         *     既定では未処理 (`open`) のものだけを、**古い順**に返します。
+         *     古い順なのは、通報が滞留したときに最初に届いたものから
+         *     処理されるようにするためです。
+         *
+         *     ### 並び順は `id` 昇順です
+         *
+         *     `created_at` ではありません。**`created_at` は一意ではない**ので、
+         *     キーセットページネーションの境界に使うと、
+         *     同じ時刻の行が複数あるページ境界で取りこぼしと重複が起きます。
+         *     通報は荒らしへの対応という性質上、短時間に集中して届きます。
+         *
+         *     `id` は IDENTITY なので一意かつ単調増加で、
+         *     `created_at` の既定は `now()` です —— 順序は実質同じになります。
+         *
+         *     ### 通報数は返しません
+         *
+         *     同じ対象への通報が何件あるかは、**この一覧には含めません。**
+         *     件数を前面に出すと、閾値で判断する運用へ引き寄せられます
+         *     (決定 4 が明確に避けたもの)。
+         */
+        get: operations["listReports"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/moderation/reports/{reportId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 通報 ID */
+                reportId: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * 通報を処理済みにする
+         * @description **moderator または admin だけが呼べます。**
+         *
+         *     `resolved` は「対処した」、`rejected` は「対処不要と判断した」です。
+         *     どちらも `resolved_at` と `resolved_by` が入ります ——
+         *     **「誰が解決したか分からない解決済み通報」を作れないよう、
+         *     DB 側の CHECK 制約が両方を要求します。**
+         *
+         *     ### 削除はしません
+         *
+         *     この操作は通報の状態を変えるだけで、投稿には触れません。
+         *     削除するなら `POST /moderation/actions` を別に呼んでください。
+         *
+         *     分けているのは、**「通報を却下する」と「投稿を消す」が
+         *     別の判断**だからです。まとめると、キューを片付ける操作が
+         *     そのまま削除になり、誤操作が投稿に届きます。
+         *
+         *     ### `open` に戻すことはできません
+         *
+         *     処理済みの通報を未処理へ戻す経路は作っていません。
+         *     判断をやり直したい場合は、投稿に対する操作
+         *     (`moderation_actions`) の側で記録が残ります。
+         */
+        patch: operations["resolveReport"];
+        trace?: never;
+    };
+    "/users/{publicId}/role": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description 利用者の公開 ID (UUID v7)。
+                 *
+                 *     **内部 ID (`users.id`) は受け取りません。**
+                 *     API が扱う識別子は `publicId` だけです
+                 *     (docs/adr/0003-open-questions.md 未決 #11)。
+                 */
+                publicId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * 利用者のロールを変更する
+         * @description **admin だけが呼べます** (ADR 0011 決定 1)。
+         *
+         *     3 段階に分けているのは、**投稿を消せる権限と、
+         *     権限を配れる権限を分離する**ためです。
+         *     モデレーターを増やしても、権限を配れる人間は増えません。
+         *
+         *     ### 変更は監査記録に残ります
+         *
+         *     `moderation_actions` に `change_role` として記録されます
+         *     (決定 1「変更は監査記録に残す」/ 決定 3)。
+         *     削除と同じテーブルで、`target_type` は `user` になります。
+         *
+         *     ### 自分のロールは変更できません
+         *
+         *     **最後の admin が自分を降格させると、誰もロールを配れなくなります。**
+         *     復旧には DB を直接触るか、`BOOTSTRAP_ADMIN_GOOGLE_SUB` を
+         *     設定し直して再ログインするしかありません。
+         *
+         *     他の admin を降格させることはできます。
+         *
+         *     ### ただし、最後の admin は降格させられません
+         *
+         *     **自分を触らせないだけでは足りません。** admin が 2 人いるとき、
+         *     互いを同時に降格させると両方が「自分ではない」を通り、
+         *     **admin が 0 人になります** (レビュー指摘)。
+         *
+         *     そのため、admin を降格させる変更では
+         *     **他に admin が残ることを同じトランザクションで確かめます。**
+         *     確認は admin の行をロックして行うので、
+         *     同時に走った 2 つの降格は直列化され、後から来たほうが 422 になります。
+         */
+        patch: operations["changeUserRole"];
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -714,16 +915,129 @@ export interface components {
             height: number;
         };
         /**
+         * @description 通報の対象種別 (docs/adr/0011-moderation.md 決定 4)。
+         *
+         *     **画像は含めません。** 画像はコメント / スレッドに従属するので、
+         *     通報の単位にしません —— 画像だけを消す判断は
+         *     モデレーター側が `POST /moderation/actions` で行います。
+         * @example comment
+         * @enum {string}
+         */
+        ReportTargetType: "thread" | "comment";
+        /**
+         * @description 通報の理由。**自由記述ではなく固定の 4 値**です。
+         *     集計と絞り込みができる形にしておくためで、
+         *     補足は `note` に書きます。
+         * @example abuse
+         * @enum {string}
+         */
+        ReportReason: "spam" | "abuse" | "illegal" | "other";
+        /**
+         * @description 通報の状態。`open` が未処理です。
+         *
+         *     `resolved` は「対処した」、`rejected` は「対処不要と判断した」。
+         *     **どちらも通報の行は残ります** —— 誰が何を通報したかは記録として要ります。
+         * @example open
+         * @enum {string}
+         */
+        ReportStatus: "open" | "resolved" | "rejected";
+        CreateReportRequest: {
+            targetType: components["schemas"]["ReportTargetType"];
+            /**
+             * Format: int64
+             * @description 対象の ID。**`moderation_actions` と違って整数です** ——
+             *     対象が `threads` / `comments` に限られ、型が混ざらないためです。
+             * @example 10
+             */
+            targetId: number;
+            /**
+             * Format: int64
+             * @description **`targetType` が `comment` のときだけ必須**です。
+             *     スレッドの通報では指定できません (指定すると 400)。
+             *
+             *     `comments` は `thread_id` による HASH パーティションで、
+             *     主キーが `(thread_id, id)` です。**通報を受けた側が
+             *     対象を引けるようにするため、通報の時点で受け取ります。**
+             * @example 1
+             */
+            threadId?: number;
+            reason: components["schemas"]["ReportReason"];
+            /**
+             * @description 補足。任意です。
+             *
+             *     DB 側の CHECK 制約 `reports_note_length` と同じ上限です。
+             * @example 同じ文面を連投しています
+             */
+            note?: string;
+        };
+        Report: {
+            /**
+             * Format: int64
+             * @example 1
+             */
+            id: number;
+            targetType: components["schemas"]["ReportTargetType"];
+            /**
+             * Format: int64
+             * @example 10
+             */
+            targetId: number;
+            /**
+             * Format: int64
+             * @description **`targetType` が `comment` のときだけ現れます。**
+             *     スレッドの通報では省略されます (null ではありません)。
+             * @example 1
+             */
+            threadId?: number;
+            reason: components["schemas"]["ReportReason"];
+            /**
+             * @description 指定されなかった場合は `null` です。
+             * @example 同じ文面を連投しています
+             */
+            note: string | null;
+            status: components["schemas"]["ReportStatus"];
+            /**
+             * Format: date-time
+             * @example 2026-08-15T12:00:00Z
+             */
+            createdAt: string;
+            /**
+             * Format: date-time
+             * @description 未処理の場合は `null` です。
+             * @example 2026-08-15T13:00:00Z
+             */
+            resolvedAt: string | null;
+        };
+        ReportList: {
+            reports: components["schemas"]["Report"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        /**
          * @description モデレーション操作の種類 (docs/adr/0011-moderation.md 決定 3)。
          *
-         *     DB 側の CHECK 制約 `moderation_action_valid` には `change_role` も
-         *     含まれますが、**このエンドポイントでは受け付けません。**
-         *     ロール変更は対象と入力の形が違う (新しいロールが要る) ため、
-         *     専用のエンドポイントが書きます。記録先のテーブルは同じです。
+         *     **Go 側の定数と DB の CHECK 制約 `moderation_action_valid` と
+         *     同じ 4 値**です。記録として現れうるものをすべて並べています。
+         *
+         *     リクエストで受け付ける集合は狭く、`ModerationDeleteAction` が別にあります。
          * @example delete_comment
          * @enum {string}
          */
-        ModerationActionType: "delete_thread" | "delete_comment" | "delete_image";
+        ModerationActionType: "delete_thread" | "delete_comment" | "delete_image" | "change_role";
+        /**
+         * @description `POST /moderation/actions` が**受け付ける**操作。
+         *
+         *     `change_role` は含めません。**入力の形が違う** (新しいロールが要る) ため、
+         *     `PATCH /users/{publicId}/role` が専用に受けます。
+         *     記録先のテーブルは同じで、記録された `action` は
+         *     `ModerationActionType` のほうに現れます。
+         *
+         *     つまり定義の関係は
+         *     **「Go の定数 = DB の CHECK 制約 ⊃ このエンドポイントの入力」**
+         *     という非対称な形になります (`action_test.go` が検査します)。
+         * @example delete_comment
+         * @enum {string}
+         */
+        ModerationDeleteAction: "delete_thread" | "delete_comment" | "delete_image";
         /**
          * @description 操作の対象種別。**`action` から一意に決まります**
          *     (`delete_thread` なら `thread`)。
@@ -735,7 +1049,7 @@ export interface components {
          */
         ModerationTargetType: "thread" | "comment" | "image" | "user";
         CreateModerationActionRequest: {
-            action: components["schemas"]["ModerationActionType"];
+            action: components["schemas"]["ModerationDeleteAction"];
             /**
              * @description 対象の ID。**型が混在するため文字列です**
              *     (`threads` / `comments` は BIGINT、`images` は UUID)。
@@ -1207,6 +1521,270 @@ export interface operations {
             };
             /** @description 対象が存在しないか、既に削除されています。 */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createReport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateReportRequest"];
+            };
+        };
+        responses: {
+            /**
+             * @description **既に通報済みです。** 最初の通報をそのまま返します。
+             *     エラーではありません。
+             */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Report"];
+                };
+            };
+            /** @description 通報した */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Report"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /**
+             * @description 通報の対象が存在しないか、既に削除されています。
+             *
+             *     **存在を確かめてから積みます。** 確かめないと、
+             *     存在しない ID の通報でキューを埋められます。
+             */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listReports: {
+        parameters: {
+            query?: {
+                /**
+                 * @description 次ページの取得位置を表す不透明トークン。
+                 *     直前のレスポンスの `nextCursor` をそのまま渡します。
+                 *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
+                 *
+                 *     中身はサーバ側の実装詳細なので、
+                 *     **クライアントは解釈も生成も改変もしないでください。**
+                 *     並び順を追加してもこの型は変わりません
+                 *     (docs/adr/0018-opaque-cursor.md)。
+                 */
+                cursor?: components["parameters"]["Cursor"];
+                /**
+                 * @description 取得件数。省略時は 20。
+                 *     上限を設けないと、1 リクエストで全件走査させられてしまいます。
+                 */
+                size?: components["parameters"]["Size"];
+                /**
+                 * @description 絞り込む状態。省略時は `open` だけを返します。
+                 *
+                 *     **部分索引 `reports_open_idx` が効くのは `open` のときだけ**です。
+                 *     解決済みを引く場合は全体の走査になります (件数が増え続けるため、
+                 *     調査用と割り切ってください)。
+                 */
+                status?: components["schemas"]["ReportStatus"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReportList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。
+             *     ロールが `moderator` / `admin` ではありません。
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    resolveReport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 通報 ID */
+                reportId: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * @description `open` は指定できません。未処理へ戻す経路は作っていません。
+                     * @enum {string}
+                     */
+                    status: "resolved" | "rejected";
+                };
+            };
+        };
+        responses: {
+            /** @description 処理済みにした */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Report"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。
+             *     ロールが `moderator` / `admin` ではありません。
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description 通報が存在しないか、**既に処理済み**です。 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    changeUserRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description 利用者の公開 ID (UUID v7)。
+                 *
+                 *     **内部 ID (`users.id`) は受け取りません。**
+                 *     API が扱う識別子は `publicId` だけです
+                 *     (docs/adr/0003-open-questions.md 未決 #11)。
+                 */
+                publicId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    role: components["schemas"]["Role"];
+                    /** @description 変更の理由。任意ですが、記録の価値はここに集まります。 */
+                    reason?: string;
+                };
+            };
+        };
+        responses: {
+            /**
+             * @description 変更した。記録された操作を返します。
+             *
+             *     **`targetId` は対象の `publicId`** です。
+             *     `moderation_actions` テーブルには内部 ID (`users.id`) を
+             *     書いていますが (監査記録から `users` を辿るため)、
+             *     **API が内部 ID を出さない方針**に従って詰め替えます
+             *     (docs/adr/0003-open-questions.md 未決 #11)。
+             *
+             *     返ってきた `targetId` はそのまま他の API へ渡せます。
+             */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModerationAction"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。原因は 3 つあります。
+             *
+             *     - **ロールが `admin` ではない**
+             *     - **自分自身を対象にした**
+             *     - 状態変更メソッドの `Origin` / `Referer` が許可リストに無い
+             *
+             *     **ロールの検査は対象を探す前に行います。**
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description 利用者が存在しないか、退会しています。 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description `code` は `FAILED_PRECONDITION` です。
+             *
+             *     **最後の admin を降格させようとしました。**
+             *     誰もロールを配れない状態にはできません。
+             *
+             *     先に別の利用者を admin にしてから降格させてください
+             *     —— 再試行しても解決しません。
+             */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

@@ -12,6 +12,35 @@ import (
 	"github.com/google/uuid"
 )
 
+const commentExists = `-- name: CommentExists :one
+SELECT EXISTS (
+    SELECT 1 FROM comments
+    WHERE thread_id = $1
+      AND id = $2
+      AND deleted_at IS NULL
+)
+`
+
+type CommentExistsParams struct {
+	ThreadID int64
+	ID       int64
+}
+
+// コメントが存在し、論理削除されていないかを返す。
+//
+// **通報の対象を確かめるために要る** (ADR 0011 決定 4)。
+// 確かめずに積むと、存在しない ID の通報でキューを埋められる。
+//
+// thread_id が要るのは主キーが (thread_id, id) だから ——
+// 無いと 8 パーティションすべてを走査する。
+// 通報のリクエストが threadId を受け取るのは、この検査のためでもある。
+func (q *Queries) CommentExists(ctx context.Context, arg CommentExistsParams) (bool, error) {
+	row := q.db.QueryRow(ctx, commentExists, arg.ThreadID, arg.ID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const commentOwnership = `-- name: CommentOwnership :one
 SELECT COALESCE(author_id = $1, false)::boolean AS owned
 FROM comments

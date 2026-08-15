@@ -176,3 +176,67 @@ SET avatar_image_id = sqlc.narg('avatar_image_id'),
 WHERE users.id = sqlc.arg('id')
   AND users.deleted_at IS NULL
 RETURNING users.id, users.public_id, users.google_sub, users.email, users.display_name, users.avatar_url, users.created_at, users.updated_at, users.deleted_at, users.role, users.avatar_image_id;
+
+-- name: ChangeUserRole :one
+-- 利用者のロールを変更する (ADR 0011 決定 1)。
+--
+-- **呼べるのは admin だけ**だが、その判定はここではなくユースケース側にある
+-- (SQL は「誰が呼んだか」を知らない)。
+--
+-- 【PromoteToAdmin と分けている理由】
+-- あちらは google_sub を鍵にした「最初の 1 人」専用の経路で、
+-- **UI から到達できないことに意味がある。**
+-- こちらは public_id を鍵にした通常の管理操作になる。
+-- 1 つにまとめると、UI から google_sub を指定する形が生まれうる。
+--
+-- 【role <> 'admin' のような条件は付けない】
+-- PromoteToAdmin は「毎ログインで撃たれる」ので冪等性のために絞っているが、
+-- こちらは明示的な操作なので、同じロールへの変更も 1 行として扱う。
+-- **記録には残る** —— 「変えようとした」ことも監査の対象になる。
+--
+-- 退会済み (deleted_at IS NOT NULL) は対象外。
+-- 0 行なら「居ない、または退会済み」で、呼び出し側は 404 にする。
+UPDATE users
+SET role = sqlc.arg('role'), updated_at = now()
+WHERE public_id = sqlc.arg('public_id')
+  AND deleted_at IS NULL
+RETURNING id, public_id, google_sub, email, display_name, avatar_url, created_at, updated_at, deleted_at, role, avatar_image_id;
+
+-- name: LockAdminsAndCount :one
+-- admin の行をロックして数える。
+--
+-- **降格が admin を 0 人にしないことを確かめるために要る** (レビュー指摘)。
+--
+-- 【自分自身を弾くだけでは足りない】
+-- admin が 2 人いるとき、互いを同時に降格させると
+-- 両方が「対象は自分ではない」を通り、更新する行も別なので
+-- ロックも衝突せず、**両方コミットして admin が 0 人になる。**
+--
+-- 【なぜ FOR UPDATE が要るのか】
+-- 単に数えるだけでは、2 つのトランザクションが同じスナップショットで
+-- 「2 人いる」を読み、どちらも自分の対象を降格させてしまう。
+-- **admin の行をすべてロックすると、この 2 つが直列化される** ——
+-- 後から来たほうは、先のコミット後に数え直して 1 人だと分かる。
+--
+-- 【集約に FOR UPDATE は付けられない】
+-- PostgreSQL は集約を含む問い合わせに FOR UPDATE を許さないため、
+-- 副問い合わせでロックしてから外側で数える。
+--
+-- 対象は多くない (users_privileged_idx が role <> 'user' の部分索引)。
+SELECT count(*)::bigint AS admins
+FROM (
+    SELECT id FROM users
+    WHERE role = 'admin' AND deleted_at IS NULL
+    FOR UPDATE
+) locked;
+
+-- name: FindRoleByPublicID :one
+-- 公開 ID から内部 ID と現在のロールを引く。
+--
+-- **LockAdminsAndCount のあとに呼ぶ。** 降格の判定は
+-- 「対象が今 admin か」と「他に admin が残るか」の 2 つで決まるため、
+-- ロックを取ったあとの値を読む必要がある。
+SELECT id, role
+FROM users
+WHERE public_id = sqlc.arg('public_id')
+  AND deleted_at IS NULL;

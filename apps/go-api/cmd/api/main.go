@@ -145,6 +145,12 @@ func run() error {
 		// login / images のように「設定が無ければ 503」にする理由がない
 		// (ADR 0011 決定 3 の記録は外部サービスに依存しない)。
 		moderationusecase.NewInteractor(postgres.NewModerationRepository(pool)),
+		// 通報も設定に依存しない。対象の存在確認と通報の読み書きを
+		// 同じ実体 (ReportRepository) が satisfy する。
+		func() *moderationusecase.ReportInteractor {
+			repo := postgres.NewReportRepository(pool)
+			return moderationusecase.NewReportInteractor(repo, repo)
+		}(),
 		cfg.Auth,
 	)
 

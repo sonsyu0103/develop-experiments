@@ -306,6 +306,7 @@ func newTestEnv(t *testing.T) *testEnv {
 			nil,
 			// モデレーションは設定に依存しないので、ここでも結線する。
 			moderationusecase.NewInteractor(newFakeModerationRepo()),
+			moderationusecase.NewReportInteractor(newFakeReportRepo(), newFakeReportRepo()),
 			config.AuthConfig{},
 		),
 		AllowedOrigins: []string{"http://localhost:3000"},

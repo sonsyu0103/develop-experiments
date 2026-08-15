@@ -202,6 +202,7 @@ func newAuthEnv(t *testing.T, loginEnabled bool) *authEnv {
 			// モデレーションは常に結線する (nil は NewServer が拒否する)。
 			// 削除の検査は moderation_test.go が別に組み立てる。
 			moderationusecase.NewInteractor(newFakeModerationRepo()),
+			moderationusecase.NewReportInteractor(newFakeReportRepo(), newFakeReportRepo()),
 			config.AuthConfig{FrontendURL: "http://localhost:3000"},
 		),
 		AllowedOrigins: []string{"http://localhost:3000"},

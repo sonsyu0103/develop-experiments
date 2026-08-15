@@ -143,6 +143,7 @@ func newImageEnv(t *testing.T) *imageEnv {
 			nil,
 			imageInteractor,
 			moderationusecase.NewInteractor(newFakeModerationRepo()),
+			moderationusecase.NewReportInteractor(newFakeReportRepo(), newFakeReportRepo()),
 			config.AuthConfig{FrontendURL: "http://localhost:3000"},
 		),
 		AllowedOrigins: []string{"http://localhost:3000"},

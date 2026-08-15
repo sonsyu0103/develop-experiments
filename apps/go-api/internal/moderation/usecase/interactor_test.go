@@ -38,6 +38,17 @@ type fakeRepo struct {
 
 	recorded  *model.Action
 	deleteErr error
+
+	// ロール変更で渡された値。**何が書かれたか**を見るために持ちます。
+	changedTo       *string
+	changedPublicID *uuid.UUID
+	changeErr       error
+
+	// admins は LockAdminsAndCount が返す人数 (0 なら 2 を返す)。
+	admins int64
+	// targetRole は FindRole が返す現在のロール (空なら "user")。
+	targetRole  string
+	findRoleErr error
 }
 
 var _ repository.Repository = (*fakeRepo)(nil)
@@ -72,7 +83,36 @@ func (f *fakeRepo) MarkImageDeleted(_ context.Context, id uuid.UUID) error {
 	return f.deleteErr
 }
 
+// ChangeRole は呼ばれた引数を記録します。
+func (f *fakeRepo) ChangeRole(_ context.Context, publicID uuid.UUID, role string) (int64, error) {
+	f.changedTo = &role
+	f.changedPublicID = &publicID
+	return 4242, f.changeErr
+}
+
+// LockAdminsAndCount は admin の人数を返します。既定は 2 人 (降格できる状態)。
+func (f *fakeRepo) LockAdminsAndCount(context.Context) (int64, error) {
+	if f.admins == 0 {
+		return 2, nil
+	}
+	return f.admins, nil
+}
+
+// FindRole は対象の現在のロールを返します。既定は user (降格の対象外)。
+func (f *fakeRepo) FindRole(context.Context, uuid.UUID) (int64, string, error) {
+	role := f.targetRole
+	if role == "" {
+		role = "user"
+	}
+	return 4242, role, f.findRoleErr
+}
+
 func moderator() model.Actor { return model.Actor{UserID: 42, CanModerate: true} }
+
+// admin は「権限を配れる」実行者です。
+func admin() model.Actor {
+	return model.Actor{UserID: 42, CanModerate: true, CanChangeRoles: true}
+}
 
 // ---------------------------------------------------------------------------
 // 検査

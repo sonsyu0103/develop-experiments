@@ -122,6 +122,29 @@ func (r *ModerationRepository) MarkImageDeleted(ctx context.Context, id uuid.UUI
 	return requireAffected("ModerationRepository.MarkImageDeleted", affected)
 }
 
+// ChangeRole は利用者のロールを変更し、その内部 ID を返します。
+//
+// **記録と同じトランザクションで呼ばれます** (ADR 0011 決定 1
+// 「変更は監査記録に残す」)。分けると「権限が変わったのに
+// 誰がやったか分からない」状態が作れます。
+//
+// 返すのが内部 ID なのは、moderation_actions.target_id に書くためです。
+// **公開 ID (public_id) ではありません** —— 監査記録から users を
+// 辿るのに内部 ID が要ります。
+func (r *ModerationRepository) ChangeRole(
+	ctx context.Context, publicID uuid.UUID, role string,
+) (int64, error) {
+	row, err := r.q.ChangeUserRole(ctx, sqlcgen.ChangeUserRoleParams{
+		PublicID: publicID,
+		Role:     role,
+	})
+	if err != nil {
+		// 0 行は「居ない、または退会済み」。translateError が 404 にする。
+		return 0, translateError("ModerationRepository.ChangeRole", err)
+	}
+	return row.ID, nil
+}
+
 // requireAffected は更新行数が 0 なら apperr.ErrNotFound にします。
 //
 // **「今回この操作で変化した」ことをここで確かめます。**
@@ -137,4 +160,28 @@ func requireAffected(op string, affected int64) error {
 		return fmt.Errorf("%s: %w", op, apperr.ErrNotFound)
 	}
 	return nil
+}
+
+// LockAdminsAndCount は admin の行をロックして数えます。
+//
+// **トランザクションの中で呼んでください。** 外で呼ぶと
+// ロックが文の終わりで解け、同時降格を直列化できません。
+func (r *ModerationRepository) LockAdminsAndCount(ctx context.Context) (int64, error) {
+	n, err := r.q.LockAdminsAndCount(ctx)
+	if err != nil {
+		return 0, translateError("ModerationRepository.LockAdminsAndCount", err)
+	}
+	return n, nil
+}
+
+// FindRole は公開 ID から内部 ID と現在のロールを引きます。
+func (r *ModerationRepository) FindRole(
+	ctx context.Context, publicID uuid.UUID,
+) (int64, string, error) {
+	row, err := r.q.FindRoleByPublicID(ctx, publicID)
+	if err != nil {
+		// 0 行は「居ない、または退会済み」。translateError が 404 にする。
+		return 0, "", translateError("ModerationRepository.FindRole", err)
+	}
+	return row.ID, row.Role, nil
 }
