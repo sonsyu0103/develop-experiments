@@ -1,5 +1,7 @@
 import type { components } from '../schema';
 
+import { AdminLink } from './AdminLink';
+
 // schema.d.ts は openapi.yaml から自動生成される (npm run gen:types)。
 // ここで手書きの型を作らないことで、API とフロントの定義が必ず一致する。
 type Thread = components['schemas']['Thread'];
@@ -55,6 +57,13 @@ export default async function Page() {
       <h1 style={{ borderBottom: '1px solid #00f', paddingBottom: '0.5rem' }}>
         Wired Thread List
       </h1>
+
+      {/*
+        **Client Component です。** ロールはブラウザから引きます ——
+        ここで引くと、この Server Component の出力が利用者ごとに変わり、
+        ADR 0005 の 4 層キャッシュを全部確認する必要が出ます。
+      */}
+      <AdminLink />
 
       {threads.length === 0 ? (
         <p style={{ color: '#55f' }}>スレッドがまだありません。</p>
