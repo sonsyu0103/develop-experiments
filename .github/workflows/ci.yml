@@ -162,6 +162,35 @@ jobs:
       - name: Build
         run: npm run build
 
+      # 管理画面は**状態遷移の検査を型でもビルドでも代替できない**。
+      # レビューで出た指摘 6 件のうち 4 件がその領域だった
+      # (古い応答が新しい一覧に混ざる、削除の二重送信が通る、など)。
+      #
+      # **実バックエンドは使わない。** 応答は page.route で差し替えるので、
+      # Go API も Postgres も MinIO も要らず、このジョブに閉じる。
+      # 理由は apps/next-app/playwright.config.ts に書いてある。
+      - name: Resolve Playwright version
+        id: playwright
+        run: |
+          version=$(node -p "require('@playwright/test/package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # ブラウザは 100 MB 近くある。**バージョンを鍵にする** ——
+      # パッケージを上げたときに古いブラウザを引き当てると、
+      # Playwright が起動時に不一致で落ちる。
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Playwright (管理画面の状態遷移)
+        run: npx playwright test
+
   # --------------------------------------------------
   # 生成物のドリフト検出
   # --------------------------------------------------

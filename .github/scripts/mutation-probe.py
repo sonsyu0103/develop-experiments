@@ -42,8 +42,9 @@ sqlc の推論型が変わってビルドが落ちた。テストは赤くなる
     --- end
 
   file    リポジトリ直下からの相対パス
-  pkg     apps/go-api からの相対パス (go test に渡す)
-  test    go test -run に渡すパターン
+  runner  go (既定) / playwright
+  pkg     apps/go-api からの相対パス (go test に渡す)。**go のときだけ**
+  test    go test -run / playwright -g に渡すパターン
   expect  fail = 壊したらテストが落ちるべき (既定)
           pass = 壊しても落ちない (= 検出できない) ことを記録として残す
   max     from が一致してよい最大件数 (既定 1)。
@@ -52,6 +53,17 @@ sqlc の推論型が変わってビルドが落ちた。テストは赤くなる
   to      置換後。空にすると削除になる
 
 --- from と --- to の間の行はそのまま使う。インデントも保たれる。
+
+【runner: playwright を足した理由】
+
+管理画面のレビューで出た指摘 6 件のうち 4 件が、
+**「応答が遅れた / 失敗したときのクライアントの状態」**だった
+(古い応答が新しい一覧に混ざる、削除の二重送信が通る、など)。
+go test では届かず、**変異で測れないテストが増える**形になっていた。
+
+「テストが通った」を信用しない、というこのスクリプトの前提は
+フロントでも変わらない。1 変異あたり数十秒かかる (毎回ビルドし直すため)
+ので、**go の変異と同じ感覚では並べられない**点にだけ注意する。
 """
 
 import os
@@ -62,6 +74,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 API = os.path.join(ROOT, "apps", "go-api")
+NEXT = os.path.join(ROOT, "apps", "next-app")
 
 RED = "\033[31m"
 GREEN = "\033[32m"
@@ -74,6 +87,7 @@ class Mutation:
     def __init__(self, label):
         self.label = label
         self.file = None
+        self.runner = "go"
         self.pkg = None
         self.test = None
         self.expect = "fail"
@@ -82,7 +96,15 @@ class Mutation:
         self.to = ""
 
     def validate(self):
-        for name in ("file", "pkg", "test", "frm"):
+        if self.runner not in ("go", "playwright"):
+            raise ValueError(
+                f"{self.label}: runner は go か playwright です (got {self.runner})")
+
+        # pkg は go test にだけ渡す。playwright は testDir 全体から
+        # -g で絞るので、パッケージという単位が無い。
+        required = ("file", "pkg", "test", "frm") if self.runner == "go" \
+            else ("file", "test", "frm")
+        for name in required:
             if getattr(self, name) is None:
                 raise ValueError(f"{self.label}: {name} が指定されていません")
         if self.expect not in ("fail", "pass"):
@@ -140,7 +162,7 @@ def parse(path):
             if not line.strip() or line.startswith("#"):
                 continue
 
-            m = re.match(r"^(file|pkg|test|expect|max):\s*(.*)$", line)
+            m = re.match(r"^(file|runner|pkg|test|expect|max):\s*(.*)$", line)
             if not m:
                 raise ValueError(f"{path}:{lineno}: 解釈できません: {line!r}")
             setattr(current, m.group(1), m.group(2).strip())
@@ -154,14 +176,20 @@ def parse(path):
     return mutations
 
 
-def run_test(pkg, pattern):
-    """go test を 1 回走らせ、(結果, 出力) を返す。
+def run_test(mut):
+    """テストを 1 回走らせ、(結果, 出力) を返す。
 
     結果は "pass" / "fail" / "build" / "empty" のいずれか。
     **ビルド失敗を fail と混同しない。** 混同すると、
     「テストが守っている」と「コンパイルが通らなくなった」を取り違える。
+    """
+    if mut.runner == "playwright":
+        return _run_playwright(mut.test)
+    return _run_go(mut.pkg, mut.test)
 
-    -count=1 を付けるのは、壊す前と壊したあとで同じコマンドになるため。
+
+def _run_go(pkg, pattern):
+    """-count=1 を付けるのは、壊す前と壊したあとで同じコマンドになるため。
     キャッシュに当たると、壊したのに前回の結果が返る。
     """
     proc = subprocess.run(
@@ -181,6 +209,36 @@ def run_test(pkg, pattern):
             return "empty", out
         return "pass", out
     return "fail", out
+
+
+def _run_playwright(pattern):
+    """Playwright を 1 回走らせる。
+
+    **毎回 webServer が本番ビルドをやり直します** (playwright.config.ts)。
+    壊したソースを確実に反映させるためで、そのぶん 1 変異あたり
+    数十秒かかります。`next start` を使い回すと、
+    **壊す前のバンドルを検査してしまう** —— go の -count=1 と同じ理由になります。
+
+    `-g` に一致しないと Playwright は "No tests found" を出して
+    **終了コード 1 で終わります。** 落ちたのと見分けが付かないので、
+    ここで "empty" に分けます。分けないと、検査名を書き換えたときに
+    「壊したら落ちた」と誤って数えます。
+    """
+    proc = subprocess.run(
+        ["npx", "playwright", "test", "-g", pattern],
+        cwd=NEXT, capture_output=True, text=True,
+        # Node のラッパが差し込む NODE_OPTIONS を外す (Makefile の NODE と同じ)。
+        env={k: v for k, v in os.environ.items() if k != "NODE_OPTIONS"},
+    )
+    out = proc.stdout + proc.stderr
+
+    if "No tests found" in out:
+        return "empty", out
+    # webServer の起動に失敗した場合は、実装が壊れて型検査に落ちたか、
+    # ビルドが通らなくなったかのどちらか。fail と混同しない。
+    if "Error: Process from config.webServer" in out or "error TS" in out:
+        return "build", out
+    return ("pass", out) if proc.returncode == 0 else ("fail", out)
 
 
 class Restorer:
@@ -246,17 +304,19 @@ def main():
     print(f"{DIM}壊す前のテストを確認しています...{OFF}", flush=True)
     baseline = {}
     for mut in mutations:
-        key = (mut.pkg, mut.test)
+        key = (mut.runner, mut.pkg, mut.test)
         if key in baseline:
             continue
-        result, out = run_test(*key)
+        result, out = run_test(mut)
         baseline[key] = result
+        where = f"{mut.pkg} -run {mut.test}" if mut.runner == "go" \
+            else f"playwright -g {mut.test}"
         if result == "empty":
-            print(f"{RED}{mut.pkg} -run {mut.test} に一致するテストがありません。"
+            print(f"{RED}{where} に一致するテストがありません。"
                   f"テスト名が変わったか、まだ書かれていません。{OFF}", file=sys.stderr)
             return 1
         if result != "pass":
-            print(f"{RED}壊す前の時点で {mut.pkg} -run {mut.test} が通っていません "
+            print(f"{RED}壊す前の時点で {where} が通っていません "
                   f"({result})。先にそちらを直してください。{OFF}", file=sys.stderr)
             print(out[-2000:], file=sys.stderr)
             return 1
@@ -301,7 +361,7 @@ def main():
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(mutated)
-            result, out = run_test(mut.pkg, mut.test)
+            result, out = run_test(mut)
         finally:
             restorer.restore()
 

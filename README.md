@@ -534,6 +534,7 @@ api/openapi.yaml を書く
 | [ADR 0017](docs/adr/0017-arch-lint-and-depguard.md) | モジュール境界の検査を go-arch-lint に移し、depguard を外す |
 | [ADR 0018](docs/adr/0018-opaque-cursor.md) | カーソルを不透明トークン (base64url + JSON) にする |
 | [ADR 0019](docs/adr/0019-comment-concurrency.md) | コメント投稿の並行制御 —— レス番号を題材に据える |
+| [ADR 0020](docs/adr/0020-frontend-testing.md) | フロントの検査は「状態遷移」を対象にする |
 | [インフラ構成](docs/infrastructure.md) | AWS 理想構成 (実際にはデプロイしない) |
 
 [ADR 0015](docs/adr/0015-idempotency.md) と

@@ -1,0 +1,117 @@
+// 管理画面が叩く API を差し替えるための道具。
+//
+// **応答の形は schema.d.ts の型で縛る。** 手書きの JSON を置くと、
+// 仕様書が変わったときにテストだけが古い形のまま緑になる ——
+// 「テストが通っているのに画面が壊れている」という、
+// いちばん困る状態を作れてしまう。
+import type { Page, Route } from '@playwright/test';
+
+import type { components } from '../schema';
+
+type Schemas = components['schemas'];
+
+export type Me = Schemas['Me'];
+export type Report = Schemas['Report'];
+export type ReportList = Schemas['ReportList'];
+export type Thread = Schemas['Thread'];
+export type ErrorCode = Schemas['Error']['error']['code'];
+
+export const moderator: Me = {
+  publicId: '01920000-0000-7000-8000-0000000000aa',
+  displayName: 'モデレーター',
+  // 実在しないドメインにする (検査用の値が本物に見えないように)。
+  email: 'moderator@example.invalid',
+  role: 'moderator',
+};
+
+export const admin: Me = { ...moderator, role: 'admin', displayName: '管理者' };
+export const plainUser: Me = { ...moderator, role: 'user', displayName: '一般利用者' };
+
+/** 通報 1 件。既定はスレッドへの未処理の通報。 */
+export function report(over: Partial<Report> = {}): Report {
+  return {
+    id: 1,
+    targetType: 'thread',
+    targetId: 100,
+    reason: 'spam',
+    note: null,
+    status: 'open',
+    createdAt: '2026-08-16T00:00:00Z',
+    resolvedAt: null,
+    ...over,
+  };
+}
+
+export function thread(over: Partial<Thread> = {}): Thread {
+  return {
+    id: 100,
+    title: 'テスト用のスレッド',
+    commentCount: 0,
+    // **匿名投稿は author が null。** 退会済みとは別物になる
+    // (退会済みは publicId がフィールドごと省略される)。
+    author: null,
+    icon: null,
+    createdAt: '2026-08-16T00:00:00Z',
+    ...over,
+  };
+}
+
+export function list(reports: Report[], nextCursor: string | null = null): ReportList {
+  return { reports, nextCursor };
+}
+
+function json(route: Route, status: number, body: unknown) {
+  return route.fulfill({
+    status,
+    contentType: 'application/json',
+    body: JSON.stringify(body),
+  });
+}
+
+/** 仕様書どおりの形でエラーを返す。**クライアントは `code` で分岐する。** */
+export function fail(route: Route, status: number, code: ErrorCode, message = 'テスト用の失敗') {
+  return json(route, status, { error: { code, message } });
+}
+
+export function ok(route: Route, body: unknown) {
+  return json(route, 200, body);
+}
+
+/** 指定ミリ秒だけ待つ。**順序を作るために使う。** */
+export function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * `GET /me` を差し替えます。
+ *
+ * `null` を渡すと 401 (未ログイン) になります。
+ */
+export async function mockMe(page: Page, me: Me | null) {
+  await page.route('**/me', (route) =>
+    me === null ? fail(route, 401, 'UNAUTHENTICATED', 'ログインが必要です') : ok(route, me),
+  );
+}
+
+/**
+ * `GET /threads/{id}` を差し替えます。既定はどの ID でも 200。
+ */
+export async function mockThread(
+  page: Page,
+  handler: (route: Route, id: number) => Promise<unknown> = (route) => ok(route, thread()),
+) {
+  await page.route(/\/threads\/(\d+)(\?|$)/, (route) => {
+    const m = /\/threads\/(\d+)/.exec(route.request().url());
+    return handler(route, Number(m?.[1] ?? 0));
+  });
+}
+
+/** 通報キューの取得で使われた `status` を取り出します。 */
+export function statusOf(url: string): string {
+  return new URL(url).searchParams.get('status') ?? '';
+}
+
+/** 通報キューの取得で使われた `cursor` を取り出します。 */
+export function cursorOf(url: string): string | null {
+  return new URL(url).searchParams.get('cursor');
+}
