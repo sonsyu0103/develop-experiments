@@ -19,6 +19,13 @@ const config = [
       'next-env.d.ts',
       // openapi.yaml から自動生成されるため手を入れない
       'schema.d.ts',
+      // Playwright の実行成果物。**中身は minify 済みのバンドル**で、
+      // 検査すると数千件の指摘が出る (実測 3030 件)。
+      // .gitignore にも入れているが、eslint は無視ファイルを見ないので
+      // ここにも書く必要がある。
+      'playwright-report/**',
+      'test-results/**',
+      'blob-report/**',
     ],
   },
 

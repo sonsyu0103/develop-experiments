@@ -439,7 +439,7 @@ make concurrency-probe PROBE_WORKERS=64
 | Phase 7 | 人気スレッド一覧 (閲覧数) | 設計完了 |
 | Phase 8 | 問い合わせフォームとメール送信 | 設計完了 |
 | Phase 9 | ログ基盤 (Fluent Bit → S3 → Athena) | 設計完了 |
-| Phase 10 | モデレーション (ロール・通報・管理画面) | API は完了。管理画面が残り |
+| Phase 10 | モデレーション (ロール・通報・管理画面) | **完了** |
 | Phase 11 | スレッド検索 (`pg_trgm`) | 設計完了 |
 
 ### 着手順
@@ -465,9 +465,13 @@ make concurrency-probe PROBE_WORKERS=64
    (匿名は画像を投稿できない)。アップロードと添付を分けたため、
    参照されない画像を回収する定期処理が要った
    ([ADR 0007](docs/adr/0007-image-storage.md))
-4. **Phase 10 の後半 (通報・管理画面)** —— 削除の対象が出揃ってから。
-   画像の実削除は回収バッチに相乗りする
-   ([ADR 0011](docs/adr/0011-moderation.md))
+4. ~~**Phase 10 の後半 (通報・管理画面)**~~ —— **完了**。削除の対象が
+   出揃ってから着手した。画像の実削除は回収バッチに相乗りする
+   ([ADR 0011](docs/adr/0011-moderation.md))。
+   管理画面は**取得も更新もブラウザから行う** ——
+   サーバ側の `fetch` は `Origin` を送らず `csrfGuard` に弾かれるためで
+   ([ADR 0013](docs/adr/0013-http-defense.md))、
+   結果として認証済み応答のキャッシュを見る層が 1 つに減った
 5. **Phase 11 (検索)** —— 他と依存がない。Phase 4 の測定対象に含めるため、
    ベンチマークより前に置く
 6. **Phase 9 の後半 → Phase 7 (人気一覧) + Phase 4 (ベンチマーク)** —— 合流させる。
@@ -530,6 +534,7 @@ api/openapi.yaml を書く
 | [ADR 0017](docs/adr/0017-arch-lint-and-depguard.md) | モジュール境界の検査を go-arch-lint に移し、depguard を外す |
 | [ADR 0018](docs/adr/0018-opaque-cursor.md) | カーソルを不透明トークン (base64url + JSON) にする |
 | [ADR 0019](docs/adr/0019-comment-concurrency.md) | コメント投稿の並行制御 —— レス番号を題材に据える |
+| [ADR 0020](docs/adr/0020-frontend-testing.md) | フロントの検査は「状態遷移」を対象にする |
 | [インフラ構成](docs/infrastructure.md) | AWS 理想構成 (実際にはデプロイしない) |
 
 [ADR 0015](docs/adr/0015-idempotency.md) と

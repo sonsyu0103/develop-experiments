@@ -180,6 +180,20 @@ lint: arch ## Go / TypeScript の静的解析を実行する
 	cd $(NEXT_DIR) && $(NODE) npx tsc --noEmit
 	cd $(NEXT_DIR) && $(NODE) npm run lint
 
+.PHONY: e2e
+e2e: ## 管理画面の状態遷移を実ブラウザで検査する (DB 不要)
+	# **実バックエンドは使わない。** 応答は page.route で差し替える。
+	# ここで測るのは API の挙動ではなく、遅延・失敗・順序に対する
+	# クライアントの状態遷移になる —— 「A の応答が B より後に届く」は
+	# 実 API では作れない (apps/next-app/playwright.config.ts に理由)。
+	#
+	# API 側を実 HTTP 越しに見るのは make smoke の役目。重ねない。
+	#
+	# install は導入済みなら数秒で終わる。**入れ忘れで落ちるのを避ける**
+	# ほうが、毎回数秒払うより安い。
+	cd $(NEXT_DIR) && $(NODE) npx playwright install chromium
+	cd $(NEXT_DIR) && $(NODE) npx playwright test
+
 .PHONY: arch
 arch: ## モジュール境界とレイヤの依存方向を検査する
 	# 本体用とテスト用の 2 枚を両方通す必要がある。
@@ -276,7 +290,7 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 		fi
 
 .PHONY: check
-check: lint test cover verify-tidy verify-generated arch-probe ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test cover verify-tidy verify-generated arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
 check-all: check smoke ## check に加えて実 DB での疎通確認まで行う
