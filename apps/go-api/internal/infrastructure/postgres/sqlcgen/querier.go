@@ -6,6 +6,7 @@ package sqlcgen
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -50,6 +51,44 @@ type Querier interface {
 	// 応答 (response_status / response_body) はこの時点では NULL。
 	// 処理が終わってから CompleteIdempotencyKey で埋める。
 	ClaimIdempotencyKey(ctx context.Context, arg ClaimIdempotencyKeyParams) (ClaimIdempotencyKeyRow, error)
+	// 送信する行を確保する。**このリポジトリで唯一の SKIP LOCKED。**
+	//
+	// 【二重送信を防ぐ】
+	// ワーカーは API プロセスの中で動くので (ADR 0003 未決 #9)、
+	// **レプリカの数だけ同時に走る**。素朴に SELECT すると、
+	// 同じ問い合わせが 2 通届く。
+	//
+	// `FOR UPDATE SKIP LOCKED` は、他のトランザクションがロック中の行を
+	// **待たずに飛ばす**。各インスタンスは互いに異なる行を取得する。
+	//   SKIP LOCKED 無し → 解放を待ち、待った先で処理済みの行を読む
+	//   NOWAIT          → エラーになる (どちらも使えない)
+	//
+	// 【SELECT ではなく UPDATE にしている】
+	// ADR 0008 の図は「取り出す → 送信 → status 更新」を 1 つの流れで書いているが、
+	// そのまま 1 トランザクションにすると **SMTP の往復のあいだ行ロックを
+	// 保持し続ける**。外部サービスの応答時間だけ長いトランザクションが残り、
+	// プールの接続も 1 本占有する。
+	//
+	// そこで**確保だけを 1 文で終わらせて即コミットする**。
+	// 画像の回収 (ADR 0007 / image usecase の Reclaim) が
+	// 「確保 → S3 削除 → DB 反映」と 3 段階に割っているのと同じ形になる。
+	//
+	// 確保の中身は 2 つ:
+	//   attempt_count を先に増やす  クラッシュを繰り返す行が無限に居座らない
+	//   next_attempt_at を先送りする 送信中の行を他のインスタンスが拾わない
+	//                               (= リース。送信が落ちてもリース切れで戻る)
+	//
+	// **これは at-least-once であって exactly-once ではない** (ADR 0008)。
+	// 送信の直後、status を書く前にプロセスが落ちると、リース切れの後に
+	// もう一度送られる。SMTP に冪等キーが無い以上ここは避けられないので、
+	// **重複を許して取りこぼしを許さない**側を選んでいる。
+	// 問い合わせが届かないほうが、2 通届くより悪い。
+	//
+	// 【ORDER BY を索引と揃える】
+	// contact_pending_idx が (next_attempt_at, id) WHERE status = 'pending' なので、
+	// 同じ並びにすると索引をそのまま辿れる。id を第 2 キーに置くのは
+	// next_attempt_at が一意でないため。
+	ClaimPendingContacts(ctx context.Context, arg ClaimPendingContactsParams) ([]ClaimPendingContactsRow, error)
 	// コメントが存在し、論理削除されていないかを返す。
 	//
 	// **通報の対象を確かめるために要る** (ADR 0011 決定 4)。
@@ -81,6 +120,26 @@ type Querier interface {
 	// もう一度 INSERT される。それが正しい挙動になる。
 	CompleteIdempotencyKey(ctx context.Context, arg CompleteIdempotencyKeyParams) (int64, error)
 	CountCommentsByThreadID(ctx context.Context, threadID int64) (int64, error)
+	// 同じ IP からの直近の件数を数える (ADR 0008 決定 4 のレート制限)。
+	//
+	// 【なぜ専用のカウンタストアを置かないか】
+	// **アプリのメモリで数えると、複数インスタンスでは効かない。**
+	// ECS のタスクが N 個あれば実質 N 倍まで通る。閲覧数バッファ (ADR 0006) と
+	// 同じ構造の問題だが、閲覧数は多少ずれてよいのに対し
+	// **レート制限はずれると意味を失う**。
+	//
+	// 問い合わせは 1 日数十件を想定しているので、
+	// **contact_messages をそのまま数えれば足りる。**
+	// contact_rate_limit_idx (client_ip, created_at) で引く。
+	//
+	// **この方法が成立するのは問い合わせだからで、コメント投稿には使えない。**
+	// 毎リクエストで集計クエリを走らせることになる。その段階になったら
+	// WAF のレート制限ルールか Redis での集計を使う。
+	//
+	// **client_ip が NULL の行は数に入らない。** 等値比較は NULL に一致しない
+	// ため、消し込み済みの古い行は自動的に対象外になる。
+	// 窓 (既定 1 時間) より古い行しか消し込まないので、実害は無い。
+	CountRecentContacts(ctx context.Context, arg CountRecentContactsParams) (int64, error)
 	// 採番と挿入を 1 文で行う。unique モード専用 (ADR 0019 決定 2)。
 	//
 	// **1 文にしても競合は消えない。** 集約はスナップショットから計算されるため、
@@ -118,6 +177,28 @@ type Querier interface {
 	// 投稿者の解決は 1 往復に含める。RETURNING は挿入行しか返せないので
 	// CTE で包んで LEFT JOIN する (threads.sql の CreateThread と同じ理由)。
 	CreateCommentWithSeq(ctx context.Context, arg CreateCommentWithSeqParams) (CreateCommentWithSeqRow, error)
+	// =============================================================================
+	// 問い合わせ (docs/adr/0008-contact-and-mail.md)
+	//
+	// 【このファイルは 2 種類のクエリに割れている】
+	//   受付側  リクエストの中で走る。CreateContactMessage と CountRecentContacts
+	//   送信側  定期処理の中で走る。Claim... 以降
+	//
+	// 分かれているのが決定 1 (保存と送信を分ける) そのものになる。
+	// 受付側は外部サービスに触らないので、メールプロバイダが落ちていても
+	// 問い合わせは受け取れる。
+	// =============================================================================
+	// 問い合わせを 1 件保存する。**この時点ではまだ送っていない。**
+	//
+	// status は既定の 'pending'、next_attempt_at は既定の now() に任せる。
+	// 明示的に渡さないのは、**「受け付けたらすぐ送信対象になる」が既定である
+	// ことをスキーマ側に持たせる**ため。ここで時刻を計算すると、
+	// アプリの時計と DB の時計のずれが送信の遅延として出る。
+	//
+	// **id を返すが、外には出さない。** ログ (contact_id) と
+	// 送信側の追跡に使う内部の識別子で、応答には含めない
+	// (ADR 0003 未決 #11 / OpenAPI の ContactAccepted を参照)。
+	CreateContactMessage(ctx context.Context, arg CreateContactMessageParams) (CreateContactMessageRow, error)
 	// =============================================================================
 	// モデレーション (docs/adr/0011-moderation.md)
 	//
@@ -238,6 +319,14 @@ type Querier interface {
 	// 「全端末からログアウト」。パスワード変更に相当する操作や、
 	// 権限剥奪の直後に呼ぶ。sessions (user_id) の索引で引く。
 	DeleteSessionsByUserID(ctx context.Context, userID int64) (int64, error)
+	// 試行回数の上限を超えた行を打ち切る (ADR 0008 決定 1)。
+	//
+	// **無限にリトライしない。** 送信できないメールが延々とプロバイダを
+	// 叩き続けることになり、まともなメールの送達にも響く。
+	//
+	// 行は消さない。「受け付けたが送れなかった問い合わせ」が残らないと、
+	// 運用が手で拾い直すこともできなくなる。
+	FailContact(ctx context.Context, arg FailContactParams) (int64, error)
 	// 既に積まれている通報を読む。**重複通報のときだけ呼ぶ。**
 	//
 	// CreateReport が 0 行だったあとに引くので、必ず 1 行見つかる想定。
@@ -602,6 +691,17 @@ type Querier interface {
 	// SSI (SERIALIZABLE) を使うならこの明示ロックは不要だが、
 	// 悲観ロック版と楽観 (SSI) 版のスループット差を計測するために両方用意している。
 	LockThreadForUpdate(ctx context.Context, id int64) (int64, error)
+	// 送信できた行を確定する。
+	//
+	// **status = 'pending' を条件に含める。** 含めないと、リース切れで
+	// 2 つのワーカーが同じ行を送ったときに、後から来たほうが
+	// sent_at を上書きして「いつ送ったか」がずれる。
+	//
+	// last_error を消すのは、前回の失敗理由が残っていると
+	// 「送信済みなのにエラーが出ている行」に見えるため。
+	//
+	// CHECK 制約 contact_sent_complete が status と sent_at の対応を要求する。
+	MarkContactSent(ctx context.Context, id int64) (int64, error)
 	// モデレーターが画像を削除する (ADR 0011 決定 5)。
 	//
 	// **status を書き替えるだけで、行も S3 のオブジェクトも消さない。**
@@ -668,6 +768,20 @@ type Querier interface {
 	// ::int で明示的にキャストしているのは、COALESCE(MAX(...), 0) + 1 の
 	// 型推論が sqlc 側で interface{} に落ちるのを避けるため。
 	NextCommentSeq(ctx context.Context, threadID int64) (int32, error)
+	// 最も古い未送信の問い合わせの受付時刻。**メトリクス用。**
+	//
+	// ADR 0008 の「引き受けるコスト」が挙げているのがこれになる ——
+	// ワーカーが止まっていることに気づく仕組みが無いと、
+	// **問い合わせが静かに溜まり続ける**。送信が回っていれば
+	// この値は常に数分以内で、止まると単調に古くなる。
+	//
+	// 0 行なら未送信が無い (= 正常)。
+	//
+	// **created_at で並べる。** contact_pending_idx は
+	// (next_attempt_at, id) なので並べ替えが要るが、pending の集合は
+	// 送信が追いついていれば常に小さい。止まっているときは大きくなるが、
+	// そのときは既に検知したい状態そのものなので、遅くて構わない。
+	OldestPendingContact(ctx context.Context) (time.Time, error)
 	// 最初の管理者を作る唯一の経路 (ADR 0011 決定 1「最初の管理者をどう作るか」)。
 	//
 	// **UI からは作れない。** 「最初の 1 人」を作る機能は、そのまま
@@ -683,6 +797,16 @@ type Querier interface {
 	// 毎ログインで UPDATE を撃つと、更新日時だけが動いて監査の邪魔になる。
 	// 該当が無ければ 0 行が返るので、呼び出し側は「昇格したか」を判定できる。
 	PromoteToAdmin(ctx context.Context, googleSub string) (User, error)
+	// 送信に失敗した行を、次の試行へ回す。
+	//
+	// **attempt_count はここで増やさない** —— 確保 (ClaimPendingContacts) が
+	// 既に増やしている。両方で増やすと、1 回の失敗で 2 回ぶん減る。
+	//
+	// next_attempt_at はリース (確保時に置いた仮の時刻) を、
+	// 指数バックオフで計算し直した時刻で上書きする。
+	// 待ち時間を DB に持つので、**プロセスが落ちても待ちは失われない**
+	// (Phase 2 のプロセス内リトライとの違い)。
+	RescheduleContact(ctx context.Context, arg RescheduleContactParams) (int64, error)
 	// 通報を処理済みにする。
 	//
 	// **status = 'open' を条件に含める。** 含めないと、
@@ -699,6 +823,24 @@ type Querier interface {
 	// 「通報を却下する」と「投稿を消す」は別の判断であり、
 	// まとめるとキューを片付ける操作がそのまま削除になる。
 	ResolveReport(ctx context.Context, arg ResolveReportParams) (ResolveReportRow, error)
+	// 古い行から client_ip を消す。
+	//
+	// **個人データを無期限に持たない** (ADR 0008「client_ip は個人データに
+	// あたるため、無期限には保持しない」)。保持期間はログ (ADR 0010 決定 6 の
+	// 400 日) と揃える —— 同じ IP がログ側にも出ているので、
+	// 片方だけ短くしても消えたことにならない。
+	//
+	// **行は消さない。** 消すと問い合わせの記録そのものが消える。
+	// 消すのは列の値だけで、レート制限は窓 (既定 1 時間) の中でしか
+	// 数えないため、古い行の値が無くても影響しない。
+	//
+	// 一度に更新する件数を制限しているのは、期限切れキーの削除と同じ理由。
+	// 呼び出し側は「0 行になるまで繰り返す」形で使う。
+	//
+	// contact_ip_scrub_idx (created_at) WHERE client_ip IS NOT NULL で引く。
+	// 述語に client_ip IS NOT NULL が入っているので、
+	// **消し込みが進むほど索引が小さくなる。**
+	ScrubContactClientIPs(ctx context.Context, arg ScrubContactClientIPsParams) (int64, error)
 	// タイトルの中間一致でスレッドを絞り込む (Phase 11 / ADR 0012)。
 	//
 	// 【なぜ ListThreadsWithCommentCount と 1 本にまとめないか】

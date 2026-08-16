@@ -41,6 +41,8 @@ export type ReportTargetType = Schemas['ReportTargetType'];
 export type Thread = Schemas['Thread'];
 export type ModerationAction = Schemas['ModerationAction'];
 export type ModerationDeleteAction = Schemas['ModerationDeleteAction'];
+export type CreateContactRequest = Schemas['CreateContactRequest'];
+export type ContactAccepted = Schemas['ContactAccepted'];
 
 /** エラーの機械可読な種別。**文言ではなくこの値で分岐します。** */
 export type ErrorCode = Schemas['Error']['error']['code'];
@@ -221,6 +223,22 @@ export function createModerationAction(body: {
   reason?: string;
 }): Promise<ModerationAction> {
   return request<ModerationAction>('/moderation/actions', jsonBody('POST', body));
+}
+
+/**
+ * 問い合わせを送ります。**ログインは不要です。**
+ *
+ * 返る `202` は**受理であって送信完了ではありません**
+ * (docs/adr/0008-contact-and-mail.md 決定 1)。メールは定期処理が
+ * 後から送るので、画面の文言も「受け付けました」に留めてください ——
+ * 「送信しました」と書くと、送信が失敗しても利用者は成功したと思ったままになります。
+ *
+ * **`website` は honeypot です。** 呼び出し側は空文字を送ってください。
+ * 値が入っていると API 側で破棄されますが、応答は成功と同じです
+ * (エラーにするとボットに引き金を教えることになるため)。
+ */
+export function submitContact(body: CreateContactRequest): Promise<ContactAccepted> {
+  return request<ContactAccepted>('/contact', jsonBody('POST', body));
 }
 
 /**

@@ -14,6 +14,7 @@ import (
 
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/config"
+	contactusecase "develop-experiments/apps/go-api/internal/contact/usecase"
 	"develop-experiments/apps/go-api/internal/httpapi/oapigen"
 	imageusecase "develop-experiments/apps/go-api/internal/image/usecase"
 	moderationusecase "develop-experiments/apps/go-api/internal/moderation/usecase"
@@ -51,6 +52,15 @@ type Server struct {
 	moderation *moderationusecase.Interactor
 	// reports も**必ず存在します**。moderation と同じく DB だけで動きます。
 	reports *moderationusecase.ReportInteractor
+	// contact は問い合わせの**受付**です。**必ず存在します。**
+	//
+	// **メールの設定に依存させません** (docs/adr/0008-contact-and-mail.md 決定 1)。
+	// 受付は DB に書くだけで、送信は定期処理が後から行います。
+	// 設定が無いときに 503 を返す形にすると、**その間に来た問い合わせが
+	// 失われます** —— 画像やログインと違い、利用者はもう一度送りに
+	// 来てくれません。送信できない状態は「未送信が溜まる」として
+	// 観測されます (Dispatcher.observePending)。
+	contact *contactusecase.Interactor
 	// viewCounts は閲覧数の計上です。**必ず存在します**
 	// (docs/adr/0006-view-count-and-popularity.md)。
 	//
@@ -83,6 +93,7 @@ func NewServer(
 	images *imageusecase.ImageInteractor,
 	moderation *moderationusecase.Interactor,
 	reports *moderationusecase.ReportInteractor,
+	contact *contactusecase.Interactor,
 	viewCounts viewcount.Recorder,
 	authCfg config.AuthConfig,
 ) *Server {
@@ -98,6 +109,11 @@ func NewServer(
 	if reports == nil {
 		panic("httpapi: moderation.ReportInteractor は必須です (nil だと通報の経路が落ちます)")
 	}
+	// **メールの設定とは無関係に必須です。** 受付は DB だけで完結し、
+	// ここが nil だと問い合わせを受け取れません (contact フィールドの説明を参照)。
+	if contact == nil {
+		panic("httpapi: contact.Interactor は必須です (nil だと問い合わせを受け取れません)")
+	}
 	// **数えないことは失敗として見えません。** 結線漏れを起動時に落とす。
 	if viewCounts == nil {
 		panic("httpapi: viewcount.Recorder は必須です (nil だと閲覧数が一切増えません)")
@@ -111,6 +127,7 @@ func NewServer(
 		images:     images,
 		moderation: moderation,
 		reports:    reports,
+		contact:    contact,
 		viewCounts: viewCounts,
 		authCfg:    authCfg,
 	}

@@ -81,6 +81,20 @@ func respondError(c *gin.Context, err error) {
 	case errors.Is(err, apperr.ErrFailedPrecondition):
 		c.JSON(http.StatusUnprocessableEntity, newErrorBody(oapigen.FAILEDPRECONDITION, err.Error()))
 
+	// 429。**err.Error() を返さない。**
+	//
+	// 上限と窓をそのまま返すと、「何件までなら通るか」を教えることになる。
+	// 弾かれた側に必要なのは「時間をおけば通る」ことだけで、
+	// 境界の値は攻撃側にとってだけ有用な情報になる
+	// (403 を固定文言にしているのと同じ考え方)。
+	//
+	// **Retry-After も付けない。** 移動窓なので正確な待ち時間を出すには
+	// 集計クエリがもう 1 本要り、弾いた要求のために DB を叩くことになる
+	// (仕様書の TooManyRequests の説明を参照)。
+	case errors.Is(err, apperr.ErrResourceExhausted):
+		c.JSON(http.StatusTooManyRequests, newErrorBody(oapigen.RESOURCEEXHAUSTED,
+			"要求が多すぎます。時間をおいて試してください"))
+
 	case errors.Is(err, apperr.ErrConflict):
 		c.JSON(http.StatusConflict, newErrorBody(oapigen.CONFLICT,
 			"同時更新が競合しました。時間をおいて再試行してください"))

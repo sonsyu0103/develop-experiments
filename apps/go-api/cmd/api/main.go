@@ -16,8 +16,10 @@ import (
 
 	commentusecase "develop-experiments/apps/go-api/internal/comment/usecase"
 	"develop-experiments/apps/go-api/internal/config"
+	contactusecase "develop-experiments/apps/go-api/internal/contact/usecase"
 	"develop-experiments/apps/go-api/internal/httpapi"
 	imageusecase "develop-experiments/apps/go-api/internal/image/usecase"
+	"develop-experiments/apps/go-api/internal/infrastructure/mail"
 	"develop-experiments/apps/go-api/internal/infrastructure/objectstorage"
 	oidcprovider "develop-experiments/apps/go-api/internal/infrastructure/oidc"
 	"develop-experiments/apps/go-api/internal/infrastructure/postgres"
@@ -162,6 +164,16 @@ func run() error {
 	// (未設定なら /me の avatarUrl は Google のものだけになる)。
 	sessionInteractor := userusecase.NewSessionInteractor(sessionRepo, sessionImageResolver)
 
+	// 問い合わせの受付 (docs/adr/0008-contact-and-mail.md)。
+	//
+	// **メールの設定で分岐させない。** 受付は DB に書くだけで完結し、
+	// 送信は下の定期処理が後から追いつく (決定 1)。設定が無い環境で
+	// 503 を返す形にすると、**その間に来た問い合わせが失われる** ——
+	// ログインや画像と違い、利用者はもう一度送りに来てくれない。
+	contactRepo := postgres.NewContactRepository(pool)
+	contactInteractor := contactusecase.NewInteractor(contactRepo,
+		contactusecase.WithRateLimit(cfg.Contact.RateLimitWindow, cfg.Contact.RateLimitMax))
+
 	server := httpapi.NewServer(
 		threadusecase.NewThreadInteractor(threadRepo, threadImageResolver),
 		commentusecase.NewCommentInteractor(
@@ -180,6 +192,7 @@ func run() error {
 			repo := postgres.NewReportRepository(pool)
 			return moderationusecase.NewReportInteractor(repo, repo)
 		}(),
+		contactInteractor,
 		viewCounts,
 		cfg.Auth,
 	)
@@ -289,6 +302,64 @@ func run() error {
 			}),
 		})
 	}
+
+	// 問い合わせメールの送信 (docs/adr/0008-contact-and-mail.md 決定 1)。
+	//
+	// **設定が揃っているときだけ登録する。** 画像の回収と同じ形で、
+	// 設定が無い環境で回すと毎回 SMTP に届かず ERROR を吐き続ける。
+	//
+	// **受付 (POST /contact) はこの分岐に関係なく動く。** 未送信のまま
+	// 溜まるだけで、設定を入れた後の周回で送られる ——
+	// それが「保存と送信を分ける」ことの見返りになる。
+	if cfg.Contact.Mail.Enabled() {
+		sender, senderErr := mail.NewSMTP(cfg.Contact.Mail)
+		if senderErr != nil {
+			return fmt.Errorf("メール送信の初期化に失敗しました: %w", senderErr)
+		}
+		dispatcher := contactusecase.NewDispatcher(contactRepo, sender)
+		if err := dispatcher.Validate(); err != nil {
+			return err
+		}
+
+		jobs = append(jobs, scheduler.Job{
+			Name:     "contact_mail_dispatch",
+			Interval: cfg.Contact.DispatchInterval,
+			// **drain で包む。** 1 周回は batchSize (既定 20) 件までなので、
+			// 溜まっている状態では 1 回の実行で捌ききれない。
+			//
+			// 失敗した行は next_attempt_at が先送りされ、次の周回の
+			// 対象から外れる。**だから止まる** —— プロバイダが落ちていても
+			// 無限ループにはならない。
+			Run: drain("contact_mail_dispatch", func(ctx context.Context) (int64, error) {
+				got, err := dispatcher.Dispatch(ctx)
+				if err != nil {
+					return 0, err
+				}
+				return int64(got.Total()), nil
+			}),
+		})
+		slog.Info("contact_mail_enabled",
+			slog.String("smtp_host", cfg.Contact.Mail.Host),
+			slog.Bool("starttls", cfg.Contact.Mail.StartTLS))
+	} else {
+		// **受付は動く。** 溜まった未送信は設定を入れれば送られる。
+		slog.Warn("contact_mail_disabled")
+	}
+
+	// 送信元 IP の消し込み (ADR 0008「client_ip は個人データにあたるため、
+	// 無期限には保持しない」)。
+	//
+	// **メールの設定とは無関係に回す。** 消し込みは DB だけで完結し、
+	// メールが送れない環境でも個人データは溜まる。
+	// 送信の可否と保持期間の管理を同じ条件に束ねると、
+	// 「SMTP の設定を入れ忘れた環境だけ IP が消えない」ことになる。
+	jobs = append(jobs, scheduler.Job{
+		Name:     "contact_ip_scrub",
+		Interval: 12 * time.Hour,
+		Run: drain("contact_ip_scrub", func(ctx context.Context) (int64, error) {
+			return contactRepo.ScrubClientIPs(ctx, cfg.Contact.IPRetention, 0)
+		}),
+	})
 
 	sched := scheduler.New(jobs...)
 	sched.Start(ctx)

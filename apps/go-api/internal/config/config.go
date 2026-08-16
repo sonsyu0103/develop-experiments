@@ -51,6 +51,86 @@ type Config struct {
 	Storage StorageConfig
 	// ViewCount は閲覧数の計上に関する設定です。
 	ViewCount ViewCountConfig
+	// Contact は問い合わせの受付と送信の設定です。
+	Contact ContactConfig
+}
+
+// ContactConfig は問い合わせに関する設定です
+// (docs/adr/0008-contact-and-mail.md)。
+type ContactConfig struct {
+	// Mail はメール送信の設定です。**揃っていなければ送信だけが止まります**
+	// (受付は動きます。下記 Mail の説明を参照)。
+	Mail MailConfig
+
+	// RateLimitWindow / RateLimitMax はレート制限です (決定 4)。
+	//
+	// **無効にする設定はありません。** 外部に開いた書き込み口なので、
+	// 「無効化できる」形にすると無効なまま運用する余地が生まれます
+	// (閲覧数バッファと同じ判断)。
+	RateLimitWindow time.Duration
+	RateLimitMax    int64
+
+	// DispatchInterval は送信ワーカーを回す間隔です。
+	//
+	// **短くしても速くなりません。** 送信の遅さを決めるのは
+	// SMTP の往復で、ここは「溜まった行に気づく頻度」です。
+	DispatchInterval time.Duration
+
+	// IPRetention は client_ip を保持する期間です。
+	//
+	// **ログの保持期間と揃えます** (ADR 0010 決定 6 の 400 日)。
+	// 同じ IP がログ側にも出ているので、片方だけ短くしても
+	// 「消した」ことになりません。
+	IPRetention time.Duration
+}
+
+// MailConfig はメール送信の設定です。
+//
+// **すべて任意です。** 揃っていない場合、問い合わせの**受付は動き**、
+// 送信ワーカーだけが登録されません (AuthConfig / StorageConfig と同じ形)。
+//
+// **受付だけ動くことに意味があります。** ADR 0008 決定 1 が
+// 「保存が成功した時点で内容は失われない」と決めており、
+// 送信は後から追いつけるためです。設定漏れで 503 を返すと、
+// **その間に来た問い合わせが失われます** —— 画像やログインと違って、
+// 利用者はもう一度送りに来てくれません。
+type MailConfig struct {
+	// Host / Port は SMTP サーバです。ローカルは Mailpit、
+	// 理想構成は Amazon SES を想定します。
+	Host string
+	Port int
+	// Username / Password は SMTP 認証の資格情報です。
+	// **空なら認証しません** (Mailpit は要求しません)。
+	Username string
+	Password string
+	// From は差出人です。**利用者のアドレスは入りません** (決定 3)。
+	From string
+	// To は運営の固定の宛先です。
+	//
+	// **入力されたアドレスへは送りません** (決定 2)。検証されていない
+	// アドレスへ送ると、他人のアドレスを入力するだけで
+	// このシステムを踏み台にできます。
+	To string
+	// StartTLS は STARTTLS を使うかどうかです。
+	//
+	// **既定は false です。** ローカルの Mailpit が平文なためで、
+	// 本番 (SES) では必ず true にします。既定を true にすると
+	// 手元の経路が動かず、「ローカルで確認できない機能」になります。
+	StartTLS bool
+	// Timeout は接続と往復の上限です。
+	//
+	// **上限が要ります。** 送信は定期処理の中で動くので、応答しない
+	// サーバに当たると**シャットダウンの待ち合わせごと止まります。**
+	Timeout time.Duration
+}
+
+// Enabled はメールを送れるだけの設定が揃っているかを返します。
+//
+// **資格情報は判定に含めません。** Mailpit は認証を要求しないため、
+// 必須にすると手元で経路を確認できなくなります
+// (StorageConfig が Endpoint と資格情報を判定に含めないのと同じ理由)。
+func (m MailConfig) Enabled() bool {
+	return m.Host != "" && m.Port > 0 && m.From != "" && m.To != ""
 }
 
 // ViewCountConfig は閲覧数の計上に関する設定です
@@ -386,6 +466,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	contactCfg, err := loadContact()
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		Addr:            stringEnv("ADDR", ":8080"),
 		DatabaseURL:     dsn,
@@ -428,6 +513,83 @@ func Load() (*Config, error) {
 			SecretAccessKey: os.Getenv("S3_SECRET_ACCESS_KEY"),
 			PublicBaseURL:   os.Getenv("S3_PUBLIC_BASE_URL"),
 		},
+		Contact: contactCfg,
+	}, nil
+}
+
+// loadContact は問い合わせの設定を読み取ります。
+//
+// **Load から切り出しています。** 読む環境変数が 10 個近くあり、
+// そのまま並べると Load の中で「どこからどこまでが問い合わせか」が
+// 見えなくなるためです。
+func loadContact() (ContactConfig, error) {
+	// レート制限 (ADR 0008 決定 4)。
+	//
+	// **どちらも 0 を許しません。**
+	//   窓 0 秒   → 数える対象が常に空になり、実質無制限
+	//   上限 0 件 → 誰も送れない
+	// 無効化に見える設定を「うっかり」で作れないようにします。
+	rateWindowSec, err := intEnv("CONTACT_RATE_LIMIT_WINDOW_SECONDS", 3600, 1)
+	if err != nil {
+		return ContactConfig{}, err
+	}
+	rateMax, err := intEnv("CONTACT_RATE_LIMIT_MAX", 5, 1)
+	if err != nil {
+		return ContactConfig{}, err
+	}
+
+	// 送信の間隔。既定 1 分。
+	// **0 を許しません。** 0 だとスケジューラが既定値 (10 分) へ丸めるので、
+	// 「速くするつもりで 0 にしたら、いちばん遅くなった」が起きます
+	// (VIEW_COUNT_FLUSH_SECONDS と同じ理由)。
+	dispatchSec, err := intEnv("CONTACT_DISPATCH_INTERVAL_SECONDS", 60, 1)
+	if err != nil {
+		return ContactConfig{}, err
+	}
+
+	// client_ip の保持日数。既定 400 日 (ADR 0010 決定 6 のログ保持期間)。
+	// **0 を許します** —— 「受け付けた直後の周回で消す」は、
+	// レート制限の窓より短くなるだけで、設定として不正ではありません。
+	// その場合レート制限が効かなくなることは運用の判断になります。
+	ipRetentionDays, err := intEnv("CONTACT_IP_RETENTION_DAYS", 400, 0)
+	if err != nil {
+		return ContactConfig{}, err
+	}
+
+	smtpPort, err := intEnv("MAIL_SMTP_PORT", 1025, 0)
+	if err != nil {
+		return ContactConfig{}, err
+	}
+	mailTimeoutSec, err := intEnv("MAIL_TIMEOUT_SECONDS", 10, 1)
+	if err != nil {
+		return ContactConfig{}, err
+	}
+
+	return ContactConfig{
+		Mail: MailConfig{
+			// **既定値を持たせるのはポートだけです。** ホストや宛先に
+			// 既定を入れると、設定を忘れた本番が Enabled() を満たし、
+			// どこにも届かないメールを送り続けます
+			// (AuthConfig.RedirectURL と同じ理由)。
+			//
+			// 1025 は Mailpit の既定ポートで、SMTP の 25 ではありません ——
+			// 特権ポートを既定にすると、うっかり本物の MTA を叩きます。
+			Host:     os.Getenv("MAIL_SMTP_HOST"),
+			Port:     smtpPort,
+			Username: os.Getenv("MAIL_SMTP_USERNAME"),
+			Password: os.Getenv("MAIL_SMTP_PASSWORD"),
+			// TrimSpace するのは、.env から貼り付けたときの末尾空白で
+			// アドレスの解釈が落ちるのを避けるためです
+			// (BOOTSTRAP_ADMIN_GOOGLE_SUB と同じ)。
+			From:     strings.TrimSpace(os.Getenv("MAIL_FROM")),
+			To:       strings.TrimSpace(os.Getenv("MAIL_TO")),
+			StartTLS: boolEnv("MAIL_SMTP_STARTTLS"),
+			Timeout:  time.Duration(mailTimeoutSec) * time.Second,
+		},
+		RateLimitWindow:  time.Duration(rateWindowSec) * time.Second,
+		RateLimitMax:     int64(rateMax),
+		DispatchInterval: time.Duration(dispatchSec) * time.Second,
+		IPRetention:      time.Duration(ipRetentionDays) * 24 * time.Hour,
 	}, nil
 }
 

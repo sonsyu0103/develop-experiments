@@ -264,6 +264,17 @@ export default async function Page({
       */}
       <AdminLink />
 
+      {/*
+        問い合わせへの導線 (ADR 0008)。**ログインの有無で出し分けない** ——
+        「ログインできない」という問い合わせが来る前提なので、
+        未ログインにこそ見えている必要がある (AdminLink とは逆の判断)。
+      */}
+      <p style={{ margin: '0 0 1rem' }}>
+        <Link href="/contact" style={{ color: '#55f' }}>
+          お問い合わせ
+        </Link>
+      </p>
+
       <SearchForm query={query} />
 
       <SortLinks query={query} sort={sort} />

@@ -360,6 +360,8 @@ func newTestEnv(t *testing.T) *testEnv {
 			// モデレーションは設定に依存しないので、ここでも結線する。
 			moderationusecase.NewInteractor(newFakeModerationRepo()),
 			moderationusecase.NewReportInteractor(newFakeReportRepo(), newFakeReportRepo()),
+			// 問い合わせの受付は設定に依存せず常に結線する (ADR 0008 決定 1)。
+			newTestContactInteractor(),
 			viewcount.New(),
 			config.AuthConfig{}),
 		AllowedOrigins: []string{"http://localhost:3000"},

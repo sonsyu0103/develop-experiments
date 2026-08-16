@@ -209,6 +209,45 @@ services:
       mc mb --ignore-existing local/bbs-logs
       "
 
+  # 問い合わせメールの受け口 (docs/adr/0008-contact-and-mail.md)。
+  #
+  # **本物のメールは 1 通も外へ出ない。** Mailpit は受け取ったメールを
+  # 自分の中に溜めてブラウザで見せるだけで、どこへも転送しない。
+  # 手元で「実際に届いた内容」を目で確認できるようにするために置く ——
+  # ヘッダにユーザー入力が混ざっていないこと (決定 3) は、
+  # 最終的に届いたものを見るのがいちばん確実になる。
+  #
+  # 本番の理想構成は Amazon SES。差分は接続先と資格情報だけで、
+  # アプリ側は MailSender の背後にあるので変わらない。
+  # ただし **SES の初期状態はサンドボックス**で、検証済みアドレス以外へは
+  # 送れない (解除申請が前提。ADR 0008 の「引き受けるコスト」)。
+  mailpit:
+    image: axllent/mailpit:v1.21.8
+    ports:
+      # 1025 が SMTP、8025 が受信箱の画面。
+      # **画面を開けているのが要点。** ここを見ないと、送信が成功したのか
+      # 「成功したことにしただけ」なのか区別がつかない。
+      - "1025:1025"
+      - "8025:8025"
+    environment:
+      # 保存先をメモリだけにする。**溜めたメールは再起動で消える。**
+      # 手元の確認用なので永続化する理由がなく、
+      # 個人データを含む本文をボリュームに残さない側に倒す。
+      MP_MAX_MESSAGES: "500"
+      # 認証なしで受ける (MAIL_SMTP_USERNAME を空にしてあるのと対)。
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    healthcheck:
+      # **/readyz を叩く。** wget があるイメージなので curl は要らない。
+      # go-api が depends_on: service_healthy で待てるようにしておく ——
+      # 待たないと、起動直後の送信だけが必ず失敗する
+      # (失敗してもリトライで届くが、毎回 1 回目が落ちるのは調査の邪魔になる)。
+      test: ["CMD", "wget", "-qO-", "http://localhost:8025/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
   # ログを集約して S3 互換ストレージへ流す (docs/adr/0010-log-pipeline.md)。
   #
   # 本番は ECS の FireLens がサイドカーとして同じ fluent-bit を動かす。
@@ -371,6 +410,27 @@ services:
       # 入れると、API は動くのに <img src> が解決できない。
       # API はこの値をそのまま絶対 URL として返す (ADR 0007 決定 5)。
       S3_PUBLIC_BASE_URL: http://localhost:9000/bbs-images
+      # 問い合わせメール (ADR 0008)。
+      #
+      # **揃っていなければ送信ワーカーだけが登録されない。**
+      # 受付 (POST /contact) は動き続け、未送信として溜まる ——
+      # 画像やログインの「経路ごと 503」とは扱いが違う。
+      # 設定漏れで 503 にすると、その間の問い合わせが失われるため。
+      MAIL_SMTP_HOST: mailpit
+      MAIL_SMTP_PORT: "1025"
+      # **STARTTLS は付けない。** Mailpit は平文で受ける。
+      # 本番 (SES) では MAIL_SMTP_STARTTLS=true と資格情報が要る。
+      MAIL_SMTP_STARTTLS: "false"
+      # 差出人と宛先は**こちら側の固定値**。利用者が入力したアドレスは
+      # ヘッダに入らない (決定 2・決定 3)。
+      MAIL_FROM: no-reply@bbs.example.com
+      MAIL_TO: ops@bbs.example.com
+      # 送信の間隔。**既定 (60 秒) より短くしてある** ——
+      # 手元で確認するときに 1 分待つのは長い。
+      # 本番の既定値を compose に書き写しているわけではない
+      # (COMMENT_POST_MODE のように既定を二重管理しないため、
+      #  ここは「手元だけ短くする」という別の意図で明示している)。
+      CONTACT_DISPATCH_INTERVAL_SECONDS: "10"
     depends_on:
       postgres:
         condition: service_healthy
@@ -378,6 +438,12 @@ services:
         condition: service_completed_successfully
       minio-init:
         condition: service_completed_successfully
+      # メールの受け口も先に立てる (ADR 0008)。
+      # **待たなくても壊れない** —— 送信は失敗してもリトライされる。
+      # それでも待つのは、起動直後の 1 回目だけが必ず失敗する状態が
+      # ログを読むときの雑音になるため。
+      mailpit:
+        condition: service_healthy
       # ログの受け口を先に立てる。**これだけでは足りない** ——
       # 接続するのは docker daemon なので、compose の依存関係とは別の層になる。
       # 取りこぼしを許す設定 (fluentd-async) を下で併用している。

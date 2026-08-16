@@ -91,6 +91,8 @@ func newDeleteEnv(t *testing.T) *deleteEnv {
 			nil,
 			moderationusecase.NewInteractor(newFakeModerationRepo()),
 			moderationusecase.NewReportInteractor(newFakeReportRepo(), newFakeReportRepo()),
+			// 問い合わせの受付は設定に依存せず常に結線する (ADR 0008 決定 1)。
+			newTestContactInteractor(),
 			viewcount.New(),
 			config.AuthConfig{FrontendURL: "http://localhost:3000"}),
 		AllowedOrigins: []string{testOrigin},

@@ -399,6 +399,8 @@ Phase 4 の測定対象に加える。
 | --- | --- | --- |
 | `contact_messages` | `(next_attempt_at, id) WHERE status = 'pending'` | A |
 | | `(client_ip, created_at)` | A |
+| | **`(user_id) WHERE user_id IS NOT NULL`** | A |
+| | **`(created_at) WHERE client_ip IS NOT NULL`** | A |
 | `reports` | `UNIQUE (reporter_id, target_type, target_id)` | A |
 | | `(created_at) WHERE status = 'open'` | A |
 | | **`(target_type, target_id) WHERE status = 'open'`** | A |
@@ -411,6 +413,16 @@ Phase 4 の測定対象に加える。
 一意制約の先頭が `reporter_id` のため
 **「この投稿への通報を全部見る」に使えない**ため。
 モデレーターが投稿を判断するときの主要な経路になる。
+
+> **`contact_messages` の下 2 本は Phase 8 の実装時に足している。**
+> 初版は [ADR 0008](0008-contact-and-mail.md) のスキーマから索引だけを
+> 転記しており、**外部キー (`user_id`) の索引が漏れていた** ——
+> 同じ節の「外部キーには必ず索引を貼る」に反している。
+> 転記は漏れる。`reports.resolved_by` で一度踏んだのと同じ形になる。
+>
+> 4 本目は `client_ip` の消し込み (個人データの保持期間) が拾う行のための
+> もので、**述語に `client_ip IS NOT NULL` を含めると消し込みが進むほど
+> 索引が小さくなる** (`images_reclaimable_idx` と同じ考え方)。
 
 ## マイグレーションの分割
 

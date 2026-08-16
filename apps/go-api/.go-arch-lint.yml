@@ -127,6 +127,18 @@ components:
   moderation-usecase:
     in: internal/moderation/usecase
 
+  # 問い合わせ (docs/adr/0008-contact-and-mail.md)。
+  # **受付と送信が 1 つのモジュールに入る。** 分けたくなるが、
+  # 同じ 1 テーブル (contact_messages) の別の列を触るだけで、
+  # 送信側だけを別のモジュールにすると
+  # 「問い合わせとは何か」の定義が 2 か所に割れる
+  contact-model:
+    in: internal/contact/domain/model
+  contact-repository:
+    in: internal/contact/domain/repository
+  contact-usecase:
+    in: internal/contact/usecase
+
   httpapi:
     in: internal/httpapi
   httpapi-oapigen:
@@ -138,6 +150,11 @@ components:
     in: internal/infrastructure/oidc
   object-storage:
     in: internal/infrastructure/objectstorage
+  # メール送信 (ADR 0008 決定 3)。**SMTP を知ってよいのはここだけ。**
+  # 広く許すと contact モジュールがヘッダを組み立てられるようになり、
+  # 「ユーザー入力はヘッダに入れない」が構造ではなく規律の問題に落ちる
+  mail-sender:
+    in: internal/infrastructure/mail
   postgres-sqlcgen:
     in: internal/infrastructure/postgres/sqlcgen
 
@@ -251,6 +268,30 @@ deps:
       - moderation-model
       - moderation-repository
 
+  # 問い合わせ (docs/adr/0008-contact-and-mail.md)。
+  #
+  # **user モジュールを知らない。** 匿名でも問い合わせできる (決定 4) ため、
+  # 投稿者は「あるかもしれない内部 ID」(*int64) としてだけ運ぶ。
+  # user-model を足すと、匿名を表すために nil のユーザーを扱う羽目になる。
+  #
+  # **canUse が無い。** import するのは apperr (commonComponents) と
+  # 標準ライブラリ (net/mail・net/netip) だけになる
+  contact-repository:
+    mayDependOn:
+      - contact-model
+  contact-usecase:
+    mayDependOn:
+      - contact-model
+      - contact-repository
+
+  # 外側のアダプタ。contact モジュールが定義した MailSender を実装する。
+  # **SMTP を知ってよいのはここだけ** (ADR 0008 のモジュール構成)。
+  # object-storage / oidc-provider と同じ位置づけになる
+  mail-sender:
+    mayDependOn:
+      - contact-repository
+      - shared-config
+
   # 外側のアダプタ。image モジュールが定義した ObjectStorage を実装する。
   # **SDK を知ってよいのはここだけ** (ADR 0007 のモジュール構成)
   object-storage:
@@ -286,6 +327,10 @@ deps:
       # usecase だけでなく model も見る (ロールの判定は user-model 側)
       - moderation-usecase
       - moderation-model
+      # 問い合わせの受付 (ADR 0008)。**送信側 (Dispatcher) は同じ
+      # パッケージにあるが、ハンドラからは呼ばない** ——
+      # 呼べる形にすると、リクエストの中でメールを送る実装が書ける
+      - contact-usecase
       - httpapi-oapigen
       - shared-config
       # 閲覧を数える (ADR 0006)。**ここは DB に触らない** ——
@@ -311,6 +356,9 @@ deps:
       # 4 つのインターフェースを満たす
       - moderation-model
       - moderation-repository
+      # 問い合わせ。**送信ワーカーの確保 (SKIP LOCKED) もここが持つ**
+      - contact-model
+      - contact-repository
       - postgres-sqlcgen
       - shared-config
 

@@ -111,6 +111,14 @@ components:
   moderation-usecase:
     in: internal/moderation/usecase
 
+  # 問い合わせ (docs/adr/0008-contact-and-mail.md)
+  contact-model:
+    in: internal/contact/domain/model
+  contact-repository:
+    in: internal/contact/domain/repository
+  contact-usecase:
+    in: internal/contact/usecase
+
   httpapi:
     in: internal/httpapi
   httpapi-oapigen:
@@ -122,6 +130,9 @@ components:
     in: internal/infrastructure/oidc
   object-storage:
     in: internal/infrastructure/objectstorage
+  # メール送信 (ADR 0008 決定 3)。SMTP を知ってよいのはここだけ
+  mail-sender:
+    in: internal/infrastructure/mail
   postgres-sqlcgen:
     in: internal/infrastructure/postgres/sqlcgen
 
@@ -235,6 +246,29 @@ deps:
       - moderation-model
       - moderation-repository
 
+  # 問い合わせ (docs/adr/0008-contact-and-mail.md)。
+  # **user モジュールを知らない** —— 匿名でも問い合わせできるため、
+  # 投稿者は *int64 としてだけ運ぶ。
+  #
+  # **緩和していない。** 受付も送信もフェイクのリポジトリと
+  # フェイクの MailSender で検査できる (実際にメールを送るテストは書かない)。
+  contact-repository:
+    mayDependOn:
+      - contact-model
+  contact-usecase:
+    mayDependOn:
+      - contact-model
+      - contact-repository
+
+  # 外側のアダプタ。contact が定義した MailSender を実装する。
+  # **テストでもここだけが SMTP を知る。** ただしテストは
+  # メッセージの組み立て (buildMessage) だけを見るので、
+  # 実際に SMTP を話す相手は要らない
+  mail-sender:
+    mayDependOn:
+      - contact-repository
+      - shared-config
+
   # 外側のアダプタ。usecase が定義した Provider を実装する
   # テストでも SDK を知ってよいのはここだけ。
   # 実 MinIO に対する検証をこのパッケージ内で行うため、
@@ -272,6 +306,8 @@ deps:
       # usecase だけでなく model も見る (ロールの判定は user-model 側)
       - moderation-usecase
       - moderation-model
+      # 問い合わせの受付 (ADR 0008)
+      - contact-usecase
       - httpapi-oapigen
       - shared-config
       # 閲覧を数える (ADR 0006)。**ここは DB に触らない**
@@ -297,6 +333,11 @@ deps:
       # モデレーションも同じ。削除のテストは Repository のフェイクを組む。
       # **本体用には足していない** —— ハンドラは usecase の DTO だけを見る
       - moderation-repository
+      # 問い合わせも同じ。受付のテストは ContactRepository のフェイクを組む。
+      # **contact-model も要る** —— Save が受け取る Submission を
+      # フェイク側で検査するため
+      - contact-repository
+      - contact-model
 
   postgres:
     canUse:
@@ -316,6 +357,10 @@ deps:
       # 4 つのインターフェースを満たす
       - moderation-model
       - moderation-repository
+      # 問い合わせ。SKIP LOCKED の検査は実 DB でしかできないため、
+      # このパッケージ内に live テストを置く
+      - contact-model
+      - contact-repository
       - postgres-sqlcgen
       - shared-config
 
