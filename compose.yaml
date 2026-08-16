@@ -5,14 +5,27 @@ services:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: password
       POSTGRES_DB: bbs
-      # ロケールを C に固定する理由:
-      #   - 照合順序が「バイト順」になり、比較のたびに ICU/libc を呼ばなくなるので
+      # 照合順序 (LC_COLLATE) を C に固定する理由:
+      #   - 比較が「バイト順」になり、比較のたびに ICU/libc を呼ばなくなるので
       #     ソートとインデックス走査が速い
       #   - LIKE 'prefix%' が B-Tree インデックスで効くようになる
       #     (C 以外のロケールでは text_pattern_ops を明示する必要がある)
       #   - glibc のバージョン差でインデックスが壊れる事故を避けられる
       # 日本語の「辞書順」ソートが必要になったら、その列だけ COLLATE を指定する。
-      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      #
+      # **文字種判定 (LC_CTYPE) だけは C.UTF-8 にする。** ここを C にすると、
+      # PostgreSQL は「1 バイト = 1 文字」の速い経路に入り、
+      # **日本語の文字が「文字」と判定されなくなる。**
+      # pg_trgm は語をなす文字の並びからトライグラムを切り出すため、
+      # LC_CTYPE=C では日本語のタイトルから 1 つもトライグラムが作られず、
+      # 検索用の GIN インデックスが丸ごと無効になる (ADR 0012 で実測)。
+      #
+      #   LC_CTYPE=C       : show_trgm('検証') = {}
+      #   LC_CTYPE=C.UTF-8 : show_trgm('検証') = {0x0b1253,osW,0x912f90}
+      #
+      # 上に挙げた 3 つの利点はすべて LC_COLLATE 側のものなので、
+      # 分けて指定すれば両立する。
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C.UTF-8"
     command:
       - postgres
       # pg_stat_statements: クエリ単位の実行時間・呼び出し回数を集計する拡張。

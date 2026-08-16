@@ -12,5 +12,15 @@
 --   LIMIT 10;
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
+-- スレッド検索 (ADR 0012)。文字列を 3 文字のトライグラムに分解し、
+-- 中間一致 (LIKE '%語%') に GIN 索引を効かせる。
+-- 索引そのものはマイグレーション 000010 が張る。
+--
+-- **このファイルは初回起動時にしか実行されない。**
+-- Phase 11 より前に作ったボリュームには pg_trgm が入っていないため、
+-- make clean && make up でデータベースを作り直す必要がある
+-- (000010 が拡張の有無を確かめて、その旨のエラーを出す)。
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 -- 注: auto_explain は SQL 拡張ではなく共有ライブラリなので、
 -- ここではなく compose.yaml の shared_preload_libraries で読み込んでいる。

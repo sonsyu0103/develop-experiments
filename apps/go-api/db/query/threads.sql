@@ -89,6 +89,77 @@ LEFT JOIN images img ON img.id = p.icon_image_id
     AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL
 ORDER BY p.id DESC;
 
+-- name: SearchThreadsWithCommentCount :many
+-- タイトルの中間一致でスレッドを絞り込む (Phase 11 / ADR 0012)。
+--
+-- 【なぜ ListThreadsWithCommentCount と 1 本にまとめないか】
+-- 絞り込みの有無をパラメータで分ける書き方だと、こうなる。
+--
+--   WHERE deleted_at IS NULL
+--     AND (sqlc.narg('q')::text IS NULL OR title ILIKE '%' || ... || '%')
+--
+-- **この OR は索引を殺しうる。** 検索語が渡っている実行では
+-- 「NULL かどうか」の分岐が定数に畳まれてほしいが、それが起きるのは
+-- パラメータ値を見て計画を立てたとき (custom plan) だけになる。
+-- PostgreSQL は同じ prepared statement を繰り返し実行すると
+-- 汎用計画 (generic plan) に切り替えることがあり、そうなると
+-- OR の左辺を畳めず、GIN 索引を使えないまま全表走査に落ちる。
+--
+-- **「たまに遅い」がいちばん困る形**なので、クエリを 2 本に割って
+-- 計画を分ける。SELECT 句の重複は承知のうえで、
+-- 索引が使われるかどうかを実行のたびに賭けないほうを採る。
+--
+-- 【なぜ ILIKE か】
+-- pg_trgm の索引はトライグラムを小文字化して持つため、
+-- ILIKE でも索引が効く。ロケールは C だが、日本語には大小の区別がなく
+-- 実質 LIKE と同じ挙動になる。英数字のタイトルだけが恩恵を受ける。
+--
+-- 【ワイルドカードは呼び出し側でエスケープ済み】
+-- title_query には % _ \ をエスケープした文字列が入る。
+-- 生のまま渡すと、利用者が '%' の 1 文字で全件一致を作れる (ADR 0012 の罠)。
+-- エスケープは永続化層の仕事にしてある —— LIKE の構文は
+-- PostgreSQL の都合であって、ドメインが知るべきことではない。
+--
+-- 【並び順は新着順のまま】
+-- 関連度順にしない理由は ADR 0012 決定 3。id DESC のままなら
+-- キーセットページネーションがそのまま使える。
+--
+-- 索引の選び方は planner に任せている。検索語が珍しいほど
+-- GIN (threads_title_trgm_idx) が有利で、ありふれた語ほど
+-- id 順に読んで捨てる threads_alive_id_desc_idx が有利になる。
+WITH page AS (
+    SELECT id, title, created_at, author_id, icon_image_id
+    FROM threads
+    WHERE deleted_at IS NULL
+      AND title ILIKE '%' || sqlc.arg('title_query')::text || '%' ESCAPE '\'
+      AND (sqlc.narg('cursor_id')::bigint IS NULL OR id < sqlc.narg('cursor_id')::bigint)
+    ORDER BY id DESC
+    LIMIT sqlc.arg('page_size')
+)
+SELECT
+    p.id,
+    p.title,
+    p.created_at,
+    (
+        SELECT count(*)
+        FROM comments c
+        WHERE c.thread_id = p.id
+          AND c.deleted_at IS NULL
+    )::bigint AS comment_count,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
+FROM page p
+LEFT JOIN users u ON u.id = p.author_id
+LEFT JOIN images img ON img.id = p.icon_image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL
+ORDER BY p.id DESC;
+
 -- name: GetThreadWithCommentCount :one
 -- 一覧と同じ理由で、JOIN + GROUP BY ではなく相関サブクエリで数える。
 SELECT

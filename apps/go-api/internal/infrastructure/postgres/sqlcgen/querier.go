@@ -618,6 +618,44 @@ type Querier interface {
 	// 「通報を却下する」と「投稿を消す」は別の判断であり、
 	// まとめるとキューを片付ける操作がそのまま削除になる。
 	ResolveReport(ctx context.Context, arg ResolveReportParams) (ResolveReportRow, error)
+	// タイトルの中間一致でスレッドを絞り込む (Phase 11 / ADR 0012)。
+	//
+	// 【なぜ ListThreadsWithCommentCount と 1 本にまとめないか】
+	// 絞り込みの有無をパラメータで分ける書き方だと、こうなる。
+	//
+	//   WHERE deleted_at IS NULL
+	//     AND (sqlc.narg('q')::text IS NULL OR title ILIKE '%' || ... || '%')
+	//
+	// **この OR は索引を殺しうる。** 検索語が渡っている実行では
+	// 「NULL かどうか」の分岐が定数に畳まれてほしいが、それが起きるのは
+	// パラメータ値を見て計画を立てたとき (custom plan) だけになる。
+	// PostgreSQL は同じ prepared statement を繰り返し実行すると
+	// 汎用計画 (generic plan) に切り替えることがあり、そうなると
+	// OR の左辺を畳めず、GIN 索引を使えないまま全表走査に落ちる。
+	//
+	// **「たまに遅い」がいちばん困る形**なので、クエリを 2 本に割って
+	// 計画を分ける。SELECT 句の重複は承知のうえで、
+	// 索引が使われるかどうかを実行のたびに賭けないほうを採る。
+	//
+	// 【なぜ ILIKE か】
+	// pg_trgm の索引はトライグラムを小文字化して持つため、
+	// ILIKE でも索引が効く。ロケールは C だが、日本語には大小の区別がなく
+	// 実質 LIKE と同じ挙動になる。英数字のタイトルだけが恩恵を受ける。
+	//
+	// 【ワイルドカードは呼び出し側でエスケープ済み】
+	// title_query には % _ \ をエスケープした文字列が入る。
+	// 生のまま渡すと、利用者が '%' の 1 文字で全件一致を作れる (ADR 0012 の罠)。
+	// エスケープは永続化層の仕事にしてある —— LIKE の構文は
+	// PostgreSQL の都合であって、ドメインが知るべきことではない。
+	//
+	// 【並び順は新着順のまま】
+	// 関連度順にしない理由は ADR 0012 決定 3。id DESC のままなら
+	// キーセットページネーションがそのまま使える。
+	//
+	// 索引の選び方は planner に任せている。検索語が珍しいほど
+	// GIN (threads_title_trgm_idx) が有利で、ありふれた語ほど
+	// id 順に読んで捨てる threads_alive_id_desc_idx が有利になる。
+	SearchThreadsWithCommentCount(ctx context.Context, arg SearchThreadsWithCommentCountParams) ([]SearchThreadsWithCommentCountRow, error)
 	// プロフィール画像を設定する / 外す (ADR 0007)。
 	//
 	// **所有者の確認はここで行わない。** 画像が自分のものかは

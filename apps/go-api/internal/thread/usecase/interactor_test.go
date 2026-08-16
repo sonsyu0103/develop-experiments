@@ -57,7 +57,7 @@ func TestThreadInteractor_FetchThreadList(t *testing.T) {
 	repo := newFakeRepo(5)
 	uc := NewThreadInteractor(repo, nil)
 
-	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 3))
+	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 3), nil)
 	if err != nil {
 		t.Fatalf("FetchThreadList が失敗した: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestThreadInteractor_FetchThreadList_NoCursorOnLastPage(t *testing.T) {
 
 	uc := NewThreadInteractor(newFakeRepo(2), nil)
 
-	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10))
+	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10), nil)
 	if err != nil {
 		t.Fatalf("FetchThreadList が失敗した: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestThreadInteractor_FetchThreadList_EmptyReturnsNonNilSlice(t *testing.T) 
 
 	uc := NewThreadInteractor(newFakeRepo(0), nil)
 
-	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10))
+	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10), nil)
 	if err != nil {
 		t.Fatalf("FetchThreadList が失敗した: %v", err)
 	}
@@ -124,7 +124,7 @@ func TestThreadInteractor_FetchThreadList_WithCursor(t *testing.T) {
 	uc := NewThreadInteractor(newFakeRepo(5), nil)
 
 	cursor := int64(4)
-	got, err := uc.FetchThreadList(context.Background(), mustPage(t, &cursor, 10))
+	got, err := uc.FetchThreadList(context.Background(), mustPage(t, &cursor, 10), nil)
 	if err != nil {
 		t.Fatalf("FetchThreadList が失敗した: %v", err)
 	}
@@ -144,9 +144,155 @@ func TestThreadInteractor_FetchThreadList_PropagatesRepositoryError(t *testing.T
 	repo := newFakeRepo(3)
 	repo.listErr = sentinel
 
-	_, err := NewThreadInteractor(repo, nil).FetchThreadList(context.Background(), mustPage(t, nil, 10))
+	_, err := NewThreadInteractor(repo, nil).FetchThreadList(context.Background(), mustPage(t, nil, 10), nil)
 	if !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want %v", err, sentinel)
+	}
+}
+
+// searchQuery は検索語を渡すためのヘルパです。
+// **正規化前の生の文字列を渡します** —— ユースケースが
+// model.ParseSearchQuery に委ねる形なので、テストも同じ入口を通ります。
+func searchQuery(s string) *string { return &s }
+
+func TestThreadInteractor_FetchThreadList_Search(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepoWithTitles("PostgreSQL の話", "Go の話", "PostgreSQL と Go")
+	uc := NewThreadInteractor(repo, nil)
+
+	got, err := uc.FetchThreadList(
+		context.Background(), mustPage(t, nil, 10), searchQuery("PostgreSQL"))
+	if err != nil {
+		t.Fatalf("FetchThreadList が失敗した: %v", err)
+	}
+
+	if len(got.Threads) != 2 {
+		t.Fatalf("件数 = %d, want 2 (%+v)", len(got.Threads), got.Threads)
+	}
+	// 絞り込んでも新着順のまま (ADR 0012 決定 3)。
+	if got.Threads[0].ID != 3 || got.Threads[1].ID != 1 {
+		t.Errorf("並び順が想定と違う: %+v", got.Threads)
+	}
+
+	// **絞り込みのない一覧に落ちていないこと。**
+	// 検索語を受け取りながら ListSummaries を呼ぶと、
+	// 全件が返って「検索したのに絞り込まれない」になる。
+	if n := repo.listCalls.Load(); n != 0 {
+		t.Errorf("ListSummaries の呼び出し回数 = %d, want 0 (検索は SearchSummaries を使う)", n)
+	}
+	if len(repo.searchCalls) != 1 || repo.searchCalls[0] != "PostgreSQL" {
+		t.Errorf("永続化層に届いた検索語 = %v, want [PostgreSQL]", repo.searchCalls)
+	}
+}
+
+// **指定なしと空白だけは同じ扱い。** どちらも絞り込まない一覧に落ちます。
+// 空白を落とす前に「nil かどうか」だけで分岐すると、
+// q=" " が「空白 1 文字を含むタイトル」の検索になって 0 件が返ります。
+func TestThreadInteractor_FetchThreadList_BlankQueryFallsBackToList(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		query *string
+	}{
+		{name: "指定なし", query: nil},
+		{name: "空文字", query: searchQuery("")},
+		{name: "半角スペースだけ", query: searchQuery("   ")},
+		{name: "全角スペースだけ", query: searchQuery("　")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			repo := newFakeRepoWithTitles("PostgreSQL の話", "Go の話")
+			uc := NewThreadInteractor(repo, nil)
+
+			got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10), tt.query)
+			if err != nil {
+				t.Fatalf("FetchThreadList が失敗した: %v", err)
+			}
+			if len(got.Threads) != 2 {
+				t.Fatalf("件数 = %d, want 2 (絞り込みなし)", len(got.Threads))
+			}
+			if len(repo.searchCalls) != 0 {
+				t.Errorf("SearchSummaries が呼ばれた: %v, want 呼ばれない", repo.searchCalls)
+			}
+		})
+	}
+}
+
+// 長すぎる検索語は 400 になること。仕様検証ミドルウェアが先に弾きますが、
+// ユースケースを直接呼ぶ経路でも同じ判定になることを見ます。
+func TestThreadInteractor_FetchThreadList_TooLongQuery(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepoWithTitles("Go の話")
+	uc := NewThreadInteractor(repo, nil)
+
+	long := strings.Repeat("あ", model.SearchQueryMaxLength+1)
+	_, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10), &long)
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Errorf("err = %v, want apperr.ErrInvalidArgument", err)
+	}
+	// **弾いたなら DB を引かない。**
+	if len(repo.searchCalls) != 0 {
+		t.Errorf("SearchSummaries が呼ばれた: %v, want 呼ばれない", repo.searchCalls)
+	}
+}
+
+func TestThreadInteractor_FetchThreadList_SearchPagesWithSameCursor(t *testing.T) {
+	t.Parallel()
+
+	// 一致するのは id 1・3・5 の 3 件。size 2 で切って 2 ページに分ける。
+	repo := newFakeRepoWithTitles("Go 入門", "Rust 入門", "Go 中級", "Rust 中級", "Go 上級")
+	uc := NewThreadInteractor(repo, nil)
+
+	first, err := uc.FetchThreadList(
+		context.Background(), mustPage(t, nil, 2), searchQuery("Go"))
+	if err != nil {
+		t.Fatalf("1 ページ目が失敗した: %v", err)
+	}
+	if len(first.Threads) != 2 || first.Threads[0].ID != 5 || first.Threads[1].ID != 3 {
+		t.Fatalf("1 ページ目 = %+v, want id 5, 3", first.Threads)
+	}
+	// **カーソルは検索結果の最後の id を指す。** 絞り込む前の id ではない。
+	wantNextCursor(t, first.NextCursor, 3)
+
+	cursor := int64(3)
+	second, err := uc.FetchThreadList(
+		context.Background(), mustPage(t, &cursor, 2), searchQuery("Go"))
+	if err != nil {
+		t.Fatalf("2 ページ目が失敗した: %v", err)
+	}
+	if len(second.Threads) != 1 || second.Threads[0].ID != 1 {
+		t.Fatalf("2 ページ目 = %+v, want id 1 のみ", second.Threads)
+	}
+	if second.NextCursor != nil {
+		t.Errorf("NextCursor = %v, want nil (最終ページ)", *second.NextCursor)
+	}
+}
+
+func TestThreadInteractor_FetchThreadList_SearchNoHit(t *testing.T) {
+	t.Parallel()
+
+	uc := NewThreadInteractor(newFakeRepoWithTitles("Go の話"), nil)
+
+	got, err := uc.FetchThreadList(
+		context.Background(), mustPage(t, nil, 10), searchQuery("見つからない語"))
+	if err != nil {
+		t.Fatalf("FetchThreadList が失敗した: %v", err)
+	}
+	// 一覧と同じく、0 件でも nil スライスにしない (JSON が null になる)。
+	if got.Threads == nil {
+		t.Error("Threads = nil, want 空スライス")
+	}
+	if len(got.Threads) != 0 {
+		t.Errorf("件数 = %d, want 0", len(got.Threads))
+	}
+	if got.NextCursor != nil {
+		t.Errorf("NextCursor = %v, want nil", *got.NextCursor)
 	}
 }
 
