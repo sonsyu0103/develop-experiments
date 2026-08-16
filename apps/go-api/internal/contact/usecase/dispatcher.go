@@ -20,8 +20,11 @@ const (
 	// 送信できないメールが延々とプロバイダを叩き続けると、
 	// まともなメールの送達にも響きます。
 	//
-	// 8 回・基準 1 分の指数バックオフだと、打ち切りまでおよそ 2 時間強に
-	// なります。プロバイダの一時的な障害はその中に収まり、
+	// 8 回・基準 1 分の指数バックオフで、上限 30 分の頭打ちを含めると
+	// 打ち切りまで **1+2+4+8+16+30+30 = 91 分**になります
+	// (初版のコメントは「2 時間強」と書いていましたが、
+	//  頭打ちを勘定に入れていませんでした。レビュー指摘)。
+	// プロバイダの一時的な障害はその中に収まり、
 	// 収まらない障害は人が気づくべき事象になります。
 	DefaultMaxAttempts int32 = 8
 
@@ -311,6 +314,16 @@ func (d *Dispatcher) backoff(attempt int32) time.Duration {
 // 失敗しても Dispatch は成功のままにします。観測のために
 // 送信そのものを失敗扱いにする理由がありません。
 func (d *Dispatcher) observePending(ctx context.Context) {
+	// **中断されていたら測りません** (レビュー指摘)。
+	//
+	// 上のループは isDone で抜けるので、そのまま測ると
+	// `context canceled` で必ず失敗し、**デプロイのたびに WARN が出ます。**
+	// スケジューラが「シャットダウン由来の失敗を ERROR にしない」
+	// (scheduler.go の run) と決めているのと同じ理由で、ここでも黙ります。
+	if isDone(ctx) {
+		return
+	}
+
 	oldest, ok, err := d.repo.OldestPending(ctx)
 	if err != nil {
 		slog.WarnContext(ctx, "contact_pending_probe_failed", slog.String("error", err.Error()))

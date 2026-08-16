@@ -14,10 +14,7 @@ import (
 )
 
 const claimPendingContacts = `-- name: ClaimPendingContacts :many
-UPDATE contact_messages
-SET attempt_count   = attempt_count + 1,
-    next_attempt_at = now() + $1::interval
-WHERE id IN (
+WITH claimed AS (
     SELECT id FROM contact_messages
     WHERE status = 'pending'
       AND next_attempt_at <= now()
@@ -25,7 +22,14 @@ WHERE id IN (
     FOR UPDATE SKIP LOCKED
     LIMIT $2
 )
-RETURNING id, user_id, name, email, subject, body, attempt_count, created_at
+UPDATE contact_messages
+SET attempt_count   = attempt_count + 1,
+    next_attempt_at = now() + $1::interval
+FROM claimed
+WHERE contact_messages.id = claimed.id
+RETURNING contact_messages.id, contact_messages.user_id, contact_messages.name,
+          contact_messages.email, contact_messages.subject, contact_messages.body,
+          contact_messages.attempt_count, contact_messages.created_at
 `
 
 type ClaimPendingContactsParams struct {
@@ -83,6 +87,32 @@ type ClaimPendingContactsRow struct {
 // contact_pending_idx が (next_attempt_at, id) WHERE status = 'pending' なので、
 // 同じ並びにすると索引をそのまま辿れる。id を第 2 キーに置くのは
 // next_attempt_at が一意でないため。
+//
+// 【CTE にしている理由 —— IN (SELECT ... LIMIT n) では件数を絞れない】
+// 初版は `WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED LIMIT $2)` と
+// 書いていた。**LIMIT が効かず、pending の全件を確保していた** (実測)。
+//
+//	Update on contact_messages (rows=4)
+//	  -> Nested Loop Semi Join (rows=4)
+//	       -> Seq Scan on contact_messages (rows=4)
+//	       -> Subquery Scan (rows=1, loops=4)   ← **外側の行ごとに再実行**
+//	            -> Limit (rows=1, loops=4)
+//
+// プランナが半結合に展開すると、副問い合わせは外側の行ごとに評価される。
+// LIMIT は「1 回の評価あたり」にしか効かないので、
+// **4 行あれば 4 行とも確保される。**
+//
+// 実害は 2 つ:
+//   - バッチサイズ (既定 20) が意味を失い、溜まっていれば全件を
+//     1 周回で送ろうとする。SMTP の往復が入るので、
+//     シャットダウンの待ち合わせがそのぶん伸びる
+//   - 全件を同時にリースするため、途中でプロセスが落ちると
+//     リース切れまで**大量の行が止まる**
+//
+// CTE にすると 1 回だけ評価される。**FOR UPDATE を含む CTE は
+// インライン展開されない** (ロックという副作用を持つため) ので、
+// ここは実装依存ではなく規定の挙動になる。
+// ジョブキューを DB で作るときの定石として知られた形でもある。
 func (q *Queries) ClaimPendingContacts(ctx context.Context, arg ClaimPendingContactsParams) ([]ClaimPendingContactsRow, error) {
 	rows, err := q.db.Query(ctx, claimPendingContacts, arg.Lease, arg.BatchSize)
 	if err != nil {
@@ -320,15 +350,17 @@ func (q *Queries) RescheduleContact(ctx context.Context, arg RescheduleContactPa
 }
 
 const scrubContactClientIPs = `-- name: ScrubContactClientIPs :execrows
-UPDATE contact_messages
-SET client_ip = NULL
-WHERE id IN (
+WITH target AS (
     SELECT id FROM contact_messages
     WHERE client_ip IS NOT NULL
       AND created_at <= now() - $1::interval
     ORDER BY created_at
     LIMIT $2
 )
+UPDATE contact_messages
+SET client_ip = NULL
+FROM target
+WHERE contact_messages.id = target.id
 `
 
 type ScrubContactClientIPsParams struct {
@@ -353,6 +385,12 @@ type ScrubContactClientIPsParams struct {
 // contact_ip_scrub_idx (created_at) WHERE client_ip IS NOT NULL で引く。
 // 述語に client_ip IS NOT NULL が入っているので、
 // **消し込みが進むほど索引が小さくなる。**
+//
+// **こちらも CTE にしてある** (ClaimPendingContacts と同じ理由)。
+// 実測した時点のプランは Hash Semi Join (loops=1) で LIMIT は効いていたが、
+// **それは統計次第で変わる。** 確保のほうは同じ書き方で
+// Nested Loop Semi Join になり、件数の上限が丸ごと無効になっていた。
+// 「1 周回で扱う件数」を**プランの選択に委ねない**形に揃える。
 func (q *Queries) ScrubContactClientIPs(ctx context.Context, arg ScrubContactClientIPsParams) (int64, error) {
 	result, err := q.db.Exec(ctx, scrubContactClientIPs, arg.Retention, arg.MaxRows)
 	if err != nil {

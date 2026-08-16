@@ -51,14 +51,92 @@ func insertContact(t *testing.T, pool *pgxpool.Pool, subject string) int64 {
 	return id
 }
 
-// **同時に確保しても、同じ行が 2 つのワーカーに配られないこと。**
+// **ロック中の行を、待たずに飛ばすこと。**
 //
-// ADR 0008 決定 1 の「複数インスタンスでの二重送信を防ぐ」がこれです。
-// SKIP LOCKED が無いと、後続の確保はロック解放を待ち、
-// 待った先で処理済みの行を読みます。
+// ADR 0008 決定 1 の「複数インスタンスでの二重送信を防ぐ」の本体です。
+//
+// 【初版はこれを検査できていませんでした】(レビュー指摘)
+// 確保を 2 回**続けて**呼んでいたので、2 回目が走る時点で 1 回目は
+// 既にコミット済みでした。**ロックされた行が 1 つも無い状態**なので
+// SKIP LOCKED に到達せず、実際に見ていたのはリースの効果だけです ——
+// クエリから SKIP LOCKED を消しても緑のままでした。
+//
+// そこで**別のトランザクションで明示的に行ロックを取ってから**確保します。
+// SKIP LOCKED が無ければ、この確保はロックの解放まで**待ち**、
+// 締め切り (下の 5 秒) に当たって失敗します。
 func TestContactRepository_ClaimSkipsLocked_Live(t *testing.T) {
 	pool := liveDB(t)
 	const subject = "live-contact-skip-locked"
+	cleanupContacts(t, pool, subject)
+
+	locked := insertContact(t, pool, subject)
+	others := map[int64]bool{
+		insertContact(t, pool, subject): true,
+		insertContact(t, pool, subject): true,
+	}
+
+	// **別の接続で行ロックを取り、保持したままにします。**
+	tx, err := pool.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("トランザクションを開始できない: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	if _, lockErr := tx.Exec(t.Context(),
+		`SELECT id FROM contact_messages WHERE id = $1 FOR UPDATE`, locked); lockErr != nil {
+		t.Fatalf("行ロックを取れない: %v", lockErr)
+	}
+
+	// **締め切りを付けるのが要点。** SKIP LOCKED が無ければここで待たされ、
+	// 5 秒後に context deadline exceeded になります。
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+
+	repo := NewContactRepository(pool)
+	claimed, err := repo.ClaimPending(ctx, 5*time.Minute, 10)
+	if err != nil {
+		t.Fatalf("ロック中の行を待ってしまった (SKIP LOCKED が効いていない): %v", err)
+	}
+
+	if len(claimed) != len(others) {
+		t.Fatalf("確保できた件数 = %d, want %d", len(claimed), len(others))
+	}
+	for _, m := range claimed {
+		if m.ID == locked {
+			t.Error("ロック中の行が配られた")
+		}
+		if !others[m.ID] {
+			t.Errorf("知らない行が返った: id = %d", m.ID)
+		}
+		// **確保の時点で attempt_count が増えていること。**
+		// 増やさないと、クラッシュを繰り返す行が上限に達せず居座ります。
+		if m.AttemptCount != 1 {
+			t.Errorf("attempt_count = %d, want 1", m.AttemptCount)
+		}
+	}
+
+	// **飛ばされただけで、消えてはいないこと。**
+	// ロックを解けば、次の周回で拾われます。
+	if rollbackErr := tx.Rollback(t.Context()); rollbackErr != nil {
+		t.Fatalf("ロックを解けない: %v", rollbackErr)
+	}
+	after, err := repo.ClaimPending(t.Context(), 5*time.Minute, 10)
+	if err != nil {
+		t.Fatalf("確保に失敗: %v", err)
+	}
+	if len(after) != 1 || after[0].ID != locked {
+		t.Errorf("飛ばした行が拾い直されていない: %+v", after)
+	}
+}
+
+// **確保した行はリースのあいだ他から見えないこと。**
+//
+// SKIP LOCKED とは別の仕組みです。確保は 1 文で終わってコミットするので、
+// **送信中の行を隠しているのはロックではなく next_attempt_at の先送り**に
+// なります。これが効いていないと、送信中の行を次の周回が拾い直します。
+func TestContactRepository_ClaimLeases_Live(t *testing.T) {
+	pool := liveDB(t)
+	const subject = "live-contact-lease"
 	cleanupContacts(t, pool, subject)
 
 	want := map[int64]bool{}
@@ -68,8 +146,6 @@ func TestContactRepository_ClaimSkipsLocked_Live(t *testing.T) {
 
 	repo := NewContactRepository(pool)
 
-	// **2 回続けて確保する。** 1 回目で確保した行は next_attempt_at が
-	// リースぶん先送りされるので、2 回目には現れない。
 	first, err := repo.ClaimPending(t.Context(), 5*time.Minute, 2)
 	if err != nil {
 		t.Fatalf("1 回目の確保に失敗: %v", err)
@@ -78,7 +154,6 @@ func TestContactRepository_ClaimSkipsLocked_Live(t *testing.T) {
 	if err != nil {
 		t.Fatalf("2 回目の確保に失敗: %v", err)
 	}
-
 	if len(first) != 2 || len(second) != 2 {
 		t.Fatalf("確保できた件数 = %d, %d (want 2, 2)", len(first), len(second))
 	}
@@ -92,15 +167,9 @@ func TestContactRepository_ClaimSkipsLocked_Live(t *testing.T) {
 		if !want[m.ID] {
 			t.Errorf("知らない行が返った: id = %d", m.ID)
 		}
-		// **確保の時点で attempt_count が増えていること。**
-		// 増やさないと、クラッシュを繰り返す行が上限に達せず居座ります。
-		if m.AttemptCount != 1 {
-			t.Errorf("attempt_count = %d, want 1", m.AttemptCount)
-		}
 	}
 
-	// **3 回目は空。** 4 件すべてがリース中なので、
-	// 他のインスタンスから見えなくなっている。
+	// **3 回目は空。** 4 件すべてがリース中になっている。
 	third, err := repo.ClaimPending(t.Context(), 5*time.Minute, 10)
 	if err != nil {
 		t.Fatalf("3 回目の確保に失敗: %v", err)

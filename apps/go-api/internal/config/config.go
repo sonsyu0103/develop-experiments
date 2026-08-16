@@ -24,6 +24,19 @@ type Config struct {
 	ShutdownTimeout time.Duration
 	// AllowedOrigins は CORS で許可するオリジンの一覧です。
 	AllowedOrigins []string
+	// TrustedProxies は X-Forwarded-For を信じてよい送信元 (CIDR / IP) です。
+	//
+	// **既定は空 = 誰も信じません。** gin の既定はその逆
+	// (すべてを信頼するプロキシとみなす) で、そのままだと
+	// **X-Forwarded-For に書いた値がそのまま ClientIP になります** ——
+	// レート制限 (docs/adr/0008-contact-and-mail.md 決定 4) を
+	// ヘッダ 1 本で回避でき、他人の IP を名乗って締め出すこともできます。
+	//
+	// ALB や CloudFront の背後に置く構成では、その経路の CIDR を
+	// TRUSTED_PROXIES に列挙してください。設定を忘れた環境が
+	// 偽装を受け入れるより、**接続元アドレスだけを見て精度が落ちる**ほうが
+	// 安全側になります (SecureCookie と同じ判断)。
+	TrustedProxies []string
 	// Debug は開発モードかどうかです。gin のモード切り替えに使います。
 	//
 	// ENV=development のときだけ true になります。
@@ -478,6 +491,8 @@ func Load() (*Config, error) {
 		MinConns:        minConns,
 		ShutdownTimeout: time.Duration(shutdownSec) * time.Second,
 		AllowedOrigins:  csvEnv("CORS_ALLOWED_ORIGINS", []string{"http://localhost:3000"}),
+		// **既定を空にする。** 誰も信じない側が安全 (上記 TrustedProxies)。
+		TrustedProxies:  csvEnv("TRUSTED_PROXIES", nil),
 		Debug:           debug,
 		LogFormat:       logFormat,
 		CommentPostMode: commentPostMode,

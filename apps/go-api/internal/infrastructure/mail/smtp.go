@@ -24,6 +24,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"mime"
 	"net"
 	netmail "net/mail"
@@ -128,7 +129,26 @@ func (s *SMTPSender) Send(ctx context.Context, n repository.Notification) error 
 		return fmt.Errorf("mail: 本文の確定に失敗しました: %w", err)
 	}
 
-	return client.Quit()
+	// **QUIT の失敗を送信の失敗にしません** (レビュー指摘)。
+	//
+	// 上の Close が成功した時点でメールは届いています。ここで返る error は
+	// 「221 が返ってこなかった」でしかありません —— サーバが 221 を返さずに
+	// 接続を切る、経路の NAT が落とす、締め切り (SetDeadline) が
+	// QUIT の途中で来る、のどれでも起きます。
+	//
+	// **返すと二重送信になります。** 呼び出し側は送信失敗として行を
+	// 次の試行へ回すので、QUIT で必ずこける相手に対しては
+	// **同じ問い合わせが上限 (8 回) まで届き、そのうえ failed として
+	// 打ち切られます** —— 8 通届いているのに ERROR が鳴る形になります。
+	//
+	// 記録は残します。頻発するなら経路の問題なので、気づけるようにします。
+	if err := client.Quit(); err != nil {
+		slog.InfoContext(ctx, "mail_quit_failed",
+			slog.Int64("contact_id", n.ContactID),
+			slog.String("error", err.Error()),
+		)
+	}
+	return nil
 }
 
 // connect は SMTP サーバへ接続します。

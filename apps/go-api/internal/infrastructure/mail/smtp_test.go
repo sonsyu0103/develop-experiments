@@ -1,14 +1,18 @@
 package mail
 
 import (
+	"bufio"
 	"encoding/base64"
 	"mime"
+	"net"
 	netmail "net/mail"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"develop-experiments/apps/go-api/internal/config"
+	"develop-experiments/apps/go-api/internal/contact/domain/repository"
 )
 
 // **実際にメールを送るテストは書きません** (ADR 0008)。
@@ -202,4 +206,173 @@ func headerValue(t *testing.T, head, name string) string {
 	}
 	t.Fatalf("ヘッダ %q が無い:\n%s", name, head)
 	return ""
+}
+
+// **QUIT に失敗しても送信は成功として扱うこと** (レビュー指摘)。
+//
+// DATA の終端をサーバが受理した時点でメールは届いています。そのあと
+// 221 が返らなかっただけで失敗を返すと、呼び出し側が行を次の試行へ回し、
+// **同じ問い合わせが上限まで届いたうえで failed として打ち切られます。**
+//
+// ここだけは実際に SMTP を話す相手が要ります (組み立てたバイト列を
+// 見ても分からない性質のため)。**外へは出ません** ——
+// ループバックに立てた偽サーバが相手です。
+func TestSend_QuitFailureIsNotASendFailure(t *testing.T) {
+	t.Parallel()
+
+	addr, received := startFakeSMTP(t, fakeSMTPOptions{dropOnQuit: true})
+	sender := newTestSender(t, addr)
+
+	if err := sender.Send(t.Context(), repository.Notification{ContactID: 7, Body: "本文"}); err != nil {
+		t.Fatalf("QUIT の失敗が送信の失敗になった: %v", err)
+	}
+	if got := <-received; !strings.Contains(got, "Subject:") {
+		t.Errorf("サーバがメッセージを受け取っていない:\n%s", got)
+	}
+}
+
+// **正常系も一度は通しておくこと。**
+//
+// 上の検査は「失敗しても成功扱い」を見るので、これが無いと
+// Send が常に nil を返す実装でも緑になります。
+func TestSend_Succeeds(t *testing.T) {
+	t.Parallel()
+
+	addr, received := startFakeSMTP(t, fakeSMTPOptions{})
+	sender := newTestSender(t, addr)
+
+	if err := sender.Send(t.Context(), repository.Notification{ContactID: 1, Body: "本文"}); err != nil {
+		t.Fatalf("送信に失敗した: %v", err)
+	}
+	got := <-received
+	// **ヘッダはこちら側の値だけ** (ADR 0008 決定 3)。
+	if !strings.Contains(got, "From: no-reply@example.com") ||
+		!strings.Contains(got, "To: ops@example.com") {
+		t.Errorf("ヘッダが届いていない:\n%s", got)
+	}
+}
+
+// **DATA の受理に失敗したら、送信の失敗として扱うこと。**
+//
+// こちらは本当に届いていないので、次の試行へ回す必要があります。
+func TestSend_DataRejectionIsAFailure(t *testing.T) {
+	t.Parallel()
+
+	addr, _ := startFakeSMTP(t, fakeSMTPOptions{rejectData: true})
+	sender := newTestSender(t, addr)
+
+	if err := sender.Send(t.Context(), repository.Notification{ContactID: 1, Body: "本文"}); err == nil {
+		t.Fatal("届いていないのに成功として扱われた")
+	}
+}
+
+func newTestSender(t *testing.T, addr string) *SMTPSender {
+	t.Helper()
+
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("アドレスを分解できない: %v", err)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		t.Fatalf("ポートを読めない: %v", err)
+	}
+
+	sender, err := NewSMTP(config.MailConfig{
+		Host: host, Port: p,
+		From: "no-reply@example.com", To: "ops@example.com",
+		Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("送信器を作れない: %v", err)
+	}
+	return sender
+}
+
+type fakeSMTPOptions struct {
+	// dropOnQuit は QUIT に 221 を返さず接続を切ります。
+	dropOnQuit bool
+	// rejectData は DATA の終端に 5xx を返します。
+	rejectData bool
+}
+
+// startFakeSMTP はループバックに最小限の SMTP サーバを立てます。
+//
+// **1 接続だけ受けて終わります。** 受け取ったメッセージ本体を
+// チャネルへ流すので、呼び出し側はそれを検査できます。
+func startFakeSMTP(t *testing.T, opts fakeSMTPOptions) (addr string, received chan string) {
+	t.Helper()
+
+	// **ListenConfig を使います。** 素の net.Listen は ctx を取らないため
+	// noctx が禁じています (テストの締め切りが待ち受けに伝わらない)。
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("ループバックに待ち受けできないためスキップ: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	received = make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		serveFakeSMTP(conn, opts, received)
+	}()
+	return ln.Addr().String(), received
+}
+
+func serveFakeSMTP(conn net.Conn, opts fakeSMTPOptions, received chan<- string) {
+	r := bufio.NewReader(conn)
+	write := func(s string) { _, _ = conn.Write([]byte(s + "\r\n")) }
+
+	write("220 fake ESMTP")
+	var body strings.Builder
+	inData := false
+
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		line = strings.TrimRight(line, "\r\n")
+
+		if inData {
+			if line == "." {
+				inData = false
+				received <- body.String()
+				if opts.rejectData {
+					write("554 transaction failed")
+					continue
+				}
+				write("250 OK")
+				continue
+			}
+			body.WriteString(line + "\n")
+			continue
+		}
+
+		switch {
+		case strings.HasPrefix(line, "EHLO"), strings.HasPrefix(line, "HELO"):
+			// **拡張は 1 つも名乗りません。** STARTTLS も AUTH も
+			// 使わない経路を検査したいためです。
+			write("250 fake")
+		case strings.HasPrefix(line, "MAIL FROM"), strings.HasPrefix(line, "RCPT TO"):
+			write("250 OK")
+		case strings.HasPrefix(line, "DATA"):
+			inData = true
+			write("354 send data")
+		case strings.HasPrefix(line, "QUIT"):
+			if opts.dropOnQuit {
+				// **221 を返さずに切る。** これが指摘された経路になります。
+				return
+			}
+			write("221 bye")
+			return
+		default:
+			write("250 OK")
+		}
+	}
 }

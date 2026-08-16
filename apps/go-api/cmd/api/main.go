@@ -200,6 +200,9 @@ func run() error {
 	router, err := httpapi.NewRouter(httpapi.Deps{
 		Server:         server,
 		AllowedOrigins: cfg.AllowedOrigins,
+		// **空なら X-Forwarded-For を信じない** (レビュー指摘)。
+		// gin の既定はその逆で、ヘッダ 1 本でレート制限を回避できる。
+		TrustedProxies: cfg.TrustedProxies,
 	})
 	if err != nil {
 		return err

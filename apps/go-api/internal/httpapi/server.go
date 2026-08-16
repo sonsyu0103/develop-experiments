@@ -551,6 +551,10 @@ func idempotencyEndpoint(c *gin.Context) string {
 type Deps struct {
 	Server         *Server
 	AllowedOrigins []string
+	// TrustedProxies は X-Forwarded-For を信じてよい送信元です。
+	//
+	// **空なら誰も信じません** (下記 NewRouter の説明を参照)。
+	TrustedProxies []string
 }
 
 // NewRouter はルーティングを組み立てた gin.Engine を返します。
@@ -568,6 +572,35 @@ func NewRouter(deps Deps) (*gin.Engine, error) {
 	spec.Servers = nil
 
 	r := gin.New()
+
+	// **X-Forwarded-For を信じる相手を明示する** (レビュー指摘)。
+	//
+	// gin の既定は「すべての送信元を信頼するプロキシとみなす」
+	// (`trustedCIDRs = 0.0.0.0/0, ::/0`) で、その状態の ClientIP は
+	// **X-Forwarded-For の最も左 = 送信者が自由に書ける値**を返す。
+	//
+	// 何が起きるか:
+	//
+	//   - レート制限 (ADR 0008 決定 4) は、ヘッダ 1 本で回避できる。
+	//     毎回違う IP を名乗れば、集計は常に 0 件になる
+	//   - **逆に他人を締め出せる。** 他人の IP を名乗って 5 件送ると、
+	//     その IP からの問い合わせが 1 時間 429 になる
+	//
+	// 「偽装されうる値」であること自体は IP でレート制限する以上ついて回るが、
+	// **それは「信頼できるプロキシが XFF を付け替える」前提での話**になる。
+	// 境界を宣言していない状態では、プロキシが 1 つも無くても偽装できる。
+	//
+	// **既定は空 (= 誰も信じない)。** SetTrustedProxies(nil) で
+	// ClientIP は接続元アドレスだけを見るようになる。
+	// 安全側に倒すのは SecureCookie と同じ判断で、
+	// ALB や CloudFront の背後に置く構成では TRUSTED_PROXIES を明示する。
+	//
+	// 閲覧数の重複抑制 (ADR 0006 の visitorKey) も同じ値を使うので、
+	// そちらの精度もこの設定で決まる。
+	if err := r.SetTrustedProxies(deps.TrustedProxies); err != nil {
+		return nil, fmt.Errorf("信頼するプロキシの設定が不正です: %w", err)
+	}
+
 	// 並びの意味は middlewares のコメントを参照。
 	r.Use(middlewares(deps.AllowedOrigins)...)
 

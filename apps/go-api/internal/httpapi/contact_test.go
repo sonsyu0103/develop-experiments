@@ -103,6 +103,8 @@ func (f *fakeContactRepo) dispatchCalled(name string) {
 type contactEnv struct {
 	*testEnv
 	repo *fakeContactRepo
+	// server はルータを組み直す検査 (TRUSTED_PROXIES) で使い回します。
+	server *Server
 }
 
 func newContactEnv(t *testing.T) *contactEnv {
@@ -113,26 +115,28 @@ func newContactEnv(t *testing.T) *contactEnv {
 	// なっていないことを、テストの側から見張ります。
 	repo.t = t
 
+	server := NewServer(
+		threadusecase.NewThreadInteractor(&fakeThreadRepo{}, nil),
+		commentusecase.NewCommentInteractor(&fakeCommentRepo{}, &fakeThreadRepo{}, nil),
+		&fakePinger{},
+		userusecase.NewSessionInteractor(&fakeSessionRepo{}, nil),
+		nil,
+		nil,
+		moderationusecase.NewInteractor(newFakeModerationRepo()),
+		moderationusecase.NewReportInteractor(newFakeReportRepo(), newFakeReportRepo()),
+		contactusecase.NewInteractor(repo),
+		viewcount.New(),
+		config.AuthConfig{})
+
 	router, err := NewRouter(Deps{
-		Server: NewServer(
-			threadusecase.NewThreadInteractor(&fakeThreadRepo{}, nil),
-			commentusecase.NewCommentInteractor(&fakeCommentRepo{}, &fakeThreadRepo{}, nil),
-			&fakePinger{},
-			userusecase.NewSessionInteractor(&fakeSessionRepo{}, nil),
-			nil,
-			nil,
-			moderationusecase.NewInteractor(newFakeModerationRepo()),
-			moderationusecase.NewReportInteractor(newFakeReportRepo(), newFakeReportRepo()),
-			contactusecase.NewInteractor(repo),
-			viewcount.New(),
-			config.AuthConfig{}),
+		Server:         server,
 		AllowedOrigins: []string{testOrigin},
 	})
 	if err != nil {
 		t.Fatalf("NewRouter が失敗した: %v", err)
 	}
 
-	return &contactEnv{testEnv: &testEnv{router: router}, repo: repo}
+	return &contactEnv{testEnv: &testEnv{router: router}, repo: repo, server: server}
 }
 
 // **受理は 202 であること** (ADR 0008 決定 1)。
@@ -281,4 +285,58 @@ func TestCreateContact_RejectsCrossOrigin(t *testing.T) {
 // nil を渡せないので、どのテストもこれを使います。
 func newTestContactInteractor() *contactusecase.Interactor {
 	return contactusecase.NewInteractor(newFakeContactRepo())
+}
+
+// **X-Forwarded-For でレート制限の集計先を偽装できないこと** (レビュー指摘)。
+//
+// gin の既定はすべての送信元を信頼するプロキシとみなすため、
+// 設定しないと **XFF に書いた値がそのまま ClientIP になります。**
+// そうなると:
+//
+//   - 毎回違う IP を名乗るだけでレート制限を回避できる
+//   - 他人の IP を名乗って 5 件送ると、その IP を 1 時間締め出せる
+//
+// NewRouter が SetTrustedProxies を明示しているので、
+// **信頼リストが空のときは接続元アドレスだけ**が使われます。
+func TestCreateContact_IgnoresForwardedForByDefault(t *testing.T) {
+	t.Parallel()
+
+	env := newContactEnv(t)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/contact",
+		strings.NewReader(`{"name":"ホシノ","email":"a@example.com","subject":"件名","body":"本文"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", testOrigin)
+	req.Header.Set("X-Forwarded-For", "203.0.113.99")
+	req.Header.Set("X-Real-IP", "203.0.113.98")
+	res := httptest.NewRecorder()
+	env.router.ServeHTTP(res, req)
+
+	if res.Code != http.StatusAccepted {
+		t.Fatalf("ステータス = %d, want 202: %s", res.Code, res.Body.String())
+	}
+	if len(env.repo.saved) != 1 {
+		t.Fatalf("保存件数 = %d, want 1", len(env.repo.saved))
+	}
+
+	got := env.repo.saved[0].ClientIP.String()
+	if got == "203.0.113.99" || got == "203.0.113.98" {
+		t.Errorf("ヘッダの値が採用された: %s (偽装できてしまう)", got)
+	}
+}
+
+// **信頼するプロキシの指定が不正なら、起動時に落ちること。**
+//
+// 黙って既定 (すべて信頼) に戻ると、設定したつもりの環境が
+// 偽装を受け入れる状態で動きます。
+func TestNewRouter_RejectsBadTrustedProxies(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewRouter(Deps{
+		Server:         newContactEnv(t).server,
+		AllowedOrigins: []string{testOrigin},
+		TrustedProxies: []string{"これは CIDR ではない"},
+	})
+	if err == nil {
+		t.Error("不正な TRUSTED_PROXIES が通ってしまった")
+	}
 }

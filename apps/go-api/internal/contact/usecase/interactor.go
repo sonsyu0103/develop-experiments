@@ -168,7 +168,14 @@ func (i *Interactor) Submit(ctx context.Context, cmd SubmitCommand) (time.Time, 
 	}
 	slog.InfoContext(ctx, "contact_received", attrs...)
 
-	return saved.CreatedAt, nil
+	// **UTC に揃えます** (レビュー指摘)。
+	//
+	// pgx は timestamptz を**プロセスのローカル時刻**として復元するので、
+	// コンテナの TZ が UTC でない環境では、ここが `+09:00` になります。
+	// honeypot 経路 (time.Now().UTC()) と表記が食い違い、
+	// **応答を見るだけで破棄されたかどうかが分かってしまいます** ——
+	// ID を返さないことで消したはずの手掛かりが、時刻の表記で戻ります。
+	return saved.CreatedAt.UTC(), nil
 }
 
 // ensureUnderRateLimit は同じ送信元からの連投を弾きます。
