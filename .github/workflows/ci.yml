@@ -276,6 +276,11 @@ jobs:
           POSTGRES_USER: app
           POSTGRES_PASSWORD: password
           POSTGRES_DB: bbs
+          # **compose.yaml と同じロケールにする。**
+          # LC_CTYPE を C にすると pg_trgm が日本語からトライグラムを
+          # 作らなくなり、検索の索引が無言で無効になる (ADR 0012)。
+          # ここが compose と食い違うと、CI と手元で別の DB を検査することになる。
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C.UTF-8"
         ports:
           - 5432:5432
         options: >-
@@ -340,6 +345,35 @@ jobs:
             | tar xvz -C /tmp migrate
           sudo mv /tmp/migrate /usr/local/bin/migrate
           migrate -version
+
+      # **service コンテナは docker-entrypoint-initdb.d を実行しない。**
+      # compose ではボリュームに載せた db/init が初回起動時に走るが、
+      # services: にはその口が無い (minio を docker run にしたのと同じ制約)。
+      #
+      # **ファイルをそのまま流す。** ここに CREATE EXTENSION を書き写すと、
+      # 拡張を足したときに compose 側だけが更新されて CI がすり抜ける。
+      - name: Create extensions (compose の db/init と同じ)
+        run: |
+          PGPASSWORD=password psql -h localhost -U app -d bbs \
+            -v ON_ERROR_STOP=1 -f apps/go-api/db/init/00-extensions.sql
+
+      # **pg_trgm が日本語を索引できることを確かめる (ADR 0012)。**
+      #
+      # LC_CTYPE が C だと show_trgm('検証') が空配列になり、
+      # 検索用の GIN 索引は作られるのに 1 件も載らない。
+      # **CREATE INDEX は成功し、エラーもどこにも出ない** ため、
+      # ここで撃ち落とさないと実行計画を読むまで誰も気づけない。
+      - name: Verify pg_trgm can index Japanese
+        run: |
+          n=$(PGPASSWORD=password psql -h localhost -U app -d bbs -tAc \
+            "SELECT coalesce(array_length(show_trgm('検証'), 1), 0)")
+          echo "show_trgm('検証') の要素数: $n"
+          if [ "$n" -lt 1 ]; then
+            PGPASSWORD=password psql -h localhost -U app -d bbs \
+              -c "SELECT datcollate, datctype FROM pg_database WHERE datname = 'bbs'"
+            echo "::error::pg_trgm が日本語からトライグラムを作れていません。LC_CTYPE を確認してください (ADR 0012)"
+            exit 1
+          fi
 
       - name: Apply migrations
         run: |
