@@ -47,6 +47,10 @@ export function thread(over: Partial<Thread> = {}): Thread {
     id: 100,
     title: 'テスト用のスレッド',
     commentCount: 0,
+    // 閲覧数は概算値 (docs/adr/0006-view-count-and-popularity.md)。
+    // 管理画面の検査では中身を見ないが、**必須フィールドなので省けない** ——
+    // 省くと「API が返さない形」をモックしたことになる。
+    viewCount: 0,
     // **匿名投稿は author が null。** 退会済みとは別物になる
     // (退会済みは publicId がフィールドごと省略される)。
     author: null,

@@ -62,9 +62,11 @@ func New(jobs ...Job) *Scheduler {
 	normalized := make([]Job, 0, len(jobs))
 	for _, job := range jobs {
 		if job.Interval <= 0 {
-			slog.Warn("定期処理の間隔が未設定のため既定値を使います",
+			slog.Warn("scheduler_interval_defaulted",
 				slog.String("job", job.Name),
-				slog.Duration("interval", DefaultInterval),
+				// **Duration にしない。** JSON ハンドラではナノ秒の整数になり、
+				// Athena で毎回 / 1e6 を書くことになる (ADR 0010 の 4-4)。
+				slog.Int64("interval_ms", DefaultInterval.Milliseconds()),
 			)
 			job.Interval = DefaultInterval
 		}
@@ -132,7 +134,7 @@ func (s *Scheduler) run(ctx context.Context, job Job) {
 	for {
 		select {
 		case <-ctx.Done():
-			slog.InfoContext(ctx, "定期処理を停止しました", slog.String("job", job.Name))
+			slog.InfoContext(ctx, "scheduler_job_stopped", slog.String("job", job.Name))
 			return
 		case <-timer.C:
 		}
@@ -148,12 +150,12 @@ func (s *Scheduler) run(ctx context.Context, job Job) {
 			if ctx.Err() != nil {
 				level = slog.LevelInfo
 			}
-			slog.Log(ctx, level, "定期処理が失敗しました",
+			slog.Log(ctx, level, "scheduler_job_failed",
 				slog.String("job", job.Name),
 				slog.String("error", err.Error()),
 			)
 		}
-		slog.DebugContext(ctx, "定期処理が完了しました",
+		slog.DebugContext(ctx, "scheduler_job_completed",
 			slog.String("job", job.Name),
 			slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 		)

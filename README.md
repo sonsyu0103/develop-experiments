@@ -33,6 +33,10 @@ Go (Gin) + PostgreSQL + Next.js による掲示板アプリケーション。
 │   │       ├── comment/         コメントドメイン
 │   │       └── infrastructure/postgres/   pgx によるリポジトリ実装 + sqlc 生成物
 │   └── next-app/                Next.js (App Router / RSC)
+├── infra/
+│   ├── fluent-bit/              ログ転送の設定 (本番の FireLens と共通)
+│   ├── athena/                  テーブル定義 (列の正) と分析クエリ
+│   └── duckdb/                  S3 上のログを手元で SQL で読む
 ├── docs/
 │   ├── adr/                     設計判断の記録
 │   ├── infrastructure.md        AWS 理想構成 (実際にはデプロイしない)
@@ -75,8 +79,12 @@ make cover             # 手書きロジックのカバレッジを測り、下�
 make cover-html        # どこが通っていないかをブラウザで見る
 make check             # 静的検査 + ユニットテスト + カバレッジ + 生成物のドリフト検出 (DB 不要)
 make smoke             # 実 DB を立てて API を起動し、HTTP 越しに疎通を検証
-make check-all         # check + smoke
+make logs-verify       # ログ基盤が本番と同じ形で動いているかを実測
+make check-all         # check + smoke + logs-verify
 ```
+
+**`docker compose logs go-api` は空になる。** ログは fluent-bit へ
+転送されるため (下の「ログ基盤」節)。`make logs` なら両方まとめて見える。
 
 ### コード生成の流れ
 
@@ -116,7 +124,7 @@ CI の `generated-ci` ジョブが再生成して差分を検査するため、
 | --- | --- | --- |
 | GET | `/healthz` | Liveness (DB は見ない) |
 | GET | `/readyz` | Readiness (DB 疎通を含む) |
-| GET | `/threads` | スレッド一覧 (コメント数つき)。`?q=` でタイトル検索 |
+| GET | `/threads` | スレッド一覧 (コメント数つき)。`?q=` でタイトル検索、`?sort=popular` で人気順 |
 | POST | `/threads` | スレッド作成 |
 | GET | `/threads/{threadId}` | スレッド 1 件 |
 | GET | `/threads/{threadId}/comments` | コメント一覧 |
@@ -189,20 +197,30 @@ DB 側の負荷も N 倍になる。
 **20 件返すために 20 スレッド分のコメント実データを読んでしまう**ため、
 先に `LIMIT` でスレッドを絞ってから相関サブクエリで数える形にしている。
 
-2,005 スレッド / 200,016 コメントでの実測 (`EXPLAIN ANALYZE`、各 3 回):
+2,000 スレッド / 201,000 コメント / 200 利用者での実測
+(`make bench-dataset && make query-probe`、各 3 回の中央値):
 
 | 実装 | 実行時間 | shared buffers |
 | --- | --- | --- |
-| `LEFT JOIN` + `GROUP BY` | 5.84 – 7.43 ms | 2,054 |
-| **採用した形** | **1.04 – 1.11 ms** | **59** |
+| `LEFT JOIN` + `GROUP BY` | 4.13 ms | 7,205 |
+| **採用した形** | **1.71 ms** | **1,664** |
 
-約 5.5 倍速く、バッファ読み取りは 35 分の 1。結果が一致することも確認済み。
-部分インデックスによる `Index Only Scan` (`Heap Fetches: 0`) が効くためで、
-この差は visibility map が整備された状態 (VACUUM 後) で現れる。
+約 2.4 倍速く、バッファ読み取りは 4.3 分の 1。結果が一致することも確認済み。
+
+**投稿者の `LEFT JOIN users` を足す前は「5.5 倍 / 35 分の 1」だった。**
+両者に共通のコスト (投稿者の解決) が加わったぶん、相対差が縮んでいる。
+データセットも作り直しているので 2 つの数字は直接比べられない ——
+言えるのは「相関サブクエリのほうが速い」が保たれていることまでになる。
+
+**planner は部分インデックスではなく主キーの逆順走査を選んだ。**
+削除済みが 1% しかない分布では、`threads_pkey` を逆に辿って 20 件取るほうが
+安いと判断される。部分インデックスが選ばれるのは深いページ
+(カーソルつき) のほうで、無駄になったわけではない。
 
 比較用の N+1 実装は
 [`interactor_nplus1.go`](apps/go-api/internal/thread/usecase/interactor_nplus1.go)
-に残してあり、Phase 4 のベンチマークで両者を計測する。
+に残してある。**ただし HTTP に繋がっていないため、まだ実測していない**
+(上の数字は「集計方法の差」であって、N+1 との比較ではない)。
 
 ### ページネーションが OFFSET でない
 
@@ -215,6 +233,39 @@ DB 側の負荷も N 倍になる。
 人気順を足すと境界が `(view_count, id)` の複合キーになるため、
 `id` をそのまま公開したままだと並び順を増やすたびに API が壊れる
 ([ADR 0018](docs/adr/0018-opaque-cursor.md))。
+
+### 閲覧数を同期 UPDATE していない
+
+`GET /threads/{id}` で `UPDATE threads SET view_count = view_count + 1` を
+打つと、3 つの問題が同時に起きる。
+
+1. **人気スレッドほど同じ行に更新が集中する** (ホットロウ)。
+   一覧の上位ほど遅くなる、という最悪の相関になる
+2. **Phase 2 の SERIALIZABLE を殺す。** コメント投稿は親スレッドの存在確認で
+   `threads` を読むため、そこに閲覧数の更新が混ざると rw-conflict が
+   大量に生まれる。**閲覧というまったく無関係な操作が、
+   コメント投稿の直列化失敗率を押し上げる**
+3. `view_count` に索引を張ると **HOT update が効かなくなる**
+
+そのため計上はアプリのメモリ上で行い、一定間隔でまとめて反映している
+([ADR 0006](docs/adr/0006-view-count-and-popularity.md))。
+**性能上の最適化ではなく、Phase 2 の測定を成立させるための前提**になる。
+
+代償として **`view_count` は正確な値ではない** ——
+最大でフラッシュ間隔ぶん遅れ、プロセスが異常終了すれば増分は消える。
+表示用の指標であり、課金や順位の確定には使わない。
+API 仕様にもそう書いてある。
+
+副産物として、**人気順のキーセットページネーションが成立する**。
+閲覧数を毎回更新すると並び順のキーがページ送りの最中に動き、
+行の重複と取りこぼしが起きる —— `OFFSET` を採らなかった理由が、
+別の入口から戻ってくる形になる。
+
+**2 は実測した。** 同期 UPDATE にすると、16 件のコメント投稿のうち
+**8 件がリトライを使い切って失敗した** (閲覧なし・バッファ版では 0 件)。
+投稿する側は何も変えていない ——
+変えたのは「別の利用者がそのスレッドを見ているかどうか」だけになる
+(`make viewcount-probe`)。
 
 ### パーティショニングは「必要だから」入れたのではない
 
@@ -315,6 +366,60 @@ EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM comments WHERE thread_id = 1;
 ```
 
 100ms を超えたクエリは実行計画つきで `docker compose logs postgres` に出る。
+
+## ログ基盤
+
+構造化ログを S3 に集約し、**SQL で読む** ([ADR 0010](docs/adr/0010-log-pipeline.md))。
+
+```
+go-api ──(fluentd ドライバ)──▶ fluent-bit ──┬──▶ MinIO (S3 互換) ──▶ DuckDB
+                                            └──▶ stdout
+```
+
+本番は ECS の FireLens が同じ fluent-bit を動かし、出力先が S3 と
+CloudWatch Logs になる。**設定ファイルは共通**で、差はエンドポイントと
+フラッシュ間隔だけになる。
+
+```bash
+make logs-verify                        # パイプライン全体を実測して検査する
+make logs-query Q=/queries/errors.sql   # 保存したクエリを流す
+make logs-query Q='SELECT msg, count(*) FROM go_api_logs GROUP BY 1'
+```
+
+キーは Hive 形式 (`logs/service=go-api/dt=.../hour=.../`) で、
+Athena の partition projection がこの規則性だけに依存する。
+**これを外すとスキャン量が全期間に膨らむ。**
+
+### ログは目視では壊れたと分からない
+
+パーサが JSON の展開に失敗しても、fluent-bit はレコードを捨てずに
+素通しする。**オブジェクトは増え続け、エラーも出ない。**
+気づくのは Athena でクエリを書こうとした数日後になる。
+
+実際にその形で壊れていた —— ログの形式がデバッグモードに束ねられており、
+`ENV=development` では JSON ですらなかった
+([ADR 0010](docs/adr/0010-log-pipeline.md)「実装して分かったこと 1」)。
+
+検査は 2 つに分けてある。**片方では届かない範囲があるため。**
+
+| | 見るもの | 届かない範囲 | 実行場所 |
+| --- | --- | --- | --- |
+| `make verify-log-events` | Go のソース | 実行時にしか決まらないこと | **CI** |
+| `make logs-verify` | S3 に着地したログ | 呼ばれなかった経路のログ | 手元 |
+
+エラー経路のログは、手元で 1 回動かしただけでは出ない。
+出ないものは実行時の検査では守れないので、ソース側からも見る。
+
+### `msg` はイベント名であって自由文ではない
+
+```go
+slog.Info("server_started", slog.String("addr", cfg.Addr))   // ○
+slog.Info("サーバを起動しました", ...)                         // ×
+```
+
+自由文にすると、集計のたびに `LIKE` を書くことになり、
+文言を直した瞬間に過去のクエリが当たらなくなる。
+`make verify-log-events` が CI で検査する。
 
 ## テストの層
 
@@ -425,6 +530,36 @@ make concurrency-probe PROBE_WORKERS=64
 **CI には載せない。** 数字が環境の性能に左右されるため、
 通す / 落とすの基準にできない。正しさの検査はスモーク側にある。
 
+### 閲覧数の反映方式とクエリも実測する (Phase 4)
+
+```
+make viewcount-probe                      閲覧数の反映方式を比べる
+make bench-dataset && make query-probe    一覧・検索・ページ送りを測る
+```
+
+`viewcount-probe` は **同期 UPDATE にするとコメント投稿の半分が失敗する**
+ことを示す ([ADR 0006](docs/adr/0006-view-count-and-popularity.md))。
+`query-probe` は「Phase 4 で測る」と書いたまま残っていた 3 件 ——
+コメント数の集計 (投稿者の JOIN を足してから測っていなかった)、
+検索の分布、深いページのカーソル —— を片付ける。
+
+**`bench-dataset` は既存のデータを消す。** 戻すには `make seed`。
+
+#### まだ測っていないもの
+
+Phase 4 として挙げていた項目のうち、**次の 3 つは未測定**である。
+
+| 項目 | 測っていない理由 |
+| --- | --- |
+| **N+1 (goroutine 並列集計) vs 単一クエリ** | 比較実装 (`interactor_nplus1.go`) は**ユースケース層にあるだけで HTTP に繋がっていない**。ベンチから叩く経路が無い。測るなら実 DB を使う Go のベンチマークを足す |
+| **パーティションの損益分岐点** | `comments` の 8 分割が「どの規模から効き始めるか」。20 万行では**まだ効かない側**にいることしか分からない。数千万行のデータセットが要る |
+| **スケール限界の測定** | [ADR 0009](docs/adr/0009-scaling-strategy.md) の見積もり (読み取り 4,200 RPS) に対する実測。単一マシンの compose では負荷生成側が先に飽和する |
+
+**測った 3 件と混ぜて「Phase 4 完了」とは書かない。**
+上の表の 1 行目は SQL レベルの比較 (`LEFT JOIN` + `GROUP BY` vs
+相関サブクエリ) で代替しているが、**それは N+1 との比較ではない** ——
+どちらも DB への往復は 1 回で、測っているのは集計方法の差になる。
+
 ## ロードマップ
 
 | | 内容 | 状態 |
@@ -433,12 +568,12 @@ make concurrency-probe PROBE_WORKERS=64
 | Phase 1 | OpenAPI → Go スタブ / TypeScript 型の自動生成 | 完了 (`make generate`) |
 | Phase 2 | コメント投稿の並行制御強化 (SSI + リトライ、悲観ロック版との比較、冪等キー) | **完了** |
 | Phase 3 | Next.js の画面 (一覧・詳細・マイページ・各種フォーム) | 一覧のみ実装 |
-| Phase 4 | ベンチマーク (N+1 vs 単一クエリ、パーティションの損益分岐点、スケール限界の測定) | 未着手 |
+| Phase 4 | ベンチマーク (閲覧数の反映方式、集計クエリ、検索の分布) | **一部完了** (下記) |
 | Phase 5 | 認証 (Google OIDC) とマイページ | **完了** |
 | Phase 6 | 画像投稿 (コメント添付 / プロフィール / スレッドアイコン) | **完了** |
-| Phase 7 | 人気スレッド一覧 (閲覧数) | 設計完了 |
+| Phase 7 | 人気スレッド一覧 (閲覧数) | **完了** |
 | Phase 8 | 問い合わせフォームとメール送信 | 設計完了 |
-| Phase 9 | ログ基盤 (Fluent Bit → S3 → Athena) | 設計完了 |
+| Phase 9 | ログ基盤 (Fluent Bit → S3 → Athena) | **完了** |
 | Phase 10 | モデレーション (ロール・通報・管理画面) | **完了** |
 | Phase 11 | スレッド検索 (`pg_trgm`) | **完了** |
 
@@ -483,7 +618,25 @@ make concurrency-probe PROBE_WORKERS=64
    閲覧数の設計がそのままベンチマークの題材になり
    ([ADR 0006](docs/adr/0006-view-count-and-popularity.md))、
    その分析はログ基盤の上で行う
-   ([ADR 0010](docs/adr/0010-log-pipeline.md))
+   ([ADR 0010](docs/adr/0010-log-pipeline.md))。
+   ~~**Phase 9 の後半**~~ —— **完了**。fluent-bit で S3 に集約し、
+   手元では MinIO + DuckDB で同じ経路を再現する。
+   **設計どおりに作ったら、手元のログは JSON ですらなかった** ——
+   ログの形式がデバッグモードに束ねられており、パーサが 1 行も
+   展開できていなかった。オブジェクトは増え続け、エラーも出ない
+   ([ADR 0010](docs/adr/0010-log-pipeline.md) の「実装して分かったこと 1」)。
+   ~~**Phase 7 (人気一覧)**~~ —— **完了**。閲覧数はメモリに貯めて
+   まとめて反映する。**同期 UPDATE にすると、閲覧という無関係な操作が
+   コメント投稿の直列化失敗率を押し上げる**ためで、性能上の最適化ではなく
+   Phase 2 の測定を成立させるための前提になる
+   ([ADR 0006](docs/adr/0006-view-count-and-popularity.md))。
+   **Phase 4 (ベンチマーク)** —— **一部完了**。
+   閲覧数を同期 UPDATE にすると、**コメント投稿の半分が失敗した** ——
+   投稿する側は何も変えていないのに
+   ([ADR 0006](docs/adr/0006-view-count-and-popularity.md) の「実測」)。
+   検索では、**いちばん GIN が効くはずの珍しい語で planner が
+   GIN を選ばなかった** ([ADR 0012](docs/adr/0012-search.md) の 3-2)。
+   **測っていない項目が 3 つ残っている** (次の節)
 7. **Phase 8 (問い合わせ)** —— 他と依存がない
 
 ### 各段階の進め方

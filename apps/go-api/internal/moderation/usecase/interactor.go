@@ -128,7 +128,10 @@ func (i *Interactor) Delete(ctx context.Context, cmd DeleteCommand) (*model.Acti
 		slog.Int64("actor_id", recorded.ActorID),
 		slog.String("action", string(recorded.Type)),
 		slog.String("target_type", string(recorded.Target)),
-		slog.String("target_id", recorded.TargetID),
+		// **target_id にしない。** 通報側が int64 で使っており、
+		// こちらは型が混在するため文字列になる (model.Action の説明)。
+		// 同名で型が違う列は Athena に宣言できない (ADR 0010 の 4-2)。
+		slog.String("target_ref", recorded.TargetID),
 	)
 	return recorded, nil
 }

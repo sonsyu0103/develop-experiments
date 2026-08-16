@@ -190,6 +190,59 @@ func TestLoad_CommentPostMode(t *testing.T) {
 	}
 }
 
+// ログの出力形式 (docs/adr/0010-log-pipeline.md)。
+//
+// **形式は Debug から独立している**ことがここの主題です。
+// 束ねていたせいで、ENV=development のときだけ logfmt になり、
+// fluent-bit のパーサが 1 行も展開できませんでした。
+// 「開発環境で、DEBUG レベルのまま JSON を出せる」ことを守ります。
+func TestLoad_LogFormat(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     string
+		devMode bool
+		want    LogFormat
+		wantErr bool
+	}{
+		{name: "未設定かつ本番相当なら json", env: "", want: LogFormatJSON},
+		{name: "未設定かつ開発なら text (従来の見え方を変えない)", env: "", devMode: true, want: LogFormatText},
+
+		// ここが本題。開発モードのまま JSON を選べる。
+		{name: "開発モードでも json を選べる", env: "json", devMode: true, want: LogFormatJSON},
+		{name: "本番相当でも text を選べる", env: "text", want: LogFormatText},
+		{name: "大文字と空白を許す", env: "  JSON ", want: LogFormatJSON},
+
+		{name: "未知の値は起動時に落とす", env: "logfmt", wantErr: true},
+		{name: "空白だけも落とす", env: "   ", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://app:password@localhost:5432/bbs")
+			t.Setenv("LOG_FORMAT", tt.env)
+			if tt.devMode {
+				t.Setenv("ENV", "development")
+			} else {
+				t.Setenv("ENV", "")
+			}
+
+			cfg, err := Load()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("LOG_FORMAT=%q で Load が成功した (format=%q)", tt.env, cfg.LogFormat)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load が失敗した: %v", err)
+			}
+			if cfg.LogFormat != tt.want {
+				t.Errorf("LogFormat = %q, want %q", cfg.LogFormat, tt.want)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 画像のストレージ (docs/adr/0007-image-storage.md)
 // ---------------------------------------------------------------------------

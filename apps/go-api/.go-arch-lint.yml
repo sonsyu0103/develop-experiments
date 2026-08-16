@@ -76,6 +76,18 @@ components:
   # **Job の中身は知らない。** 束ねて回すだけで、実処理は main が渡す
   shared-scheduler:
     in: internal/scheduler
+  # 閲覧数のバッファ (docs/adr/0006-view-count-and-popularity.md)。
+  #
+  # **commonComponents には入れない。** どこからでも触れる形にすると、
+  # ドメインやユースケースが「ついでに閲覧数を足す」経路を作れてしまう。
+  # それは ADR 0006 が禁じたこと (主トランザクションに混ぜない) そのもので、
+  # 混ぜた瞬間に Phase 2 の測定が汚れる。
+  #
+  # 触ってよいのは 2 か所だけ:
+  #   httpapi  閲覧を数える (DB には触らない)
+  #   main     フラッシュを定期処理として回す
+  viewcount:
+    in: internal/viewcount
 
   thread-model:
     in: internal/thread/domain/model
@@ -276,6 +288,9 @@ deps:
       - moderation-model
       - httpapi-oapigen
       - shared-config
+      # 閲覧を数える (ADR 0006)。**ここは DB に触らない** ——
+      # メモリ上のカウンタに +1 するだけで、反映は main が回す定期処理が行う
+      - viewcount
 
   # アダプタは外側なので、内側 (domain) を知ってよい
   postgres:

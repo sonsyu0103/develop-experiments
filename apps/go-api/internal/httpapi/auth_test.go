@@ -23,6 +23,7 @@ import (
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
 	userrepo "develop-experiments/apps/go-api/internal/user/domain/repository"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
+	"develop-experiments/apps/go-api/internal/viewcount"
 )
 
 // ---------------------------------------------------------------------------
@@ -182,7 +183,7 @@ func newAuthEnv(t *testing.T, loginEnabled bool) *authEnv {
 	// コメント投稿の親スレッド確認に使うので、生存しているスレッドを 1 件持たせる。
 	threads := &fakeThreadRepo{
 		summaries: []threadmodel.Summary{
-			{Thread: *threadmodel.Reconstruct(1, "スレッド", nil, nil, time.Unix(1, 0).UTC())},
+			{Thread: *threadmodel.Reconstruct(1, "スレッド", nil, nil, time.Unix(1, 0).UTC(), 0)},
 		},
 	}
 	comments := &fakeCommentRepo{}
@@ -203,8 +204,8 @@ func newAuthEnv(t *testing.T, loginEnabled bool) *authEnv {
 			// 削除の検査は moderation_test.go が別に組み立てる。
 			moderationusecase.NewInteractor(newFakeModerationRepo()),
 			moderationusecase.NewReportInteractor(newFakeReportRepo(), newFakeReportRepo()),
-			config.AuthConfig{FrontendURL: "http://localhost:3000"},
-		),
+			viewcount.New(),
+			config.AuthConfig{FrontendURL: "http://localhost:3000"}),
 		AllowedOrigins: []string{"http://localhost:3000"},
 	})
 	if err != nil {

@@ -18,6 +18,15 @@ type ThreadRepository interface {
 	// コメント数の集計は 1 クエリで完結します。
 	ListSummaries(ctx context.Context, page pagination.Page) ([]model.Summary, error)
 
+	// ListPopularSummaries は同じ組を閲覧数の多い順に取得します
+	// (docs/adr/0006-view-count-and-popularity.md)。
+	//
+	// **カーソルの意味が ListSummaries と違います。** 並びのキーが
+	// (view_count, id) の複合キーになるため、新着順のカーソルを
+	// そのまま渡すと「閲覧数 0 の位置から」始まります。
+	// 並び順の一致は上の層が検査します (pagination.Cursor.Sort)。
+	ListPopularSummaries(ctx context.Context, page pagination.Page) ([]model.Summary, error)
+
 	// SearchSummaries はタイトルの中間一致で絞り込んだうえで、
 	// ListSummaries と同じ組を新しい順に取得します
 	// (docs/adr/0012-search.md 決定 3: 関連度順にはしません)。

@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,6 +47,10 @@ type fakeRepo struct {
 	// searchCalls は SearchSummaries に渡された検索語です。
 	searchCallMux sync.Mutex
 	searchCalls   []string
+	// popularCalls は ListPopularSummaries の呼び出し回数です。
+	// **新着順に落ちていないこと**を見るために要ります ——
+	// 落ちても件数は同じになるので、結果だけでは区別できません。
+	popularCalls atomic.Int64
 }
 
 var (
@@ -104,6 +109,47 @@ func (f *fakeRepo) ListSummaries(_ context.Context, page pagination.Page) ([]mod
 	return f.summaries(page), nil
 }
 
+// ListPopularSummaries は閲覧数の多い順に返します
+// (docs/adr/0006-view-count-and-popularity.md)。
+//
+// **カーソルの扱いが新着順と違うことを、フェイクでも表しています。**
+// 境界は (view_count, id) の複合キーで、片方だけでは決まりません ——
+// ここを id だけで切ると、同じ閲覧数の塊の途中でページが割れたときに
+// 行が重複・欠落します。それは実装のバグとして起きうる形なので、
+// フェイクが「id だけ見ても通る」状態にしてしまうと、
+// ユースケース層のカーソル組み立ての検査が意味を失います。
+func (f *fakeRepo) ListPopularSummaries(
+	_ context.Context, page pagination.Page,
+) ([]model.Summary, error) {
+	f.popularCalls.Add(1)
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+
+	all := f.summariesAll()
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].ViewCount != all[j].ViewCount {
+			return all[i].ViewCount > all[j].ViewCount
+		}
+		return all[i].ID > all[j].ID
+	})
+
+	out := make([]model.Summary, 0, len(all))
+	for _, s := range all {
+		if vc, id := page.CursorViewCount(), page.CursorID(); vc != nil && id != nil {
+			// 行値比較 (view_count, id) < (cursor_view_count, cursor_id)
+			if s.ViewCount > *vc || (s.ViewCount == *vc && s.ID >= *id) {
+				continue
+			}
+		}
+		out = append(out, s)
+		if int32(len(out)) == page.Size {
+			break
+		}
+	}
+	return out, nil
+}
+
 // SearchSummaries は検索語を記録したうえで、タイトルの部分一致で絞り込みます。
 //
 // **ILIKE の意味を真似はしません。** ここで見たいのは
@@ -154,8 +200,9 @@ func (f *fakeRepo) Create(_ context.Context, thread *model.Thread) (*model.Threa
 		icon = model.NewImage(*thread.IconImageID,
 			"images/"+thread.IconImageID.String()+".webp", 64, 64)
 	}
+	// 作成直後の閲覧数は必ず 0。加算はフラッシュだけが行う。
 	return model.Reconstruct(int64(len(f.createdThreads)), thread.Title, thread.Author,
-		icon, time.Unix(0, 0).UTC()), nil
+		icon, time.Unix(0, 0).UTC(), 0), nil
 }
 
 func (f *fakeRepo) Exists(_ context.Context, id int64) (bool, error) {
@@ -223,7 +270,7 @@ func newFakeRepoWithTitles(titles ...string) *fakeRepo {
 	for i := len(titles); i >= 1; i-- {
 		id := int64(i)
 		threads = append(threads,
-			*model.Reconstruct(id, titles[i-1], nil, nil, time.Unix(int64(i), 0).UTC()))
+			*model.Reconstruct(id, titles[i-1], nil, nil, time.Unix(int64(i), 0).UTC(), 0))
 		counts[id] = 0
 	}
 	return &fakeRepo{threads: threads, counts: counts}
@@ -235,7 +282,7 @@ func newFakeRepo(n int) *fakeRepo {
 	counts := make(map[int64]int64, n)
 	for i := n; i >= 1; i-- {
 		id := int64(i)
-		threads = append(threads, *model.Reconstruct(id, fmt.Sprintf("スレッド %d", id), nil, nil, time.Unix(int64(i), 0).UTC()))
+		threads = append(threads, *model.Reconstruct(id, fmt.Sprintf("スレッド %d", id), nil, nil, time.Unix(int64(i), 0).UTC(), 0))
 		counts[id] = id * 3
 	}
 	return &fakeRepo{threads: threads, counts: counts}

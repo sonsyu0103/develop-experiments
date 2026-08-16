@@ -17,6 +17,7 @@ import (
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
+	"develop-experiments/apps/go-api/internal/viewcount"
 )
 
 // ---------------------------------------------------------------------------
@@ -54,7 +55,7 @@ func newDeleteEnv(t *testing.T) *deleteEnv {
 	// Author を返すため (thread.go の型コメント)。所有の判定に使うのは
 	// 内部 ID のほうなので、ここでは書き込み時と同じ形に手で揃える。
 	ownedThread := func(id int64, title string, authorID *int64, at int64) threadmodel.Summary {
-		th := threadmodel.Reconstruct(id, title, nil, nil, time.Unix(at, 0).UTC())
+		th := threadmodel.Reconstruct(id, title, nil, nil, time.Unix(at, 0).UTC(), 0)
 		th.AuthorID = authorID
 		return threadmodel.Summary{Thread: *th}
 	}
@@ -90,8 +91,8 @@ func newDeleteEnv(t *testing.T) *deleteEnv {
 			nil,
 			moderationusecase.NewInteractor(newFakeModerationRepo()),
 			moderationusecase.NewReportInteractor(newFakeReportRepo(), newFakeReportRepo()),
-			config.AuthConfig{FrontendURL: "http://localhost:3000"},
-		),
+			viewcount.New(),
+			config.AuthConfig{FrontendURL: "http://localhost:3000"}),
 		AllowedOrigins: []string{testOrigin},
 	})
 	if err != nil {

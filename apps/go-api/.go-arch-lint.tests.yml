@@ -67,6 +67,11 @@ components:
   # **Job の中身は知らない。** 束ねて回すだけで、実処理は main が渡す
   shared-scheduler:
     in: internal/scheduler
+  # 閲覧数のバッファ (docs/adr/0006-view-count-and-popularity.md)。
+  # 本体用と同じく commonComponents には入れない ——
+  # 「ついでに閲覧数を足す」経路を作れる形にしないため。
+  viewcount:
+    in: internal/viewcount
 
   thread-model:
     in: internal/thread/domain/model
@@ -269,6 +274,8 @@ deps:
       - moderation-model
       - httpapi-oapigen
       - shared-config
+      # 閲覧を数える (ADR 0006)。**ここは DB に触らない**
+      - viewcount
       # 緩和: ハンドラのテストはフェイクのリポジトリを組むため
       # ドメインの型を必要とする。ここを縛るとテストのために本番コードが歪む。
       # 一方 postgres は許していない —— テストでも永続化層には触らせない

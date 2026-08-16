@@ -41,6 +41,17 @@ type Thread struct {
 	// **image モジュールの型は使いません** (ADR 0004 / ADR 0014 の Author と同じ形)。
 	Icon      *Image
 	CreatedAt time.Time
+	// ViewCount は閲覧数です (docs/adr/0006-view-count-and-popularity.md)。
+	//
+	// **正確な値ではありません。** 計上はアプリのメモリ上で行い、
+	// 一定間隔でまとめて反映するため、最大でその間隔ぶん遅れます。
+	// プロセスが異常終了すればバッファ内の増分は消えます。
+	//
+	// 表示用の指標であり、課金や順位の確定には使いません。
+	//
+	// **書き込み経路では埋まりません。** 作成時は必ず 0 で、
+	// 加算はフラッシュだけが行います。
+	ViewCount int64
 }
 
 // Image は表示用のスレッドアイコンです。
@@ -104,7 +115,7 @@ func NewThread(title string, authorID *int64, iconImageID *uuid.UUID) (*Thread, 
 // Reconstruct は永続化層から読み出した値でスレッドを復元します。
 // 保存済みのデータが対象なので、検証は行いません。
 func Reconstruct(
-	id int64, title string, author *Author, icon *Image, createdAt time.Time,
+	id int64, title string, author *Author, icon *Image, createdAt time.Time, viewCount int64,
 ) *Thread {
 	return &Thread{
 		ID:        id,
@@ -112,5 +123,6 @@ func Reconstruct(
 		Author:    author,
 		Icon:      icon,
 		CreatedAt: createdAt,
+		ViewCount: viewCount,
 	}
 }

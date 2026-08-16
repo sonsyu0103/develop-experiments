@@ -86,7 +86,7 @@ func respondError(c *gin.Context, err error) {
 			"同時更新が競合しました。時間をおいて再試行してください"))
 
 	default:
-		slog.ErrorContext(c.Request.Context(), "未分類のエラー",
+		slog.ErrorContext(c.Request.Context(), "unhandled_error",
 			slog.String("path", c.FullPath()),
 			slog.String("error", err.Error()),
 		)

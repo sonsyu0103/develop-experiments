@@ -31,12 +31,93 @@ type Config struct {
 	// 気づかないうちにデバッグモードで動くほうが危険なため、
 	// 安全側に倒しています。
 	Debug bool
+	// LogFormat はログの出力形式です (docs/adr/0010-log-pipeline.md)。
+	//
+	// **Debug と分けてあります。** 初版はログ形式をデバッグモードに
+	// 束ねており、ENV=development では必ずテキスト形式になっていました。
+	// その結果、ログ基盤をローカルで検証すると
+	// **fluent-bit のパーサが 1 行も展開できない** —— 本番だけ JSON、
+	// 手元は logfmt なので、パイプラインの検証が本番の形に対して
+	// 行われていませんでした (ADR 0010「実装して分かったこと 1」)。
+	//
+	// レベル (何を出すか) と形式 (どう出すか) は独立した関心なので、
+	// 別々に決められるようにします。
+	LogFormat LogFormat
 	// CommentPostMode はコメント投稿の並行制御の方式です。
 	CommentPostMode CommentPostMode
 	// Auth は Google OIDC の設定です。
 	Auth AuthConfig
 	// Storage は画像を置くオブジェクトストレージの設定です。
 	Storage StorageConfig
+	// ViewCount は閲覧数の計上に関する設定です。
+	ViewCount ViewCountConfig
+}
+
+// ViewCountConfig は閲覧数の計上に関する設定です
+// (docs/adr/0006-view-count-and-popularity.md)。
+//
+// **無効化する設定はありません。** 閲覧数が増えていないことは
+// 誰も検算しないので目に見えず、「無効なまま運用していた」に
+// 気づく手立てが無いためです。調整できるのは頻度と窓だけになります。
+type ViewCountConfig struct {
+	// FlushInterval はバッファを DB へ反映する間隔です。
+	//
+	// **短くするほど値は新しくなり、UPDATE の回数が増えます。**
+	// 閲覧数と無関係に、この間隔だけで更新頻度が決まるのが
+	// バッファリングを選んだ理由そのものです。
+	FlushInterval time.Duration
+	// DedupeWindow は同一の訪問者を数え直さない時間です。
+	//
+	// Phase 4 で「抑制あり / なし」を比べられるよう、外から変えられます。
+	DedupeWindow time.Duration
+	// Mode は閲覧数の反映方式です。
+	Mode ViewCountMode
+}
+
+// ViewCountMode は閲覧数の反映方式です
+// (docs/adr/0006-view-count-and-popularity.md)。
+type ViewCountMode string
+
+const (
+	// ViewCountModeBuffered はメモリに貯めてまとめて反映します。**既定。**
+	ViewCountModeBuffered ViewCountMode = "buffered"
+	// ViewCountModeSync は閲覧のたびに UPDATE を打ちます (選択肢 A)。
+	//
+	// **Phase 4 の比較専用で、本番相当の設定では選べません。**
+	// これを本番で使うと、閲覧というまったく無関係な操作が
+	// コメント投稿の直列化失敗率を押し上げます。
+	// COMMENT_POST_MODE の naive と同じ扱いにしてあります。
+	ViewCountModeSync ViewCountMode = "sync"
+)
+
+// viewCountModes は選べる方式と、本番相当の設定で許すかどうかです。
+var viewCountModes = map[ViewCountMode]bool{
+	ViewCountModeBuffered: true,
+	ViewCountModeSync:     false,
+}
+
+// parseViewCountMode は VIEW_COUNT_MODE を読み取ります。
+//
+// 未知の値をエラーにする理由は parseCommentPostMode と同じです。
+// 綴りを間違えたまま起動すると、ベンチマークで
+// 「sync を測ったつもりの buffered の値」が出ます。
+func parseViewCountMode(raw string, debug bool) (ViewCountMode, error) {
+	if raw == "" {
+		return ViewCountModeBuffered, nil
+	}
+
+	mode := ViewCountMode(strings.TrimSpace(strings.ToLower(raw)))
+	allowedInProduction, known := viewCountModes[mode]
+	if !known {
+		return "", fmt.Errorf(
+			"config: VIEW_COUNT_MODE が不正です (got %q, 選べるのは buffered / sync)", raw)
+	}
+	if !allowedInProduction && !debug {
+		return "", fmt.Errorf(
+			"config: VIEW_COUNT_MODE=%s は ENV=development でのみ選べます "+
+				"(コメント投稿の直列化失敗率を押し上げます)", mode)
+	}
+	return mode, nil
 }
 
 // StorageConfig は S3 互換ストレージの設定です (docs/adr/0007-image-storage.md)。
@@ -144,6 +225,52 @@ func parseCommentPostMode(raw string, debug bool) (CommentPostMode, error) {
 	return mode, nil
 }
 
+// LogFormat はログの出力形式です。
+type LogFormat string
+
+const (
+	// LogFormatJSON は 1 行 1 JSON です。**本番と、ログ基盤を通す経路の形式。**
+	// Athena / DuckDB はこの形を前提にスキーマオンリードで読みます。
+	LogFormatJSON LogFormat = "json"
+	// LogFormatText は人間が読むための logfmt 形式です。
+	// **fluent-bit のパーサはこれを展開できません** (JSON ではないため)。
+	LogFormatText LogFormat = "text"
+)
+
+// logFormats は選べる形式です。
+var logFormats = map[LogFormat]bool{
+	LogFormatJSON: true,
+	LogFormatText: true,
+}
+
+// parseLogFormat は LOG_FORMAT を読み取ります。
+//
+// 未設定のときは debug から決めます (開発はテキスト、それ以外は JSON)。
+// **既定を残すのは、この変更で既存の環境の見え方を変えないためです。**
+// ログ基盤を通す環境 (compose / 本番) は LOG_FORMAT=json を明示します。
+//
+// 未知の値をエラーにするのは parseCommentPostMode と同じ理由です。
+// 綴りを間違えたまま黙ってテキストで動くと、S3 に着地したログが
+// **1 行も展開されないまま貯まり続けます。** 気づくのは、Athena で
+// クエリを書こうとした数日後になります。
+// **空白だけは既定に落とさずエラーです** (parseCommentPostMode と同じ)。
+// 空文字は compose の ${LOG_FORMAT:-} が普通に生む形なので未設定と同義に
+// 扱いますが、空白だけが入るのは打ち間違いしかありません。
+func parseLogFormat(raw string, debug bool) (LogFormat, error) {
+	if raw == "" {
+		if debug {
+			return LogFormatText, nil
+		}
+		return LogFormatJSON, nil
+	}
+
+	format := LogFormat(strings.TrimSpace(strings.ToLower(raw)))
+	if !logFormats[format] {
+		return "", fmt.Errorf("config: LOG_FORMAT が不正です (got %q, 選べるのは json / text)", raw)
+	}
+	return format, nil
+}
+
 // AuthConfig は Google OIDC による認証の設定です。
 //
 // **すべて任意です。** 揃っていない場合、API は起動しますが
@@ -235,6 +362,30 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	logFormat, err := parseLogFormat(os.Getenv("LOG_FORMAT"), debug)
+	if err != nil {
+		return nil, err
+	}
+
+	// 既定は 5 秒 (ADR 0006 の「一定間隔 (既定 5 秒)」)。
+	// **0 を許さない。** 0 だとスケジューラが既定値 (10 分) へ丸めるので、
+	// 「即時に反映されるつもりで 0 にしたら、いちばん遅くなった」が起きる。
+	flushSec, err := intEnv("VIEW_COUNT_FLUSH_SECONDS", 5, 1)
+	if err != nil {
+		return nil, err
+	}
+	// 既定は 10 分。0 を許すと抑制が無効になるが、それは Phase 4 の
+	// 比較で使う設定なので、下限を 0 にして明示的に選べるようにする。
+	dedupeSec, err := intEnv("VIEW_COUNT_DEDUPE_SECONDS", 600, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	viewCountMode, err := parseViewCountMode(os.Getenv("VIEW_COUNT_MODE"), debug)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		Addr:            stringEnv("ADDR", ":8080"),
 		DatabaseURL:     dsn,
@@ -243,7 +394,13 @@ func Load() (*Config, error) {
 		ShutdownTimeout: time.Duration(shutdownSec) * time.Second,
 		AllowedOrigins:  csvEnv("CORS_ALLOWED_ORIGINS", []string{"http://localhost:3000"}),
 		Debug:           debug,
+		LogFormat:       logFormat,
 		CommentPostMode: commentPostMode,
+		ViewCount: ViewCountConfig{
+			FlushInterval: time.Duration(flushSec) * time.Second,
+			DedupeWindow:  time.Duration(dedupeSec) * time.Second,
+			Mode:          viewCountMode,
+		},
 		Auth: AuthConfig{
 			GoogleClientID:     os.Getenv("GOOGLE_CLIENT_ID"),
 			GoogleClientSecret: os.Getenv("GOOGLE_CLIENT_SECRET"),

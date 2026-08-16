@@ -147,7 +147,7 @@ func (i *ImageInteractor) Upload(
 		// **pending の行は消しません。** 消すと、PUT が実は成功していた場合に
 		// 「DB に記録の無いオブジェクト」が残ります (決定 3 が避けたかった形)。
 		// 残しておけば回収バッチが両方を消せます。
-		slog.ErrorContext(ctx, "画像の保存に失敗しました (pending のまま残ります)",
+		slog.ErrorContext(ctx, "image_store_failed",
 			slog.String("image_id", saved.ID.String()),
 			slog.String("error", putErr.Error()),
 		)
@@ -159,7 +159,7 @@ func (i *ImageInteractor) Upload(
 	if err != nil {
 		// ここで落ちても、オブジェクトと pending 行の両方が残っている。
 		// 回収バッチが対にして消せる状態なので、握りつぶさずに返す。
-		slog.ErrorContext(ctx, "画像の確定に失敗しました (pending のまま残ります)",
+		slog.ErrorContext(ctx, "image_commit_failed",
 			slog.String("image_id", saved.ID.String()),
 			slog.String("error", err.Error()),
 		)

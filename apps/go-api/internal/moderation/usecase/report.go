@@ -228,7 +228,8 @@ func (i *ReportInteractor) Resolve(
 	slog.InfoContext(ctx, "report_resolved",
 		slog.Int64("report_id", resolved.ID),
 		slog.Int64("actor_id", actor.UserID),
-		slog.String("status", string(resolved.Status)),
+		// status は http_request が int で使っている (ADR 0010 の 4-2)。
+		slog.String("report_status", string(resolved.Status)),
 	)
 	return resolved, nil
 }

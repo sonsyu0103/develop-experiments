@@ -140,7 +140,9 @@ func (i *ImageInteractor) Reclaim(
 			slog.ErrorContext(finish, "image_reclaim_storage_failed",
 				slog.String("image_id", img.ID.String()),
 				slog.String("object_key", img.ObjectKey),
-				slog.String("status", string(img.Status)),
+				// **status は使わない。** http_request が int で出しており、
+				// Athena は同名で型が違う列を宣言できない (ADR 0010 の 4-2)。
+				slog.String("image_status", string(img.Status)),
 				slog.String("error", err.Error()),
 			)
 			continue

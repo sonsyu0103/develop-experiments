@@ -45,19 +45,51 @@ var tokenEncoding = base64.RawURLEncoding
 
 // Cursor は「どの行の続きから読むか」を表します。
 //
-// 現在の並び順は id 降順だけなので中身は id 1 つですが、
-// 人気順を追加すると view_count が加わります。フィールドを増やしても
-// API 上の型 (文字列) は変わらないため、クライアントは影響を受けません。
+// フィールドを増やしても API 上の型 (文字列) は変わらないため、
+// クライアントは影響を受けません。
 type Cursor struct {
 	// Version は形式のバージョン。復号時に検査します。
 	Version int `json:"v"`
+	// Sort は発行元の並び順です。**既定 (新着順) は空文字**にしてあり、
+	// 並び順が 1 つだった頃に発行したトークンも読めます。
+	//
+	// **この値の一致を検査するのは、このパッケージではありません**
+	// (ADR 0018「並び順を足すときの規則」)。どの並び順を要求されたかを
+	// 知っているのは上の層だけで、ここに持ち込むと
+	// ソート種別の一覧を下位層が知ることになります。
+	//
+	// 検査しないと何が起きるか:
+	// **新着順が発行したトークン (ViewCount なし) を人気順に渡すと、
+	// ViewCount がゼロ値に落ち、「閲覧数 0 の位置から」ページングが始まる。**
+	// 400 も出ず、黙って誤ったページが返ります。
+	Sort string `json:"s,omitempty"`
 	// ID はこの値より小さい id を次に読む、という境界です。
 	ID int64 `json:"id"`
+	// ViewCount は人気順の第 1 キーです。新着順では nil になります。
+	//
+	// **ポインタなのは 0 と「無い」を区別するため。** 閲覧数 0 の
+	// スレッドは普通に存在するので、ゼロ値では表せません。
+	ViewCount *int64 `json:"vc,omitempty"`
 }
 
-// NewCursor は id からカーソルを組み立てます。
+// NewCursor は id からカーソルを組み立てます (新着順)。
 func NewCursor(id int64) Cursor {
 	return Cursor{Version: cursorVersion, ID: id}
+}
+
+// WithSort は並び順の識別子を付けたカーソルを返します。
+//
+// **識別子の文字列はこのパッケージが決めません。** 呼び出し側が
+// 自分の並び順の語彙で渡します (上の Sort の説明を参照)。
+func (c Cursor) WithSort(sort string) Cursor {
+	c.Sort = sort
+	return c
+}
+
+// WithViewCount は人気順の第 1 キーを付けたカーソルを返します。
+func (c Cursor) WithViewCount(viewCount int64) Cursor {
+	c.ViewCount = &viewCount
+	return c
 }
 
 // Encode はカーソルを API に返す不透明トークンへ変換します。
@@ -159,6 +191,38 @@ func (p Page) CursorID() *int64 {
 	return &id
 }
 
+// CursorViewCount は人気順の境界値を返します。
+// 先頭ページ、または新着順のカーソルでは nil です。
+//
+// **nil をそのまま SQL へ渡してよい形にしてあります。** 人気順のクエリは
+// cursor_view_count が NULL なら先頭から読むので、
+// 「新着順のトークンが混ざった」場合も先頭ページとして振る舞います。
+// ただしそれは**握りつぶしではなく最後の砦**で、
+// 混入は上の層が並び順の一致で弾きます (Cursor.Sort の説明)。
+func (p Page) CursorViewCount() *int64 {
+	if p.Cursor == nil || p.Cursor.ViewCount == nil {
+		return nil
+	}
+	vc := *p.Cursor.ViewCount
+	return &vc
+}
+
+// CursorSort は発行元の並び順を返します。先頭ページでは空文字です。
+//
+// **先頭ページと「新着順のトークン」は、どちらも空文字になります。**
+// この 2 つを区別するには Cursor が nil かどうかを見てください。
+//
+// **一致の検査では区別が要ります。** 「どちらも新着順として扱ってよい」
+// と考えると、人気順の 1 ページ目 (カーソル無し) が
+// 「新着順のトークンが混ざった」と判定され、**必ず 400 になります**
+// (実際にその形で作り、テストで捕まえました)。
+func (p Page) CursorSort() string {
+	if p.Cursor == nil {
+		return ""
+	}
+	return p.Cursor.Sort
+}
+
 // NextToken は次ページ用のトークンを決めます。
 //
 // 「size 件ちょうど返ってきたら次ページがあるかもしれない」という判断なので、
@@ -168,10 +232,20 @@ func (p Page) CursorID() *int64 {
 //
 // 次ページがない場合は nil を返します。
 func NextToken(lastID int64, returned int, size int32) (*string, error) {
+	return NextTokenFor(NewCursor(lastID), returned, size)
+}
+
+// NextTokenFor は組み立て済みのカーソルから次ページ用のトークンを決めます。
+//
+// 並び順ごとにカーソルの中身が違うため、**「次ページがあるか」の判定だけを
+// ここに残し、値の組み立ては呼び出し側に置いてあります。**
+// ここで並び順ごとに分岐させると、このパッケージが
+// ソート種別の一覧を知ることになります (Cursor.Sort の説明)。
+func NextTokenFor(c Cursor, returned int, size int32) (*string, error) {
 	if returned == 0 || returned != int(size) {
 		return nil, nil
 	}
-	t, err := NewCursor(lastID).Encode()
+	t, err := c.Encode()
 	if err != nil {
 		return nil, err
 	}

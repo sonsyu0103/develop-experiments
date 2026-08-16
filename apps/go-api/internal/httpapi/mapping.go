@@ -39,6 +39,7 @@ func toWireThread(d threadusecase.ThreadDTO) oapigen.Thread {
 		Id:           d.ID,
 		Title:        d.Title,
 		CommentCount: d.CommentCount,
+		ViewCount:    d.ViewCount,
 		Author:       author,
 		Icon:         icon,
 		CreatedAt:    d.CreatedAt,

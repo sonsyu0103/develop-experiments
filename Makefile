@@ -16,6 +16,15 @@ NODE := env -u NODE_OPTIONS
 # migrate コンテナは compose ネットワーク内から接続するため、ホスト名はサービス名
 MIGRATE_URL := postgres://app:password@postgres:5432/bbs?sslmode=disable
 
+# MinIO を mc で操作する使い捨てコンテナ。
+#
+# **MC_HOST_<alias> で接続先を渡す。** `mc alias set` を先に流す形だと
+# entrypoint を sh にする必要があり、minio/mc のイメージには
+# grep すら無いのでシェル芸が書けない (実測)。環境変数なら 1 コマンドで済む。
+MC := docker compose run --rm \
+	-e MC_HOST_local=http://minioadmin:minioadmin@minio:9000 \
+	--entrypoint mc minio-init
+
 # バージョンを固定する理由:
 #   @latest のままだと、ある日リンタのルールが増えて CI が突然赤くなる。
 #   更新は「意図した変更」としてコミットに残したい。
@@ -83,7 +92,63 @@ clean: ## 全サービスを停止し、DB のデータも消す
 
 .PHONY: logs
 logs: ## ログを追尾する
+	# **go-api のログは fluent-bit 側に出る** (ADR 0010 決定 1)。
+	# fluentd ログドライバが stdout を横取りするので、
+	# `docker compose logs go-api` は空になる。
+	# 全サービスをまとめて追尾するこの形なら、どちらでも見える。
 	docker compose logs -f
+
+.PHONY: logs-query
+logs-query: ## S3 に着地したログを SQL で読む (make logs-query Q='SELECT ...')
+ifndef Q
+	$(error Q が未指定です。例: make logs-query Q='SELECT msg, count(*) FROM go_api_logs GROUP BY 1')
+endif
+	# ビュー名は go_api_logs。パーティション列 (service / dt / hour) も見える。
+	# 保存したクエリは /queries に読み取り専用でマウントしてある:
+	#   make logs-query Q=/queries/http-status.sql
+	docker compose run --rm logs-query "$(Q)"
+
+.PHONY: logs-verify
+logs-verify: ## ログ基盤が本番と同じ形で動いているかを実測する
+	# **目視では気づけない壊れ方を捕まえる。**
+	# パーサが展開に失敗しても fluent-bit はレコードを捨てないので、
+	# S3 にはオブジェクトが増え続ける —— 見た目には動いている。
+	# 気づくのは Athena でクエリを書こうとした数日後になる。
+	#
+	# 実際にその形で壊れていた (ADR 0010「実装して分かったこと 1」)。
+	@$(MAKE) --no-print-directory up
+	# **過去のログを消してから測る。** 混ざると、いま壊れている設定でも
+	# 「前に着地した正しいログ」で検査が通ってしまう。
+	@echo "S3 上の既存ログを消しています..."
+	@$(MC) rm --recursive --force local/bbs-logs/logs/ >/dev/null 2>&1 || true
+	# go-api を作り直す。LOG_FORMAT を変えた直後に、
+	# 古い設定のまま動いているプロセスを検査しないようにする (make smoke と同じ理由)。
+	docker compose up -d --force-recreate go-api
+	@for i in $$(seq 1 45); do \
+		curl -sf -o /dev/null http://localhost:8080/healthz && break || sleep 2; \
+	done
+	# **いろいろな応答を出させる。** 200 だけだと、ステータスや
+	# レイテンシで切るクエリが「動いたが何も分からない」形になる。
+	@curl -sf -o /dev/null "http://localhost:8080/threads" || true
+	@curl -sf -o /dev/null "http://localhost:8080/threads?size=1" || true
+	@curl -s  -o /dev/null "http://localhost:8080/threads/999999" || true
+	@curl -s  -o /dev/null "http://localhost:8080/threads?cursor=壊れたトークン" || true
+	@curl -s  -o /dev/null -X POST "http://localhost:8080/threads" \
+		-H 'Content-Type: application/json' -d '{"title":""}' || true
+	# **スレッド詳細も叩く。** 閲覧が計上され、フラッシュが走ると
+	# view_count_flushed が着地する。
+	#
+	# レビュー指摘で分かったことだが、**この検査は「出たログ」しか見られない**。
+	# 叩かない経路のイベントは、DDL に宣言し忘れていても検出されない。
+	# 網を完全にはできないので、**少なくとも今回入れたイベントは通す。**
+	@curl -sf -o /dev/null "http://localhost:8080/threads/1" || true
+	@curl -sf -o /dev/null "http://localhost:8080/threads/2" || true
+	# **待ち合わせは検査側が持っている。** ここで「オブジェクトが 1 つ
+	# できたか」を見て進むと、アプリの起動ログ (gin のルート登録) が
+	# 先にアップロードされた時点で抜けてしまい、**リクエストのログが
+	# 1 件も無い状態で検査を始める**ことになる (実測で誤検出した)。
+	# verify.py は http_request が着地するまで待つ。
+	docker compose run --rm --entrypoint python logs-query /opt/logs/verify.py
 
 .PHONY: psql
 psql: ## PostgreSQL に対話接続する
@@ -282,6 +347,61 @@ concurrency-probe: ## 4 つの並行制御モードを実 DB で比較計測す�
 	PROBE_WORKERS=$(PROBE_WORKERS) \
 	python3 .github/scripts/concurrency-probe.py
 
+.PHONY: verify-log-events
+verify-log-events: ## ログの msg がイベント名になっているかを検査する
+	# **実行時の検査では届かない範囲を埋める。** make logs-verify は
+	# 実際に出たログしか見られないので、エラー経路のログは検査されない。
+	# こちらはソースを見るので、呼ばれていないログも全部対象になる。
+	#
+	# DB も MinIO も要らないため、ログ基盤の検証でここだけが CI に載る
+	# (ADR 0010「実装して分かったこと 3」)。
+	.github/scripts/verify-log-events.py
+
+PROBE_VIEWERS ?= 16
+
+.PHONY: viewcount-probe
+viewcount-probe: ## 閲覧数の反映方式を実 DB で比較計測する (Phase 4 / ADR 0006)
+	# **本命は「閲覧数の更新あり / なしでコメント投稿の直列化失敗率がどう変わるか」。**
+	# 無関係に見える機能追加が、別の機能の並行制御を壊すことを数字で示す。
+	#
+	# concurrency-probe と同じく **CI には載せない** ——
+	# 数字が環境の性能に左右されるので、通す / 落とすの基準にできない。
+	#
+	# **測定中はコンテナを何度も作り直す。** 条件ごとに
+	# VIEW_COUNT_MODE を差し替えるため、数分かかる。
+	@$(MAKE) --no-print-directory up
+	@echo "API の起動を待っています..."
+	@for i in $$(seq 1 30); do \
+		curl -sf -o /dev/null http://localhost:8080/healthz && break || sleep 2; \
+	done
+	BASE_URL=http://localhost:8080 \
+	SQL_EXEC="docker compose exec -T postgres psql -U app -d bbs -X -q" \
+	PROBE_WORKERS=$(PROBE_WORKERS) \
+	PROBE_VIEWERS=$(PROBE_VIEWERS) \
+	python3 .github/scripts/viewcount-probe.py
+
+.PHONY: bench-dataset
+bench-dataset: ## Phase 4 用のデータセットを投入する (2,000 スレッド / 20 万コメント。既存データは消える)
+	# **開発用シードとは別物。** あちらは目視で確認できる 5 スレッドで、
+	# こちらは「索引が効くかどうかが結果に出る」規模を作る。
+	#
+	# **既存のデータは消える** (先頭で TRUNCATE している)。
+	# 戻すには make seed を流す。
+	docker compose exec -T postgres psql -U app -d bbs -X -q -v ON_ERROR_STOP=1 \
+		< $(GO_API_DIR)/db/bench/dataset.sql
+
+.PHONY: query-probe
+query-probe: ## 一覧・検索・ページ送りのクエリを実測する (Phase 4)
+	# 「Phase 4 で測る」と書いたまま残っていた 3 件を片付ける:
+	#   - コメント数の集計 (投稿者の JOIN を足してから測っていない)
+	#   - 検索クエリのレスポンス分布 (ADR 0012)
+	#   - 深いページでカーソルの OR を COALESCE にすべきか (レビュー指摘)
+	#
+	# **先に make bench-dataset が要る。** 開発シードの 5 スレッドでは
+	# 何を測っても意味が無い。
+	SQL_EXEC="docker compose exec -T postgres psql -U app -d bbs -X -q" \
+	python3 .github/scripts/query-probe.py
+
 .PHONY: verify-generated
 verify-generated: generate ## 生成物がコミット済みの内容と一致するか検査する
 	@git diff --exit-code -- \
@@ -327,7 +447,7 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 		fi
 
 .PHONY: check
-check: lint test cover verify-tidy verify-generated arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test cover verify-tidy verify-generated verify-log-events arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
-check-all: check smoke ## check に加えて実 DB での疎通確認まで行う
+check-all: check smoke logs-verify ## check に加えて実 DB / ログ基盤まで確認する

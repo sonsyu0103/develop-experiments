@@ -119,7 +119,7 @@ func toUserModel(row sqlcgen.User) *model.User {
 		// 呼び出し側がエラーを返せない位置なので、
 		// 一般利用者へ倒したうえで記録に残す。
 		// DB の CHECK 制約があるため、到達するのは制約を外したときだけ。
-		slog.Error("ロールを解釈できません",
+		slog.Error("role_parse_failed",
 			slog.Int64("user_id", row.ID), slog.String("role", row.Role))
 		role = model.RoleUser
 	}

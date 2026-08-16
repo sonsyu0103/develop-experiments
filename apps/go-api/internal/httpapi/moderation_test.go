@@ -24,6 +24,7 @@ import (
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
+	"develop-experiments/apps/go-api/internal/viewcount"
 )
 
 // ---------------------------------------------------------------------------
@@ -332,7 +333,7 @@ func newModerationEnv(t *testing.T, role usermodel.Role) *moderationEnv {
 	reports := newFakeReportRepo()
 	threads := &fakeThreadRepo{
 		summaries: []threadmodel.Summary{
-			{Thread: *threadmodel.Reconstruct(1, "スレッド", nil, nil, time.Unix(1, 0).UTC())},
+			{Thread: *threadmodel.Reconstruct(1, "スレッド", nil, nil, time.Unix(1, 0).UTC(), 0)},
 		},
 	}
 	comments := &fakeCommentRepo{}
@@ -347,8 +348,8 @@ func newModerationEnv(t *testing.T, role usermodel.Role) *moderationEnv {
 			nil,
 			moderationusecase.NewInteractor(repo),
 			moderationusecase.NewReportInteractor(reports, reports),
-			config.AuthConfig{FrontendURL: "http://localhost:3000"},
-		),
+			viewcount.New(),
+			config.AuthConfig{FrontendURL: "http://localhost:3000"}),
 		AllowedOrigins: []string{testOrigin},
 	})
 	if err != nil {
