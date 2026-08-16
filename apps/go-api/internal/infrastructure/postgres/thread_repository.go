@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -36,7 +37,59 @@ func (r *ThreadRepository) ListSummaries(ctx context.Context, page pagination.Pa
 	if err != nil {
 		return nil, translateError("ThreadRepository.ListSummaries", err)
 	}
+	return toSummaries(rows), nil
+}
 
+// SearchSummaries はタイトルの中間一致で絞り込んで取得します
+// (docs/adr/0012-search.md)。
+//
+// **ワイルドカードのエスケープはここで行います。** 検索語をそのまま
+// LIKE に渡すと、`%` の 1 文字で全件一致を作られます (ADR 0012 の罠)。
+// ドメイン側でやらないのは、`%` と `_` が特別なのは PostgreSQL の LIKE の
+// 都合であって、検索語そのものの性質ではないためです。
+func (r *ThreadRepository) SearchSummaries(
+	ctx context.Context, query model.SearchQuery, page pagination.Page,
+) ([]model.Summary, error) {
+	rows, err := r.q.SearchThreadsWithCommentCount(ctx, sqlcgen.SearchThreadsWithCommentCountParams{
+		TitleQuery: escapeLikePattern(query.Keyword()),
+		CursorID:   page.CursorID(),
+		PageSize:   page.Size,
+	})
+	if err != nil {
+		return nil, translateError("ThreadRepository.SearchSummaries", err)
+	}
+
+	// **行の型は同一の SELECT 句から生成されるので変換できます。**
+	// 片方の列を増やした時点でこの変換はコンパイルエラーになり、
+	// 詰め替えの取りこぼしに気づけます。
+	listRows := make([]sqlcgen.ListThreadsWithCommentCountRow, 0, len(rows))
+	for _, row := range rows {
+		listRows = append(listRows, sqlcgen.ListThreadsWithCommentCountRow(row))
+	}
+	return toSummaries(listRows), nil
+}
+
+// escapeLikePattern は LIKE のワイルドカードを打ち消します。
+//
+// エスケープ文字は `\` で、SQL 側の ESCAPE '\' と対になっています。
+//
+// **順に置換していく実装にしないこと。** `%` を先に `\%` へ変えてから
+// `\` を `\\` へ変えると、**自分が挿入した `\` をもう一度エスケープ**して
+// `\\%` (「バックスラッシュに続く任意の文字列」) に化けます。
+// strings.NewReplacer は入力を 1 回だけ走査し、挿入した文字を読み直さないので、
+// この形なら順序を気にする必要がありません
+// (この誤りは変異プローブで実測しました。ADR 0012 の 6)。
+func escapeLikePattern(keyword string) string {
+	r := strings.NewReplacer(
+		`\`, `\\`,
+		`%`, `\%`,
+		`_`, `\_`,
+	)
+	return r.Replace(keyword)
+}
+
+// toSummaries は取得した行を一覧の要素に詰め替えます。
+func toSummaries(rows []sqlcgen.ListThreadsWithCommentCountRow) []model.Summary {
 	summaries := make([]model.Summary, 0, len(rows))
 	for _, row := range rows {
 		summaries = append(summaries, model.Summary{
@@ -48,7 +101,7 @@ func (r *ThreadRepository) ListSummaries(ctx context.Context, page pagination.Pa
 			CommentCount: row.CommentCount,
 		})
 	}
-	return summaries, nil
+	return summaries
 }
 
 // FindSummaryByID は 1 件のスレッドをコメント数つきで取得します。

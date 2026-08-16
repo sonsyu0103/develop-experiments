@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +32,9 @@ type fakeRepo struct {
 	countDelay time.Duration
 
 	// 以下は観測用。
+	// listCalls は ListSummaries の呼び出し回数です。
+	// 検索のとき「絞り込まない一覧」に落ちていないことを見るために使います。
+	listCalls        atomic.Int64
 	countCalls       atomic.Int64
 	concurrentNow    atomic.Int64
 	concurrentPeak   atomic.Int64
@@ -39,6 +43,9 @@ type fakeRepo struct {
 	// deleteCalls は SoftDeleteOwn に渡された (id, actorID) です。
 	deleteCallMux sync.Mutex
 	deleteCalls   [][2]int64
+	// searchCalls は SearchSummaries に渡された検索語です。
+	searchCallMux sync.Mutex
+	searchCalls   []string
 }
 
 var (
@@ -60,12 +67,28 @@ func (f *fakeRepo) SoftDeleteOwn(_ context.Context, id, actorID int64) error {
 }
 
 func (f *fakeRepo) summaries(page pagination.Page) []model.Summary {
+	return applyPage(f.summariesAll(), page)
+}
+
+// summariesAll は絞り込み前の全件を新しい順で返します。
+func (f *fakeRepo) summariesAll() []model.Summary {
 	out := make([]model.Summary, 0, len(f.threads))
 	for _, t := range f.threads {
-		if cursorID := page.CursorID(); cursorID != nil && t.ID >= *cursorID {
+		out = append(out, model.Summary{Thread: t, CommentCount: f.counts[t.ID]})
+	}
+	return out
+}
+
+// applyPage はカーソルと件数の絞り込みを行います。
+// **一覧と検索で共通です** —— 検索結果も新着順なので、
+// カーソルの扱いが変わらないことを実装でも表しています (ADR 0012 決定 3)。
+func applyPage(all []model.Summary, page pagination.Page) []model.Summary {
+	out := make([]model.Summary, 0, len(all))
+	for _, s := range all {
+		if cursorID := page.CursorID(); cursorID != nil && s.ID >= *cursorID {
 			continue
 		}
-		out = append(out, model.Summary{Thread: t, CommentCount: f.counts[t.ID]})
+		out = append(out, s)
 		if int32(len(out)) == page.Size {
 			break
 		}
@@ -74,10 +97,41 @@ func (f *fakeRepo) summaries(page pagination.Page) []model.Summary {
 }
 
 func (f *fakeRepo) ListSummaries(_ context.Context, page pagination.Page) ([]model.Summary, error) {
+	f.listCalls.Add(1)
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
 	return f.summaries(page), nil
+}
+
+// SearchSummaries は検索語を記録したうえで、タイトルの部分一致で絞り込みます。
+//
+// **ILIKE の意味を真似はしません。** ここで見たいのは
+// 「検索語が永続化層まで正規化された形で届くこと」と
+// 「絞り込んでもページ送りの組み立てが変わらないこと」の 2 つで、
+// 一致の判定そのものは実 DB の検査が持ちます (ADR 0012)。
+//
+// **エスケープ済みの文字列は届きません。** LIKE のワイルドカードを
+// 打ち消すのは PostgreSQL 実装の中だけの話なので、
+// ここに `\%` が来たらそれは層の切り分けが崩れた合図になります。
+func (f *fakeRepo) SearchSummaries(
+	_ context.Context, query model.SearchQuery, page pagination.Page,
+) ([]model.Summary, error) {
+	f.searchCallMux.Lock()
+	f.searchCalls = append(f.searchCalls, query.Keyword())
+	f.searchCallMux.Unlock()
+
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+
+	matched := make([]model.Summary, 0, len(f.threads))
+	for _, s := range f.summariesAll() {
+		if strings.Contains(s.Title, query.Keyword()) {
+			matched = append(matched, s)
+		}
+	}
+	return applyPage(matched, page), nil
 }
 
 func (f *fakeRepo) FindSummaryByID(_ context.Context, id int64) (*model.Summary, error) {
@@ -159,6 +213,20 @@ func (f *fakeRepo) CountComments(ctx context.Context, threadID int64) (int64, er
 	}
 
 	return f.counts[threadID], nil
+}
+
+// newFakeRepoWithTitles は指定したタイトルのスレッドを持つフェイクを作ります。
+// titles は id の昇順で渡し、保持は新しい順 (降順) になります。
+func newFakeRepoWithTitles(titles ...string) *fakeRepo {
+	threads := make([]model.Thread, 0, len(titles))
+	counts := make(map[int64]int64, len(titles))
+	for i := len(titles); i >= 1; i-- {
+		id := int64(i)
+		threads = append(threads,
+			*model.Reconstruct(id, titles[i-1], nil, nil, time.Unix(int64(i), 0).UTC()))
+		counts[id] = 0
+	}
+	return &fakeRepo{threads: threads, counts: counts}
 }
 
 // newFakeRepo は id が 1..n のスレッドを新しい順 (降順) に持つフェイクを作ります。

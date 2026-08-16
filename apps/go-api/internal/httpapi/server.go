@@ -259,7 +259,11 @@ func (s *Server) ListThreads(c *gin.Context, params oapigen.ListThreadsParams) {
 		return
 	}
 
-	result, err := s.threads.FetchThreadList(c.Request.Context(), page)
+	// **検索語はそのまま渡します。** 正規化 (前後の空白を落とす、
+	// 空なら絞り込まない) はドメインの規則なので、ユースケース層が
+	// model.ParseSearchQuery に委ねます —— タイトルを model.NewThread に
+	// 渡しているのと同じ形です (docs/adr/0012-search.md / ADR 0017 の層の境界)。
+	result, err := s.threads.FetchThreadList(c.Request.Context(), page, params.Q)
 	if err != nil {
 		respondError(c, err)
 		return

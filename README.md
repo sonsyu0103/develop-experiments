@@ -116,7 +116,7 @@ CI の `generated-ci` ジョブが再生成して差分を検査するため、
 | --- | --- | --- |
 | GET | `/healthz` | Liveness (DB は見ない) |
 | GET | `/readyz` | Readiness (DB 疎通を含む) |
-| GET | `/threads` | スレッド一覧 (コメント数つき) |
+| GET | `/threads` | スレッド一覧 (コメント数つき)。`?q=` でタイトル検索 |
 | POST | `/threads` | スレッド作成 |
 | GET | `/threads/{threadId}` | スレッド 1 件 |
 | GET | `/threads/{threadId}/comments` | コメント一覧 |
@@ -440,7 +440,7 @@ make concurrency-probe PROBE_WORKERS=64
 | Phase 8 | 問い合わせフォームとメール送信 | 設計完了 |
 | Phase 9 | ログ基盤 (Fluent Bit → S3 → Athena) | 設計完了 |
 | Phase 10 | モデレーション (ロール・通報・管理画面) | **完了** |
-| Phase 11 | スレッド検索 (`pg_trgm`) | 設計完了 |
+| Phase 11 | スレッド検索 (`pg_trgm`) | **完了** |
 
 ### 着手順
 
@@ -472,8 +472,13 @@ make concurrency-probe PROBE_WORKERS=64
    サーバ側の `fetch` は `Origin` を送らず `csrfGuard` に弾かれるためで
    ([ADR 0013](docs/adr/0013-http-defense.md))、
    結果として認証済み応答のキャッシュを見る層が 1 つに減った
-5. **Phase 11 (検索)** —— 他と依存がない。Phase 4 の測定対象に含めるため、
-   ベンチマークより前に置く
+5. ~~**Phase 11 (検索)**~~ —— **完了**。他と依存がない。
+   Phase 4 の測定対象に含めるため、ベンチマークより前に置いた。
+   **設計どおりに作ったら日本語が 1 件も索引されていなかった** ——
+   データベースの `LC_CTYPE` が `C` だと `pg_trgm` が
+   日本語をトライグラムに分解しない。索引は作られ、エラーも出ず、
+   実行計画にだけ出る形で壊れていた
+   ([ADR 0012](docs/adr/0012-search.md) の「実装して分かったこと 1」)
 6. **Phase 9 の後半 → Phase 7 (人気一覧) + Phase 4 (ベンチマーク)** —— 合流させる。
    閲覧数の設計がそのままベンチマークの題材になり
    ([ADR 0006](docs/adr/0006-view-count-and-popularity.md))、

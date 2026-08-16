@@ -62,6 +62,9 @@ type fakeThreadRepo struct {
 	// deletedThreads は論理削除済みのスレッド ID です。
 	// 二重削除が 404 になることを見るために持ちます。
 	deletedThreads map[int64]bool
+
+	// searchedFor は SearchSummaries に届いた検索語です。
+	searchedFor []string
 }
 
 var _ threadrepo.ThreadRepository = (*fakeThreadRepo)(nil)
@@ -71,6 +74,26 @@ func (f *fakeThreadRepo) ListSummaries(context.Context, pagination.Page) ([]thre
 		return nil, f.err
 	}
 	return f.summaries, nil
+}
+
+// SearchSummaries はタイトルの部分一致で絞り込みます。
+// **受け取った検索語を記録します** —— HTTP 層で見たいのは
+// 「?q= がどんな形で永続化層まで届くか」だからです
+// (一致の判定そのものは実 DB の検査が持ちます)。
+func (f *fakeThreadRepo) SearchSummaries(
+	_ context.Context, query threadmodel.SearchQuery, _ pagination.Page,
+) ([]threadmodel.Summary, error) {
+	f.searchedFor = append(f.searchedFor, query.Keyword())
+	if f.err != nil {
+		return nil, f.err
+	}
+	matched := make([]threadmodel.Summary, 0, len(f.summaries))
+	for _, s := range f.summaries {
+		if strings.Contains(s.Title, query.Keyword()) {
+			matched = append(matched, s)
+		}
+	}
+	return matched, nil
 }
 
 func (f *fakeThreadRepo) FindSummaryByID(_ context.Context, id int64) (*threadmodel.Summary, error) {
@@ -380,6 +403,62 @@ func TestListThreads(t *testing.T) {
 	}
 }
 
+func TestListThreads_Search(t *testing.T) {
+	env := newTestEnv(t)
+
+	rec := env.do(t, http.MethodGet, "/threads?q=2%20%E7%95%AA%E7%9B%AE", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	got := decodeJSON[oapigen.ThreadList](t, rec)
+	if len(got.Threads) != 1 || got.Threads[0].Id != 2 {
+		t.Fatalf("threads = %+v, want id 2 の 1 件", got.Threads)
+	}
+	if len(env.threads.searchedFor) != 1 || env.threads.searchedFor[0] != "2 番目" {
+		t.Errorf("永続化層に届いた検索語 = %v, want [2 番目]", env.threads.searchedFor)
+	}
+}
+
+// **空白だけの q は「指定なし」。** 400 にはしません。
+// 検索欄を空のまま送信したフォームが弾かれると、
+// 利用者には「検索が壊れている」としか見えません。
+func TestListThreads_BlankSearchIsNoFilter(t *testing.T) {
+	for _, q := range []string{"", "%20%20", "%E3%80%80"} {
+		t.Run("q="+q, func(t *testing.T) {
+			env := newTestEnv(t)
+
+			rec := env.do(t, http.MethodGet, "/threads?q="+q, "")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+			}
+			got := decodeJSON[oapigen.ThreadList](t, rec)
+			if len(got.Threads) != 2 {
+				t.Errorf("件数 = %d, want 2 (絞り込みなし)", len(got.Threads))
+			}
+			if len(env.threads.searchedFor) != 0 {
+				t.Errorf("検索が実行された: %v, want 実行されない", env.threads.searchedFor)
+			}
+		})
+	}
+}
+
+// 検索語は「そのままの文字」として永続化層まで届くこと。
+// **LIKE のエスケープを HTTP 層やドメインでやっていない**ことの確認になります
+// (エスケープ済みの文字列がここに現れたら、層の切り分けが崩れています)。
+func TestListThreads_SearchKeepsWildcardCharacters(t *testing.T) {
+	env := newTestEnv(t)
+
+	// "100%_x" を URL エンコードしたもの。
+	rec := env.do(t, http.MethodGet, "/threads?q=100%25_x", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if len(env.threads.searchedFor) != 1 || env.threads.searchedFor[0] != "100%_x" {
+		t.Errorf("永続化層に届いた検索語 = %v, want [100%%_x]", env.threads.searchedFor)
+	}
+}
+
 func TestListThreads_EmptyIsJSONArrayNotNull(t *testing.T) {
 	env := newTestEnv(t)
 	env.threads.summaries = nil
@@ -552,6 +631,9 @@ func TestSpecValidation_RejectsInvalidRequests(t *testing.T) {
 		{"cursor に使えない文字 (pattern 違反)", http.MethodGet, "/threads?cursor=abc.def", ""},
 		{"cursor が長すぎる (maxLength: 256 違反)", http.MethodGet,
 			"/threads?cursor=" + strings.Repeat("A", 257), ""},
+		// q に minLength は無い (空は「指定なし」)。上限だけを見る。
+		{"q が長すぎる (maxLength: 200 違反)", http.MethodGet,
+			"/threads?q=" + strings.Repeat("a", threadmodel.SearchQueryMaxLength+1), ""},
 
 		// リクエストボディ (requestBody の schema)
 		{"title が空 (minLength: 1 違反)", http.MethodPost, "/threads", `{"title":""}`},

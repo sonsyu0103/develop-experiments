@@ -5,14 +5,27 @@ services:
       POSTGRES_USER: app
       POSTGRES_PASSWORD: password
       POSTGRES_DB: bbs
-      # ロケールを C に固定する理由:
-      #   - 照合順序が「バイト順」になり、比較のたびに ICU/libc を呼ばなくなるので
+      # 照合順序 (LC_COLLATE) を C に固定する理由:
+      #   - 比較が「バイト順」になり、比較のたびに ICU/libc を呼ばなくなるので
       #     ソートとインデックス走査が速い
       #   - LIKE 'prefix%' が B-Tree インデックスで効くようになる
       #     (C 以外のロケールでは text_pattern_ops を明示する必要がある)
       #   - glibc のバージョン差でインデックスが壊れる事故を避けられる
       # 日本語の「辞書順」ソートが必要になったら、その列だけ COLLATE を指定する。
-      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      #
+      # **文字種判定 (LC_CTYPE) だけは C.UTF-8 にする。** ここを C にすると、
+      # PostgreSQL は「1 バイト = 1 文字」の速い経路に入り、
+      # **日本語の文字が「文字」と判定されなくなる。**
+      # pg_trgm は語をなす文字の並びからトライグラムを切り出すため、
+      # LC_CTYPE=C では日本語のタイトルから 1 つもトライグラムが作られず、
+      # 検索用の GIN インデックスが丸ごと無効になる (ADR 0012 で実測)。
+      #
+      #   LC_CTYPE=C       : show_trgm('検証') = {}
+      #   LC_CTYPE=C.UTF-8 : show_trgm('検証') = {0x0b1253,osW,0x912f90}
+      #
+      # 上に挙げた 3 つの利点はすべて LC_COLLATE 側のものなので、
+      # 分けて指定すれば両立する。
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C.UTF-8"
     command:
       - postgres
       # pg_stat_statements: クエリ単位の実行時間・呼び出し回数を集計する拡張。
@@ -42,6 +55,41 @@ services:
       retries: 20
       start_period: 10s
 
+  # 拡張を作って終了する使い捨てコンテナ。
+  #
+  # **db/init はボリュームの初回作成時にしか実行されない。**
+  # Phase 11 より前に作ったボリュームには pg_trgm が入っておらず、
+  # マイグレーション 000010 がガードで落ちる。しかも migrate は
+  # restart: on-failure なので、**最初に出した「make clean && make up して
+  # ください」は再試行のログに流され**、以後は golang-migrate の
+  # 「Dirty database version 10」しか見えなくなる (レビュー指摘)。
+  #
+  # 同じファイルをここでも流して、既存のボリュームにも行き渡らせる。
+  # CI も services: に initdb.d の口が無いため同じことをしており
+  # (.github/workflows/ci.yml)、3 者が同じファイルを見る形になる。
+  #
+  # **拡張の作成が運用の作業であること自体は変えていない** (ADR 0012)。
+  # 実行する主体が「初回起動の entrypoint」から「毎回走る使い捨てコンテナ」に
+  # 変わっただけで、内容は db/init/*.sql のままになる。
+  db-init:
+    image: postgres:17-alpine
+    volumes:
+      - ./apps/go-api/db/init:/init:ro
+    environment:
+      PGHOST: postgres
+      PGUSER: app
+      PGPASSWORD: password
+      PGDATABASE: bbs
+    # ON_ERROR_STOP=1 が無いと、途中で失敗しても psql が続行して
+    # 終了コード 0 を返す (seed と同じ理由)。
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'set -e; for f in /init/*.sql; do psql -v ON_ERROR_STOP=1 -f "$$f"; done'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   # マイグレーションを実行して終了する使い捨てコンテナ。
   # go-api はこれの正常終了を待ってから起動する。
   migrate:
@@ -53,8 +101,9 @@ services:
       - -database=postgres://app:password@postgres:5432/bbs?sslmode=disable
       - up
     depends_on:
-      postgres:
-        condition: service_healthy
+      # 拡張を要する索引があるので、postgres が healthy なだけでは足りない。
+      db-init:
+        condition: service_completed_successfully
     restart: on-failure
 
   # 開発用のシードデータを投入して終了する使い捨てコンテナ。

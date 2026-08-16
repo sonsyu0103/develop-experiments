@@ -52,6 +52,7 @@ import sys
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8080").rstrip("/")
 
@@ -288,6 +289,105 @@ if status == 200:
     check("コメント 2 ページ目は 1 ページ目より小さい ID だけを返す",
           cids2 and max(cids2) < min(cids1), f"1: {cids1}, 2: {cids2}")
     check("コメントのページ間で重複しない", not set(cids1) & set(cids2))
+
+section("スレッド検索 (ADR 0012)")
+
+# シードのタイトル (5 件):
+#   1 Go の並列処理を学ぶ部屋 / 2 PostgreSQL のパーティショニング検証
+#   3 キーセットページネーションの話 / 4 sqlc と型安全な SQL
+#   5 コメントが 0 件のスレッド
+#
+# **ここは書き込みの節より前に置く。** 後ろに置くと、
+# スモークが作った "smoke test" が検索結果に混ざって件数が変わる。
+status, hit, _ = call("GET", "/threads?q=" + quote("PostgreSQL"))
+check("q=PostgreSQL がスレッド 2 だけを返す",
+      status == 200 and [t["id"] for t in hit["threads"]] == [2],
+      f"status={status}, got={[t['id'] for t in hit.get('threads', [])]}")
+
+# ILIKE なので大文字小文字は区別しない。
+# LIKE に変えるとここだけが落ちる。
+status, hit, _ = call("GET", "/threads?q=" + quote("postgresql"))
+check("大文字小文字を区別しない (ILIKE)",
+      status == 200 and [t["id"] for t in hit["threads"]] == [2],
+      f"got={[t['id'] for t in hit.get('threads', [])]}")
+
+# 日本語の中間一致。**pg_trgm の索引が効くかどうかとは別の話**で、
+# ここで見ているのは「一致するか」だけになる
+# (索引が使われるかは EXPLAIN の領域で、ADR 0012 に実測を残している)。
+status, hit, _ = call("GET", "/threads?q=" + quote("検証"))
+check("日本語の中間一致 (q=検証) がスレッド 2 を返す",
+      status == 200 and [t["id"] for t in hit["threads"]] == [2],
+      f"got={[t['id'] for t in hit.get('threads', [])]}")
+
+# **ここが検索でいちばん危ない。**
+# エスケープが外れると、利用者は "%" の 1 文字で全件を引ける
+# (ADR 0012 の罠)。0 件であることを確かめる。
+status, hit, _ = call("GET", "/threads?q=%25")
+check("q=% が全件一致にならない (LIKE のエスケープ)",
+      status == 200 and hit["threads"] == [],
+      f"status={status}, 件数={len(hit.get('threads', []))}")
+
+status, hit, _ = call("GET", "/threads?q=_")
+check("q=_ が任意の 1 文字にならない",
+      status == 200 and hit["threads"] == [],
+      f"件数={len(hit.get('threads', []))}")
+
+# 空と空白だけは「指定なし」。**400 にしない。**
+# 検索欄を空のまま送信したフォームが弾かれるのを避けるため。
+status, blank, _ = call("GET", "/threads?q=")
+check("空の q は絞り込みなしと同じ",
+      status == 200 and len(blank["threads"]) == 5,
+      f"status={status}, 件数={len(blank.get('threads', []))}")
+
+status, blank, _ = call("GET", "/threads?q=" + quote("　 "))
+check("空白だけの q も絞り込みなし (全角スペースを含む)",
+      status == 200 and len(blank["threads"]) == 5,
+      f"status={status}, 件数={len(blank.get('threads', []))}")
+
+status, none, _ = call("GET", "/threads?q=" + quote("該当しない語"))
+check("一致なしは 200 かつ空配列 (404 ではない)",
+      status == 200 and none["threads"] == [] and none["nextCursor"] is None,
+      f"status={status}, got={none}")
+
+# **検索結果もカーソルで送れること** (ADR 0012 決定 3)。
+# 関連度順にしなかったのは、まさにこれをそのまま使うためになる。
+#
+# "ン" が入るのは 2 (パーティショニング)・3 (ページネーション)・5 (コメント) の
+# 3 件。**size=2 で割り切れない数を選んである** —— 2 ページ目が
+# ちょうど埋まると「最終ページで nextCursor が消えるか」を見られない。
+status, sall, _ = call("GET", "/threads?q=" + quote("ン"))
+check("q=ン が 3 件 (5, 3, 2) に一致する",
+      status == 200 and [t["id"] for t in sall["threads"]] == [5, 3, 2],
+      f"got={[t['id'] for t in sall.get('threads', [])]}")
+
+status, spage1, _ = call("GET", "/threads?q=" + quote("ン") + "&size=2")
+if status == 200:
+    sids1 = [t["id"] for t in spage1["threads"]]
+    check("検索結果の 1 ページ目が [5, 3]", sids1 == [5, 3], f"ids={sids1}")
+    stoken = spage1["nextCursor"]
+    check("検索結果にも nextCursor が付く", isinstance(stoken, str), f"got={stoken!r}")
+
+    status, spage2, _ = call(
+        "GET", "/threads?q=" + quote("ン") + f"&size=2&cursor={stoken}")
+    sids2 = [t["id"] for t in spage2["threads"]]
+    # **カーソルは絞り込んだ結果の最後の id を指す。**
+    # 絞り込む前の id で切っていると、ここに 4 が現れるか 2 が消える。
+    check("検索結果の 2 ページ目が [2]", sids2 == [2], f"ids={sids2}")
+    check("検索結果のページ間で重複しない", not set(sids1) & set(sids2))
+    check("検索結果の最終ページで nextCursor が null",
+          spage2["nextCursor"] is None, f"got={spage2['nextCursor']}")
+
+check_status("q が 200 文字を超えると 400", "GET",
+             "/threads?q=" + "a" * 201, 400)
+
+# **NUL は 500 ではなく 400** (レビュー指摘)。
+# PostgreSQL の text は NUL を格納できず、パラメータとして送ると
+# SQLSTATE 22021 が返る。翻訳を外すと 500 になり、
+# **未ログインの誰でも 1 文字でサーバ内部エラーを作れる。**
+check_status("q に NUL を入れても 500 にならない", "GET",
+             "/threads?q=%00", 400, want_code="INVALID_ARGUMENT")
+check_status("q の内側の制御文字も 400", "GET",
+             "/threads?q=a%00b", 400, want_code="INVALID_ARGUMENT")
 
 section("単体取得とコメント")
 check_status("GET /threads/1", "GET", "/threads/1", 200)

@@ -18,6 +18,16 @@ type ThreadRepository interface {
 	// コメント数の集計は 1 クエリで完結します。
 	ListSummaries(ctx context.Context, page pagination.Page) ([]model.Summary, error)
 
+	// SearchSummaries はタイトルの中間一致で絞り込んだうえで、
+	// ListSummaries と同じ組を新しい順に取得します
+	// (docs/adr/0012-search.md 決定 3: 関連度順にはしません)。
+	//
+	// **並び順が同じなので、カーソルの意味も同じ**です。
+	// 絞り込みの有無でページ送りの扱いを変える必要はありません。
+	SearchSummaries(
+		ctx context.Context, query model.SearchQuery, page pagination.Page,
+	) ([]model.Summary, error)
+
 	// FindSummaryByID は 1 件のスレッドをコメント数つきで取得します。
 	// 存在しない場合は apperr.ErrNotFound を返します。
 	FindSummaryByID(ctx context.Context, id int64) (*model.Summary, error)

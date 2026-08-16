@@ -101,8 +101,29 @@ func NewThreadInteractor(
 //
 // 「goroutine で並列集計」した版は FetchThreadListNPlusOne に残してあり、
 // Phase 4 のベンチマークで両者を比較します。
-func (i *ThreadInteractor) FetchThreadList(ctx context.Context, page pagination.Page) (ThreadListResult, error) {
-	summaries, err := i.repo.ListSummaries(ctx, page)
+//
+// **rawQuery は正規化前の検索語です** (docs/adr/0012-search.md)。
+// nil か、前後の空白を落とすと空になる文字列なら絞り込みません。
+// 解釈をここで行うのは、タイトルを model.NewThread に渡しているのと同じ形で、
+// HTTP 層にドメインの型を持ち込まないためです (ADR 0017 の層の境界)。
+//
+// 検索の有無で分かれるのは取得の 1 か所だけで、ページ送りの組み立て
+// (buildListResult) から先は共通です —— 検索結果も新着順なので、
+// カーソルの意味が変わらないためです (ADR 0012 決定 3)。
+func (i *ThreadInteractor) FetchThreadList(
+	ctx context.Context, page pagination.Page, rawQuery *string,
+) (ThreadListResult, error) {
+	query, err := model.ParseSearchQuery(rawQuery)
+	if err != nil {
+		return ThreadListResult{}, err
+	}
+
+	var summaries []model.Summary
+	if query == nil {
+		summaries, err = i.repo.ListSummaries(ctx, page)
+	} else {
+		summaries, err = i.repo.SearchSummaries(ctx, *query, page)
+	}
 	if err != nil {
 		return ThreadListResult{}, err
 	}
