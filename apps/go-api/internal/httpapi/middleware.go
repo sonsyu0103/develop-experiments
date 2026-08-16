@@ -317,7 +317,10 @@ func recovery() gin.HandlerFunc {
 		// スタックは復帰処理の中で取る。パニックしたフレームがまだ
 		// 積まれているため、発生箇所まで辿れる。
 		slog.ErrorContext(c.Request.Context(), "panic",
-			slog.Any("panic", recovered),
+			// **Any にしない。** recover した値は任意の型で、
+			// JSON に出る形が呼び出しごとに変わる。Athena は
+			// 1 つの型しか宣言できないので、ここで文字列に固定する。
+			slog.String("panic", fmt.Sprint(recovered)),
 			slog.String("stack", string(debug.Stack())),
 		)
 		c.AbortWithStatusJSON(http.StatusInternalServerError,

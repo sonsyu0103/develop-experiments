@@ -541,3 +541,60 @@ func TestWithDedupeWindow_NegativeIsIgnored(t *testing.T) {
 		t.Error("負値で抑制が外れている (既定のままであるべき)")
 	}
 }
+
+// **SyncCounter でも期限切れの記録が捨てられること** (レビュー指摘)。
+//
+// 以前は eviction の契機を Buffer.Flush だけが持っていたため、
+// 同期版では seen が一度も掃除されなかった。上限に達すると
+// 新しい訪問者を覚えなくなるので、**抑制が静かに無効になった状態で
+// 測定が続く** —— Phase 4 で「抑制あり」の条件を作ったつもりが
+// 「抑制なし」になる。
+//
+// フラッシュを持たない実装なので、**gate 自身が掃除する**必要がある。
+func TestSyncCounter_EvictsExpiredVisitors(t *testing.T) {
+	t.Parallel()
+
+	c := &clock{now: time.Unix(1_700_000_000, 0)}
+	sink := &fakeSink{}
+	// 上限 2。掃除されなければ 3 人目を覚えられない。
+	counter := NewSync(sink, WithClock(c.Now),
+		WithDedupeWindow(time.Minute), WithMaxVisitors(2))
+
+	counter.Record(t.Context(), 1, "a")
+	counter.Record(t.Context(), 1, "b")
+
+	// 窓を過ぎてから次の閲覧。ここで掃除が走る。
+	c.advance(2 * time.Minute)
+	counter.Record(t.Context(), 2, "c")
+
+	// 掃除されていれば "c" を覚えているので、再訪は抑制される。
+	if counter.Record(t.Context(), 2, "c") {
+		t.Error("掃除されておらず、新しい訪問者を覚えられていない")
+	}
+	// 期限切れの "a" は忘れられているので、また数えられる。
+	if !counter.Record(t.Context(), 1, "a") {
+		t.Error("期限切れの記録が残っている")
+	}
+}
+
+// 閲覧が続いている間も掃除が走ること (Buffer 側)。
+//
+// **Flush を待たない。** 閲覧だけが続いてフラッシュが遅い設定では、
+// 掃除が来ないまま seen が膨らむ。
+func TestRecord_EvictsExpiredVisitorsWithoutFlush(t *testing.T) {
+	t.Parallel()
+
+	c := &clock{now: time.Unix(1_700_000_000, 0)}
+	b := newTestBuffer(c, WithDedupeWindow(time.Minute), WithMaxVisitors(2))
+
+	b.Record(t.Context(), 1, "a")
+	b.Record(t.Context(), 1, "b")
+
+	// Flush を挟まずに窓を越える。
+	c.advance(2 * time.Minute)
+	b.Record(t.Context(), 2, "c")
+
+	if b.Record(t.Context(), 2, "c") {
+		t.Error("Flush 無しでは掃除されていない")
+	}
+}

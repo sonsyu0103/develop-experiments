@@ -101,14 +101,23 @@ type visitorGate struct {
 	window time.Duration
 	max    int
 	now    func() time.Time
+	// lastEvict は最後に期限切れを捨てた時刻です。
+	//
+	// **掃除の契機を gate 自身が持ちます。** 以前は Buffer.Flush だけが
+	// 呼んでおり、**SyncCounter (選択肢 A) では一度も掃除されませんでした**
+	// (レビュー指摘)。seen が上限に達すると新しい訪問者を覚えなくなるため、
+	// **抑制が静かに無効になった状態で測定が続く** ——
+	// Phase 4 で「抑制あり」の条件を作ったつもりが「抑制なし」になります。
+	lastEvict time.Time
 }
 
 func newVisitorGate(window time.Duration, max int, now func() time.Time) *visitorGate {
 	return &visitorGate{
-		seen:   make(map[visitKey]time.Time),
-		window: window,
-		max:    max,
-		now:    now,
+		seen:      make(map[visitKey]time.Time),
+		window:    window,
+		max:       max,
+		now:       now,
+		lastEvict: now(),
 	}
 }
 
@@ -125,6 +134,12 @@ func (g *visitorGate) allow(threadID int64, visitor string) bool {
 	defer g.mu.Unlock()
 
 	now := g.now()
+	// **窓が 1 周するごとに掃除する。** 毎回走査すると訪問者の数だけ
+	// 回ることになり、Record が重くなります。
+	if now.Sub(g.lastEvict) >= g.window {
+		g.evictExpiredLocked(now)
+	}
+
 	key := visitKey{visitor: hashVisitor(visitor), threadID: threadID}
 	if last, ok := g.seen[key]; ok && now.Sub(last) < g.window {
 		return false
@@ -140,15 +155,23 @@ func (g *visitorGate) allow(threadID int64, visitor string) bool {
 
 // evictExpired は期限切れの記録を捨てます。
 //
-// **呼ばれるたびに全件走査します。** 訪問者の数だけ回るので、
-// 上限 (max) がそのまま 1 回のコストの上限になります。
-// 期限切れを別の索引で管理する形にはしていません ——
-// 数万件の走査は数 ms で終わり、フラッシュは秒単位の間隔で回るためです。
+// **allow が窓ごとに自動で呼ぶので、通常は外から呼ぶ必要はありません。**
+// フラッシュの契機でも呼んでいるのは、閲覧が止まっている間に
+// 記録を抱えたままにしないためです (allow が呼ばれなければ掃除も走らない)。
 func (g *visitorGate) evictExpired() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.evictExpiredLocked(g.now())
+}
 
-	now := g.now()
+// evictExpiredLocked は呼び出し側がロックを保持している前提で掃除します。
+//
+// **全件走査します。** 訪問者の数だけ回るので、上限 (max) が
+// そのまま 1 回のコストの上限になります。期限切れを別の索引で
+// 管理する形にはしていません —— 数万件の走査は数 ms で終わり、
+// 掃除は窓ごとにしか走らないためです。
+func (g *visitorGate) evictExpiredLocked(now time.Time) {
+	g.lastEvict = now
 	for key, last := range g.seen {
 		if now.Sub(last) >= g.window {
 			delete(g.seen, key)

@@ -64,7 +64,9 @@ func New(jobs ...Job) *Scheduler {
 		if job.Interval <= 0 {
 			slog.Warn("scheduler_interval_defaulted",
 				slog.String("job", job.Name),
-				slog.Duration("interval", DefaultInterval),
+				// **Duration にしない。** JSON ハンドラではナノ秒の整数になり、
+				// Athena で毎回 / 1e6 を書くことになる (ADR 0010 の 4-4)。
+				slog.Int64("interval_ms", DefaultInterval.Milliseconds()),
 			)
 			job.Interval = DefaultInterval
 		}

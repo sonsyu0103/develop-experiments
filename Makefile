@@ -135,6 +135,14 @@ logs-verify: ## ログ基盤が本番と同じ形で動いているかを実測�
 	@curl -s  -o /dev/null "http://localhost:8080/threads?cursor=壊れたトークン" || true
 	@curl -s  -o /dev/null -X POST "http://localhost:8080/threads" \
 		-H 'Content-Type: application/json' -d '{"title":""}' || true
+	# **スレッド詳細も叩く。** 閲覧が計上され、フラッシュが走ると
+	# view_count_flushed が着地する。
+	#
+	# レビュー指摘で分かったことだが、**この検査は「出たログ」しか見られない**。
+	# 叩かない経路のイベントは、DDL に宣言し忘れていても検出されない。
+	# 網を完全にはできないので、**少なくとも今回入れたイベントは通す。**
+	@curl -sf -o /dev/null "http://localhost:8080/threads/1" || true
+	@curl -sf -o /dev/null "http://localhost:8080/threads/2" || true
 	# **待ち合わせは検査側が持っている。** ここで「オブジェクトが 1 つ
 	# できたか」を見て進むと、アプリの起動ログ (gin のルート登録) が
 	# 先にアップロードされた時点で抜けてしまい、**リクエストのログが
