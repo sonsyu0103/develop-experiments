@@ -54,7 +54,7 @@ func (r *SessionRepository) FindLive(ctx context.Context, token model.SessionTok
 	// 制約を外した瞬間に権限が広がる。
 	role, err := model.ParseRole(row.Role)
 	if err != nil {
-		slog.ErrorContext(ctx, "ロールを解釈できません",
+		slog.ErrorContext(ctx, "role_parse_failed",
 			slog.Int64("owner_id", row.UserID), slog.String("role", row.Role))
 		role = model.RoleUser
 	}
@@ -136,7 +136,7 @@ func (r *SessionRepository) SetAvatarImage(
 
 	role, err := model.ParseRole(row.Role)
 	if err != nil {
-		slog.ErrorContext(ctx, "ロールを解釈できません",
+		slog.ErrorContext(ctx, "role_parse_failed",
 			slog.Int64("owner_id", row.ID), slog.String("role", row.Role))
 		role = model.RoleUser
 	}

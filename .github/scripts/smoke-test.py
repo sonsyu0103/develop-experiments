@@ -49,6 +49,7 @@ import secrets
 import shlex
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -1951,6 +1952,116 @@ if SQL_EXEC:
 else:
     section("通報とロール変更 (ADR 0011)")
     skip("通報とロール変更", "SQL_EXEC が未設定")
+
+# ---------------------------------------------------------------------------
+# 人気スレッド一覧と閲覧数 (docs/adr/0006-view-count-and-popularity.md)
+# ---------------------------------------------------------------------------
+
+section("人気スレッド一覧 (ADR 0006)")
+
+if SQL_EXEC:
+    try:
+        # **並びを SQL で作る。** HTTP から差を付けようとすると、
+        # 同一 IP からの連打が重複抑制で 1 回にまとめられるため、
+        # 「スレッドごとに違う閲覧数」を作れない (抑制そのものは下で検証する)。
+        sql("UPDATE threads SET view_count = 0;")
+        sql("UPDATE threads SET view_count = 500 WHERE id = 2;")
+        sql("UPDATE threads SET view_count = 300 WHERE id = 4;")
+        sql("UPDATE threads SET view_count = 100 WHERE id = 1;")
+
+        # **固定の ID を期待しない。** ここまでの節が作ったスレッドが
+        # 残っているため、シードの 5 件だけを前提にすると落ちる
+        # (実際に落として気づいた)。並びは「性質」で検査する。
+        status, popular, _ = call("GET", "/threads?sort=popular&size=100")
+        check("GET /threads?sort=popular が 200", status == 200, f"status={status}")
+        expected_order: list[int] = []
+        if status == 200:
+            rows = [(t["viewCount"], t["id"]) for t in popular["threads"]]
+            expected_order = [t["id"] for t in popular["threads"]]
+            check("閲覧数の多い順で返る",
+                  rows == sorted(rows, key=lambda r: (-r[0], -r[1])), f"rows={rows}")
+            # **同値の並びが不定だと、ページ境界で行が重複・欠落する。**
+            # 上のソート条件に id を含めているので、同値の塊が
+            # id 降順でなければここで落ちる。
+            ties = [r for r in rows if sum(1 for x in rows if x[0] == r[0]) > 1]
+            check("同値の閲覧数が存在する (ページ境界の検査の前提)",
+                  len(ties) >= 2, f"rows={rows}")
+            check("先頭は最大の閲覧数",
+                  rows and rows[0][0] == max(r[0] for r in rows), f"rows={rows}")
+            check("viewCount が返る",
+                  popular["threads"][0]["viewCount"] == 500,
+                  f"got={popular['threads'][0]['viewCount']}")
+
+        # **同値の塊をまたぐページ送り。** ここが行値比較の要点で、
+        # id だけで境界を作ると重複・欠落が出る。
+        seen: list[int] = []
+        cursor = ""
+        # 一括取得と同じ並びを、2 件ずつ辿って再現できるかを見る。
+        # 上限は「全件 / 2 + 余裕」。無限ループを避けるための保険。
+        for _ in range(len(expected_order) + 2):
+            path = "/threads?sort=popular&size=2"
+            if cursor:
+                path += f"&cursor={cursor}"
+            status, page, _ = call("GET", path)
+            if status != 200:
+                check("人気順のページ送りが 200", False, f"status={status}")
+                break
+            seen.extend(t["id"] for t in page["threads"])
+            if page["nextCursor"] is None:
+                break
+            cursor = page["nextCursor"]
+        check("人気順のページ送りで重複・欠落が無い",
+              seen == expected_order, f"seen={seen}, want={expected_order}")
+
+        # **並び順ごとにカーソルの意味が変わる。**
+        # 弾かないと「閲覧数 0 の位置から」黙って始まる (ADR 0018)。
+        status, page1, _ = call("GET", "/threads?size=2")
+        new_token = page1["nextCursor"]
+        check_status("新着順のカーソルを人気順に渡すと 400", "GET",
+                     f"/threads?size=2&sort=popular&cursor={new_token}", 400)
+
+        status, ppage1, _ = call("GET", "/threads?size=2&sort=popular")
+        popular_token = ppage1["nextCursor"]
+        check_status("人気順のカーソルを新着順に渡すと 400", "GET",
+                     f"/threads?size=2&cursor={popular_token}", 400)
+
+        # 検索と人気順は索引をどちらか一方しか使えない (仕様書の Sort)。
+        check_status("q と sort=popular の同時指定は 400", "GET",
+                     "/threads?q=Go&sort=popular", 400)
+        check_status("未知の sort は 400", "GET", "/threads?sort=views", 400)
+
+        # -------------------------------------------------------------------
+        # 計上とフラッシュ
+        #
+        # **ここだけは待つ。** 計上はメモリ上で行われ、DB へは
+        # フラッシュ間隔ごとにしか反映されない。待たずに検査すると、
+        # 「増えていない」のか「まだ反映されていない」のか区別できない。
+        # -------------------------------------------------------------------
+        sql("UPDATE threads SET view_count = 0 WHERE id = 3;")
+
+        status, _, _ = call("GET", "/threads/3")
+        check("スレッド詳細が 200", status == 200, f"status={status}")
+        # 同じ訪問者の連打。**抑制されるので 1 しか増えないはず。**
+        for _ in range(4):
+            call("GET", "/threads/3")
+
+        flush_wait = float(os.environ.get("SMOKE_FLUSH_WAIT_SECONDS", "8"))
+        print(f"       閲覧数のフラッシュを待っています ({flush_wait:.0f} 秒)...")
+        time.sleep(flush_wait)
+
+        status, thread3, _ = call("GET", "/threads/3")
+        got_view = thread3["viewCount"] if status == 200 else None
+        check("閲覧が DB まで反映される", got_view is not None and got_view >= 1,
+              f"viewCount={got_view}")
+        # **抑制が効いていること。** 効いていないと 5 になる。
+        # ここが崩れると、リロードだけで人気順を押し上げられる。
+        check("同一の訪問者の連打が抑制される", got_view == 1,
+              f"viewCount={got_view} (5 なら抑制が効いていない)")
+    finally:
+        # シードの前提 (他の節が見る値) を戻す。
+        sql("UPDATE threads SET view_count = 0;")
+else:
+    skip("人気スレッド一覧", "SQL_EXEC が未設定")
 
 # ---------------------------------------------------------------------------
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -57,7 +58,7 @@ func TestThreadInteractor_FetchThreadList(t *testing.T) {
 	repo := newFakeRepo(5)
 	uc := NewThreadInteractor(repo, nil)
 
-	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 3), nil)
+	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 3), nil, nil)
 	if err != nil {
 		t.Fatalf("FetchThreadList が失敗した: %v", err)
 	}
@@ -88,7 +89,7 @@ func TestThreadInteractor_FetchThreadList_NoCursorOnLastPage(t *testing.T) {
 
 	uc := NewThreadInteractor(newFakeRepo(2), nil)
 
-	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10), nil)
+	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10), nil, nil)
 	if err != nil {
 		t.Fatalf("FetchThreadList が失敗した: %v", err)
 	}
@@ -105,7 +106,7 @@ func TestThreadInteractor_FetchThreadList_EmptyReturnsNonNilSlice(t *testing.T) 
 
 	uc := NewThreadInteractor(newFakeRepo(0), nil)
 
-	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10), nil)
+	got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10), nil, nil)
 	if err != nil {
 		t.Fatalf("FetchThreadList が失敗した: %v", err)
 	}
@@ -124,7 +125,7 @@ func TestThreadInteractor_FetchThreadList_WithCursor(t *testing.T) {
 	uc := NewThreadInteractor(newFakeRepo(5), nil)
 
 	cursor := int64(4)
-	got, err := uc.FetchThreadList(context.Background(), mustPage(t, &cursor, 10), nil)
+	got, err := uc.FetchThreadList(context.Background(), mustPage(t, &cursor, 10), nil, nil)
 	if err != nil {
 		t.Fatalf("FetchThreadList が失敗した: %v", err)
 	}
@@ -144,7 +145,7 @@ func TestThreadInteractor_FetchThreadList_PropagatesRepositoryError(t *testing.T
 	repo := newFakeRepo(3)
 	repo.listErr = sentinel
 
-	_, err := NewThreadInteractor(repo, nil).FetchThreadList(context.Background(), mustPage(t, nil, 10), nil)
+	_, err := NewThreadInteractor(repo, nil).FetchThreadList(context.Background(), mustPage(t, nil, 10), nil, nil)
 	if !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want %v", err, sentinel)
 	}
@@ -162,7 +163,7 @@ func TestThreadInteractor_FetchThreadList_Search(t *testing.T) {
 	uc := NewThreadInteractor(repo, nil)
 
 	got, err := uc.FetchThreadList(
-		context.Background(), mustPage(t, nil, 10), searchQuery("PostgreSQL"))
+		context.Background(), mustPage(t, nil, 10), searchQuery("PostgreSQL"), nil)
 	if err != nil {
 		t.Fatalf("FetchThreadList が失敗した: %v", err)
 	}
@@ -209,7 +210,7 @@ func TestThreadInteractor_FetchThreadList_BlankQueryFallsBackToList(t *testing.T
 			repo := newFakeRepoWithTitles("PostgreSQL の話", "Go の話")
 			uc := NewThreadInteractor(repo, nil)
 
-			got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10), tt.query)
+			got, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10), tt.query, nil)
 			if err != nil {
 				t.Fatalf("FetchThreadList が失敗した: %v", err)
 			}
@@ -232,7 +233,7 @@ func TestThreadInteractor_FetchThreadList_TooLongQuery(t *testing.T) {
 	uc := NewThreadInteractor(repo, nil)
 
 	long := strings.Repeat("あ", model.SearchQueryMaxLength+1)
-	_, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10), &long)
+	_, err := uc.FetchThreadList(context.Background(), mustPage(t, nil, 10), &long, nil)
 	if !errors.Is(err, apperr.ErrInvalidArgument) {
 		t.Errorf("err = %v, want apperr.ErrInvalidArgument", err)
 	}
@@ -250,7 +251,7 @@ func TestThreadInteractor_FetchThreadList_SearchPagesWithSameCursor(t *testing.T
 	uc := NewThreadInteractor(repo, nil)
 
 	first, err := uc.FetchThreadList(
-		context.Background(), mustPage(t, nil, 2), searchQuery("Go"))
+		context.Background(), mustPage(t, nil, 2), searchQuery("Go"), nil)
 	if err != nil {
 		t.Fatalf("1 ページ目が失敗した: %v", err)
 	}
@@ -262,7 +263,7 @@ func TestThreadInteractor_FetchThreadList_SearchPagesWithSameCursor(t *testing.T
 
 	cursor := int64(3)
 	second, err := uc.FetchThreadList(
-		context.Background(), mustPage(t, &cursor, 2), searchQuery("Go"))
+		context.Background(), mustPage(t, &cursor, 2), searchQuery("Go"), nil)
 	if err != nil {
 		t.Fatalf("2 ページ目が失敗した: %v", err)
 	}
@@ -280,7 +281,7 @@ func TestThreadInteractor_FetchThreadList_SearchNoHit(t *testing.T) {
 	uc := NewThreadInteractor(newFakeRepoWithTitles("Go の話"), nil)
 
 	got, err := uc.FetchThreadList(
-		context.Background(), mustPage(t, nil, 10), searchQuery("見つからない語"))
+		context.Background(), mustPage(t, nil, 10), searchQuery("見つからない語"), nil)
 	if err != nil {
 		t.Fatalf("FetchThreadList が失敗した: %v", err)
 	}
@@ -494,5 +495,252 @@ func TestDeleteOwnThread_PassesActorID(t *testing.T) {
 	}
 	if len(repo.deleteCalls) != 1 || repo.deleteCalls[0] != [2]int64{7, 42} {
 		t.Errorf("渡された値 = %v, want [{7 42}]", repo.deleteCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 人気順 (docs/adr/0006-view-count-and-popularity.md)
+// ---------------------------------------------------------------------------
+
+// newFakeRepoWithViewCounts は閲覧数を指定したフェイクを作ります。
+// viewCounts は id 1..n の順に渡します。
+func newFakeRepoWithViewCounts(viewCounts ...int64) *fakeRepo {
+	threads := make([]model.Thread, 0, len(viewCounts))
+	counts := make(map[int64]int64, len(viewCounts))
+	for i := len(viewCounts); i >= 1; i-- {
+		id := int64(i)
+		threads = append(threads, *model.Reconstruct(
+			id, fmt.Sprintf("スレッド %d", id), nil, nil,
+			time.Unix(int64(i), 0).UTC(), viewCounts[i-1]))
+		counts[id] = 0
+	}
+	return &fakeRepo{threads: threads, counts: counts}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+// sort=popular が人気順の経路へ届くこと。
+//
+// **件数だけでは区別できません。** 新着順に落ちても同じ数が返るので、
+// フェイク側で呼び出しを数えています。
+func TestFetchThreadList_PopularUsesPopularRepository(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepoWithViewCounts(10, 300, 20)
+	uc := NewThreadInteractor(repo, nil)
+
+	got, err := uc.FetchThreadList(t.Context(), pagination.Page{Size: 10}, nil, ptr("popular"))
+	if err != nil {
+		t.Fatalf("FetchThreadList が失敗した: %v", err)
+	}
+	if repo.popularCalls.Load() != 1 {
+		t.Fatalf("人気順の経路が呼ばれていない (popularCalls = %d)", repo.popularCalls.Load())
+	}
+	if repo.listCalls.Load() != 0 {
+		t.Errorf("新着順の経路に落ちている (listCalls = %d)", repo.listCalls.Load())
+	}
+
+	// 閲覧数の多い順。
+	wantIDs := []int64{2, 3, 1}
+	for i, want := range wantIDs {
+		if got.Threads[i].ID != want {
+			t.Fatalf("並び = %v, want %v", ids(got.Threads), wantIDs)
+		}
+	}
+	// **閲覧数が API まで運ばれること。** ここが落ちると、
+	// 人気順で並んでいるのに理由が画面から見えない。
+	if got.Threads[0].ViewCount != 300 {
+		t.Errorf("viewCount = %d, want 300", got.Threads[0].ViewCount)
+	}
+}
+
+func ids(threads []ThreadDTO) []int64 {
+	out := make([]int64, 0, len(threads))
+	for _, t := range threads {
+		out = append(out, t.ID)
+	}
+	return out
+}
+
+// 未指定と "new" は新着順になること。
+func TestFetchThreadList_DefaultsToNewest(t *testing.T) {
+	t.Parallel()
+
+	for _, sort := range []*string{nil, ptr(""), ptr("new")} {
+		repo := newFakeRepoWithViewCounts(10, 300, 20)
+		if _, err := NewThreadInteractor(repo, nil).
+			FetchThreadList(t.Context(), pagination.Page{Size: 10}, nil, sort); err != nil {
+			t.Fatalf("FetchThreadList が失敗した: %v", err)
+		}
+		if repo.popularCalls.Load() != 0 {
+			t.Errorf("sort=%v で人気順の経路が呼ばれている", sort)
+		}
+	}
+}
+
+// 未知の並び順は既定に落とさずエラーにすること。
+//
+// **黙って新着順で返すと、「人気順で並べたつもりの新着順」になります。**
+// 利用者にもこちらにも間違いが見えません。
+func TestFetchThreadList_RejectsUnknownSort(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepoWithViewCounts(1, 2, 3)
+	_, err := NewThreadInteractor(repo, nil).
+		FetchThreadList(t.Context(), pagination.Page{Size: 10}, nil, ptr("views"))
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Fatalf("err = %v, want ErrInvalidArgument", err)
+	}
+	if repo.popularCalls.Load() != 0 || repo.listCalls.Load() != 0 {
+		t.Error("不正な並び順なのに永続化層まで届いている")
+	}
+}
+
+// 検索と人気順の同時指定を弾くこと (仕様書の Sort パラメータ)。
+func TestFetchThreadList_RejectsSearchWithPopular(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepoWithViewCounts(1, 2, 3)
+	_, err := NewThreadInteractor(repo, nil).
+		FetchThreadList(t.Context(), pagination.Page{Size: 10}, ptr("スレ"), ptr("popular"))
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Fatalf("err = %v, want ErrInvalidArgument", err)
+	}
+	if repo.popularCalls.Load() != 0 {
+		t.Error("弾いたはずなのに永続化層まで届いている")
+	}
+}
+
+// 人気順のカーソルに閲覧数が入ること。
+//
+// **id だけだと、同じ閲覧数の塊の途中で境界を作れません。**
+// 次ページが「閲覧数 0 の位置から」始まったり、同値の行を
+// 飛ばしたりします (ADR 0018 の規則)。
+func TestFetchThreadList_PopularCursorCarriesViewCount(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepoWithViewCounts(10, 300, 20)
+	got, err := NewThreadInteractor(repo, nil).
+		FetchThreadList(t.Context(), pagination.Page{Size: 2}, nil, ptr("popular"))
+	if err != nil {
+		t.Fatalf("FetchThreadList が失敗した: %v", err)
+	}
+	if got.NextCursor == nil {
+		t.Fatal("nextCursor が nil")
+	}
+
+	c, err := pagination.DecodeCursor(*got.NextCursor)
+	if err != nil {
+		t.Fatalf("カーソルを復号できない: %v", err)
+	}
+	if c.Sort != "popular" {
+		t.Errorf("cursor.Sort = %q, want popular", c.Sort)
+	}
+	if c.ViewCount == nil {
+		t.Fatal("cursor に閲覧数が入っていない")
+	}
+	// 2 件目 (id=3, viewCount=20) が境界になる。
+	if *c.ViewCount != 20 || c.ID != 3 {
+		t.Errorf("cursor = (vc=%v, id=%d), want (20, 3)", *c.ViewCount, c.ID)
+	}
+}
+
+// 新着順のカーソルには閲覧数を入れないこと。
+//
+// 入れると、並び順が 1 つだった頃のトークンと形が変わります。
+func TestFetchThreadList_NewCursorHasNoViewCount(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepoWithViewCounts(10, 300, 20)
+	got, err := NewThreadInteractor(repo, nil).
+		FetchThreadList(t.Context(), pagination.Page{Size: 2}, nil, nil)
+	if err != nil {
+		t.Fatalf("FetchThreadList が失敗した: %v", err)
+	}
+	c, err := pagination.DecodeCursor(*got.NextCursor)
+	if err != nil {
+		t.Fatalf("カーソルを復号できない: %v", err)
+	}
+	if c.Sort != "" || c.ViewCount != nil {
+		t.Errorf("cursor = (sort=%q, vc=%v), want (\"\", nil)", c.Sort, c.ViewCount)
+	}
+}
+
+// **並び順の違うカーソルを弾くこと** (ADR 0018「並び順を足すときの規則」)。
+//
+// 弾かないと、新着順が発行したトークン (閲覧数なし) を人気順に渡したとき、
+// 「閲覧数 0 の位置から」ページングが始まります。
+// 400 も出ず、黙って誤ったページが返ります。
+func TestFetchThreadList_RejectsCursorFromOtherSort(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepoWithViewCounts(10, 300, 20)
+	uc := NewThreadInteractor(repo, nil)
+
+	// 新着順のトークンを取る。
+	first, err := uc.FetchThreadList(t.Context(), pagination.Page{Size: 2}, nil, nil)
+	if err != nil {
+		t.Fatalf("FetchThreadList が失敗した: %v", err)
+	}
+	page, err := pagination.NewPage(first.NextCursor, 2)
+	if err != nil {
+		t.Fatalf("NewPage が失敗した: %v", err)
+	}
+
+	// それを人気順に渡す。
+	_, err = uc.FetchThreadList(t.Context(), page, nil, ptr("popular"))
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Fatalf("err = %v, want ErrInvalidArgument", err)
+	}
+
+	// 逆向き (人気順のトークンを新着順へ) も弾く。
+	popular, err := uc.FetchThreadList(t.Context(), pagination.Page{Size: 2}, nil, ptr("popular"))
+	if err != nil {
+		t.Fatalf("FetchThreadList (popular) が失敗した: %v", err)
+	}
+	popularPage, err := pagination.NewPage(popular.NextCursor, 2)
+	if err != nil {
+		t.Fatalf("NewPage が失敗した: %v", err)
+	}
+	if _, err := uc.FetchThreadList(t.Context(), popularPage, nil, nil); !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Fatalf("err = %v, want ErrInvalidArgument", err)
+	}
+}
+
+// 人気順のページ送りが、同じ閲覧数の塊をまたいでも重複・欠落しないこと。
+func TestFetchThreadList_PopularPaginationHasNoGapOrOverlap(t *testing.T) {
+	t.Parallel()
+
+	// **同値を混ぜる。** 閲覧数が同じスレッドは必ず存在するので、
+	// そこが境界になったときの振る舞いが本番の形になる。
+	repo := newFakeRepoWithViewCounts(5, 5, 5, 5, 5)
+	uc := NewThreadInteractor(repo, nil)
+
+	seen := make([]int64, 0, 5)
+	var cursor *string
+	for range 5 {
+		page, err := pagination.NewPage(cursor, 2)
+		if err != nil {
+			t.Fatalf("NewPage が失敗した: %v", err)
+		}
+		got, err := uc.FetchThreadList(t.Context(), page, nil, ptr("popular"))
+		if err != nil {
+			t.Fatalf("FetchThreadList が失敗した: %v", err)
+		}
+		seen = append(seen, ids(got.Threads)...)
+		if got.NextCursor == nil {
+			break
+		}
+		cursor = got.NextCursor
+	}
+
+	want := []int64{5, 4, 3, 2, 1}
+	if len(seen) != len(want) {
+		t.Fatalf("辿った件数 = %d (%v), want %d", len(seen), seen, len(want))
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Fatalf("辿った順 = %v, want %v", seen, want)
+		}
 	}
 }

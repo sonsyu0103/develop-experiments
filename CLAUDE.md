@@ -22,6 +22,7 @@
 | `apps/next-app` | Next.js のフロント。OpenAPI から TypeScript 型を生成 |
 | `api/openapi.yaml` | API のスキーマ。**ここが単一の情報源**。ハンドラの型を直接いじらない |
 | `apps/go-api/db` | マイグレーションとクエリ |
+| `infra` | ログ基盤 (fluent-bit の設定、Athena のテーブル定義、DuckDB での検証) |
 | `docs/adr` | 設計判断の記録。大きめの判断をしたら 1 件足す |
 
 ## コマンド
@@ -35,6 +36,7 @@ make test             # Go のテスト (race detector + カバレッジ)
 make lint             # Go / TypeScript の静的解析
 make generate         # 生成物をすべて作り直す
 make verify-generated # 生成物がコミット済みと一致するか検査
+make logs-verify      # ログ基盤が本番と同じ形で動いているか実測 (実環境が要る)
 ```
 
 `make help` で全ターゲットが出る。

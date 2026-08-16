@@ -498,6 +498,12 @@ export interface paths {
          *     `q` を渡すと、タイトルの中間一致で絞り込みます。
          *     **絞り込んでも並び順は新着順のまま**なので、`cursor` の使い方は変わりません
          *     (docs/adr/0012-search.md 決定 3)。
+         *
+         *     `sort=popular` で閲覧数の多い順になります。
+         *     **カーソルは並び順ごとに意味が変わります** ——
+         *     `sort` を変えたら先頭から取り直してください。
+         *     混ぜて渡した場合は 400 になります
+         *     (docs/adr/0006-view-count-and-popularity.md)。
          */
         get: operations["listThreads"];
         put?: never;
@@ -661,6 +667,22 @@ export interface components {
              * @example 7
              */
             commentCount: number;
+            /**
+             * Format: int64
+             * @description 閲覧数。
+             *
+             *     **正確な値ではありません** (docs/adr/0006-view-count-and-popularity.md)。
+             *
+             *     - **最新ではありません。** 計上はアプリのメモリ上で行い、
+             *       一定間隔でまとめて反映するため、最大でその間隔ぶん遅れます
+             *     - **欠落します。** プロセスが異常終了するとバッファ内の増分は消えます
+             *     - **同一利用者の連打は一定時間まとめられます。** インスタンスを
+             *       またいだ厳密性は保証しません
+             *
+             *     表示用の指標であり、課金や順位の確定には使えません。
+             * @example 1284
+             */
+            viewCount: number;
             author: components["schemas"]["Author"];
             /** @description スレッドアイコン。**設定されていなければ `null`** です。 */
             icon: components["schemas"]["Image"] | null;
@@ -1252,6 +1274,23 @@ export interface components {
          *     上限を設けないと、1 リクエストで全件走査させられてしまいます。
          */
         Size: number;
+        /**
+         * @description 並び順。
+         *
+         *     - `new` (既定): 新着順 (id の降順)
+         *     - `popular`: 閲覧数の多い順 (docs/adr/0006-view-count-and-popularity.md)
+         *
+         *     **`q` との同時指定はできません** (400)。
+         *     検索結果の並び順は新着順に固定してあり
+         *     (docs/adr/0012-search.md 決定 3)、人気順を重ねると
+         *     `title ILIKE` の GIN 索引と `(view_count, id)` の索引の
+         *     どちらか一方しか使えません。どちらが有利かは検索語の珍しさで
+         *     変わるため、**測ってから決めます** (Phase 4)。
+         *
+         *     黙って新着順に落とさないのは、「人気順で並べたつもりの新着順」を
+         *     返すと、利用者にもこちらにも間違いが見えないためです。
+         */
+        Sort: "new" | "popular";
         /**
          * @description スレッドのタイトルに対する検索語 (中間一致)。
          *
@@ -1917,6 +1956,23 @@ export interface operations {
                  * @example PostgreSQL
                  */
                 q?: components["parameters"]["SearchQuery"];
+                /**
+                 * @description 並び順。
+                 *
+                 *     - `new` (既定): 新着順 (id の降順)
+                 *     - `popular`: 閲覧数の多い順 (docs/adr/0006-view-count-and-popularity.md)
+                 *
+                 *     **`q` との同時指定はできません** (400)。
+                 *     検索結果の並び順は新着順に固定してあり
+                 *     (docs/adr/0012-search.md 決定 3)、人気順を重ねると
+                 *     `title ILIKE` の GIN 索引と `(view_count, id)` の索引の
+                 *     どちらか一方しか使えません。どちらが有利かは検索語の珍しさで
+                 *     変わるため、**測ってから決めます** (Phase 4)。
+                 *
+                 *     黙って新着順に落とさないのは、「人気順で並べたつもりの新着順」を
+                 *     返すと、利用者にもこちらにも間違いが見えないためです。
+                 */
+                sort?: components["parameters"]["Sort"];
             };
             header?: never;
             path?: never;

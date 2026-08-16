@@ -99,7 +99,7 @@ func (s *Server) resolveSession() gin.HandlerFunc {
 			// **それ以外 (DB 障害など) を素通ししない。**
 			// 素通しすると 401 に化け、利用者からは全員が突然ログアウトされた
 			// ように見えるうえ、原因の手がかりがどこにも残らない。
-			slog.ErrorContext(c.Request.Context(), "セッションの解決に失敗しました",
+			slog.ErrorContext(c.Request.Context(), "session_resolve_failed",
 				slog.String("path", c.Request.URL.Path),
 				slog.String("error", err.Error()),
 			)

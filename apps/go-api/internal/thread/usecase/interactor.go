@@ -29,6 +29,9 @@ type ThreadDTO struct {
 	ID           int64  `json:"id"`
 	Title        string `json:"title"`
 	CommentCount int64  `json:"commentCount"`
+	// ViewCount は閲覧数です。**正確な値ではありません**
+	// (docs/adr/0006-view-count-and-popularity.md)。
+	ViewCount int64 `json:"viewCount"`
 	// Author は匿名投稿では nil になります。
 	Author *AuthorDTO `json:"author"`
 	// Icon はスレッドアイコンです。設定されていなければ nil になります。
@@ -110,24 +113,61 @@ func NewThreadInteractor(
 // 検索の有無で分かれるのは取得の 1 か所だけで、ページ送りの組み立て
 // (buildListResult) から先は共通です —— 検索結果も新着順なので、
 // カーソルの意味が変わらないためです (ADR 0012 決定 3)。
+// **rawSort は正規化前の並び順です** (docs/adr/0006-view-count-and-popularity.md)。
+// nil か空文字なら新着順になります。
+//
+// 検索と人気順は同時に指定できません。理由は仕様書の Sort パラメータに
+// 書いてあるとおりで、索引をどちらか一方しか使えないためです。
+// **黙って新着順に落とさず 400 にします** ——
+// 「人気順で並べたつもりの新着順」は、利用者にもこちらにも見えません。
 func (i *ThreadInteractor) FetchThreadList(
-	ctx context.Context, page pagination.Page, rawQuery *string,
+	ctx context.Context, page pagination.Page, rawQuery *string, rawSort *string,
 ) (ThreadListResult, error) {
 	query, err := model.ParseSearchQuery(rawQuery)
 	if err != nil {
 		return ThreadListResult{}, err
 	}
+	order, err := model.ParseListOrder(rawSort)
+	if err != nil {
+		return ThreadListResult{}, err
+	}
+	if query != nil && order == model.ListOrderPopular {
+		return ThreadListResult{}, fmt.Errorf(
+			"検索と人気順は同時に指定できません: %w", apperr.ErrInvalidArgument)
+	}
+
+	// **カーソルの並び順が要求と一致しているかを検査する** (ADR 0018)。
+	//
+	// 検査しないと、新着順が発行したトークン (view_count なし) を
+	// 人気順に渡したときに「閲覧数 0 の位置から」ページングが始まる。
+	// 400 も出ず、黙って誤ったページが返る。
+	//
+	// **pagination には持ち込まない。** 並び順の語彙を知っているのは
+	// この層で、下位層がソート種別の一覧を知る形にはしない。
+	//
+	// **先頭ページは検査しない。** カーソルが無いので発行元も無い。
+	// ここを外すと、人気順の 1 ページ目が必ず 400 になる ——
+	// 「先頭ページ」と「新着順のトークン」がどちらも空文字で、
+	// 区別できないため (テストで実測した)。
+	if page.Cursor != nil && page.CursorSort() != order.CursorSort() {
+		return ThreadListResult{}, fmt.Errorf(
+			"cursor は別の並び順で発行されたものです。先頭ページから取得し直してください: %w",
+			apperr.ErrInvalidArgument)
+	}
 
 	var summaries []model.Summary
-	if query == nil {
-		summaries, err = i.repo.ListSummaries(ctx, page)
-	} else {
+	switch {
+	case query != nil:
 		summaries, err = i.repo.SearchSummaries(ctx, *query, page)
+	case order == model.ListOrderPopular:
+		summaries, err = i.repo.ListPopularSummaries(ctx, page)
+	default:
+		summaries, err = i.repo.ListSummaries(ctx, page)
 	}
 	if err != nil {
 		return ThreadListResult{}, err
 	}
-	return i.buildListResult(summaries, page.Size)
+	return i.buildListResult(summaries, page.Size, order)
 }
 
 // FetchThread は 1 件のスレッドをコメント数つきで取得します。
@@ -190,6 +230,7 @@ func (i *ThreadInteractor) toDTO(s model.Summary) ThreadDTO {
 		ID:           s.ID,
 		Title:        s.Title,
 		CommentCount: s.CommentCount,
+		ViewCount:    s.ViewCount,
 		Author:       toAuthorDTO(s.Author),
 		Icon:         i.toImageDTO(s.Icon),
 		CreatedAt:    s.CreatedAt,
@@ -213,19 +254,30 @@ func toAuthorDTO(a *model.Author) *AuthorDTO {
 }
 
 // buildListResult は取得結果を DTO に詰め替え、次ページ用のカーソルを決めます。
-// 次ページの有無の判定は pagination.NextToken にまとめてあります。
-func (i *ThreadInteractor) buildListResult(summaries []model.Summary, size int32) (ThreadListResult, error) {
+// 次ページの有無の判定は pagination.NextTokenFor にまとめてあります。
+//
+// **カーソルの中身は並び順ごとに違います。** 人気順は
+// (view_count, id) の複合キーになるため、閲覧数も埋めます ——
+// id だけだと、同じ閲覧数の塊の途中で境界を作れません。
+func (i *ThreadInteractor) buildListResult(
+	summaries []model.Summary, size int32, order model.ListOrder,
+) (ThreadListResult, error) {
 	dtos := make([]ThreadDTO, 0, len(summaries))
 	for _, s := range summaries {
 		dtos = append(dtos, i.toDTO(s))
 	}
 
-	var lastID int64
+	var last ThreadDTO
 	if len(dtos) > 0 {
-		lastID = dtos[len(dtos)-1].ID
+		last = dtos[len(dtos)-1]
 	}
 
-	next, err := pagination.NextToken(lastID, len(dtos), size)
+	cursor := pagination.NewCursor(last.ID).WithSort(order.CursorSort())
+	if order == model.ListOrderPopular {
+		cursor = cursor.WithViewCount(last.ViewCount)
+	}
+
+	next, err := pagination.NextTokenFor(cursor, len(dtos), size)
 	if err != nil {
 		return ThreadListResult{}, err
 	}

@@ -1,3 +1,13 @@
+# fluent-bit が S3 へアップロードする契機 (ADR 0010 決定 2)。
+#
+# **本番の値 (5m) とは変えている。** 手元で 5 分待たないと着地しないと
+# 確認にならない。アップロードの契機が設定で決まるという性質は同じ。
+#
+# **2 か所から参照する。** fluent-bit (出す側) と logs-query (待つ側) が
+# 同じ値を見る必要があるため —— ずれると、検査が「まだ来ていないログ」を
+# 見て落ちるか、逆に待ちすぎるかのどちらかになる。
+x-log-upload-timeout: &log-upload-timeout "10s"
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -187,12 +197,100 @@ services:
     # mb は既に存在するとエラーになるので --ignore-existing を付ける。
     # 付けないと 2 回目の up でこのコンテナが失敗し、
     # depends_on の service_completed_successfully が満たされなくなる。
+    # **ログのバケットは公開しない。** 画像と違ってブラウザから直接
+    # 読ませるものではなく、中身は request_id や IP を含む
+    # (ADR 0010 の 4-5)。anonymous set download を掛けるのは
+    # bbs-images だけにする。
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 minioadmin minioadmin &&
       mc mb --ignore-existing local/bbs-images &&
-      mc anonymous set download local/bbs-images
+      mc anonymous set download local/bbs-images &&
+      mc mb --ignore-existing local/bbs-logs
       "
+
+  # ログを集約して S3 互換ストレージへ流す (docs/adr/0010-log-pipeline.md)。
+  #
+  # 本番は ECS の FireLens がサイドカーとして同じ fluent-bit を動かす。
+  # ローカルは compose の fluentd ログドライバで forward に載せるため、
+  # **設定ファイルは本番と同じものを使える** (差分はエンドポイントだけ)。
+  #
+  # 【ポートをホストに公開している理由】
+  # ログドライバで接続するのは go-api コンテナではなく **docker daemon**
+  # なので、compose ネットワーク内の名前 (fluent-bit:24224) を解決できない。
+  # ホスト側のポートを見せて localhost:24224 で繋ぐ必要がある。
+  fluent-bit:
+    # **-debug タグを使う。** 通常のタグは distroless で sh も curl も無く、
+    # compose の healthcheck (コンテナ内でコマンドを実行する) が
+    # 「health: starting のまま永久に固まる」形で成立しない。
+    # 本番は FireLens が aws-for-fluent-bit を動かすので、
+    # この選択はローカルにしか影響しない。
+    image: fluent/fluent-bit:3.2.10-debug
+    volumes:
+      - ./infra/fluent-bit:/fluent-bit/etc:ro
+    environment:
+      # **UTC を明示する。** S3 のキー (dt/hour) はコンテナの TZ で決まるため、
+      # ここが JST になると Athena の partition projection の範囲と
+      # レコード内の time (UTC 固定) が 9 時間ずれる。
+      TZ: UTC
+      FB_LOG_LEVEL: info
+      LOG_BUCKET: bbs-logs
+      AWS_REGION: ap-northeast-1
+      # 実 S3 では空にする。MinIO のときだけ指定する。
+      LOG_S3_ENDPOINT: http://minio:9000
+      # **本番の値 (50M) とは変えている。** 手元で 50MB 貯まるのは現実的でない。
+      LOG_TOTAL_FILE_SIZE: 1M
+      LOG_UPLOAD_TIMEOUT: *log-upload-timeout
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "24224:24224"
+    depends_on:
+      # バケットが無いと PutObject が 404 で失敗し続ける。
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # HTTP_Server On で生える健全性エンドポイント。
+      # **プロセスの生存だけでは足りない** —— 設定を読めていなくても
+      # fluent-bit は起動直後に落ちるとは限らない。
+      test: ["CMD", "curl", "-sf", "http://localhost:2020/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # S3 に着地したログを SQL で読む使い捨てコンテナ
+  # (ADR 0010「ローカルでの再現」)。
+  #
+  # profiles が付いているので通常の up では起動しない。
+  # 使うのは make logs-query / make logs-verify から。
+  #
+  #   docker compose run --rm logs-query -c "SELECT ..."
+  #   docker compose run --rm --entrypoint python logs-query /opt/logs/verify.py
+  logs-query:
+    build:
+      context: ./infra/duckdb
+    profiles:
+      - tools
+    environment:
+      LOG_BUCKET: bbs-logs
+      LOG_S3_ENDPOINT: http://minio:9000
+      AWS_REGION: ap-northeast-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      # 検査が「ログが出揃うのを待つ」間隔の元になる。
+      # 出す側と同じ値を見る (冒頭のアンカーを参照)。
+      LOG_UPLOAD_TIMEOUT: *log-upload-timeout
+    volumes:
+      # 保存したクエリを流し込めるようにする。
+      - ./infra/athena/queries:/queries:ro
+      # **列の単一の情報源。** DuckDB 側はここを読んで、
+      # まだデータに出ていない列を NULL で補う (infra/duckdb/logs_source.py)。
+      # 写経すると、DDL に足した列を片方だけ足し忘れる。
+      - ./infra/athena/table.sql:/athena/table.sql:ro
+    depends_on:
+      minio:
+        condition: service_healthy
 
   go-api:
     build:
@@ -207,6 +305,23 @@ services:
       - go-mod-cache:/go/pkg/mod
     environment:
       ENV: development
+      # **ENV とは別に指定する** (ADR 0010「実装して分かったこと 1」)。
+      #
+      # ENV=development の既定はテキスト形式 (人間が読む用) だが、
+      # それを fluent-bit に流すと**パーサが 1 行も展開できない** ——
+      # logfmt は JSON ではないため、log キーが文字列のまま S3 に着地する。
+      # 手元でパイプラインを検証しても、本番と違う形を検証したことになる。
+      #
+      # ここを json にすると、手元のログも本番と同じ形になる。
+      # 読みにくさは `docker compose logs fluent-bit` で払う。
+      #
+      # **外から差し替えられるようにしてある。** make logs-verify の検査が
+      # 実際に効くかは、壊してみないと分からない:
+      #
+      #   LOG_FORMAT=text make logs-verify   → 落ちれば検査が効いている
+      #
+      # COMMENT_POST_MODE を差し替えて並行制御を実測するのと同じ考え方になる。
+      LOG_FORMAT: ${LOG_FORMAT:-json}
       ADDR: ":8080"
       DATABASE_URL: postgres://app:password@postgres:5432/bbs?sslmode=disable
       CORS_ALLOWED_ORIGINS: http://localhost:3000
@@ -222,6 +337,16 @@ services:
       # 実際に食い違った —— compose だけ ssi のままで、
       # 本番既定であるはずの unique がスモークを一度も通っていなかった。
       COMMENT_POST_MODE: ${COMMENT_POST_MODE:-}
+      # 閲覧数の反映方式 (docs/adr/0006-view-count-and-popularity.md)。
+      # buffered / sync。**sync は Phase 4 の比較専用**で、
+      # ENV=development でしか選べない (config が弾く)。
+      #
+      # COMMENT_POST_MODE と同じく、**既定値をここに書かない。**
+      # 両方に既定を書くと二重管理になり、実際に食い違った経緯がある。
+      VIEW_COUNT_MODE: ${VIEW_COUNT_MODE:-}
+      # フラッシュ間隔と重複抑制の窓。ベンチマークで振るために外へ出す。
+      VIEW_COUNT_FLUSH_SECONDS: ${VIEW_COUNT_FLUSH_SECONDS:-}
+      VIEW_COUNT_DEDUPE_SECONDS: ${VIEW_COUNT_DEDUPE_SECONDS:-}
       # 認証 (Google OIDC)。
       # 値はここに書かず、リポジトリ直下の .env から補間する (.gitignore 済み)。
       # 未設定でも API は起動し、ログインの 2 経路だけが 503 になる。
@@ -253,6 +378,33 @@ services:
         condition: service_completed_successfully
       minio-init:
         condition: service_completed_successfully
+      # ログの受け口を先に立てる。**これだけでは足りない** ——
+      # 接続するのは docker daemon なので、compose の依存関係とは別の層になる。
+      # 取りこぼしを許す設定 (fluentd-async) を下で併用している。
+      fluent-bit:
+        condition: service_healthy
+    # ログを fluent-bit へ転送する (ADR 0010 決定 1)。
+    #
+    # **これを入れると `docker compose logs go-api` は空になる。**
+    # stdout がログドライバに横取りされるため。アプリのログは
+    # `docker compose logs fluent-bit` (= CloudWatch の代役) で見る。
+    # make logs はこの差を吸収してある。
+    #
+    # 【fluentd-async が必須】
+    # 既定では、コンテナ起動時に fluentd へ接続できないと
+    # **コンテナの起動そのものが失敗する。** ログの受け口が落ちている
+    # だけで API が起動しないのは本末転倒なので、非同期接続にして
+    # 「繋がるまでは捨てる」側に倒す。ADR 0010 決定 5 の
+    # 「ログは at-most-once であり、欠落しうる」と同じ判断になる。
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: localhost:24224
+        fluentd-async: "true"
+        # 再接続の間隔と上限。上限に達しても捨てるだけで、API は動き続ける。
+        fluentd-retry-wait: "1s"
+        fluentd-max-retries: "30"
+        tag: go-api
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
       interval: 10s

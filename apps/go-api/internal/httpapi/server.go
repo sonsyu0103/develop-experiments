@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"develop-experiments/apps/go-api/internal/apperr"
 
@@ -19,6 +20,7 @@ import (
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	usermodel "develop-experiments/apps/go-api/internal/user/domain/model"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
+	"develop-experiments/apps/go-api/internal/viewcount"
 )
 
 // Pinger は DB への疎通確認を抽象化したものです。*pgxpool.Pool が満たします。
@@ -49,7 +51,18 @@ type Server struct {
 	moderation *moderationusecase.Interactor
 	// reports も**必ず存在します**。moderation と同じく DB だけで動きます。
 	reports *moderationusecase.ReportInteractor
-	authCfg config.AuthConfig
+	// viewCounts は閲覧数の計上です。**必ず存在します**
+	// (docs/adr/0006-view-count-and-popularity.md)。
+	//
+	// nil 許容にしない理由: 数えていないことは目に見えません。
+	// 気づくのは「人気順が全部 0 のまま」になったときで、
+	// そのときには既に計上されなかった期間が過ぎています。
+	//
+	// **インターフェースで受けるのは Phase 4 のため。** 同期 UPDATE 版
+	// (選択肢 A) と差し替えて、閲覧数の反映方式が
+	// コメント投稿の直列化失敗率に与える影響を実測します。
+	viewCounts viewcount.Recorder
+	authCfg    config.AuthConfig
 }
 
 var _ oapigen.ServerInterface = (*Server)(nil)
@@ -70,6 +83,7 @@ func NewServer(
 	images *imageusecase.ImageInteractor,
 	moderation *moderationusecase.Interactor,
 	reports *moderationusecase.ReportInteractor,
+	viewCounts viewcount.Recorder,
 	authCfg config.AuthConfig,
 ) *Server {
 	if sessions == nil {
@@ -84,6 +98,10 @@ func NewServer(
 	if reports == nil {
 		panic("httpapi: moderation.ReportInteractor は必須です (nil だと通報の経路が落ちます)")
 	}
+	// **数えないことは失敗として見えません。** 結線漏れを起動時に落とす。
+	if viewCounts == nil {
+		panic("httpapi: viewcount.Recorder は必須です (nil だと閲覧数が一切増えません)")
+	}
 	return &Server{
 		threads:    threads,
 		comments:   comments,
@@ -93,6 +111,7 @@ func NewServer(
 		images:     images,
 		moderation: moderation,
 		reports:    reports,
+		viewCounts: viewCounts,
 		authCfg:    authCfg,
 	}
 }
@@ -263,7 +282,18 @@ func (s *Server) ListThreads(c *gin.Context, params oapigen.ListThreadsParams) {
 	// 空なら絞り込まない) はドメインの規則なので、ユースケース層が
 	// model.ParseSearchQuery に委ねます —— タイトルを model.NewThread に
 	// 渡しているのと同じ形です (docs/adr/0012-search.md / ADR 0017 の層の境界)。
-	result, err := s.threads.FetchThreadList(c.Request.Context(), page, params.Q)
+	// **並び順もそのまま渡します。** 解釈 (既定・未知の値・カーソルとの
+	// 一致検査) はユースケース層の仕事で、検索語と同じ扱いです。
+	// 仕様書の enum は生成コードが型にしていますが、
+	// **検証ミドルウェアを外した経路でも壊れない**よう、
+	// 文字列として渡して model.ParseListOrder に判断させます。
+	var sort *string
+	if params.Sort != nil {
+		raw := string(*params.Sort)
+		sort = &raw
+	}
+
+	result, err := s.threads.FetchThreadList(c.Request.Context(), page, params.Q, sort)
 	if err != nil {
 		respondError(c, err)
 		return
@@ -361,7 +391,41 @@ func (s *Server) GetThread(c *gin.Context, threadID oapigen.ThreadId) {
 		return
 	}
 
+	// **閲覧を数えるのは取得に成功した後。** 先に数えると、
+	// 存在しない ID を叩くだけで閲覧数を積める経路になる。
+	//
+	// **ここは DB に触らない** (ADR 0006 の決定 D)。メモリ上のカウンタに
+	// +1 するだけで、反映は定期処理が別トランザクションで行う。
+	// ここで UPDATE を打つと、コメント投稿の SERIALIZABLE と
+	// threads を取り合うことになり、無関係な操作が Phase 2 の
+	// 直列化失敗率を押し上げる。
+	//
+	// **応答には反映されない。** いま返している thread は
+	// 加算前の値で、次のフラッシュまで増えない。それが
+	// 「値は最新ではない」と引き受けたことの見え方になる。
+	s.viewCounts.Record(c.Request.Context(), threadID, visitorKey(c))
+
 	c.JSON(http.StatusOK, toWireThread(thread))
+}
+
+// visitorKey は重複計上を抑えるための訪問者の識別子です。
+//
+// **ログインしていれば内部 ID、していなければ IP。**
+// セッション ID を使わないのは、値をアプリのメモリに長く残さないためです
+// (ログに出さないのと同じ考え方。ADR 0010 の 4-5)。
+// 必要なのは「同じ人か」の判定だけで、元の値を復元する必要はありません。
+//
+// **プレフィックスを付けるのは名前空間を分けるため。** 付けないと、
+// 内部 ID 12 の利用者と IP "12" が同じ訪問者に見えます (現実には
+// 起きにくいものの、区別する理由のほうが強い)。
+func visitorKey(c *gin.Context) string {
+	if p := principalFromContext(c.Request.Context()); p != nil {
+		return "u:" + strconv.FormatInt(p.UserID, 10)
+	}
+	// ClientIP は信頼できるプロキシの設定に従って X-Forwarded-For を見ます。
+	// **偽装されうる値ですが、ここでの用途は重複の抑制だけ**なので、
+	// 偽装されても「数え過ぎる」方向にしか外れません。
+	return "ip:" + c.ClientIP()
 }
 
 // ---------------------------------------------------------------------------

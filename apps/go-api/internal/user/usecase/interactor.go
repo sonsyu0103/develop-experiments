@@ -147,7 +147,7 @@ func (i *LoginInteractor) CompleteLogin(
 		// 認可コードの不正と、IdP へ到達できないこと (DNS / TLS / 障害) を
 		// ここでは区別できない。利用者へは同じ 401 を返すが、
 		// 切り分けの手がかりが何も残らないのは困るのでログには出す。
-		slog.WarnContext(ctx, "認可コードの交換に失敗しました",
+		slog.WarnContext(ctx, "oidc_code_exchange_failed",
 			slog.String("error", err.Error()))
 		return nil, fmt.Errorf("ID トークンの検証に失敗しました: %w", errors.Join(err, apperr.ErrUnauthenticated))
 	}
@@ -225,7 +225,7 @@ func (i *LoginInteractor) promoteBootstrapAdmin(ctx context.Context, googleSub s
 
 	promoted, err := i.users.PromoteToAdmin(ctx, googleSub)
 	if err != nil {
-		slog.ErrorContext(ctx, "最初の管理者への昇格に失敗しました",
+		slog.ErrorContext(ctx, "bootstrap_admin_promotion_failed",
 			slog.String("error", err.Error()))
 		return
 	}

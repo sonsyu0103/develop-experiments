@@ -829,10 +829,17 @@ paths:
         `q` を渡すと、タイトルの中間一致で絞り込みます。
         **絞り込んでも並び順は新着順のまま**なので、`cursor` の使い方は変わりません
         (docs/adr/0012-search.md 決定 3)。
+
+        `sort=popular` で閲覧数の多い順になります。
+        **カーソルは並び順ごとに意味が変わります** ——
+        `sort` を変えたら先頭から取り直してください。
+        混ぜて渡した場合は 400 になります
+        (docs/adr/0006-view-count-and-popularity.md)。
       parameters:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Size'
         - $ref: '#/components/parameters/SearchQuery'
+        - $ref: '#/components/parameters/Sort'
       responses:
         '200':
           description: 成功
@@ -1233,6 +1240,30 @@ components:
         maximum: 100
         default: 20
 
+    Sort:
+      name: sort
+      in: query
+      required: false
+      description: |
+        並び順。
+
+        - `new` (既定): 新着順 (id の降順)
+        - `popular`: 閲覧数の多い順 (docs/adr/0006-view-count-and-popularity.md)
+
+        **`q` との同時指定はできません** (400)。
+        検索結果の並び順は新着順に固定してあり
+        (docs/adr/0012-search.md 決定 3)、人気順を重ねると
+        `title ILIKE` の GIN 索引と `(view_count, id)` の索引の
+        どちらか一方しか使えません。どちらが有利かは検索語の珍しさで
+        変わるため、**測ってから決めます** (Phase 4)。
+
+        黙って新着順に落とさないのは、「人気順で並べたつもりの新着順」を
+        返すと、利用者にもこちらにも間違いが見えないためです。
+      schema:
+        type: string
+        enum: [new, popular]
+        default: new
+
     SearchQuery:
       name: q
       in: query
@@ -1337,7 +1368,7 @@ components:
 
     Thread:
       type: object
-      required: [id, title, commentCount, author, icon, createdAt]
+      required: [id, title, commentCount, viewCount, author, icon, createdAt]
       properties:
         id:
           type: integer
@@ -1351,6 +1382,22 @@ components:
           format: int64
           description: 論理削除されていないコメントの件数
           example: 7
+        viewCount:
+          type: integer
+          format: int64
+          description: |
+            閲覧数。
+
+            **正確な値ではありません** (docs/adr/0006-view-count-and-popularity.md)。
+
+            - **最新ではありません。** 計上はアプリのメモリ上で行い、
+              一定間隔でまとめて反映するため、最大でその間隔ぶん遅れます
+            - **欠落します。** プロセスが異常終了するとバッファ内の増分は消えます
+            - **同一利用者の連打は一定時間まとめられます。** インスタンスを
+              またいだ厳密性は保証しません
+
+            表示用の指標であり、課金や順位の確定には使えません。
+          example: 1284
         author:
           $ref: '#/components/schemas/Author'
         icon:

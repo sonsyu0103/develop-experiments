@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"slices"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,7 @@ import (
 	threadrepo "develop-experiments/apps/go-api/internal/thread/domain/repository"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
+	"develop-experiments/apps/go-api/internal/viewcount"
 )
 
 // testOrigin は検査用のリクエストに付ける Origin です。
@@ -65,6 +67,9 @@ type fakeThreadRepo struct {
 
 	// searchedFor は SearchSummaries に届いた検索語です。
 	searchedFor []string
+
+	// popularCalls は ListPopularSummaries の呼び出し回数です。
+	popularCalls int
 }
 
 var _ threadrepo.ThreadRepository = (*fakeThreadRepo)(nil)
@@ -74,6 +79,30 @@ func (f *fakeThreadRepo) ListSummaries(context.Context, pagination.Page) ([]thre
 		return nil, f.err
 	}
 	return f.summaries, nil
+}
+
+// ListPopularSummaries は閲覧数の多い順に返します。
+//
+// **呼ばれたことを記録します。** HTTP 層で見たいのは
+// 「?sort=popular がどの経路へ届くか」で、並び替えの正しさは
+// ユースケース層とフェイク (thread/usecase) の検査が持ちます。
+// 記録しないと、新着順に落ちていても件数が同じなので区別できません。
+func (f *fakeThreadRepo) ListPopularSummaries(
+	context.Context, pagination.Page,
+) ([]threadmodel.Summary, error) {
+	f.popularCalls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	sorted := make([]threadmodel.Summary, len(f.summaries))
+	copy(sorted, f.summaries)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].ViewCount != sorted[j].ViewCount {
+			return sorted[i].ViewCount > sorted[j].ViewCount
+		}
+		return sorted[i].ID > sorted[j].ID
+	})
+	return sorted, nil
 }
 
 // SearchSummaries はタイトルの部分一致で絞り込みます。
@@ -120,7 +149,7 @@ func (f *fakeThreadRepo) Create(_ context.Context, th *threadmodel.Thread) (*thr
 	if th.IconImageID != nil {
 		icon = threadmodel.NewImage(*th.IconImageID, "images/"+th.IconImageID.String()+".webp", 64, 64)
 	}
-	return threadmodel.Reconstruct(99, th.Title, fakeAuthorFor(th.AuthorID), icon, time.Unix(0, 0).UTC()), nil
+	return threadmodel.Reconstruct(99, th.Title, fakeAuthorFor(th.AuthorID), icon, time.Unix(0, 0).UTC(), 0), nil
 }
 
 // fakeAuthorFor は author_id から投稿者を解決する DB 側の振る舞いを真似ます。
@@ -305,8 +334,8 @@ func newTestEnv(t *testing.T) *testEnv {
 
 	threads := &fakeThreadRepo{
 		summaries: []threadmodel.Summary{
-			{Thread: *threadmodel.Reconstruct(2, "2 番目のスレッド", nil, nil, time.Unix(2, 0).UTC()), CommentCount: 5},
-			{Thread: *threadmodel.Reconstruct(1, "1 番目のスレッド", nil, nil, time.Unix(1, 0).UTC()), CommentCount: 0},
+			{Thread: *threadmodel.Reconstruct(2, "2 番目のスレッド", nil, nil, time.Unix(2, 0).UTC(), 0), CommentCount: 5},
+			{Thread: *threadmodel.Reconstruct(1, "1 番目のスレッド", nil, nil, time.Unix(1, 0).UTC(), 0), CommentCount: 0},
 		},
 	}
 	comments := &fakeCommentRepo{
@@ -331,8 +360,8 @@ func newTestEnv(t *testing.T) *testEnv {
 			// モデレーションは設定に依存しないので、ここでも結線する。
 			moderationusecase.NewInteractor(newFakeModerationRepo()),
 			moderationusecase.NewReportInteractor(newFakeReportRepo(), newFakeReportRepo()),
-			config.AuthConfig{},
-		),
+			viewcount.New(),
+			config.AuthConfig{}),
 		AllowedOrigins: []string{"http://localhost:3000"},
 	})
 	if err != nil {
@@ -1055,9 +1084,9 @@ func TestListThreads_WithdrawnAuthor(t *testing.T) {
 	withdrawn := threadmodel.NewAuthor(fakeAuthorPublicID, "やめた人", &avatar, &deletedAt)
 
 	env.threads.summaries = []threadmodel.Summary{
-		{Thread: *threadmodel.Reconstruct(3, "退会者のスレッド", withdrawn, nil, time.Unix(3, 0).UTC())},
-		{Thread: *threadmodel.Reconstruct(2, "在籍者のスレッド", active, nil, time.Unix(2, 0).UTC())},
-		{Thread: *threadmodel.Reconstruct(1, "匿名のスレッド", nil, nil, time.Unix(1, 0).UTC())},
+		{Thread: *threadmodel.Reconstruct(3, "退会者のスレッド", withdrawn, nil, time.Unix(3, 0).UTC(), 0)},
+		{Thread: *threadmodel.Reconstruct(2, "在籍者のスレッド", active, nil, time.Unix(2, 0).UTC(), 0)},
+		{Thread: *threadmodel.Reconstruct(1, "匿名のスレッド", nil, nil, time.Unix(1, 0).UTC(), 0)},
 	}
 
 	rec := env.do(t, http.MethodGet, "/threads", "")
@@ -1182,7 +1211,7 @@ func TestRequestID_ReachesTheLog(t *testing.T) {
 	// 既定ロガーを差し替えて出力を捕まえる。
 	var buf bytes.Buffer
 	original := slog.Default()
-	slog.SetDefault(slog.New(logging.NewHandler(&buf, false)))
+	slog.SetDefault(slog.New(logging.NewHandler(&buf, logging.Options{JSON: true})))
 	t.Cleanup(func() { slog.SetDefault(original) })
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/threads", nil)
@@ -1228,7 +1257,7 @@ func TestRequestID_ReachesTheLog(t *testing.T) {
 func TestPanic_IsLoggedAsError(t *testing.T) {
 	var buf bytes.Buffer
 	original := slog.Default()
-	slog.SetDefault(slog.New(logging.NewHandler(&buf, false)))
+	slog.SetDefault(slog.New(logging.NewHandler(&buf, logging.Options{JSON: true})))
 	t.Cleanup(func() { slog.SetDefault(original) })
 
 	// 仕様書から生成されるルータにはパニックする経路が無いため、

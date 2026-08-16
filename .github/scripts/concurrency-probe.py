@@ -45,14 +45,33 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8080").rstrip("/")
+
+# **状態変更メソッドには Origin が要る** (docs/adr/0013-http-defense.md 決定 1)。
+#
+# csrfGuard は Origin も Referer も無い POST を 403 で弾く。
+# 「無ければ通す」にすると送らないだけで迂回できるため、
+# ブラウザ以外のクライアント (このスクリプトを含む) も付ける必要がある。
+#
+# **これが無いまま、このプローブは csrfGuard の導入以降ずっと壊れていた。**
+# CI に載せていない (数字が環境の性能に左右されるため) ので、
+# 誰も気づかないまま Phase 10 と Phase 11 を越えた。
+# smoke-test.py の SMOKE_ORIGIN と同じ既定値にしてある。
+ORIGIN = os.environ.get("PROBE_ORIGIN", "http://localhost:3000")
+
 SQL_EXEC = os.environ.get("SQL_EXEC", "")
 WORKERS = int(os.environ.get("PROBE_WORKERS", "32"))
 MODES = [m.strip() for m in
          os.environ.get("PROBE_MODES", "naive,ssi,pessimistic,unique").split(",")
          if m.strip()]
-# リトライ回数はログにしか出ない。開発モードの text 形式を読む。
+# リトライ回数はログにしか出ない。
+#
+# **読む先は fluent-bit。** Phase 9 後半でログを fluent-bit へ転送するように
+# したため (ADR 0010 決定 1)、`docker compose logs go-api` は空になる。
+# ここを直し忘れると、**試行回数が黙って 0 になるだけ**でプローブは動き続ける ——
+# 成功・失敗の数は API の応答から取れるので、表は埋まったまま
+# 「平均試行 0.00」が並ぶ。ADR 0019 の実測値を再現できなくなる。
 LOG_EXEC = os.environ.get(
-    "LOG_EXEC", "docker compose logs go-api --no-log-prefix --tail=2000")
+    "LOG_EXEC", "docker compose logs fluent-bit --no-log-prefix --tail=4000")
 
 # モードを切り替えるにはコンテナを作り直す必要がある。
 # compose.yaml が COMMENT_POST_MODE をホストから補間して渡している
@@ -63,6 +82,8 @@ COMPOSE_UP = ["docker", "compose", "up", "-d", "--force-recreate", "go-api"]
 def call(method: str, path: str, body: str | None = None):
     """API を叩き、(ステータス, JSON) を返す。"""
     req = urllib.request.Request(BASE_URL + path, method=method)
+    if method not in ("GET", "HEAD", "OPTIONS"):
+        req.add_header("Origin", ORIGIN)
     data = None
     if body is not None:
         req.add_header("Content-Type", "application/json")
@@ -97,7 +118,10 @@ def attempts_for(thread_id: int) -> tuple[float, int]:
 
     **API の応答からは分からない。** リトライは永続化層に閉じているので、
     観測できるのはログだけになる (docs/adr/0019-comment-concurrency.md 決定 4)。
-    開発モードの text 形式を前提に key=value を拾う。
+
+    **JSON と logfmt の両方を読む。** compose は LOG_FORMAT=json を渡すが
+    (ADR 0010「実装して分かったこと 1」)、text のまま動かした環境でも
+    数字が取れないと、原因がプローブ側かアプリ側か切り分けられない。
     """
     if not LOG_EXEC:
         return 0.0, 0
@@ -106,14 +130,43 @@ def attempts_for(thread_id: int) -> tuple[float, int]:
                          capture_output=True, text=True)
     values = []
     for line in out.stdout.splitlines():
-        if "msg=comment_created" not in line or f"thread_id={thread_id} " not in line:
-            continue
-        for field in line.split():
-            if field.startswith("attempts="):
-                values.append(int(field.removeprefix("attempts=")))
+        n = _attempts_from_json(line, thread_id)
+        if n is None:
+            n = _attempts_from_logfmt(line, thread_id)
+        if n is not None:
+            values.append(n)
     if not values:
         return 0.0, 0
     return sum(values) / len(values), max(values)
+
+
+def _attempts_from_json(line: str, thread_id: int) -> int | None:
+    """fluent-bit が出す 1 行 1 JSON から attempts を拾う。
+
+    fluent-bit 自身の起動ログなど JSON でない行も混ざるので、
+    **パースできない行は黙って飛ばす** (エラーにすると起動ログで落ちる)。
+    """
+    line = line.strip()
+    if not line.startswith("{"):
+        return None
+    try:
+        rec = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if rec.get("msg") != "comment_created" or rec.get("thread_id") != thread_id:
+        return None
+    attempts = rec.get("attempts")
+    return attempts if isinstance(attempts, int) else None
+
+
+def _attempts_from_logfmt(line: str, thread_id: int) -> int | None:
+    """LOG_FORMAT=text で動かした環境向け (key=value)。"""
+    if "msg=comment_created" not in line or f"thread_id={thread_id} " not in line:
+        return None
+    for field in line.split():
+        if field.startswith("attempts="):
+            return int(field.removeprefix("attempts="))
+    return None
 
 
 def restart_with_mode(mode: str) -> None:

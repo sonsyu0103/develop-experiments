@@ -26,11 +26,12 @@ import (
 	"develop-experiments/apps/go-api/internal/scheduler"
 	threadusecase "develop-experiments/apps/go-api/internal/thread/usecase"
 	userusecase "develop-experiments/apps/go-api/internal/user/usecase"
+	"develop-experiments/apps/go-api/internal/viewcount"
 )
 
 func main() {
 	if err := run(); err != nil {
-		slog.Error("起動に失敗しました", slog.String("error", err.Error()))
+		slog.Error("startup_failed", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
 }
@@ -41,7 +42,10 @@ func run() error {
 		return err
 	}
 
-	logging.Setup(cfg.Debug)
+	logging.Setup(logging.Options{
+		Debug: cfg.Debug,
+		JSON:  cfg.LogFormat == config.LogFormatJSON,
+	})
 	if cfg.Debug {
 		gin.SetMode(gin.DebugMode)
 	} else {
@@ -79,11 +83,15 @@ func run() error {
 			provider,
 			nil,
 		).WithBootstrapAdmin(cfg.Auth.BootstrapAdminGoogleSub)
-		slog.Info("ログインを有効にしました",
+		slog.Info("login_enabled",
 			slog.Bool("bootstrap_admin", cfg.Auth.BootstrapAdminGoogleSub != ""))
 	} else {
-		slog.Warn("認証の設定が無いため、/auth/google の 2 経路は 503 を返します " +
-			"(発行済みセッションの検証・/me・ログアウトは動きます)")
+		// 認証の設定が無い。**/auth/google の 2 経路だけが 503** になり、
+		// 発行済みセッションの検証・/me・ログアウトは動く (ADR 0005 決定 4)。
+		//
+		// msg はイベント名に固定してある (ADR 0010 の 4-2)。
+		// 説明を msg に書くと、Athena で数えるたびに LIKE を書くことになる。
+		slog.Warn("login_disabled")
 	}
 
 	// 画像はストレージの設定が揃っているときだけ有効にする。
@@ -99,10 +107,11 @@ func run() error {
 		}
 		imageInteractor = imageusecase.NewImageInteractor(
 			postgres.NewImageRepository(pool), storage, nil)
-		slog.Info("画像アップロードを有効にしました",
+		slog.Info("image_upload_enabled",
 			slog.String("bucket", cfg.Storage.Bucket))
 	} else {
-		slog.Warn("ストレージの設定が無いため、POST /images は 503 を返します")
+		// ストレージの設定が無い。POST /images だけが 503 になる。
+		slog.Warn("image_upload_disabled")
 	}
 
 	// **nil のポインタをインターフェースへ入れない。**
@@ -122,6 +131,26 @@ func run() error {
 		imageResolver = imageInteractor
 		threadImageResolver = imageInteractor
 		sessionImageResolver = imageInteractor
+	}
+
+	// 閲覧数のバッファ (docs/adr/0006-view-count-and-popularity.md)。
+	//
+	// **設定で分岐させない。** DB があれば動き、外部サービスも要らない。
+	// 「無効化できる」形にすると、無効なまま気づかず運用する余地が生まれる ——
+	// 閲覧数が増えていないことは、誰も検算しないので目に見えない。
+	//
+	// 重複抑制の窓を設定から取れるようにしてあるのは、
+	// **Phase 4 で「抑制あり/なし」を比べるため**。抑制はメモリ上の
+	// 近似なので、どれくらい効いているかは実測しないと分からない。
+	//
+	// **sync は Phase 4 の比較専用** (ADR 0006 の選択肢 A)。
+	// 本番相当の設定では config が弾く。
+	viewBuffer := viewcount.New(viewcount.WithDedupeWindow(cfg.ViewCount.DedupeWindow))
+	var viewCounts viewcount.Recorder = viewBuffer
+	if cfg.ViewCount.Mode == config.ViewCountModeSync {
+		viewCounts = viewcount.NewSync(threadRepo,
+			viewcount.WithDedupeWindow(cfg.ViewCount.DedupeWindow))
+		slog.Warn("view_count_sync_mode")
 	}
 
 	// **セッションの検証は常に結線する。** sessions を引いて期限を見るだけで、
@@ -151,6 +180,7 @@ func run() error {
 			repo := postgres.NewReportRepository(pool)
 			return moderationusecase.NewReportInteractor(repo, repo)
 		}(),
+		viewCounts,
 		cfg.Auth,
 	)
 
@@ -192,7 +222,7 @@ func run() error {
 					return nil
 				}
 				if round == maxRounds-1 {
-					slog.WarnContext(ctx, "定期処理が上限まで回りました (次の周回に持ち越します)",
+					slog.WarnContext(ctx, "scheduler_job_capped",
 						slog.String("job", name), slog.Int("rounds", maxRounds))
 				}
 			}
@@ -216,6 +246,30 @@ func run() error {
 			}),
 		},
 	}
+
+	// 閲覧数のフラッシュ (docs/adr/0006-view-count-and-popularity.md)。
+	//
+	// **drain で包まない。** 他の Job は「上限まで消して次の周回に持ち越す」
+	// 形だが、こちらは 1 回のフラッシュでバッファ全体を書き出す。
+	// 繰り返すと、2 周目以降は「その間に来た閲覧」を追いかけるだけになり、
+	// 止まらなくなる。
+	//
+	// **レプリカごとに走ってよい。** 各インスタンスは自分のメモリにある
+	// 増分だけを書き、加算は差分なので二重計上にならない。
+	// 行のロック順は id 昇順に固定してあり、デッドロックしない
+	// (viewcount.take と SQL の FOR UPDATE ... ORDER BY)。
+	jobs = append(jobs, scheduler.Job{
+		Name:     "view_count_flush",
+		Interval: cfg.ViewCount.FlushInterval,
+		Run: func(ctx context.Context) error {
+			// **sync のときは何も貯まっていない。** Flush は空で返る。
+			// ここを分岐させないのは、モードごとに Job の有無が変わると
+			// 「どちらのモードで測ったか」がスケジューラの構成にも
+			// 影響してしまい、比較の条件が 1 つ増えるため。
+			_, err := viewBuffer.Flush(ctx, threadRepo)
+			return err
+		},
+	})
 
 	// 画像の回収はストレージが有効なときだけ。
 	// 設定が無い環境で回すと、毎回 S3 に届かず ERROR を吐き続ける。
@@ -249,7 +303,7 @@ func run() error {
 	// サーバは別 goroutine で動かし、メインでシグナルを待つ。
 	serverErr := make(chan error, 1)
 	go func() {
-		slog.Info("サーバを起動しました", slog.String("addr", cfg.Addr))
+		slog.Info("server_started", slog.String("addr", cfg.Addr))
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 			return
@@ -262,7 +316,7 @@ func run() error {
 		return err
 
 	case <-ctx.Done():
-		slog.Info("シャットダウンを開始します")
+		slog.Info("shutdown_started")
 
 		// 処理中のリクエストを取りこぼさないよう、猶予を与えて終了する。
 		// この ctx は親から切り離す (親はすでにキャンセル済みのため)。
@@ -283,11 +337,28 @@ func run() error {
 		// 待たずに落ちますが、そのときは記録が残ります ——
 		// **黙って打ち切っていた**のが元の状態でした。
 		if err := sched.Wait(shutdownCtx); err != nil {
-			slog.Warn("定期処理の完了を待てませんでした",
+			slog.Warn("scheduler_wait_timeout",
 				slog.String("error", err.Error()))
 		}
 
-		slog.Info("シャットダウンが完了しました")
+		// **最後に閲覧数を書き出す** (docs/adr/0006-view-count-and-popularity.md)。
+		//
+		// バッファはこのプロセスのメモリにあるので、ここで書かなければ
+		// 未反映の増分は消えます。デプロイのたびに数秒ぶんの閲覧が
+		// 落ちることになり、**再デプロイが多い日ほど閲覧数が伸びない**
+		// という、原因の分かりにくい形で効きます。
+		//
+		// SIGKILL やクラッシュは救えません。それは ADR 0006 が
+		// 「値がロストする」として引き受けたコストのままです。
+		//
+		// スケジューラを待った後に置くのは、フラッシュの Job が
+		// 実行中だった場合に二重に走らせないためです。
+		if _, err := viewBuffer.Flush(shutdownCtx, threadRepo); err != nil {
+			slog.Warn("view_count_flush_failed",
+				slog.String("error", err.Error()))
+		}
+
+		slog.Info("shutdown_completed")
 		return nil
 	}
 }

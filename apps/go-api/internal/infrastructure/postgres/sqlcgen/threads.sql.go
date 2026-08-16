@@ -30,7 +30,7 @@ const createThread = `-- name: CreateThread :one
 WITH inserted AS (
     INSERT INTO threads (title, author_id, icon_image_id)
     VALUES ($1, $2, $3)
-    RETURNING id, title, created_at, author_id, icon_image_id
+    RETURNING id, title, created_at, view_count, author_id, icon_image_id
 ), attached AS (
     -- アイコンを「添付済み」にする (000007)。理由は comments.sql と同じ。
     -- スレッドのアイコンは作成時にしか指定できないので、解除の経路は無い。
@@ -49,6 +49,7 @@ SELECT
     i.id,
     i.title,
     i.created_at,
+    i.view_count,
     u.public_id    AS author_public_id,
     u.display_name AS author_display_name,
     u.avatar_url   AS author_avatar_url,
@@ -73,6 +74,7 @@ type CreateThreadRow struct {
 	ID                int64
 	Title             string
 	CreatedAt         time.Time
+	ViewCount         int64
 	AuthorPublicID    *uuid.UUID
 	AuthorDisplayName *string
 	AuthorAvatarUrl   *string
@@ -100,6 +102,7 @@ func (q *Queries) CreateThread(ctx context.Context, arg CreateThreadParams) (Cre
 		&i.ID,
 		&i.Title,
 		&i.CreatedAt,
+		&i.ViewCount,
 		&i.AuthorPublicID,
 		&i.AuthorDisplayName,
 		&i.AuthorAvatarUrl,
@@ -117,6 +120,7 @@ SELECT
     t.id,
     t.title,
     t.created_at,
+    t.view_count,
     (
         SELECT count(*)
         FROM comments c
@@ -143,6 +147,7 @@ type GetThreadWithCommentCountRow struct {
 	ID                int64
 	Title             string
 	CreatedAt         time.Time
+	ViewCount         int64
 	CommentCount      int64
 	AuthorPublicID    *uuid.UUID
 	AuthorDisplayName *string
@@ -162,6 +167,7 @@ func (q *Queries) GetThreadWithCommentCount(ctx context.Context, id int64) (GetT
 		&i.ID,
 		&i.Title,
 		&i.CreatedAt,
+		&i.ViewCount,
 		&i.CommentCount,
 		&i.AuthorPublicID,
 		&i.AuthorDisplayName,
@@ -173,6 +179,194 @@ func (q *Queries) GetThreadWithCommentCount(ctx context.Context, id int64) (GetT
 		&i.IconHeight,
 	)
 	return i, err
+}
+
+const incrementThreadViewCounts = `-- name: IncrementThreadViewCounts :execrows
+WITH input AS (
+    SELECT
+        t.id,
+        ($1::bigint[])[t.ord] AS increment
+    FROM unnest($2::bigint[]) WITH ORDINALITY AS t(id, ord)
+), locked AS (
+    SELECT t.id
+    FROM threads t
+    JOIN input i ON i.id = t.id
+    ORDER BY t.id
+    FOR UPDATE OF t
+)
+UPDATE threads t
+SET view_count = t.view_count + i.increment
+FROM input i
+WHERE t.id = i.id
+  AND t.id IN (SELECT id FROM locked)
+`
+
+type IncrementThreadViewCountsParams struct {
+	Increments []int64
+	ThreadIds  []int64
+}
+
+// バッファに溜まった閲覧数をまとめて反映する (Phase 7 / ADR 0006)。
+//
+// **呼び出し側は必ず別トランザクション・READ COMMITTED で実行すること。**
+// コメント投稿・スレッド作成のトランザクションに混ぜてはいけない。
+// 混ぜると threads への rw-conflict が大量に生まれ、
+// 閲覧という無関係な操作が Phase 2 の直列化失敗率を押し上げる。
+//
+// 【なぜ 1 文でまとめるか】
+// 1 行ずつ UPDATE すると、フラッシュ 1 回で数百往復になる。
+// DB への往復回数をフラッシュ間隔で決めることが D の目的なので、
+// そこを往復数で失っては意味がない。
+//
+// 【ロックを id 昇順で取る】
+// 複数のインスタンスが**異なる順序で同じ行集合を更新するとデッドロックする。**
+// 各インスタンスは自分のバッファに溜まった集合を反映するので、
+// 集合は重なるが順序は揃わない。
+//
+// **UPDATE ... FROM の行処理順は保証されない。** 実行計画次第で、
+// 入力配列の順序どおりにロックを取るとは限らない。
+// そのため、先に FOR UPDATE の CTE で **ORDER BY id のロックだけを取る。**
+// FOR UPDATE を含む CTE は inline されず、UPDATE 本体より先に評価される。
+//
+// 【存在しない行は黙って無視される】
+// 閲覧された後に削除されたスレッドは JOIN で落ちる。
+// 削除済みへの加算を弾く必要はない —— 一覧にも詳細にも出ないため、
+// 値が残っていても表に出ない。復活の機能を入れるなら、そのとき考える。
+//
+// 【なぜ unnest を 2 つ並べないか】
+// unnest(ids, increments) と 2 引数で書くのが素直だが、
+// **sqlc の解析器が「function unnest(unknown, unknown) does not exist」で
+// 生成に失敗する** (PostgreSQL は通る)。
+// 1 引数の unnest に WITH ORDINALITY を付け、
+// もう一方の配列を添字で引く形にすると生成できる。
+func (q *Queries) IncrementThreadViewCounts(ctx context.Context, arg IncrementThreadViewCountsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, incrementThreadViewCounts, arg.Increments, arg.ThreadIds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const listPopularThreadsWithCommentCount = `-- name: ListPopularThreadsWithCommentCount :many
+WITH page AS (
+    SELECT id, title, created_at, view_count, author_id, icon_image_id
+    FROM threads
+    WHERE deleted_at IS NULL
+      AND (
+        $1::bigint IS NULL
+        OR (view_count, id) < ($1::bigint, $2::bigint)
+      )
+    ORDER BY view_count DESC, id DESC
+    LIMIT $3
+)
+SELECT
+    p.id,
+    p.title,
+    p.created_at,
+    p.view_count,
+    (
+        SELECT count(*)
+        FROM comments c
+        WHERE c.thread_id = p.id
+          AND c.deleted_at IS NULL
+    )::bigint AS comment_count,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
+FROM page p
+LEFT JOIN users u ON u.id = p.author_id
+LEFT JOIN images img ON img.id = p.icon_image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL
+ORDER BY p.view_count DESC, p.id DESC
+`
+
+type ListPopularThreadsWithCommentCountParams struct {
+	CursorViewCount *int64
+	CursorID        *int64
+	PageSize        int32
+}
+
+type ListPopularThreadsWithCommentCountRow struct {
+	ID                int64
+	Title             string
+	CreatedAt         time.Time
+	ViewCount         int64
+	CommentCount      int64
+	AuthorPublicID    *uuid.UUID
+	AuthorDisplayName *string
+	AuthorAvatarUrl   *string
+	AuthorDeletedAt   *time.Time
+	IconID            *uuid.UUID
+	IconObjectKey     *string
+	IconWidth         *int32
+	IconHeight        *int32
+}
+
+// スレッド一覧を閲覧数の多い順に取得する (Phase 7 / ADR 0006)。
+//
+// 【なぜ ListThreadsWithCommentCount と 1 本にまとめないか】
+// 並び順が違うとカーソルの比較そのものが変わる。
+// 新着順は `id < $1` の 1 列比較、人気順は `(view_count, id) < ($1, $2)` の
+// 行値比較で、条件をパラメータで切り替えると
+// **どちらの実行でも索引を選びきれない形**になる
+// (SearchThreadsWithCommentCount を分けたのと同じ理由)。
+//
+// 【行値比較を使う】
+// AND/OR に展開した条件と違い、これは索引をそのまま辿れる。
+//
+//	-- 展開した形 (索引を辿れない)
+//	WHERE view_count < $1 OR (view_count = $1 AND id < $2)
+//
+// **id を第 2 キーに入れるのが必須。** 閲覧数が同値のスレッドは必ず存在し、
+// 同値の並びが不定だとページ境界で行が重複・欠落する。
+//
+// 【カーソルの OR はここにも残っている】
+// 先頭ページを NULL で表す形は新着順から引き継いだもの。
+// 3 本とも同じ形を保つ意味があるので、直すなら 3 本同時になる
+// (SearchThreadsWithCommentCount の同じ節を参照)。
+//
+// 【並びは「閲覧数が動かない」ことに依存している】
+// 閲覧数を毎リクエスト更新していたら、ページ送りの最中に view_count が動き、
+// 行の重複と取りこぼしが起きる。**フラッシュ間隔の間は動かない**ので、
+// 数百 ms で終わるページ送りは安定した並びを辿れる。
+// これは ADR 0006 で D (バッファリング) を選んだことの副産物になる。
+func (q *Queries) ListPopularThreadsWithCommentCount(ctx context.Context, arg ListPopularThreadsWithCommentCountParams) ([]ListPopularThreadsWithCommentCountRow, error) {
+	rows, err := q.db.Query(ctx, listPopularThreadsWithCommentCount, arg.CursorViewCount, arg.CursorID, arg.PageSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPopularThreadsWithCommentCountRow{}
+	for rows.Next() {
+		var i ListPopularThreadsWithCommentCountRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.CreatedAt,
+			&i.ViewCount,
+			&i.CommentCount,
+			&i.AuthorPublicID,
+			&i.AuthorDisplayName,
+			&i.AuthorAvatarUrl,
+			&i.AuthorDeletedAt,
+			&i.IconID,
+			&i.IconObjectKey,
+			&i.IconWidth,
+			&i.IconHeight,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listThreadIDs = `-- name: ListThreadIDs :many
@@ -222,7 +416,7 @@ func (q *Queries) ListThreadIDs(ctx context.Context, arg ListThreadIDsParams) ([
 
 const listThreadsWithCommentCount = `-- name: ListThreadsWithCommentCount :many
 WITH page AS (
-    SELECT id, title, created_at, author_id, icon_image_id
+    SELECT id, title, created_at, view_count, author_id, icon_image_id
     FROM threads
     WHERE deleted_at IS NULL
       AND ($1::bigint IS NULL OR id < $1::bigint)
@@ -233,6 +427,7 @@ SELECT
     p.id,
     p.title,
     p.created_at,
+    p.view_count,
     (
         SELECT count(*)
         FROM comments c
@@ -263,6 +458,7 @@ type ListThreadsWithCommentCountRow struct {
 	ID                int64
 	Title             string
 	CreatedAt         time.Time
+	ViewCount         int64
 	CommentCount      int64
 	AuthorPublicID    *uuid.UUID
 	AuthorDisplayName *string
@@ -288,21 +484,39 @@ type ListThreadsWithCommentCountRow struct {
 // 相関サブクエリで数えると、部分インデックス
 // comments_alive_thread_id_desc_idx だけで完結しヒープにほぼ触れない。
 //
-// 2,005 スレッド / 200,016 コメントでの実測 (EXPLAIN ANALYZE、各 3 回):
+// 【実測 1: 投稿者の LEFT JOIN を足す前】
+// 2,005 スレッド / 200,016 コメント (EXPLAIN ANALYZE、各 3 回):
 //
 //	LEFT JOIN + GROUP BY : 5.84 - 7.43 ms / shared buffers 2,054
 //	相関サブクエリ       : 1.04 - 1.11 ms / shared buffers    59
 //
-// 約 5.5 倍速く、バッファ読み取りは 35 分の 1。結果は完全に一致する
-// (両者を FULL JOIN して差分 0 件を確認済み)。
+// 約 5.5 倍速く、バッファ読み取りは 35 分の 1。
+//
+// 【実測 2: 投稿者の LEFT JOIN を含む現在の形】(Phase 4 / make query-probe)
+// 2,000 スレッド / 201,000 コメント / 200 利用者:
+//
+//	LEFT JOIN + GROUP BY : 4.13 ms / shared buffers 7,205
+//	相関サブクエリ       : 1.71 ms / shared buffers 1,664
+//
+// **約 2.4 倍速く、バッファは 4.3 分の 1。差は縮んだ。**
+// 両者に共通のコスト (users の解決) が加わったぶん、相対差が縮む。
+//
+// **2 つの数字を直接比べないこと。** コメントの分布が違う
+// (実測 2 のデータセットはスレッドごとに 1〜200 件と散らしてある)。
+// 言えるのは「相関サブクエリのほうが速い」が保たれていることまでになる。
+//
+// 結果が一致することは確認済み (両者を FULL JOIN して差分 0 件)。
 // どちらも DB への往復は 1 回なので、N+1 実装との対比は変わらない。
 //
-// 【重要】**この測定は LEFT JOIN users を足す前のもの。**
-// 投稿者の解決を加えた現在の形では測り直していない
-// (Phase 4 のデータセットが要る。開発環境は 7 スレッド / users 0 件で、
-// この規模では何を測っても意味が無い)。
-// 上の数値を「投稿者の解決を含めたコスト」として読まないこと。
-// Phase 4 で測り直し、この節を更新する。
+// 【planner は部分索引ではなく主キーを選んだ】
+// この規模・この分布では、`ORDER BY id DESC LIMIT 20` に
+// threads_alive_id_desc_idx ではなく **threads_pkey の逆順走査**が選ばれる。
+// 削除済みが 1% しかないため、主キーを逆に辿って 20 件を取るほうが安い、
+// という判断になる。
+//
+// **部分索引が無駄だったわけではない。** 深いページ (カーソルつき) では
+// threads_alive_id_desc_idx が選ばれる (make query-probe の 3 番)。
+// 論理削除の比率が上がれば先頭ページでも選ばれるようになる。
 //
 // 【注意】この差は Index Only Scan が効くことに依存する。
 // バルク INSERT 直後は visibility map が未整備で Heap Fetches が発生し、
@@ -347,6 +561,7 @@ func (q *Queries) ListThreadsWithCommentCount(ctx context.Context, arg ListThrea
 			&i.ID,
 			&i.Title,
 			&i.CreatedAt,
+			&i.ViewCount,
 			&i.CommentCount,
 			&i.AuthorPublicID,
 			&i.AuthorDisplayName,
@@ -369,7 +584,7 @@ func (q *Queries) ListThreadsWithCommentCount(ctx context.Context, arg ListThrea
 
 const searchThreadsWithCommentCount = `-- name: SearchThreadsWithCommentCount :many
 WITH page AS (
-    SELECT id, title, created_at, author_id, icon_image_id
+    SELECT id, title, created_at, view_count, author_id, icon_image_id
     FROM threads
     WHERE deleted_at IS NULL
       AND title ILIKE '%' || $1::text || '%' ESCAPE '\'
@@ -381,6 +596,7 @@ SELECT
     p.id,
     p.title,
     p.created_at,
+    p.view_count,
     (
         SELECT count(*)
         FROM comments c
@@ -412,6 +628,7 @@ type SearchThreadsWithCommentCountRow struct {
 	ID                int64
 	Title             string
 	CreatedAt         time.Time
+	ViewCount         int64
 	CommentCount      int64
 	AuthorPublicID    *uuid.UUID
 	AuthorDisplayName *string
@@ -452,11 +669,21 @@ type SearchThreadsWithCommentCountRow struct {
 //	               1 ページ目の性能は変わらない
 //
 // 加えて、この OR は ListThreadsWithCommentCount から引き継いだもので、
-// **直すなら両方を同時に直す話**になる (ページ送りの検査もやり直す)。
-// COALESCE(cursor, 9223372036854775807) にすれば OR を消せるが、
-// 番兵の値を持ち込むことになるので、深いページの実測 (Phase 4) を
-// 見てから決める。ここで検索側だけ書き換えると、
-// 2 本のクエリが「同じ形を保っている」という前提が崩れる。
+// **直すなら 3 本を同時に直す話**になる (ページ送りの検査もやり直す)。
+//
+// 【Phase 4 で測った結果: 置き換えない】(make query-probe)
+// 2,000 スレッド、カーソルを最も深い位置に置いた実測 (各 3 回の中央値):
+//
+//	IS NULL OR (現行) : 0.11 ms / buffers 167 / threads_alive_id_desc_idx
+//	COALESCE (番兵)   : 0.11 ms / buffers 167 / threads_alive_id_desc_idx
+//
+// **差が無い。** どちらも同じ索引を同じように辿る。
+// 先頭ページ (カーソルなし) でも 0.10 - 0.11 ms で並ぶ。
+//
+// 番兵の値 (9223372036854775807) を SQL に持ち込む代償のほうが大きいので、
+// **現行の OR を維持する。** 上に書いたとおり、カーソルの OR は
+// 畳めなくても索引は使える —— 失うのは開始位置だけで、
+// 検索語の OR とは違って索引そのものを失わない。
 //
 // 【なぜ ILIKE か】
 // pg_trgm の索引はトライグラムを小文字化して持つため、
@@ -489,6 +716,7 @@ func (q *Queries) SearchThreadsWithCommentCount(ctx context.Context, arg SearchT
 			&i.ID,
 			&i.Title,
 			&i.CreatedAt,
+			&i.ViewCount,
 			&i.CommentCount,
 			&i.AuthorPublicID,
 			&i.AuthorDisplayName,

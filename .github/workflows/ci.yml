@@ -106,6 +106,21 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: .github/scripts/arch-probe.sh
 
+      # ログの msg がイベント名になっているかを、ソースを見て検査する
+      # (docs/adr/0010-log-pipeline.md の 4-2)。
+      #
+      # **ログ基盤の検証で CI に載るのはここだけ。** パイプライン全体
+      # (fluent-bit → S3 → Athena) の検証は実環境が要り、CI では API を
+      # コンテナではなくランナー上で直接起動しているため、
+      # fluentd ログドライバの経路そのものを再現できない。
+      # 実測は手元の make logs-verify が担う (README の「ログ基盤」節)。
+      #
+      # 実行時の検査では、呼ばれなかった経路のログを見られない。
+      # こちらはソースを見るので、エラー経路のログも対象になる。
+      - name: Verify log event names
+        working-directory: ${{ github.workspace }}
+        run: .github/scripts/verify-log-events.py
+
       - name: Run Vulnerability Check (govulncheck)
         # 脆弱性データベースは新しいほうが良いので、ここだけは latest を使う。
         # そのためキャッシュの対象にせず、毎回入れ直す。

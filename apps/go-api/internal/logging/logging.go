@@ -196,10 +196,28 @@ func appendStep(
 	return append(out, step)
 }
 
+// Options はログ出力の構成です。
+//
+// **レベルと形式を別のフィールドにしてあります。** 初版はどちらも
+// 1 つの debug フラグから決めており、「DEBUG まで出す」と
+// 「人間向けのテキストで出す」が同時にしか切り替えられませんでした。
+//
+// そのせいで、ログ基盤を手元で検証すると
+// **fluent-bit のパーサが 1 行も展開できません** ——
+// ENV=development の出力は logfmt であって JSON ではないためです。
+// パイプラインだけが本番の形を見ていない、という穴になっていました
+// (ADR 0010「実装して分かったこと 1」)。
+type Options struct {
+	// Debug は DEBUG レベルまで出すかどうかです。
+	Debug bool
+	// JSON は 1 行 1 JSON で出すかどうかです。
+	// false なら人間が読むためのテキスト形式になります。
+	JSON bool
+}
+
 // Setup は slog の既定ロガーを構成します。
-// 本番は JSON、開発は人間が読みやすいテキスト形式にします。
-func Setup(debug bool) {
-	slog.SetDefault(slog.New(NewHandler(os.Stdout, debug)))
+func Setup(opts Options) {
+	slog.SetDefault(slog.New(NewHandler(os.Stdout, opts)))
 }
 
 // NewHandler は共通フィールドを載せたハンドラを組み立てます。
@@ -207,9 +225,9 @@ func Setup(debug bool) {
 // Setup から出力先を切り離してあるのは、**共通フィールドが実際に
 // 載っているかをテストできるようにする**ためです。
 // os.Stdout に直接書く形だと、そこを検査する手立てが無くなります。
-func NewHandler(w io.Writer, debug bool) slog.Handler {
+func NewHandler(w io.Writer, o Options) slog.Handler {
 	level := slog.LevelInfo
-	if debug {
+	if o.Debug {
 		// DEBUG を本番で出さない理由は ADR 0010 の 4-3。
 		// 保管コストと機密情報の露出リスクが同時に上がります。
 		level = slog.LevelDebug
@@ -217,10 +235,10 @@ func NewHandler(w io.Writer, debug bool) slog.Handler {
 	opts := &slog.HandlerOptions{Level: level, ReplaceAttr: toUTC}
 
 	var base slog.Handler
-	if debug {
-		base = slog.NewTextHandler(w, opts)
-	} else {
+	if o.JSON {
 		base = slog.NewJSONHandler(w, opts)
+	} else {
+		base = slog.NewTextHandler(w, opts)
 	}
 
 	return NewContextHandler(base).WithAttrs([]slog.Attr{

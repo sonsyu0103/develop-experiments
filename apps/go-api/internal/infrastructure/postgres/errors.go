@@ -95,7 +95,7 @@ func translateError(op string, err error) error {
 			// ハンドラは ErrInvalidArgument のメッセージをそのまま
 			// クライアントへ返すため、ここに操作名や制約名を含めてはいけない。
 			// 詳細はログにだけ残す。
-			slog.Warn("DB の CHECK 制約に違反した (アプリ側の検証漏れの可能性)",
+			slog.Warn("check_constraint_violated",
 				slog.String("op", op),
 				slog.String("constraint", pgErr.ConstraintName),
 			)
@@ -105,7 +105,7 @@ func translateError(op string, err error) error {
 		case codeCharacterNotInRepertoire:
 			// **文言に op を含めないこと** (codeCheckViolation と同じ理由)。
 			// ErrInvalidArgument のメッセージはそのままクライアントへ返ります。
-			slog.Warn("符号化できない文字が DB に届いた (入口の検証漏れ)",
+			slog.Warn("invalid_text_encoding",
 				slog.String("op", op),
 			)
 			return fmt.Errorf("入力に使えない文字が含まれています: %w", apperr.ErrInvalidArgument)

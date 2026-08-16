@@ -86,7 +86,7 @@ func TestReconstruct(t *testing.T) {
 	t.Parallel()
 
 	createdAt := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
-	got := Reconstruct(42, "復元されたスレッド", nil, nil, createdAt)
+	got := Reconstruct(42, "復元されたスレッド", nil, nil, createdAt, 0)
 
 	if got.ID != 42 {
 		t.Errorf("ID = %d, want 42", got.ID)
@@ -104,7 +104,7 @@ func TestReconstruct(t *testing.T) {
 func TestReconstruct_SkipsValidation(t *testing.T) {
 	t.Parallel()
 
-	got := Reconstruct(1, "", nil, nil, time.Now())
+	got := Reconstruct(1, "", nil, nil, time.Now(), 0)
 	if got.Title != "" {
 		t.Errorf("Title = %q, want 空文字 (復元時は検証しない)", got.Title)
 	}
