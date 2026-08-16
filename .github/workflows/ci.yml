@@ -352,10 +352,16 @@ jobs:
       #
       # **ファイルをそのまま流す。** ここに CREATE EXTENSION を書き写すと、
       # 拡張を足したときに compose 側だけが更新されて CI がすり抜ける。
+      #
+      # **ファイル名も決め打ちにしない** (レビュー指摘)。
+      # entrypoint は db/init 配下の *.sql を全部流すので、
+      # 01-*.sql を足した日に同じドリフトが起きる。
       - name: Create extensions (compose の db/init と同じ)
         run: |
-          PGPASSWORD=password psql -h localhost -U app -d bbs \
-            -v ON_ERROR_STOP=1 -f apps/go-api/db/init/00-extensions.sql
+          for f in apps/go-api/db/init/*.sql; do
+            echo "--- $f"
+            PGPASSWORD=password psql -h localhost -U app -d bbs -v ON_ERROR_STOP=1 -f "$f"
+          done
 
       # **pg_trgm が日本語を索引できることを確かめる (ADR 0012)。**
       #

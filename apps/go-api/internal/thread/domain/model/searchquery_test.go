@@ -96,6 +96,54 @@ func TestParseSearchQuery_TooLong(t *testing.T) {
 	}
 }
 
+// **制御文字は 400。** とくに NUL (U+0000)。
+//
+// PostgreSQL の text は NUL を格納できず、パラメータとして送ると
+// サーバが SQLSTATE 22021 を返す。ここで弾かないと
+// `?q=%00` の一撃で未ログインの誰でも 500 を作れる (レビュー指摘)。
+func TestParseSearchQuery_RejectsControlCharacters(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "NUL だけ", raw: "\x00"},
+		{name: "語の内側の NUL", raw: "a\x00b"},
+		{name: "語の内側の改行", raw: "a\nb"},
+		{name: "語の内側のタブ", raw: "a\tb"},
+		{name: "DEL", raw: "a\x7fb"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := ParseSearchQuery(&tt.raw)
+			if !errors.Is(err, apperr.ErrInvalidArgument) {
+				t.Errorf("err = %v, want apperr.ErrInvalidArgument", err)
+			}
+		})
+	}
+}
+
+// **端の改行やタブは「指定なし」のまま。** 制御文字の検査より
+// TrimSpace が先に効くので、400 にはならない。
+// 順序を入れ替えると、空欄のフォーム送信が 400 になりうる。
+func TestParseSearchQuery_TrimmedControlCharactersAreNoFilter(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{"\n", "\t", " \n\t "} {
+		got, err := ParseSearchQuery(&raw)
+		if err != nil {
+			t.Errorf("ParseSearchQuery(%q) が失敗した: %v", raw, err)
+		}
+		if got != nil {
+			t.Errorf("SearchQuery = %q, want nil (絞り込みなし)", got.Keyword())
+		}
+	}
+}
+
 // 空白を落とした結果が上限に収まるなら通ること。
 // 空白を落とす前に長さを見ていると、ここで落ちる。
 func TestParseSearchQuery_TrimBeforeLengthCheck(t *testing.T) {

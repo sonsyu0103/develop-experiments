@@ -31,6 +31,17 @@ const (
 	codeSerializationFailure = "40001"
 	// codeDeadlockDetected はデッドロック検出です。こちらもリトライ可能です。
 	codeDeadlockDetected = "40P01"
+	// codeCharacterNotInRepertoire は「その符号化で表せない文字」です。
+	//
+	// **実際に踏むのは NUL (U+0000) です。** PostgreSQL の text は
+	// NUL を格納できず、パラメータとして送ると
+	// `invalid byte sequence for encoding "UTF8": 0x00` を返します。
+	//
+	// **これを拾わないと 500 になります。** 利用者が送った 1 文字で
+	// サーバ内部エラーが出る形なので、入力の誤りとして扱います。
+	// 各経路の検証をすり抜けた場合の最後の砦で、
+	// 本来は入口 (model 側) で弾きます。
+	codeCharacterNotInRepertoire = "22021"
 )
 
 // classifyDeleteFailure は「本人による削除」が 0 行だった理由を撃ち分けます。
@@ -91,6 +102,13 @@ func translateError(op string, err error) error {
 			return fmt.Errorf("入力値が制約を満たしていません: %w", apperr.ErrInvalidArgument)
 		case codeSerializationFailure, codeDeadlockDetected:
 			return fmt.Errorf("%s: 直列化に失敗しました (%s): %w", op, pgErr.Code, apperr.ErrConflict)
+		case codeCharacterNotInRepertoire:
+			// **文言に op を含めないこと** (codeCheckViolation と同じ理由)。
+			// ErrInvalidArgument のメッセージはそのままクライアントへ返ります。
+			slog.Warn("符号化できない文字が DB に届いた (入口の検証漏れ)",
+				slog.String("op", op),
+			)
+			return fmt.Errorf("入力に使えない文字が含まれています: %w", apperr.ErrInvalidArgument)
 		}
 	}
 

@@ -380,6 +380,15 @@ if status == 200:
 check_status("q が 200 文字を超えると 400", "GET",
              "/threads?q=" + "a" * 201, 400)
 
+# **NUL は 500 ではなく 400** (レビュー指摘)。
+# PostgreSQL の text は NUL を格納できず、パラメータとして送ると
+# SQLSTATE 22021 が返る。翻訳を外すと 500 になり、
+# **未ログインの誰でも 1 文字でサーバ内部エラーを作れる。**
+check_status("q に NUL を入れても 500 にならない", "GET",
+             "/threads?q=%00", 400, want_code="INVALID_ARGUMENT")
+check_status("q の内側の制御文字も 400", "GET",
+             "/threads?q=a%00b", 400, want_code="INVALID_ARGUMENT")
+
 section("単体取得とコメント")
 check_status("GET /threads/1", "GET", "/threads/1", 200)
 check_status("GET /threads/1/comments", "GET", "/threads/1/comments", 200)

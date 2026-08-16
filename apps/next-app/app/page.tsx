@@ -9,7 +9,10 @@ import { AdminLink } from './AdminLink';
 type Thread = components['schemas']['Thread'];
 type ThreadList = components['schemas']['ThreadList'];
 
-async function getThreads(query: string): Promise<ThreadList> {
+/** 取得結果。`rejected` は「検索語を API が受け付けなかった」ことを表す。 */
+type FetchResult = { list: ThreadList; rejected: boolean };
+
+async function fetchThreads(query: string): Promise<Response> {
   // Server Components はコンテナ内から叩くので、サーバ間通信用の API_URL を優先する。
   // NEXT_PUBLIC_ 接頭辞つきの変数はブラウザにも露出するため、
   // サーバ専用の宛先はそちらに入れない。
@@ -20,12 +23,38 @@ async function getThreads(query: string): Promise<ThreadList> {
   // 生で繋ぐと「& 以降が別のパラメータになる」形の壊れ方をする。
   const search = query === '' ? '' : `?q=${encodeURIComponent(query)}`;
 
-  const res = await fetch(`${apiUrl}/threads${search}`, { cache: 'no-store' });
-  if (!res.ok) {
-    throw new Error(`Failed to fetch threads: ${res.status} ${res.statusText}`);
+  return fetch(`${apiUrl}/threads${search}`, { cache: 'no-store' });
+}
+
+/**
+ * スレッド一覧を取得する。
+ *
+ * **400 で例外にしない** (レビュー指摘)。`q` は利用者が URL に直接書ける
+ * 唯一の値なので、`?q=` に 201 文字を貼るだけで API が 400 を返す。
+ * 例外にすると `app/` に `error.tsx` が無い以上、**掲示板が丸ごと
+ * 表示できなくなる** —— 入力の誤りとしては代償が大きすぎる。
+ * 検索語を落として引き直し、絞り込みなしの一覧と断り書きを出す。
+ *
+ * `maxLength={200}` はフォーム経由しか守らないので、ここが最後の砦になる。
+ *
+ * **5xx は例外のまま。** そちらは利用者の入力ではなく API 側の障害で、
+ * 一覧を出せる見込みが無い。握り潰すと壊れていることが伝わらない。
+ */
+async function getThreads(query: string): Promise<FetchResult> {
+  const res = await fetchThreads(query);
+  if (res.ok) {
+    return { list: (await res.json()) as ThreadList, rejected: false };
   }
 
-  return (await res.json()) as ThreadList;
+  if (res.status === 400 && query !== '') {
+    const retry = await fetchThreads('');
+    if (retry.ok) {
+      return { list: (await retry.json()) as ThreadList, rejected: true };
+    }
+    throw new Error(`Failed to fetch threads: ${retry.status} ${retry.statusText}`);
+  }
+
+  throw new Error(`Failed to fetch threads: ${res.status} ${res.statusText}`);
 }
 
 // Server Component なので、日時の整形はコンテナのタイムゾーンで行われる。
@@ -129,7 +158,10 @@ export default async function Page({
   searchParams: Promise<{ [key: string]: string | string[] | undefined }>;
 }) {
   const query = toQuery((await searchParams).q);
-  const { threads, nextCursor } = await getThreads(query);
+  const {
+    list: { threads, nextCursor },
+    rejected,
+  } = await getThreads(query);
 
   return (
     <div
@@ -154,12 +186,23 @@ export default async function Page({
 
       <SearchForm query={query} />
 
+      {rejected && (
+        <p style={{ color: '#fa0' }}>
+          この検索語は受け付けられませんでした (長すぎるか、使えない文字が
+          含まれています)。絞り込みなしの一覧を表示しています。
+        </p>
+      )}
+
       {threads.length === 0 ? (
         // **「見つからない」と「まだ無い」を区別する。**
         // 検索して 0 件のときに「スレッドがまだありません」と出ると、
         // 掲示板が空だと読めてしまう。
         <p style={{ color: '#55f' }}>
-          {query === ''
+          {/*
+            **rejected のときは絞り込んでいない。**
+            「一致しません」と出すと、検索語が使われたように読める。
+          */}
+          {query === '' || rejected
             ? 'スレッドがまだありません。'
             : `「${query}」に一致するスレッドはありません。`}
         </p>

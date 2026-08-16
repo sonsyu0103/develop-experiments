@@ -96,6 +96,8 @@ func TestThreadRepository_Search_EscapesWildcards_Live(t *testing.T) {
 	percent := seedThreadTitled(t, pool, "live 検索 100% 達成")
 	under := seedThreadTitled(t, pool, "live 検索 a_b の話")
 	backslash := seedThreadTitled(t, pool, `live 検索 c\d の話`)
+	// `%` と `_` が隣り合ったタイトル。二重エスケープの検査に使う。
+	adjacent := seedThreadTitled(t, pool, "live 検索 50%_引き")
 
 	t.Run("% は全件一致にならない", func(t *testing.T) {
 		ids := searchIDs(t, repo, "%")
@@ -131,9 +133,19 @@ func TestThreadRepository_Search_EscapesWildcards_Live(t *testing.T) {
 	})
 
 	t.Run("%_ の並びも文字として扱われる", func(t *testing.T) {
-		// エスケープを順に ReplaceAll していると、ここで二重になります。
-		if ids := searchIDs(t, repo, "%"); !contains(ids, percent) {
-			t.Error("二重エスケープで引けなくなっている")
+		// **`%` と `_` が隣り合った検索語**を実 DB に通す。
+		// エスケープ文字の置換を最後に回した実装だと、
+		// `\%\_` が `\\%\\_` に化けて 1 件も引けなくなります。
+		ids := searchIDs(t, repo, "%_")
+		if !contains(ids, adjacent) {
+			t.Error("`%_` を含むタイトルが引けない (二重エスケープの疑い)")
+		}
+		// ワイルドカードとして効いていれば、ここも一致してしまいます。
+		if contains(ids, plain) {
+			t.Error("`%_` がワイルドカードとして効いている")
+		}
+		if contains(ids, under) {
+			t.Error("`%_` が「任意の文字列 + 任意の 1 文字」として効いている")
 		}
 	})
 }

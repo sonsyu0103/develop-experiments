@@ -1,6 +1,42 @@
 package postgres
 
-import "testing"
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"develop-experiments/apps/go-api/internal/apperr"
+)
+
+// **符号化できない文字は 400 に翻訳すること** (レビュー指摘)。
+//
+// PostgreSQL の text は NUL (U+0000) を格納できず、パラメータとして送ると
+// SQLSTATE 22021 を返します。拾わないと 500 になり、
+// **利用者が送った 1 文字でサーバ内部エラーが出ます。**
+//
+// 入口 (model.ParseSearchQuery) でも弾いていますが、こちらは
+// 検証をすり抜けた経路のための最後の砦です。
+func TestTranslateError_CharacterNotInRepertoire(t *testing.T) {
+	t.Parallel()
+
+	pgErr := &pgconn.PgError{
+		Code:    codeCharacterNotInRepertoire,
+		Message: `invalid byte sequence for encoding "UTF8": 0x00`,
+	}
+
+	err := translateError("TestRepository.Search", pgErr)
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Errorf("err = %v, want apperr.ErrInvalidArgument", err)
+	}
+	// **操作名を文言に含めないこと。**
+	// ErrInvalidArgument のメッセージはそのままクライアントへ返ります
+	// (codeCheckViolation と同じ扱い)。
+	if got := err.Error(); strings.Contains(got, "TestRepository.Search") {
+		t.Errorf("応答の文言に操作名が漏れている: %q", got)
+	}
+}
 
 // escapeLikePattern は「利用者の 1 文字で全件一致を作られる」のを防ぎます
 // (docs/adr/0012-search.md の罠)。

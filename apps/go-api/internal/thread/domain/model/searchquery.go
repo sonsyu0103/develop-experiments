@@ -3,6 +3,7 @@ package model
 import (
 	"fmt"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"develop-experiments/apps/go-api/internal/apperr"
@@ -56,6 +57,25 @@ func ParseSearchQuery(raw *string) (*SearchQuery, error) {
 			"検索語が長すぎます (%d 文字, 上限 %d 文字): %w",
 			n, SearchQueryMaxLength, apperr.ErrInvalidArgument,
 		)
+	}
+
+	// **制御文字を弾きます。とくに NUL (U+0000)。**
+	//
+	// PostgreSQL の text は NUL を格納できず、パラメータとして送ると
+	// サーバが `invalid byte sequence for encoding "UTF8": 0x00`
+	// (SQLSTATE 22021) を返します。**これは 500 になります** ——
+	// つまり `?q=%00` の一撃で、未ログインの誰でもエラー応答を作れます
+	// (レビュー指摘。実際に 500 を再現しました)。
+	//
+	// TrimSpace は改行やタブを「空白」として端からは落としますが、
+	// **語の内側に入った制御文字は残ります** (`a\x00b` など)。
+	// 検索語として意味を持たない文字なので、ここで 400 にします。
+	// unicode.IsControl が見るのは C0 (U+0000〜U+001F)・DEL・C1 です。
+	// 全角スペースなどの空白は制御文字ではないので、語の内側に入っていても
+	// そのまま残ります (検索語として意味があるため)。
+	if strings.ContainsFunc(keyword, unicode.IsControl) {
+		return nil, fmt.Errorf(
+			"検索語に使えない文字が含まれています: %w", apperr.ErrInvalidArgument)
 	}
 
 	return &SearchQuery{keyword: keyword}, nil

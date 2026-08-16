@@ -36,6 +36,36 @@ help: ## このヘルプを表示する
 .PHONY: up
 up: ## 全サービスを起動する (マイグレーションも自動実行)
 	docker compose up -d --build
+	@$(MAKE) --no-print-directory verify-search-locale
+
+.PHONY: verify-search-locale
+verify-search-locale: ## pg_trgm が日本語を索引できるか確かめる (警告のみ)
+	# **LC_CTYPE が C だと、pg_trgm は日本語からトライグラムを 1 つも作らない。**
+	# 索引は作られ、CREATE INDEX も成功し、エラーもどこにも出ない ——
+	# 現れるのは実行計画だけになる (docs/adr/0012-search.md)。
+	#
+	# Phase 11 より前に作ったボリュームがこの状態になる。
+	# **initdb の引数なので、作り直さないと直らない。**
+	#
+	# 【落とさない理由】
+	# 検索の結果自体は正しい (一致判定は索引と無関係で、変わるのは速度だけ)。
+	# ここで make up を失敗させると、検索を触らない作業まで止まる。
+	# CI 側は同じ検査で**落とす** —— あちらは毎回新しいコンテナなので、
+	# 空になったら設定が壊れたことを意味する。
+	@n=$$(docker compose exec -T postgres psql -U app -d bbs -tAc \
+		"SELECT coalesce(array_length(show_trgm('検証'), 1), 0)" 2>/dev/null \
+		| tr -d '[:space:]'); \
+	if [ -n "$$n" ] && [ "$$n" -lt 1 ] 2>/dev/null; then \
+		echo ""; \
+		echo "警告: このデータベースでは pg_trgm が日本語を索引できません (LC_CTYPE=C)。"; \
+		echo "      検索は動きますが GIN 索引が使われず、全表走査になります。"; \
+		echo "      直すにはボリュームの作り直しが要ります (データは消えます):"; \
+		echo ""; \
+		echo "          make clean && make up && make seed"; \
+		echo ""; \
+		echo "      詳細: docs/adr/0012-search.md の「実装して分かったこと 1」"; \
+		echo ""; \
+	fi
 
 .PHONY: up-seeded
 up-seeded: up ## 起動したうえでシードデータまで投入する (既存データは消える)
