@@ -144,7 +144,14 @@ cover: ## 手書きロジックのカバレッジを測り、下限を下回っ�
 	# 一度でも同じコマンドを流したあとに測ると下限割れで落ちるので、毎回走らせる。
 	# カバレッジは「実行した事実」の記録であって、
 	# キャッシュから復元してよい値ではない。
-	@cd $(GO_API_DIR) && 		pkgs=$$(go list ./internal/... | grep -vE 'oapigen|sqlcgen|/infrastructure/' | paste -sd, -) && 		go test -count=1 -coverpkg="$$pkgs" -coverprofile=/tmp/cover.out $$(echo "$$pkgs" | tr ',' ' ') > /dev/null && 		total=$$(go tool cover -func=/tmp/cover.out | tail -1 | grep -oE '[0-9]+\.[0-9]+') && 		echo "手書きロジックのカバレッジ: $$total% (下限 $(COVER_MIN)%)" && 		awk -v t="$$total" -v m="$(COVER_MIN)" 'BEGIN { if (t+0 < m+0) { print "下限を下回りました"; exit 1 } }'
+	#
+	# 【出力を捨てない】
+	# **以前は > /dev/null にしていて、落ちたときに理由が残らなかった。**
+	# 「カバレッジ行が出ないまま落ちるが、再実行すると通る」が 2 度起きており、
+	# どちらも原因が分からないまま閉じている。成功時は静かなままにしたいので、
+	# ログに落として**失敗したときだけ末尾を出す**形にする。
+	# 全文は /tmp/cover-test.log に残る。
+	@cd $(GO_API_DIR) && 		pkgs=$$(go list ./internal/... | grep -vE 'oapigen|sqlcgen|/infrastructure/' | paste -sd, -) && 		{ go test -count=1 -coverpkg="$$pkgs" -coverprofile=/tmp/cover.out $$(echo "$$pkgs" | tr ',' ' ') > /tmp/cover-test.log 2>&1 || { echo "カバレッジ計測のテストが失敗しました (全文: /tmp/cover-test.log)"; tail -30 /tmp/cover-test.log; exit 1; }; } && 		total=$$(go tool cover -func=/tmp/cover.out | tail -1 | grep -oE '[0-9]+\.[0-9]+') && 		echo "手書きロジックのカバレッジ: $$total% (下限 $(COVER_MIN)%)" && 		awk -v t="$$total" -v m="$(COVER_MIN)" 'BEGIN { if (t+0 < m+0) { print "下限を下回りました"; exit 1 } }'
 
 .PHONY: cover-html
 cover-html: cover ## カバレッジをブラウザで開く (どこが通っていないかを見る)
