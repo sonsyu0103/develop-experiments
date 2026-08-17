@@ -41,17 +41,40 @@ RUNS = int(os.environ.get("PROBE_RUNS", "3"))
 PRELUDE = "SET max_parallel_workers_per_gather = 0;"
 
 EXEC_TIME = re.compile(r"Execution Time: ([\d.]+) ms")
-BUFFERS = re.compile(r"Buffers: shared hit=(\d+)(?: read=(\d+))?")
-# **threads に対する走査だけを拾う。** 計画木の先頭を取ると、
+# **最初の 1 つだけを採る。** 計画木の Buffers は親が子の合計を持つので、
+# 全行を足すと入れ子の深さぶん重複して数える。根 = 最初に現れる行が全体の合計になる。
+#
+# **この数え方は途中で直している。** 以前は全行を足していたため、
+# 節が深いクエリほど大きく出ていた (パーティションを跨ぐクエリで 3 倍近く膨らんだ)。
+# db/query/threads.sql に残した実測値は、直したあとの数字に更新済み。
+#
+# **hit= を必須にしないこと。** PostgreSQL は 0 の成分を出力しないので、
+# キャッシュが冷えた実行では根が `Buffers: shared read=N` だけになる。
+# `hit=` 必須の正規表現はそこに一致せず、**次に一致した子孫の行を
+# 「クエリ全体の値」として拾う** —— 全行を足していた頃は取りこぼしても
+# 総和が少し減るだけだったが、「最初の 1 つを採る」に変えたことで、
+# 失敗の質が「無関係に小さい値を全体として記録する」に変わっている。
+BUFFERS = re.compile(r"Buffers: shared(?: hit=(\d+))?(?: read=(\d+))?")
+
+# **走査を見る対象の表を指定できるようにする。** 計画木の先頭を取ると、
 # 200 行の users への Seq Scan (それ自体は正しい選択) が出てしまい、
 # 「一覧クエリが全表走査している」と読めてしまう。
-SCAN_KIND = re.compile(
-    r"(Seq Scan|Index Scan(?: Backward)?|Index Only Scan|Bitmap Heap Scan)"
-    r"(?: using (\S+))? on threads")
+#
+# comments はパーティション名 (comments_p3 など) で出るので、前方一致で拾う。
+SCAN_PREFIX = (r"(Seq Scan|Index Scan(?: Backward)?|Index Only Scan|Bitmap Heap Scan)"
+               r"(?: using (\S+))? on ")
 
 
-def explain(sql: str, force_index: bool = False) -> tuple[float, int, str]:
-    """EXPLAIN (ANALYZE, BUFFERS) を流し、(実行 ms, 読んだバッファ, 走査の種類) を返す。
+def scan_kind_re(table: str) -> re.Pattern:
+    return re.compile(SCAN_PREFIX + table + r"\w*\b")
+
+
+# 実際に触ったパーティションの数。**「8 つ全部走る」を数字で示す**ために使う。
+SCANNED_PART = re.compile(r"on (comments_p\d+)\b")
+
+
+def explain(sql: str, force_index: bool = False, table: str = "threads") -> tuple:
+    """EXPLAIN (ANALYZE, BUFFERS) を流し、(実行 ms, バッファ, 走査の種類, 区画数) を返す。
 
     force_index=True は `enable_seqscan = off` を足す。
     **planner の選択が最善かどうか**を見るために使う ——
@@ -67,23 +90,33 @@ def explain(sql: str, force_index: bool = False) -> tuple[float, int, str]:
     m = EXEC_TIME.search(text)
     ms = float(m.group(1)) if m else 0.0
 
+    # **hit も read も無い一致は捨てる。** 上の正規表現は両方を省略可能に
+    # したので、`Buffers: shared` だけの行 (実際には出ないが) や、
+    # local / temp しか持たない節に引っかかると 0 を返してしまう。
+    # 値を持つ最初の行 = 根の合計になる。
     buffers = 0
-    for hit, read in BUFFERS.findall(text):
-        buffers += int(hit) + int(read or 0)
+    for b in BUFFERS.finditer(text):
+        if b.group(1) is None and b.group(2) is None:
+            continue
+        buffers = int(b.group(1) or 0) + int(b.group(2) or 0)
+        break
 
     # 索引を使ったかどうかが要点。索引名まで出す ——
     # 「索引を使った」だけでは、**意図した索引かどうか**が分からない。
-    matches = SCAN_KIND.findall(text)
+    matches = scan_kind_re(table).findall(text)
     if matches:
         scan, index = matches[0]
         kind = f"{scan} ({index})" if index else scan
     else:
         kind = "?"
-    return ms, buffers, kind
+
+    parts = len(set(SCANNED_PART.findall(text)))
+    return ms, buffers, kind, parts
 
 
-def measure(label: str, sql: str, note: str = "", force_index: bool = False) -> dict:
-    samples = [explain(sql, force_index) for _ in range(RUNS)]
+def measure(label: str, sql: str, note: str = "", force_index: bool = False,
+            table: str = "threads") -> dict:
+    samples = [explain(sql, force_index, table) for _ in range(RUNS)]
     times = [s[0] for s in samples]
     return {
         "label": label,
@@ -92,6 +125,7 @@ def measure(label: str, sql: str, note: str = "", force_index: bool = False) -> 
         "max": max(times),
         "buffers": statistics.median([s[1] for s in samples]),
         "kind": samples[-1][2],
+        "parts": max(s[3] for s in samples),
         "note": note,
     }
 
@@ -203,13 +237,115 @@ ORDER BY view_count DESC, id DESC LIMIT 20;
 """
 
 
-def report(title: str, rows: list[dict]) -> None:
+# ---------------------------------------------------------------------------
+# 5. 投稿者で絞る (マイページ「自分の投稿」)
+# ---------------------------------------------------------------------------
+# **画面が「実際に測ってから決めます」と書いたまま残っていた項目。**
+# ADR 0016 も「Phase 4 の測定対象に加える」で止まっていた。
+#
+# 索引は 000002 で既に入っている (threads_author_id_desc_idx /
+# comments_author_id_desc_idx)。**測るのは「足すかどうか」ではなく
+# 「足した索引で足りているか」**になる。
+#
+# comments は HASH(thread_id) の 8 分割で、author_id にキーが含まれない。
+# 除外が効かないので 8 区画すべてに索引スキャンが走る。
+# ADR 0016 はこれを「スレッド内のコメント一覧とはコストが桁で違う」と書いた。
+# その 2 つを並べて測る。
+
+
+def my_threads(author_id: int, cursor_id: int | None = None) -> str:
+    """自分のスレッド一覧。
+
+    **db/query/threads.sql の ListMyThreadsWithCommentCount と同じ文にすること。**
+    以前ここは `SELECT id, title, created_at, view_count` だけの素の走査で、
+    出荷するクエリ (コメント数の相関サブクエリ + users / images の LEFT JOIN) と
+    **別物を測っていた** (レビュー指摘)。
+    別物を測ると、実クエリを変えてもこの数字が動かず、退行が見えない。
+    """
+    cursor = "" if cursor_id is None else f"      AND id < {cursor_id}\n"
+    return f"""
+WITH page AS (
+    SELECT id, title, created_at, view_count, author_id, icon_image_id
+    FROM threads
+    WHERE threads.author_id = {author_id}
+      AND deleted_at IS NULL
+{cursor}    ORDER BY id DESC
+    LIMIT 20
+)
+SELECT
+    p.id, p.title, p.created_at, p.view_count,
+    (
+        SELECT count(*)
+        FROM comments c
+        WHERE c.thread_id = p.id
+          AND c.deleted_at IS NULL
+    )::bigint AS comment_count,
+    u.public_id, u.display_name, u.avatar_url, u.deleted_at,
+    img.id, img.object_key, img.width, img.height
+FROM page p
+LEFT JOIN users u ON u.id = p.author_id
+LEFT JOIN images img ON img.id = p.icon_image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL
+ORDER BY p.id DESC;
+"""
+
+
+def my_comments(author_id: int, cursor_id: int | None = None) -> str:
+    """自分のコメント一覧。**8 区画すべてを走る側。**
+
+    **db/query/comments.sql の ListMyComments と同じ文にすること。**
+    以前は images の LEFT JOIN も選択列も欠けた簡略形を測っていた
+    (レビュー指摘)。threads は「生きているものだけ」を LEFT JOIN する形で、
+    削除済みではタイトルが NULL になる。
+    """
+    cursor = "" if cursor_id is None else f"      AND comments.id < {cursor_id}\n"
+    return f"""
+WITH page AS (
+    SELECT id, thread_id, seq, body, created_at, image_id
+    FROM comments
+    WHERE comments.author_id = {author_id}
+      AND deleted_at IS NULL
+{cursor}    ORDER BY id DESC
+    LIMIT 20
+)
+SELECT
+    p.id, p.thread_id, p.seq, p.body, p.created_at,
+    t.title AS thread_title,
+    (t.id IS NULL)::boolean AS thread_deleted,
+    i.id AS image_id, i.object_key AS image_object_key,
+    i.width AS image_width, i.height AS image_height
+FROM page p
+LEFT JOIN threads t ON t.id = p.thread_id AND t.deleted_at IS NULL
+LEFT JOIN images i ON i.id = p.image_id
+    AND i.status <> 'deleted' AND i.object_reclaimed_at IS NULL
+ORDER BY p.id DESC;
+"""
+
+
+def thread_comments(thread_id: int) -> str:
+    """比較対象: スレッド内のコメント一覧 (除外が効く側)。"""
+    return f"""
+SELECT id, seq, body, created_at
+FROM comments
+WHERE thread_id = {thread_id}
+  AND deleted_at IS NULL
+ORDER BY id DESC LIMIT 20;
+"""
+
+
+def report(title: str, rows: list[dict], show_parts: bool = False) -> None:
     print(f"\n{title}")
-    print(f"{'クエリ':<34}{'中央値ms':>10}{'最小':>8}{'最大':>8}{'buffers':>10}  走査")
-    print("-" * 86)
+    head = f"{'クエリ':<34}{'中央値ms':>10}{'最小':>8}{'最大':>8}{'buffers':>10}"
+    if show_parts:
+        head += f"{'区画':>6}"
+    print(head + "  走査")
+    print("-" * (92 if show_parts else 86))
     for r in rows:
-        print(f"{r['label']:<34}{r['ms']:>10.2f}{r['min']:>8.2f}{r['max']:>8.2f}"
-              f"{r['buffers']:>10.0f}  {r['kind']}")
+        line = (f"{r['label']:<34}{r['ms']:>10.2f}{r['min']:>8.2f}{r['max']:>8.2f}"
+                f"{r['buffers']:>10.0f}")
+        if show_parts:
+            line += f"{r['parts'] or '-':>6}"
+        print(line + f"  {r['kind']}")
         if r["note"]:
             print(f"    {r['note']}")
 
@@ -264,6 +400,42 @@ def main() -> int:
         measure("人気順 先頭ページ", POPULAR_FIRST),
         measure("人気順 深いページ (行値比較)", popular_deep(vc, tid)),
     ])
+
+    # -----------------------------------------------------------------------
+    # 5. 投稿者で絞る
+    # -----------------------------------------------------------------------
+    # **投稿数が多い利用者を選ぶ。** 平均的な利用者を引くと、
+    # 走査する行が少なすぎて「8 区画を走る」コストが埋もれる。
+    author = int(sql_value(
+        "SELECT author_id FROM comments WHERE author_id IS NOT NULL "
+        "GROUP BY author_id ORDER BY count(*) DESC LIMIT 1;"))
+    n_threads = sql_value(
+        f"SELECT count(*) FROM threads WHERE author_id = {author} AND deleted_at IS NULL;")
+    n_comments = sql_value(
+        f"SELECT count(*) FROM comments WHERE author_id = {author} AND deleted_at IS NULL;")
+    # 深いページ用の境界。末尾から 20 件目に置く。
+    deep_comment = int(sql_value(
+        f"SELECT id FROM comments WHERE author_id = {author} AND deleted_at IS NULL "
+        f"ORDER BY id LIMIT 1 OFFSET 20;"))
+    busy_thread = int(sql_value(
+        "SELECT thread_id FROM comments WHERE deleted_at IS NULL "
+        "GROUP BY thread_id ORDER BY count(*) DESC LIMIT 1;"))
+
+    report(f"5. 投稿者で絞る (利用者 {author}: スレッド {n_threads} 件 / "
+           f"コメント {n_comments} 件)", [
+        measure("自分のスレッド 先頭ページ", my_threads(author),
+                # **threads 自体は分割していないが、区画は走る。**
+                # コメント数の相関サブクエリが comments を引くため。
+                # 簡略形 (素の走査) を測っていた頃は「区画 -」に見えていた。
+                "コメント数の相関サブクエリが comments の区画を触る"),
+        measure("自分のコメント 先頭ページ", my_comments(author),
+                "**8 区画すべてに索引スキャンが走る**", table="comments"),
+        measure("自分のコメント 深いページ", my_comments(author, deep_comment),
+                "カーソルつき。区画ごとに開始位置を探す", table="comments"),
+        measure("[比較] スレッド内のコメント一覧", thread_comments(busy_thread),
+                "除外が効く側。ADR 0016 が「桁で違う」と書いた相手",
+                table="comments"),
+    ], show_parts=True)
 
     print("\n※ Seq Scan が出ていても即座に誤りではありません ——")
     print("   一致件数が多いほど、索引を辿って捨てるより全表走査が安くなります。")

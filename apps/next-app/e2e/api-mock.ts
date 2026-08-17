@@ -14,8 +14,11 @@ export type Me = Schemas['Me'];
 export type Report = Schemas['Report'];
 export type ReportList = Schemas['ReportList'];
 export type Thread = Schemas['Thread'];
+export type ThreadList = Schemas['ThreadList'];
 export type Comment = Schemas['Comment'];
 export type CommentList = Schemas['CommentList'];
+export type MyComment = Schemas['MyComment'];
+export type MyCommentList = Schemas['MyCommentList'];
 export type ErrorCode = Schemas['Error']['error']['code'];
 
 export const moderator: Me = {
@@ -187,6 +190,75 @@ export async function mockThread(
     const m = /\/threads\/(\d+)/.exec(request.url());
     return handler(route, Number(m?.[1] ?? 0));
   });
+}
+
+/**
+ * マイページ用のコメント 1 件 (`GET /me/comments`)。
+ *
+ * **`Comment` とは別の型です。** 投稿者は持たず (常に自分なので)、
+ * 代わりに投稿先のスレッド (`threadTitle` / `threadDeleted`) が載ります。
+ * `image` は必須なので省けません。
+ *
+ * **削除済みを作るときは `deletedThreadComment` を使ってください** ——
+ * `threadDeleted: true` と `threadTitle: null` は API 側で必ず対になります。
+ */
+export function myComment(over: Partial<MyComment> = {}): MyComment {
+  return {
+    id: 1,
+    threadId: 100,
+    threadTitle: 'テスト用のスレッド',
+    // 既定は**生きている**スレッド。削除済みの経路は明示的に上書きします。
+    threadDeleted: false,
+    seq: 1,
+    body: 'テスト用のコメント',
+    createdAt: '2026-08-16T00:00:00Z',
+    image: null,
+    ...over,
+  };
+}
+
+/**
+ * 削除済みスレッドへのコメント。
+ *
+ * **`threadTitle` は必ず `null` になります。** API が返さないためで
+ * (タイトル自体が理由で消された場合に残り続けるのを防ぐ)、
+ * ここで手書きの文字列を入れると**実際には来ない応答を検査する**ことになります。
+ */
+export function deletedThreadComment(over: Partial<MyComment> = {}): MyComment {
+  return myComment({ threadDeleted: true, ...over, threadTitle: null });
+}
+
+export function myComments(items: MyComment[], nextCursor: string | null = null): MyCommentList {
+  return { comments: items, nextCursor };
+}
+
+export function threads(items: Thread[], nextCursor: string | null = null): ThreadList {
+  return { threads: items, nextCursor };
+}
+
+/**
+ * `GET /me/threads` を差し替えます。
+ *
+ * **`mockMe` のパターンとは衝突しません。** あちらは `/me` で終わる URL
+ * だけに一致するので、`/me/threads` を横取りすることはありません。
+ */
+export async function mockMyThreads(
+  page: Page,
+  handler: (route: Route, cursor: string | null) => Promise<unknown>,
+) {
+  await page.route(/\/me\/threads(\?|$)/, (route) =>
+    handler(route, cursorOf(route.request().url())),
+  );
+}
+
+/** `GET /me/comments` を差し替えます。 */
+export async function mockMyComments(
+  page: Page,
+  handler: (route: Route, cursor: string | null) => Promise<unknown>,
+) {
+  await page.route(/\/me\/comments(\?|$)/, (route) =>
+    handler(route, cursorOf(route.request().url())),
+  );
 }
 
 /** 通報キューの取得で使われた `status` を取り出します。 */

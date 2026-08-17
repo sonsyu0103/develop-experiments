@@ -283,6 +283,72 @@ func (s *Server) GetMe(c *gin.Context) {
 	c.JSON(http.StatusOK, toWireMe(p.Me))
 }
 
+// ListMyThreads は GET /me/threads を処理します。
+//
+// **投稿者は必ずセッションから採ります。** クエリや本文で受け取る形にすると、
+// 他人の ID を渡して他人のマイページを読めてしまいます。
+func (s *Server) ListMyThreads(c *gin.Context, params oapigen.ListMyThreadsParams) {
+	authorID, err := requireAuthorID(c)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	page, err := toPage(params.Cursor, params.Size)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	result, err := s.threads.FetchMyThreadList(c.Request.Context(), authorID, page)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, toWireThreadList(result))
+}
+
+// ListMyComments は GET /me/comments を処理します。
+//
+// **このエンドポイントだけは HASH パーティションの pruning が効きません。**
+// 経緯と実測は db/query/comments.sql に書いてあります。
+func (s *Server) ListMyComments(c *gin.Context, params oapigen.ListMyCommentsParams) {
+	authorID, err := requireAuthorID(c)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	page, err := toPage(params.Cursor, params.Size)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	result, err := s.comments.FetchMyComments(c.Request.Context(), authorID, page)
+	if err != nil {
+		respondError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, toWireMyCommentList(result))
+}
+
+// requireAuthorID はログイン中の利用者の内部 ID を返します。
+//
+// **仕様書に security を宣言したオペレーション専用です。**
+// 検証ミドルウェアが先に 401 を返すため、ここが nil になるのは
+// 宣言と resolveSession のどちらかが外れたときだけになります
+// (GetMe が principal を見ているのと同じ形)。
+func requireAuthorID(c *gin.Context) (int64, error) {
+	id := authorIDFromContext(c.Request.Context())
+	if id == nil {
+		return 0, fmt.Errorf("セッションがありません: %w", apperr.ErrUnauthenticated)
+	}
+	return *id, nil
+}
+
 // ---------------------------------------------------------------------------
 // threads
 // ---------------------------------------------------------------------------

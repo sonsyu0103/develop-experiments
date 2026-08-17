@@ -744,3 +744,169 @@ func TestFetchThreadList_PopularPaginationHasNoGapOrOverlap(t *testing.T) {
 		}
 	}
 }
+
+// マイページの「自分のスレッド」(GET /me/threads) の検査。
+//
+// 見たいのは 2 点です。
+//
+//  1. **他人のスレッドが混ざらないこと** —— 件数だけ見ていると気づけません
+//  2. カーソルの扱いが一覧と同じであること (並び順が同じなので共用できる)
+
+// TestThreadInteractor_FetchMyThreadList_OnlyOwnThreads は、
+// 自分のスレッドだけが返ることを確かめます。
+//
+// **匿名で立てたスレッド (owners に載っていない) も出ません。**
+// author_id が入っていないため、後から本人だと突き合わせられないためです。
+func TestThreadInteractor_FetchMyThreadList_OnlyOwnThreads(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepo(5)
+	// 5 件のうち 5・3 が自分 (ID 1)、4 が他人 (ID 2)、2・1 は匿名。
+	repo.owners = map[int64]int64{5: 1, 4: 2, 3: 1}
+
+	uc := NewThreadInteractor(repo, nil)
+
+	got, err := uc.FetchMyThreadList(context.Background(), 1, mustPage(t, nil, 10))
+	if err != nil {
+		t.Fatalf("FetchMyThreadList が失敗した: %v", err)
+	}
+
+	if len(got.Threads) != 2 {
+		t.Fatalf("件数 = %d, want 2 (自分のものだけ): %+v", len(got.Threads), got.Threads)
+	}
+	// 新しい順であること。
+	if got.Threads[0].ID != 5 || got.Threads[1].ID != 3 {
+		t.Errorf("ID = [%d %d], want [5 3]", got.Threads[0].ID, got.Threads[1].ID)
+	}
+	// 全件返しきったので次ページは無い。
+	if got.NextCursor != nil {
+		t.Errorf("NextCursor = %v, want nil", *got.NextCursor)
+	}
+
+	if ids := repo.authorListCalls; len(ids) != 1 || ids[0] != 1 {
+		t.Errorf("リポジトリに渡った投稿者 ID = %v, want [1]", ids)
+	}
+}
+
+// TestThreadInteractor_FetchMyThreadList_Paginates は、
+// カーソルが一覧と同じ意味で使えることを確かめます。
+func TestThreadInteractor_FetchMyThreadList_Paginates(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepo(5)
+	repo.owners = map[int64]int64{5: 1, 4: 1, 3: 1, 2: 1, 1: 1}
+	uc := NewThreadInteractor(repo, nil)
+
+	first, err := uc.FetchMyThreadList(context.Background(), 1, mustPage(t, nil, 2))
+	if err != nil {
+		t.Fatalf("1 ページ目が失敗した: %v", err)
+	}
+	if len(first.Threads) != 2 || first.Threads[0].ID != 5 {
+		t.Fatalf("1 ページ目 = %+v, want id 5,4", first.Threads)
+	}
+	// size ちょうど返ったので、次ページのカーソルが立つ。
+	wantNextCursor(t, first.NextCursor, 4)
+
+	second, err := uc.FetchMyThreadList(context.Background(), 1, mustPage(t, ptrInt64(4), 2))
+	if err != nil {
+		t.Fatalf("2 ページ目が失敗した: %v", err)
+	}
+	if len(second.Threads) != 2 || second.Threads[0].ID != 3 {
+		t.Fatalf("2 ページ目 = %+v, want id 3,2", second.Threads)
+	}
+}
+
+// TestThreadInteractor_FetchMyThreadList_EmptyIsNotNil は、
+// 1 件も無いときに nil スライスを返さないことを確かめます。
+// JSON で null になると、フロントの .map() が落ちます。
+func TestThreadInteractor_FetchMyThreadList_EmptyIsNotNil(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepo(3) // owners は空 = 全部匿名扱い
+	uc := NewThreadInteractor(repo, nil)
+
+	got, err := uc.FetchMyThreadList(context.Background(), 1, mustPage(t, nil, 10))
+	if err != nil {
+		t.Fatalf("FetchMyThreadList が失敗した: %v", err)
+	}
+	if got.Threads == nil {
+		t.Error("Threads = nil, want 空スライス")
+	}
+	if len(got.Threads) != 0 {
+		t.Errorf("件数 = %d, want 0", len(got.Threads))
+	}
+}
+
+func ptrInt64(v int64) *int64 { return &v }
+
+// TestThreadInteractor_FetchMyThreadList_RejectsForeignSortCursor は、
+// **別の並び順で発行されたカーソルを拒む**ことを確かめます (レビュー指摘)。
+//
+// 利用者は `GET /threads?sort=popular` が返したトークンを、そのまま
+// `/me/threads?cursor=` に貼れます。検査しないと view_count 成分が黙って
+// 捨てられ、`id < cursorID` だけが効いた「要求していない位置のページ」が
+// 400 も出さずに返ります (ADR 0018 が防ごうとしている形そのもの)。
+func TestThreadInteractor_FetchMyThreadList_RejectsForeignSortCursor(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepo(5)
+	repo.owners = map[int64]int64{5: 1, 4: 1, 3: 1}
+	uc := NewThreadInteractor(repo, nil)
+
+	// 人気順が発行する形のトークン (並び順の印と view_count を含む)。
+	token, err := pagination.NewCursor(4).
+		WithSort(model.ListOrderPopular.CursorSort()).
+		WithViewCount(10).
+		Encode()
+	if err != nil {
+		t.Fatalf("カーソルの符号化が失敗した: %v", err)
+	}
+	page, err := pagination.NewPage(&token, 10)
+	if err != nil {
+		t.Fatalf("pagination.NewPage が失敗した: %v", err)
+	}
+
+	_, err = uc.FetchMyThreadList(context.Background(), 1, page)
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
+	}
+	// **弾いたなら DB を引かない。**
+	if len(repo.authorListCalls) != 0 {
+		t.Errorf("リポジトリが呼ばれた: %v, want 呼ばれない", repo.authorListCalls)
+	}
+}
+
+// TestThreadInteractor_FetchMyThreadList_AcceptsOwnCursor は、
+// 自分が発行したトークンは通ること (先頭ページも含む) を確かめます。
+//
+// **この検査が無いと、上の拒否を「常に 400」にしても気づけません。**
+func TestThreadInteractor_FetchMyThreadList_AcceptsOwnCursor(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepo(5)
+	repo.owners = map[int64]int64{5: 1, 4: 1, 3: 1, 2: 1, 1: 1}
+	uc := NewThreadInteractor(repo, nil)
+	ctx := context.Background()
+
+	// 先頭ページ (カーソル無し) は検査の対象外。
+	first, err := uc.FetchMyThreadList(ctx, 1, mustPage(t, nil, 2))
+	if err != nil {
+		t.Fatalf("先頭ページが失敗した: %v", err)
+	}
+	if first.NextCursor == nil {
+		t.Fatal("NextCursor = nil, want トークン")
+	}
+
+	// 返したトークンをそのまま渡す経路が通ること。
+	page, err := pagination.NewPage(first.NextCursor, 2)
+	if err != nil {
+		t.Fatalf("pagination.NewPage が失敗した: %v", err)
+	}
+	second, err := uc.FetchMyThreadList(ctx, 1, page)
+	if err != nil {
+		t.Fatalf("2 ページ目が失敗した: %v", err)
+	}
+	if len(second.Threads) != 2 || second.Threads[0].ID != 3 {
+		t.Fatalf("2 ページ目 = %+v, want id 3,2", second.Threads)
+	}
+}

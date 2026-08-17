@@ -7,7 +7,20 @@
 // 型検査もビルドも通り、画面も一見正常に見える壊れ方になります。
 import { expect, test } from '@playwright/test';
 
-import { fail, mockMe, moderator, noContent, ok } from './api-mock';
+import {
+  deletedThreadComment,
+  fail,
+  mockMe,
+  mockMyComments,
+  mockMyThreads,
+  moderator,
+  myComment,
+  myComments,
+  noContent,
+  ok,
+  thread,
+  threads,
+} from './api-mock';
 
 test.describe('マイページ', () => {
   test('未ログインならログインの導線を出す', async ({ page }) => {
@@ -79,12 +92,157 @@ test.describe('マイページ', () => {
     expect(meCalls).toBe(before);
   });
 
-  test('自分の投稿一覧は、無い理由ごと出す', async ({ page }) => {
+});
+
+// 自分の投稿一覧 (GET /me/threads / GET /me/comments)。
+//
+// 【この一覧に固有の落とし穴】
+// 一覧そのものの状態遷移は ADR 0020 がスレッド詳細で洗ってあるので、
+// ここで見るのは**この画面でしか起きない**ものに絞ります。
+//
+//   - 開いていないタブまで取りに行かないか (マイページを開くだけで 2 往復しない)
+//   - 削除済みスレッドへのコメントを、消さずに・リンクにせず出せるか
+//   - 匿名の投稿が出ないことを、画面に書いてあるか
+test.describe('自分の投稿', () => {
+  test('既定でスレッドを出し、コメントは開くまで取りに行かない', async ({ page }) => {
+    let threadCalls = 0;
+    let commentCalls = 0;
+
     await mockMe(page, moderator);
+    await mockMyThreads(page, (route) => {
+      threadCalls += 1;
+      return ok(route, threads([thread({ id: 7, title: '自分で立てたスレッド' })]));
+    });
+    await mockMyComments(page, (route) => {
+      commentCalls += 1;
+      return ok(route, myComments([myComment()]));
+    });
+
+    await page.goto('/mypage');
+    await expect(page.getByRole('link', { name: '自分で立てたスレッド' })).toBeVisible();
+
+    expect(threadCalls).toBe(1);
+    // **ここが本題。** 両方を先に取ると、マイページを開くだけで 2 往復します。
+    // コメント側は 8 区画すべてを走る側なので、無駄撃ちの代償が大きくなります。
+    expect(commentCalls).toBe(0);
+
+    await page.getByRole('button', { name: '書いたコメント' }).click();
+    await expect(page.getByText('テスト用のコメント')).toBeVisible();
+    expect(commentCalls).toBe(1);
+  });
+
+  test('一度取ったタブは、戻っても取り直さない', async ({ page }) => {
+    let threadCalls = 0;
+
+    await mockMe(page, moderator);
+    await mockMyThreads(page, (route) => {
+      threadCalls += 1;
+      return ok(route, threads([thread({ id: 7, title: '自分で立てたスレッド' })]));
+    });
+    await mockMyComments(page, (route) => ok(route, myComments([myComment()])));
+
+    await page.goto('/mypage');
+    await expect(page.getByRole('link', { name: '自分で立てたスレッド' })).toBeVisible();
+    expect(threadCalls).toBe(1);
+
+    await page.getByRole('button', { name: '書いたコメント' }).click();
+    await expect(page.getByText('テスト用のコメント')).toBeVisible();
+    await page.getByRole('button', { name: '立てたスレッド' }).click();
+
+    // **読み進めた位置を捨てないため。** 戻すたびに取り直すと、
+    // 「もっと読む」で開いた続きが毎回先頭に戻ります。
+    await expect(page.getByRole('link', { name: '自分で立てたスレッド' })).toBeVisible();
+    expect(threadCalls).toBe(1);
+  });
+
+  test('削除済みスレッドへのコメントは、消さずにリンクにしない', async ({ page }) => {
+    await mockMe(page, moderator);
+    await mockMyThreads(page, (route) => ok(route, threads([])));
+    await mockMyComments(page, (route) =>
+      ok(
+        route,
+        myComments([
+          // **タイトルは API から来ません** (`null`)。
+          deletedThreadComment({ id: 1, threadId: 100, body: '消された先に書いた本文' }),
+          myComment({ id: 2, threadId: 101, threadTitle: '生きているスレッド' }),
+        ]),
+      ),
+    );
+
+    await page.goto('/mypage');
+    await page.getByRole('button', { name: '書いたコメント' }).click();
+
+    // **落としません。** 落とすと、自分の投稿が「消えた」のか
+    // 「元から無い」のかを本人が区別できなくなります。
+    await expect(page.getByText('このスレッドは削除されています')).toBeVisible();
+    // 自分が書いた本文は残ること。
+    await expect(page.getByText('消された先に書いた本文')).toBeVisible();
+
+    // **タイトルの代わりの文言を出します。** `null` をそのまま描くと
+    // 「空のタイトル」に見えます。
+    await expect(page.getByText('削除されたスレッド')).toBeVisible();
+    // **リンクにはしません。** 押した先は 404 です。
+    await expect(page.getByRole('link', { name: '削除されたスレッド' })).toHaveCount(0);
+
+    // 生きているほうは辿れること (両方ともリンクを外していないか)。
+    await expect(page.getByRole('link', { name: '生きているスレッド' })).toBeVisible();
+  });
+
+  test('取得に失敗したら「まだありません」とは書かない', async ({ page }) => {
+    await mockMe(page, moderator);
+    await mockMyThreads(page, (route) => fail(route, 500, 'INTERNAL', 'DB がダウンしています'));
+    await mockMyComments(page, (route) => ok(route, myComments([])));
+
     await page.goto('/mypage');
 
-    // **「準備中」と書きません。** 投稿者で絞る API が無いという
-    // こちらの都合なので、そのまま書きます。
-    await expect(page.getByText('一覧は用意していません')).toBeVisible();
+    await expect(page.getByText('投稿を取得できませんでした')).toBeVisible();
+    // **ここを取り違えると、投稿が消えたように見えます** (ADR 0020 ④)。
+    await expect(page.getByText('まだスレッドを立てていません')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: '再試行する' })).toBeVisible();
+  });
+
+  test('本当に 0 件なら「まだありません」を出す', async ({ page }) => {
+    await mockMe(page, moderator);
+    await mockMyThreads(page, (route) => ok(route, threads([])));
+
+    await page.goto('/mypage');
+
+    await expect(page.getByText('まだスレッドを立てていません')).toBeVisible();
+  });
+
+  test('匿名の投稿が出ないことを画面に書く', async ({ page }) => {
+    await mockMe(page, moderator);
+    await mockMyThreads(page, (route) => ok(route, threads([])));
+
+    await page.goto('/mypage');
+
+    // 出ないのは仕様ですが、書かないと「消えた」と読まれます (ADR 0005 決定 2)。
+    await expect(page.getByText('ログインせずに投稿したものは')).toBeVisible();
+  });
+
+  test('続きは受け取ったカーソルをそのまま渡す', async ({ page }) => {
+    const seen: Array<string | null> = [];
+
+    await mockMe(page, moderator);
+    await mockMyThreads(page, (route, cursor) => {
+      seen.push(cursor);
+      return cursor === null
+        ? ok(route, threads([thread({ id: 7, title: '1 ページ目' })], 'CURSOR-FROM-API'))
+        : ok(route, threads([thread({ id: 6, title: '2 ページ目' })]));
+    });
+
+    await page.goto('/mypage');
+    await expect(page.getByRole('link', { name: '1 ページ目' })).toBeVisible();
+
+    await page.getByRole('button', { name: 'もっと読む' }).click();
+    await expect(page.getByRole('link', { name: '2 ページ目' })).toBeVisible();
+
+    // **カーソルは不透明トークンです** (ADR 0018)。
+    // 解釈も生成もせず、受け取った値をそのまま返します。
+    expect(seen).toEqual([null, 'CURSOR-FROM-API']);
+    // 返しきったので、ボタンは消えます。
+    await expect(page.getByRole('button', { name: 'もっと読む' })).toHaveCount(0);
+    // 前のページも残っていること (追記であって置き換えではない)。
+    await expect(page.getByRole('link', { name: '1 ページ目' })).toBeVisible();
   });
 });

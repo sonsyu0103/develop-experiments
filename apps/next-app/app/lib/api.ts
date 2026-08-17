@@ -42,6 +42,8 @@ export type Thread = Schemas['Thread'];
 export type ThreadList = Schemas['ThreadList'];
 export type Comment = Schemas['Comment'];
 export type CommentList = Schemas['CommentList'];
+export type MyComment = Schemas['MyComment'];
+export type MyCommentList = Schemas['MyCommentList'];
 export type CreateThreadRequest = Schemas['CreateThreadRequest'];
 export type CreateCommentRequest = Schemas['CreateCommentRequest'];
 export type CreateReportRequest = Schemas['CreateReportRequest'];
@@ -253,14 +255,55 @@ export function deleteThread(id: number): Promise<void> {
  */
 export function listComments(
   threadId: number,
-  params: { cursor?: string; size?: number } = {},
+  params: PageParams = {},
 ): Promise<CommentList> {
-  const q = new URLSearchParams();
-  if (params.cursor) q.set('cursor', params.cursor);
-  if (params.size) q.set('size', String(params.size));
-  const search = q.size === 0 ? '' : `?${q.toString()}`;
+  return request<CommentList>(`/threads/${threadId}/comments${pageQuery(params)}`);
+}
 
-  return request<CommentList>(`/threads/${threadId}/comments${search}`);
+/** 一覧の位置と件数。**カーソルは不透明トークンです** (ADR 0018)。 */
+type PageParams = { cursor?: string; size?: number };
+
+/**
+ * 一覧系の検索文字列を組み立てます。
+ *
+ * **カーソルを解釈も生成もしません。** 受け取った値をそのまま載せるだけです。
+ * 空なら `?` ごと省きます —— `?cursor=` を送ると「空のカーソル」を
+ * 明示したように見えますが、API 側の扱いは省略時と同じです。
+ */
+function pageQuery({ cursor, size }: PageParams): string {
+  const q = new URLSearchParams();
+  if (cursor) q.set('cursor', cursor);
+  if (size) q.set('size', String(size));
+  return q.size === 0 ? '' : `?${q.toString()}`;
+}
+
+/**
+ * 自分が立てたスレッドを取得します。**新しい順**、ログインが必要です。
+ *
+ * **匿名で立てたスレッドは含まれません。** 投稿時にログインしていなければ
+ * `author_id` が入らず、後から本人だと突き合わせる手段がないためです
+ * (ADR 0005 決定 2)。画面ではその旨を添えてください ——
+ * 「立てたはずのスレッドが出てこない」と読まれます。
+ */
+export function listMyThreads(params: PageParams = {}): Promise<ThreadList> {
+  return request<ThreadList>(`/me/threads${pageQuery(params)}`);
+}
+
+/**
+ * 自分が書いたコメントを取得します。**新しい順**、ログインが必要です。
+ *
+ * 返るのは `Comment` ではなく `MyComment` です —— 投稿者は常に自分なので
+ * 持たせず、代わりに投稿先のスレッド (`threadTitle` / `threadDeleted`) が
+ * 載ります。どのスレッドへの投稿か分からないと一覧になりません。
+ *
+ * **削除済みのスレッドへのコメントも返ります** (`threadDeleted: true`)。
+ * 落とすと、自分の投稿が「消えた」のか「元から無い」のか区別できません。
+ * リンク先は 404 になるので、画面側でリンクにしないでください。
+ *
+ * **匿名で書いたコメントは含まれません** (`listMyThreads` と同じ理由)。
+ */
+export function listMyComments(params: PageParams = {}): Promise<MyCommentList> {
+  return request<MyCommentList>(`/me/comments${pageQuery(params)}`);
 }
 
 /**

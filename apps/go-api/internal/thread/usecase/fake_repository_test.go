@@ -58,6 +58,15 @@ type fakeRepo struct {
 	// **新着順に落ちていないこと**を見るために要ります ——
 	// 落ちても件数は同じになるので、結果だけでは区別できません。
 	popularCalls atomic.Int64
+
+	// owners は thread ID → 投稿者の内部 ID です。
+	// **載っていないスレッドは匿名投稿**として扱われ、
+	// ListSummariesByAuthor には現れません。
+	owners map[int64]int64
+	// authorListCalls は ListSummariesByAuthor に渡された投稿者 ID です。
+	// **他人の ID で呼ばれていないこと**を見るために記録します。
+	authorListCallMux sync.Mutex
+	authorListCalls   []int64
 }
 
 var (
@@ -185,6 +194,34 @@ func (f *fakeRepo) SearchSummaries(
 		}
 	}
 	return applyPage(matched, page), nil
+}
+
+// ListSummariesByAuthor は投稿者で絞った一覧を返します (GET /me/threads)。
+//
+// **絞り込みは owners が持ちます。** model.Thread の読み出し経路には
+// AuthorID が載らない (表示用の Author しか無い) ため、
+// フェイク側で「どのスレッドが誰のものか」を別に持つ必要があります。
+// owners に無いスレッドは匿名投稿の扱いで、誰の一覧にも出ません。
+//
+// 並び順とカーソルの扱いは ListSummaries と同じなので applyPage を共用します。
+func (f *fakeRepo) ListSummariesByAuthor(
+	_ context.Context, authorID int64, page pagination.Page,
+) ([]model.Summary, error) {
+	f.authorListCallMux.Lock()
+	f.authorListCalls = append(f.authorListCalls, authorID)
+	f.authorListCallMux.Unlock()
+
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+
+	mine := make([]model.Summary, 0, len(f.threads))
+	for _, s := range f.summariesAll() {
+		if owner, ok := f.owners[s.ID]; ok && owner == authorID {
+			mine = append(mine, s)
+		}
+	}
+	return applyPage(mine, page), nil
 }
 
 func (f *fakeRepo) FindSummaryByID(_ context.Context, id int64) (*model.Summary, error) {

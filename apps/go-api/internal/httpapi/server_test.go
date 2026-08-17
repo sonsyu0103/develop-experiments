@@ -70,6 +70,12 @@ type fakeThreadRepo struct {
 
 	// popularCalls は ListPopularSummaries の呼び出し回数です。
 	popularCalls int
+
+	// mySummaries は ListSummariesByAuthor が返す一覧です。
+	mySummaries []threadmodel.Summary
+	// myAuthorIDs は ListSummariesByAuthor に渡された投稿者 ID です。
+	// **セッションの利用者で呼ばれていること**を見るために記録します。
+	myAuthorIDs []int64
 }
 
 var _ threadrepo.ThreadRepository = (*fakeThreadRepo)(nil)
@@ -79,6 +85,21 @@ func (f *fakeThreadRepo) ListSummaries(context.Context, pagination.Page) ([]thre
 		return nil, f.err
 	}
 	return f.summaries, nil
+}
+
+// ListSummariesByAuthor は投稿者で絞った一覧を返します。
+//
+// **渡された投稿者 ID を記録します。** HTTP 層で見たいのは
+// 「セッションの利用者がそのまま届くか」で、絞り込みの正しさは
+// SQL 側の責務だからです。
+func (f *fakeThreadRepo) ListSummariesByAuthor(
+	_ context.Context, authorID int64, _ pagination.Page,
+) ([]threadmodel.Summary, error) {
+	f.myAuthorIDs = append(f.myAuthorIDs, authorID)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.mySummaries, nil
 }
 
 // ListPopularSummaries は閲覧数の多い順に返します。
@@ -216,6 +237,11 @@ type fakeCommentRepo struct {
 	// **nil のままなら、ヘッダが握りつぶされている**ことになります。
 	gotIdempotency *idempotency.Request
 
+	// myComments は ListByAuthor が返す「自分のコメント」です。
+	myComments []commentmodel.MyComment
+	// myAuthorIDs は ListByAuthor に渡された投稿者 ID です。
+	myAuthorIDs []int64
+
 	// deletedComments は論理削除済みのコメント ID です。
 	// 二重削除が 404 になることを見るために持ちます。
 	deletedComments map[int64]bool
@@ -230,6 +256,18 @@ func (f *fakeCommentRepo) ListByThreadID(
 		return nil, f.err
 	}
 	return f.comments, nil
+}
+
+// ListByAuthor は投稿者で絞ったコメントを返します。
+// 記録する理由は fakeThreadRepo.ListSummariesByAuthor と同じです。
+func (f *fakeCommentRepo) ListByAuthor(
+	_ context.Context, authorID int64, _ pagination.Page,
+) ([]commentmodel.MyComment, error) {
+	f.myAuthorIDs = append(f.myAuthorIDs, authorID)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.myComments, nil
 }
 
 func (f *fakeCommentRepo) Create(_ context.Context, c *commentmodel.Comment) (*commentmodel.Comment, error) {

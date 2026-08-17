@@ -2,14 +2,12 @@
 
 // プロフィールの表示と、プロフィール画像の変更。
 //
-// 【「自分の投稿一覧」はありません】
-// 出したいところですが、**それを返す API がありません。**
-// 作るには「投稿者で絞った一覧」の経路が要り、`comments` は
-// `thread_id` によるハッシュパーティションなので、
-// 投稿者で絞ると 8 パーティションすべてを走査します
-// (ADR 0016 のインデックス設計)。索引を足すかどうかは測ってから決める話で、
-// **画面側で誤魔化せる種類のものではありません。**
-// 無いものを「準備中」と書かず、理由ごと出しておきます。
+// 【自分の投稿一覧は MyPosts が持ちます】
+// 長らく「投稿者で絞る API が無い」と断りを出していた場所です。
+// `GET /me/threads` と `GET /me/comments` を入れたので、実物に置き換えました。
+// **懸案だった「コメントを投稿者で絞ると 8 区画すべてを走る」は測って通しました**
+// —— 実測 1.5 ms で、索引の追加は不要という結論です
+// (db/query/comments.sql に数字が残してあります)。
 //
 // 【表示名は変えられません】
 // Google から来た名前をそのまま使います (ADR 0005)。
@@ -22,6 +20,8 @@ import { loginUrl, logout, setMyAvatar, type Image, type Me } from '../lib/api';
 import { describeWriteError } from '../lib/errors';
 import { invalidateMe, primeMe, useMe } from '../lib/me';
 import { ImageField } from '../components/ImageField';
+
+import { MyPosts } from './MyPosts';
 
 /** ロールの説明。**画面に出す言葉で権限の境界を伝えます** (ADR 0011 決定 1)。 */
 const roleNote: Record<Me['role'], string> = {
@@ -206,13 +206,7 @@ export function MyProfile() {
         )}
       </div>
 
-      <h2>自分の投稿</h2>
-      <p className="muted measure">
-        一覧は用意していません。投稿者で絞り込む API がまだ無く、
-        コメントはスレッド ID で分割して保存しているため、投稿者で絞ると
-        分割したすべてを走査することになります。索引を足すかどうかは、
-        実際に測ってから決めます。
-      </p>
+      <MyPosts />
     </>
   );
 }

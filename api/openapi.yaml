@@ -248,6 +248,103 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /me/threads:
+    get:
+      operationId: listMyThreads
+      tags: [threads]
+      summary: 自分が立てたスレッドの一覧
+      description: |
+        ログイン中の利用者が投稿者になっているスレッドを、新しい順に返します。
+
+        **匿名で立てたスレッドは含まれません。** 投稿時にログインしていなければ
+        `author_id` が入らないため、後から本人だと突き合わせる手段がありません
+        (docs/adr/0005-authentication.md 決定 2)。
+
+        削除済みのスレッドは含まれません。
+
+        `GET /threads` と同じ `Thread` を返すので、画面は一覧のカードを
+        そのまま使い回せます。
+
+        【性能】`threads_author_id_desc_idx` (000002 で外部キー用に作成済み) が
+        効きます。2,000 スレッドで先頭ページ
+        **1.16 ms / buffers 48 / 走査区画 8** (make query-probe の 5)。
+
+        **`commentCount` の集計が comments の 8 区画すべてを触ります。**
+        threads 自体は分割していませんが、コメント数の相関サブクエリが
+        comments を引くためです。
+
+        初版はここに「0.37 ms / buffers 18、区画の走査は起きない」と
+        書いていましたが、**プローブがこの API とは別の
+        (コメント数の集計を含まない) クエリを測っていた**ための誤りでした。
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ThreadList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /me/comments:
+    get:
+      operationId: listMyComments
+      tags: [comments]
+      summary: 自分が書いたコメントの一覧
+      description: |
+        ログイン中の利用者が投稿者になっているコメントを、新しい順に返します。
+
+        **匿名で書いたコメントは含まれません** (`/me/threads` と同じ理由)。
+        削除済みのコメントも含まれません。
+
+        `Comment` ではなく `MyComment` を返します。**投稿先のスレッドが分からないと
+        一覧として成立しない**ためで、スレッドのタイトルを同梱しています。
+        逆に `author` は常に自分なので持たせていません。
+
+        【性能】**この API は 8 区画すべてを走ります。**
+        comments は `thread_id` の HASH パーティションで、`author_id` に
+        区画キーが含まれないため、partition pruning が効きません
+        (docs/adr/0016-schema-and-indexes.md)。
+
+        20 万コメントでの実測 (make query-probe の 5、投稿数が最多の利用者):
+
+        | | 時間 | buffers | 走査区画 |
+        | --- | --- | --- | --- |
+        | 自分のコメント 先頭ページ | 1.52 ms | 78 | 8 |
+        | 自分のコメント 深いページ | 1.10 ms | 57 | 8 |
+        | スレッド内のコメント一覧 (比較) | 0.16 ms | 6 | 1 |
+
+        除外が効く側とは **9.6 倍・バッファ 13 倍**の差がありますが、
+        絶対値 1.5 ms は一覧として問題にならないため、
+        **追加の索引は貼っていません。**
+      security:
+        - sessionCookie: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Size'
+      responses:
+        '200':
+          description: 成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MyCommentList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /images:
     post:
       operationId: uploadImage
@@ -1588,6 +1685,91 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Comment'
+        nextCursor:
+          $ref: '#/components/schemas/NextCursor'
+
+    MyComment:
+      type: object
+      description: |
+        マイページに出す「自分のコメント」。
+
+        `Comment` と分けているのは、**必要な情報が逆向き**だからです。
+        スレッド内の一覧では投稿者が要りますがスレッドは自明で、
+        こちらでは投稿者が自明でスレッドが要ります。
+        `Comment` に `threadTitle` を足すと、スレッド内の一覧で
+        全行に同じタイトルが並ぶことになります。
+      # image は Comment と同じ理由で required に入れる。
+      # 外すと oapi-codegen が omitempty を付け、
+      # 「画像なし」と「キーごと無い」が区別できなくなる。
+      required:
+        [id, threadId, threadTitle, threadDeleted, seq, body, image, createdAt]
+      properties:
+        id:
+          type: integer
+          format: int64
+          example: 10
+        threadId:
+          type: integer
+          format: int64
+          description: 投稿先のスレッド。`/threads/{threadId}` へのリンクに使います。
+          example: 1
+        threadTitle:
+          type: string
+          nullable: true
+          description: |
+            投稿先のスレッドのタイトル。
+
+            **削除されたスレッドでは `null` です。**
+
+            初版はここでタイトルをそのまま返していました
+            (「伏せると自分が何に書いたのか分からなくなる」ため)。
+            **モデレーションの経路を見落としていたので撤回しました** ——
+            タイトル自体が誹謗中傷や個人情報だったために消された場合、
+            この API がそれを書き込んだ全員のマイページに残し続けます。
+            `GET /threads/{threadId}` は 404 を返すので、
+            **ここが削除後にタイトルを読める唯一の経路**になっていました。
+
+            本人が失うのは「どのスレッドか」だけで、自分が書いた本文
+            (`body`) は残ります。
+          example: Go の並列処理を学ぶ部屋
+        threadDeleted:
+          type: boolean
+          description: |
+            投稿先のスレッドが削除済みか。
+
+            **削除済みでもコメントは一覧から消しません。** 消すと、
+            自分の投稿が「消えた」のか「元から無い」のか本人に区別できません。
+            リンク先は 404 になるので、画面側でその旨を出してください。
+
+            **真のとき `threadTitle` は必ず `null`** です。
+          example: false
+        seq:
+          type: integer
+          format: int32
+          minimum: 1
+          description: スレッド内のレス番号 (`Comment.seq` と同じ)
+          example: 3
+        body:
+          type: string
+          example: ふぁ〜、眠いよ〜
+        createdAt:
+          type: string
+          format: date-time
+          example: '2026-08-02T12:00:00Z'
+        image:
+          allOf:
+            - $ref: '#/components/schemas/Image'
+          nullable: true
+          description: 添付された画像。**画像がなければ `null`** です。
+
+    MyCommentList:
+      type: object
+      required: [comments, nextCursor]
+      properties:
+        comments:
+          type: array
+          items:
+            $ref: '#/components/schemas/MyComment'
         nextCursor:
           $ref: '#/components/schemas/NextCursor'
 

@@ -21,17 +21,29 @@
 --
 -- 約 5.5 倍速く、バッファ読み取りは 35 分の 1。
 --
+-- **このバッファの数字は旧方式で数えている** (下記)。時間だけが比較できる。
+--
 -- 【実測 2: 投稿者の LEFT JOIN を含む現在の形】(Phase 4 / make query-probe)
 -- 2,000 スレッド / 201,000 コメント / 200 利用者:
 --
---   LEFT JOIN + GROUP BY : 4.13 ms / shared buffers 7,205
---   相関サブクエリ       : 1.71 ms / shared buffers 1,664
+--   LEFT JOIN + GROUP BY : 4.06 ms / shared buffers 976
+--   相関サブクエリ       : 1.74 ms / shared buffers  73
 --
--- **約 2.4 倍速く、バッファは 4.3 分の 1。差は縮んだ。**
--- 両者に共通のコスト (users の解決) が加わったぶん、相対差が縮む。
+-- **約 2.3 倍速く、バッファは 13 分の 1。**
 --
--- **2 つの数字を直接比べないこと。** コメントの分布が違う
--- (実測 2 のデータセットはスレッドごとに 1〜200 件と散らしてある)。
+-- 【バッファの数え方を直した】
+-- 以前ここには「7,205 / 1,664、4.3 分の 1」と書いてあった。
+-- **query-probe が計画木の Buffers 行を全部足していたため**で、
+-- 節が深いクエリほど重複して数えられていた。
+-- 親ノードが子の合計を持つので、根 (最初の 1 行) だけを採るのが正しい。
+--
+-- **時間は変わっていない** (1.71 → 1.74 / 4.13 → 4.06 は実行ごとのばらつき)。
+-- 変わったのはバッファで、**相関サブクエリの有利さは過小評価されていた** ——
+-- 節の多い相関サブクエリのほうが重複の影響を強く受けていたため。
+--
+-- **2 つの実測を直接比べないこと。** コメントの分布が違い
+-- (実測 2 のデータセットはスレッドごとに 1〜200 件と散らしてある)、
+-- バッファの数え方も違う。
 -- 言えるのは「相関サブクエリのほうが速い」が保たれていることまでになる。
 --
 -- 結果が一致することは確認済み (両者を FULL JOIN して差分 0 件)。
@@ -319,6 +331,87 @@ SELECT
     img.height     AS icon_height
 FROM page p
 LEFT JOIN users u ON u.id = p.author_id
+LEFT JOIN images img ON img.id = p.icon_image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL
+ORDER BY p.id DESC;
+
+-- name: ListMyThreadsWithCommentCount :many
+-- 自分が立てたスレッドの一覧 (GET /me/threads)。
+--
+-- ListThreadsWithCommentCount に author_id の等値条件を足しただけの形。
+-- 並び順もカーソルの意味も同じなので、ページ送りの扱いは変わらない。
+--
+-- 【索引は足していない】
+-- threads_author_id_desc_idx (author_id, id DESC) が 000002 で
+-- **外部キー用**として既に入っている (ADR 0016)。
+-- make query-probe の 5 番で実測: 2,000 スレッドで先頭ページ
+-- **1.16 ms / buffers 48 / 走査区画 8**。一覧として問題にならない。
+--
+-- 【この数字は一度誤っていた (レビュー指摘)】
+-- 初版は「0.37 ms / buffers 18 / 区画 -」と書いていた。
+-- **プローブがこの文ではなく、素の走査を測っていたため。**
+--
+--   測っていた形: SELECT id, title, created_at, view_count FROM threads WHERE ...
+--   出荷する形  : + コメント数の相関サブクエリ + users / images の LEFT JOIN
+--
+-- 実物を測ったら 3 倍で、**「threads は分割していないので区画の走査は
+-- 起きない」も誤りだった** —— コメント数の相関サブクエリが comments を
+-- 引くので、**8 区画すべてを触る。**
+--
+-- 出荷しないクエリの数字を出荷するクエリの実測として書くと、
+-- この文を変えても数字が動かず、退行が見えない。プローブは実物に揃えた。
+--
+-- 【匿名で立てたスレッドは出てこない】
+-- author_id IS NULL の行は等値条件で落ちる。これは仕様
+-- (ADR 0005 決定 2)。投稿時にログインしていなければ、
+-- 後から本人だと突き合わせる手段が無い。
+--
+-- 【users の LEFT JOIN は残す】
+-- author_id = $1 で絞ったあとなので必ず 1 行に当たり、実質 INNER になる。
+-- それでも LEFT のままにしてあるのは、**一覧の他のクエリと行の形を
+-- 揃えるため** —— リポジトリ側の詰め替えが 1 本で済む。
+-- 主キーの参照 1 回ぶんの差しかない。
+--
+-- 【author_id を表名で修飾しているのは sqlc の都合】
+-- 裸で `WHERE author_id = ...` と書くと **sqlc の生成が
+-- 「column reference "author_id" is ambiguous」で落ちる。**
+-- CTE の中からは threads しか見えないので PostgreSQL は通るが、
+-- sqlc の解析器は外側のスコープ (page と users) を CTE の中まで
+-- 持ち込んでしまう。**外すと make generate が落ちる。**
+--
+-- なお、報告される行番号は当てにならない (この節のような
+-- 日本語コメントがあると、無関係な行を指す)。
+WITH page AS (
+    SELECT id, title, created_at, view_count, author_id, icon_image_id
+    FROM threads
+    WHERE threads.author_id = sqlc.arg('actor_id')
+      AND deleted_at IS NULL
+      AND (sqlc.narg('cursor_id')::bigint IS NULL OR id < sqlc.narg('cursor_id')::bigint)
+    ORDER BY id DESC
+    LIMIT sqlc.arg('page_size')
+)
+SELECT
+    p.id,
+    p.title,
+    p.created_at,
+    p.view_count,
+    (
+        SELECT count(*)
+        FROM comments c
+        WHERE c.thread_id = p.id
+          AND c.deleted_at IS NULL
+    )::bigint AS comment_count,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
+FROM page p
+LEFT JOIN users u ON u.id = p.author_id
+-- 実体が無い画像は結合しない (ListThreadsWithCommentCount と同じ理由)。
 LEFT JOIN images img ON img.id = p.icon_image_id
     AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL
 ORDER BY p.id DESC;

@@ -102,6 +102,36 @@ func (r *ThreadRepository) SearchSummaries(
 	return toSummaries(listRows), nil
 }
 
+// ListSummariesByAuthor は 1 人が立てたスレッドを新しい順に取得します
+// (GET /me/threads)。
+//
+// 並び順もカーソルの意味も ListSummaries と同じなので、
+// ページ送りの組み立ては呼び出し側で共通です。
+func (r *ThreadRepository) ListSummariesByAuthor(
+	ctx context.Context, authorID int64, page pagination.Page,
+) ([]model.Summary, error) {
+	rows, err := r.q.ListMyThreadsWithCommentCount(ctx, sqlcgen.ListMyThreadsWithCommentCountParams{
+		// **ポインタなのは author_id が NULL 許容列だから**で、
+		// 「匿名も対象」という意味ではありません。
+		// nil を渡すと `author_id = NULL` になり、常に 0 件になります。
+		ActorID:  &authorID,
+		CursorID: page.CursorID(),
+		PageSize: page.Size,
+	})
+	if err != nil {
+		return nil, translateError("ThreadRepository.ListSummariesByAuthor", err)
+	}
+
+	// **行の型は同一の SELECT 句から生成されるので変換できます**
+	// (SearchSummaries と同じ形)。片方の列を増やした時点で
+	// この変換はコンパイルエラーになり、詰め替えの取りこぼしに気づけます。
+	listRows := make([]sqlcgen.ListThreadsWithCommentCountRow, 0, len(rows))
+	for _, row := range rows {
+		listRows = append(listRows, sqlcgen.ListThreadsWithCommentCountRow(row))
+	}
+	return toSummaries(listRows), nil
+}
+
 // escapeLikePattern は LIKE のワイルドカードを打ち消します。
 //
 // エスケープ文字は `\` で、SQL 側の ESCAPE '\' と対になっています。

@@ -64,6 +64,136 @@ LEFT JOIN images i ON i.id = p.image_id
     AND i.status <> 'deleted' AND i.object_reclaimed_at IS NULL
 ORDER BY p.id DESC;
 
+-- name: ListMyComments :many
+-- 自分が書いたコメントの一覧 (GET /me/comments)。
+--
+-- 【このクエリは 8 区画すべてを走る。このリポジトリで唯一の形】
+-- comments は HASH(thread_id) の 8 分割で、**author_id には区画キーが
+-- 含まれない**。ListCommentsByThreadID が 1 区画で済むのに対し、
+-- こちらは pruning が効かず 8 区画すべてに索引スキャンが走る
+-- (ADR 0016 のインデックス設計)。
+--
+-- 【実測して、索引は足さないと決めた】 make query-probe の 5 番。
+-- 20 万コメント / 投稿数が最多の利用者 (1,600 件) の中央値:
+--
+--   自分のコメント 先頭ページ      1.52 ms / buffers 78 / 区画 8
+--   自分のコメント 深いページ      1.10 ms / buffers 57 / 区画 8
+--   スレッド内のコメント一覧 (比較) 0.16 ms / buffers  6 / 区画 1
+--
+-- **9.6 倍・バッファ 13 倍**の差があり、ADR 0016 の「桁で違う」は当たっていた。
+-- **が、絶対値 1.5 ms は一覧として問題にならない。**
+-- comments_author_id_desc_idx (000002 で外部キー用に作成済み) で足りる。
+--
+-- 深いページのほうが速いのは、カーソルで各区画の走査が短くなるため。
+-- 先頭ページは 8 区画それぞれから 20 件読んで併合し、20 件だけ残す。
+--
+-- 【実際に流して分かったこと 1: 効くのは実行時間だけではない】
+-- この文を実 DB で EXPLAIN すると、**計画時間が実行時間を上回る。**
+--
+--   このクエリ (8 区画)          計画 6.0 ms / 実行 1.44 ms
+--   ListCommentsByThreadID (1 区画) 計画 2.6 ms / 実行 0.20 ms
+--
+-- 区画を絞れないと**計画の段階でも 8 枚ぶんを見に行く** (計画時の
+-- バッファ読み取り 1,630)。3 回流しても値は動かないので、
+-- カタログのキャッシュ待ちではない。
+--
+-- **アプリ経路では問題にならない。** pgx が拡張問い合わせプロトコルで
+-- 文をキャッシュするため、計画は接続ごとに 1 回で済む。
+-- ただし「1.5 ms の一覧」という理解は実行時間だけの話であり、
+-- 計画を含めた初回は数 ms 高い。psql で測ると両方が乗る。
+--
+-- 【実際に流して分かったこと 2: threads の結合は全走査になる】
+-- 下の JOIN は「20 件に絞ってから」掛かるが、**planner は threads の
+-- 主キーを 20 回引かず、2,000 行を Seq Scan して Hash Join する**
+-- (buffers 25。全体 78 のうち約 3 分の 1)。
+--
+-- この規模では 20 回のランダムアクセスより連続読みのほうが安い、
+-- という判断で、**誤りではない。** ただしこの部分の costs は
+-- ページの件数ではなく **threads の行数に比例して増える。**
+-- スレッドが桁で増えたら、ここは nested loop + 主キーに変わるはずで、
+-- 変わらなければ結合のヒントか分割の見直しを考える。
+-- **次に測るならここになる。**
+--
+-- 【threads は「生きているものだけ」を LEFT JOIN する】
+-- **コメント自体は削除済みスレッドのものも返す。** 除外すると、自分の
+-- コメントが「消えた」のか「元から無い」のか本人に区別できなくなる。
+--
+-- **ただしタイトルは返さない (レビュー指摘)。**
+-- 初版は INNER JOIN で t.title をそのまま返していた。「伏せると自分が
+-- 何に書いたのか分からなくなる」という理由だったが、**モデレーションの
+-- 経路を見落としていた。**
+--
+-- タイトル自体が誹謗中傷や個人情報だったためにスレッドを消した場合、
+-- この API はそのタイトルを**書き込んだ全員のマイページに残し続ける。**
+-- GET /threads/{id} が 404 を返すので、**ここが削除後にタイトルを
+-- 読める唯一の経路**になってしまう。
+--
+-- 表示の都合より、消したものが消えることを優先する ——
+-- 画像を status = 'deleted' で結合しないのと同じ姿勢になる。
+-- 本人が失うのは「どのスレッドか」だけで、自分が書いた本文は残る。
+--
+-- **アプリ層ではなく SQL で落とすこと。** 上の層で捨てる形にすると、
+-- 別の呼び出し口が増えたときに漏れる経路が残る。
+--
+-- 【なぜ CASE ではなく ON の条件でやるか】
+-- `CASE WHEN t.deleted_at IS NULL THEN t.title END` でも同じ値になるが、
+-- **sqlc の型推論がそれを扱えない。**
+--
+--   CASE のまま      -> interface{} (型が付かない)
+--   ::text を付ける  -> string (**非 NULL。NULL が来ると Scan が実行時に落ちる**)
+--
+-- これはこのファイルの冒頭で警告している罠と同じもの。
+-- 一方 LEFT JOIN の列は *string と推論される (投稿者・画像と同じ)。
+-- **結合の条件で表現するほうが、型として安全な形になる。**
+--
+-- 削除の判定も同じ結合から採れるので、threads を 2 回引く必要もない
+-- (t.id IS NULL がそのまま「削除済み」を意味する)。
+-- thread_id は NOT NULL の外部キーで、スレッドは論理削除しかしない
+-- (行は消えない) ため、**結合が空振りする原因は削除以外に無い。**
+--
+-- 【JOIN は 20 件に絞ったあとに掛ける】
+-- 内側の CTE に混ぜると、絞り込む前の全行に対して結合が走る
+-- (一覧クエリと同じ)。
+--
+-- 【author_name / author は返さない】
+-- 投稿者は常に自分なので、行ごとに持たせる意味が無い。
+-- API 側も MyComment には author を置いていない。
+--
+-- 【author_id を表名で修飾しているのは sqlc の都合】
+-- 裸で書くと sqlc の生成が「ambiguous」で落ちる。
+-- 理由は threads.sql の ListMyThreadsWithCommentCount に書いた。
+-- **外すと make generate が落ちる。**
+WITH page AS (
+    SELECT id, thread_id, seq, body, created_at, image_id
+    FROM comments
+    WHERE comments.author_id = sqlc.arg('actor_id')
+      AND deleted_at IS NULL
+      AND (sqlc.narg('cursor_id')::bigint IS NULL OR id < sqlc.narg('cursor_id')::bigint)
+    ORDER BY id DESC
+    LIMIT sqlc.arg('page_size')
+)
+SELECT
+    p.id,
+    p.thread_id,
+    p.seq,
+    p.body,
+    p.created_at,
+    -- 生きているスレッドのタイトルだけ。削除済みでは NULL になる
+    -- (結合が空振りするため)。上記「タイトルは返さない」を参照。
+    t.title AS thread_title,
+    -- 結合が空振りした = 削除済み。IS NULL は NULL を返さないので非 NULL。
+    (t.id IS NULL)::boolean AS thread_deleted,
+    i.id         AS image_id,
+    i.object_key AS image_object_key,
+    i.width      AS image_width,
+    i.height     AS image_height
+FROM page p
+LEFT JOIN threads t ON t.id = p.thread_id AND t.deleted_at IS NULL
+-- 実体が無い画像は結合しない (ListCommentsByThreadID と同じ理由)。
+LEFT JOIN images i ON i.id = p.image_id
+    AND i.status <> 'deleted' AND i.object_reclaimed_at IS NULL
+ORDER BY p.id DESC;
+
 -- name: NextCommentSeq :one
 -- スレッド内の次のレス番号を求める。**Phase 2 の題材の中心** (ADR 0019 決定 1)。
 --

@@ -170,6 +170,41 @@ func (i *ThreadInteractor) FetchThreadList(
 	return i.buildListResult(summaries, page.Size, order)
 }
 
+// FetchMyThreadList は 1 人が立てたスレッドの一覧を取得します
+// (GET /me/threads)。
+//
+// 一覧の組み立て (buildListResult) は FetchThreadList と共用です ——
+// 並び順が新着順で同じなので、カーソルの意味も変わりません。
+//
+// **検索も人気順も受け付けません。** 自分の投稿は件数が桁違いに少なく、
+// 絞り込みや並べ替えの必要が薄いためです。必要になったら、
+// そのときカーソルの並び順の検査ごと足します
+// (FetchThreadList が既にその形を持っています)。
+//
+// **カーソルの並び順は検査します。** 発行するのは新着順のトークンだけですが、
+// **受け取る側は選べません** —— 利用者は `GET /threads?sort=popular` が返した
+// トークン (view_count を含む) をそのまま `/me/threads?cursor=` に貼れます。
+// 検査しないと view_count 成分が黙って捨てられ、`id < cursorID` だけが効いた
+// 「要求していない位置のページ」が 400 も出さずに返ります (ADR 0018)。
+//
+// **先頭ページは検査しません。** カーソルが無いので発行元も無く、
+// ここを外すと 1 ページ目が必ず 400 になります (FetchThreadList と同じ)。
+func (i *ThreadInteractor) FetchMyThreadList(
+	ctx context.Context, authorID int64, page pagination.Page,
+) (ThreadListResult, error) {
+	if page.Cursor != nil && page.CursorSort() != model.ListOrderNew.CursorSort() {
+		return ThreadListResult{}, fmt.Errorf(
+			"cursor は別の並び順で発行されたものです。先頭ページから取得し直してください: %w",
+			apperr.ErrInvalidArgument)
+	}
+
+	summaries, err := i.repo.ListSummariesByAuthor(ctx, authorID, page)
+	if err != nil {
+		return ThreadListResult{}, err
+	}
+	return i.buildListResult(summaries, page.Size, model.ListOrderNew)
+}
+
 // FetchThread は 1 件のスレッドをコメント数つきで取得します。
 // 存在しない場合は apperr.ErrNotFound を返します。
 func (i *ThreadInteractor) FetchThread(ctx context.Context, id int64) (ThreadDTO, error) {

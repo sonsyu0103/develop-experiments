@@ -37,6 +37,18 @@ type ThreadRepository interface {
 		ctx context.Context, query model.SearchQuery, page pagination.Page,
 	) ([]model.Summary, error)
 
+	// ListSummariesByAuthor は 1 人が立てたスレッドを、ListSummaries と
+	// 同じ組・同じ並び順で取得します (GET /me/threads)。
+	//
+	// **並び順が同じなので、カーソルの意味も同じ**です
+	// (SearchSummaries と同じ関係)。
+	//
+	// **匿名で立てられたスレッドは返りません。** author_id が NULL の行は
+	// 等値条件で落ちます (ADR 0005 決定 2)。
+	ListSummariesByAuthor(
+		ctx context.Context, authorID int64, page pagination.Page,
+	) ([]model.Summary, error)
+
 	// FindSummaryByID は 1 件のスレッドをコメント数つきで取得します。
 	// 存在しない場合は apperr.ErrNotFound を返します。
 	FindSummaryByID(ctx context.Context, id int64) (*model.Summary, error)
