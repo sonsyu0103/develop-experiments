@@ -14,6 +14,8 @@ export type Me = Schemas['Me'];
 export type Report = Schemas['Report'];
 export type ReportList = Schemas['ReportList'];
 export type Thread = Schemas['Thread'];
+export type Comment = Schemas['Comment'];
+export type CommentList = Schemas['CommentList'];
 export type ErrorCode = Schemas['Error']['error']['code'];
 
 export const moderator: Me = {
@@ -64,6 +66,69 @@ export function list(reports: Report[], nextCursor: string | null = null): Repor
   return { reports, nextCursor };
 }
 
+/**
+ * コメント 1 件。既定は**匿名**の投稿。
+ *
+ * **`author` と `image` は必須**なので省けない ——
+ * 省くと「API が返さない形」をモックしたことになる。
+ */
+export function comment(over: Partial<Comment> = {}): Comment {
+  return {
+    id: 1,
+    threadId: 100,
+    seq: 1,
+    // **匿名の表示名。** `author` があるときは、そちらを優先して表示する
+    // (ログイン中の投稿では、この欄は既定値のまま保存される。ADR 0014)。
+    authorName: '名無しさん',
+    author: null,
+    body: 'テスト用のコメント',
+    createdAt: '2026-08-16T00:00:00Z',
+    image: null,
+    ...over,
+  };
+}
+
+/** 指定の利用者が書いたコメントにする。 */
+export function byUser(me: Me, over: Partial<Comment> = {}): Comment {
+  return comment({
+    author: { publicId: me.publicId, displayName: me.displayName, withdrawn: false },
+    ...over,
+  });
+}
+
+export function comments(items: Comment[], nextCursor: string | null = null): CommentList {
+  return { comments: items, nextCursor };
+}
+
+/**
+ * `GET /threads/{id}/comments` を差し替えます。
+ *
+ * **`/threads/{id}` そのものとは別のルートです。** `mockThread` の正規表現は
+ * `/threads/1` で終わるものだけに一致するので、こちらが横取りすることはありません。
+ */
+export async function mockComments(
+  page: Page,
+  handler: (route: Route, cursor: string | null) => Promise<unknown>,
+) {
+  await page.route(/\/threads\/\d+\/comments(\?|$)/, (route) =>
+    handler(route, cursorOf(route.request().url())),
+  );
+}
+
+/** 201 (作成成功) を返します。 */
+export function created(route: Route, body: unknown) {
+  return route.fulfill({
+    status: 201,
+    contentType: 'application/json',
+    body: JSON.stringify(body),
+  });
+}
+
+/** 204 (本文なし) を返します。削除の応答。 */
+export function noContent(route: Route) {
+  return route.fulfill({ status: 204, body: '' });
+}
+
 function json(route: Route, status: number, body: unknown) {
   return route.fulfill({
     status,
@@ -105,7 +170,21 @@ export async function mockThread(
   handler: (route: Route, id: number) => Promise<unknown> = (route) => ok(route, thread()),
 ) {
   await page.route(/\/threads\/(\d+)(\?|$)/, (route) => {
-    const m = /\/threads\/(\d+)/.exec(route.request().url());
+    // **画面そのものの取得は素通しする。**
+    //
+    // 詳細画面の URL は `/threads/100` で、**API の宛先と同じ形**になる ——
+    // 検査では API を同一オリジンに置いているため (ADR 0020 決定 3)、
+    // 区別が付くのはメソッドや要求の種類だけになる。
+    // ここで JSON を返すと画面が開かず、原因の分かりにくい失敗になる。
+    //
+    // `RSC` ヘッダは Next.js のクライアント遷移とプリフェッチが付ける。
+    // こちらも画面の取得なので、同じく素通しする。
+    const request = route.request();
+    if (request.isNavigationRequest() || request.headers()['rsc'] !== undefined) {
+      return route.fallback();
+    }
+
+    const m = /\/threads\/(\d+)/.exec(request.url());
     return handler(route, Number(m?.[1] ?? 0));
   });
 }

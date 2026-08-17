@@ -17,8 +17,8 @@
 // 送れなかった場合に利用者は成功したと思ったままになります。
 import { useEffect, useState } from 'react';
 
-import { ApiError, getMe, submitContact } from '../lib/api';
-import { button, card, colors, input, label } from '../lib/ui';
+import { ApiError, submitContact } from '../lib/api';
+import { loadMe } from '../lib/me';
 
 // **仕様書の maxLength と同じ値です** (api/openapi.yaml の CreateContactRequest)。
 // ここは入力の途中で気づけるようにするためのもので、検査の正は API 側
@@ -44,9 +44,10 @@ export function ContactForm() {
   // 401 は黙って無視します。
   useEffect(() => {
     let alive = true;
-    getMe()
+    // ヘッダのナビも同じものを引くので、`loadMe` を通して 1 回で済ませます。
+    loadMe()
       .then((me) => {
-        if (!alive) return;
+        if (!alive || me === null) return;
         // **入力済みの値は上書きしません。** 取得は非同期なので、
         // 先に打ち始めていた文字を消してしまいます。
         setName((v) => (v === '' ? me.displayName : v));
@@ -76,73 +77,88 @@ export function ContactForm() {
 
   if (phase.kind === 'accepted') {
     return (
-      <div style={card}>
-        <p>問い合わせを受け付けました。</p>
+      <div className="card">
+        <p role="status">問い合わせを受け付けました。</p>
         {/*
           **「送信しました」と書かない。** 受理までしか終わっていません
           (ADR 0008 決定 1)。ここを正確に書くことが、
           202 を返すことにした理由そのものになります。
         */}
-        <p style={{ color: colors.dim }}>
+        <p className="muted measure">
           運営への通知は順に送られます。<strong>自動返信は届きません</strong> ——
           入力されたアドレスは検証していないため、そこへメールを送らない設計です
           (返信は担当者が手で行います)。
         </p>
-        <p>
-          <button type="button" style={button} onClick={() => setPhase({ kind: 'editing' })}>
+        <div className="actions">
+          <button type="button" className="btn" onClick={() => setPhase({ kind: 'editing' })}>
             もう 1 件送る
           </button>
-        </p>
+        </div>
       </div>
     );
   }
 
   return (
-    <div style={card}>
-      <label style={label} htmlFor="contact-name">
-        お名前
-      </label>
-      <input
-        id="contact-name"
-        style={{ ...input, width: '100%', maxWidth: '40rem' }}
-        value={name}
-        maxLength={limits.name}
-        onChange={(e) => setName(e.target.value)}
-      />
+    <div className="card">
+      <div className="field">
+        <label className="field__label" htmlFor="contact-name">
+          お名前
+        </label>
+        <input
+          id="contact-name"
+          className="input"
+          value={name}
+          maxLength={limits.name}
+          onChange={(e) => setName(e.target.value)}
+        />
+      </div>
 
-      <label style={label} htmlFor="contact-email">
-        メールアドレス
-      </label>
-      <input
-        id="contact-email"
-        type="email"
-        style={{ ...input, width: '100%', maxWidth: '40rem' }}
-        value={email}
-        maxLength={limits.email}
-        onChange={(e) => setEmail(e.target.value)}
-      />
+      <div className="field">
+        <label className="field__label" htmlFor="contact-email">
+          メールアドレス
+        </label>
+        <input
+          id="contact-email"
+          type="email"
+          className="input"
+          value={email}
+          maxLength={limits.email}
+          onChange={(e) => setEmail(e.target.value)}
+        />
+        <span className="field__hint">
+          このアドレスへ自動返信は送りません (検証していないアドレスへ送ると、
+          このシステムが踏み台になるためです)。
+        </span>
+      </div>
 
-      <label style={label} htmlFor="contact-subject">
-        件名
-      </label>
-      <input
-        id="contact-subject"
-        style={{ ...input, width: '100%', maxWidth: '40rem' }}
-        value={subject}
-        maxLength={limits.subject}
-        onChange={(e) => setSubject(e.target.value)}
-      />
+      <div className="field">
+        <label className="field__label" htmlFor="contact-subject">
+          件名
+        </label>
+        <input
+          id="contact-subject"
+          className="input"
+          value={subject}
+          maxLength={limits.subject}
+          onChange={(e) => setSubject(e.target.value)}
+        />
+      </div>
 
-      <label style={label} htmlFor="contact-body">
-        お問い合わせ内容
-      </label>
-      <textarea
-        id="contact-body"
-        style={{ ...input, width: '100%', maxWidth: '40rem', height: '12rem' }}
-        value={body}
-        maxLength={limits.body}
-        onChange={(e) => setBody(e.target.value)}
-      />
+      <div className="field">
+        <label className="field__label" htmlFor="contact-body">
+          お問い合わせ内容
+        </label>
+        <textarea
+          id="contact-body"
+          className="textarea"
+          value={body}
+          maxLength={limits.body}
+          onChange={(e) => setBody(e.target.value)}
+        />
+        <span className="field__hint">
+          {body.length} / {limits.body} 文字
+        </span>
+      </div>
 
       {/*
         honeypot (ADR 0008 決定 4)。**画面には出しません。**
@@ -168,19 +184,21 @@ export function ContactForm() {
         />
       </div>
 
-      <p style={{ margin: '1rem 0 0' }}>
+      <div className="actions">
         <button
           type="button"
-          style={button}
+          className="btn btn--primary"
           disabled={!filled || phase.kind === 'sending'}
           onClick={() => void onSubmit()}
         >
           {phase.kind === 'sending' ? '送信中…' : '送信する'}
         </button>
-      </p>
+      </div>
 
       {phase.kind === 'error' && (
-        <p style={{ color: colors.danger, margin: '0.5rem 0 0' }}>{phase.message}</p>
+        <p className="alert alert--error" role="alert">
+          {phase.message}
+        </p>
       )}
     </div>
   );

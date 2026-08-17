@@ -33,6 +33,14 @@ Go (Gin) + PostgreSQL + Next.js による掲示板アプリケーション。
 │   │       ├── comment/         コメントドメイン
 │   │       └── infrastructure/postgres/   pgx によるリポジトリ実装 + sqlc 生成物
 │   └── next-app/                Next.js (App Router / RSC)
+│       ├── app/                 画面。一覧だけ Server Component で取得する
+│       │   ├── threads/         詳細 ([id]) とスレッド作成 (new)
+│       │   ├── mypage/          プロフィール・アバター・ログアウト
+│       │   ├── admin/           通報キュー・画像削除・ロール変更
+│       │   ├── components/      画面をまたぐ部品 (画像・添付・通報)
+│       │   ├── lib/             API クライアント / ログイン状態 / 文言
+│       │   └── globals.css      配色と部品の見た目 (ADR 0021)
+│       └── e2e/                 Playwright。応答は page.route で差し替える
 ├── infra/
 │   ├── fluent-bit/              ログ転送の設定 (本番の FireLens と共通)
 │   ├── athena/                  テーブル定義 (列の正) と分析クエリ
@@ -570,7 +578,7 @@ Phase 4 として挙げていた項目のうち、**次の 3 つは未測定**�
 | Phase 0 | PostgreSQL / マイグレーション / sqlc の基盤構築 | 完了 |
 | Phase 1 | OpenAPI → Go スタブ / TypeScript 型の自動生成 | 完了 (`make generate`) |
 | Phase 2 | コメント投稿の並行制御強化 (SSI + リトライ、悲観ロック版との比較、冪等キー) | **完了** |
-| Phase 3 | Next.js の画面 (一覧・詳細・マイページ・各種フォーム) | 一覧のみ実装 |
+| Phase 3 | Next.js の画面 (一覧・詳細・マイページ・各種フォーム) | **完了** ([ADR 0021](docs/adr/0021-frontend-screens.md)) |
 | Phase 4 | ベンチマーク (閲覧数の反映方式、集計クエリ、検索の分布) | **一部完了** (下記) |
 | Phase 5 | 認証 (Google OIDC) とマイページ | **完了** |
 | Phase 6 | 画像投稿 (コメント添付 / プロフィール / スレッドアイコン) | **完了** |
@@ -649,6 +657,18 @@ Phase 4 として挙げていた項目のうち、**次の 3 つは未測定**�
    これは**このシステムで初めて外部サービスに依存する処理**で、
    ジョブキューを DB で作るときの定石がそのまま題材になっている ——
    確保・リース・指数バックオフ・打ち切り・at-least-once。
+8. ~~**Phase 3 (画面)**~~ —— **完了**。最後に置いた。
+   各段階が画面を「最後の工程」として積み残した結果、
+   詳細・投稿・マイページが揃っていなかった
+   ([ADR 0021](docs/adr/0021-frontend-screens.md))。
+
+   **取得の経路を画面ごとに変えた**のがここでの判断になる ——
+   詳細をサーバから取ると閲覧数の重複抑制に全利用者がまとめて掛かり、
+   人気一覧の指標が成立しなくなる。
+   併せて、インラインスタイルでは書けなかったもの
+   (`:focus-visible`、メディアクエリ、`prefers-reduced-motion`) を
+   グローバル CSS へ移した。旧配色 `#00f` / `#000` は
+   **コントラスト比 2.44:1** で WCAG AA に届いていなかった。
 
 ### 各段階の進め方
 
@@ -684,6 +704,16 @@ api/openapi.yaml を書く
 ログイン導線、マイページ、画像アップロード、問い合わせフォーム、
 人気順の切り替えが、それぞれの段階で増えていく。
 
+**そのつもりで進めた結果、掲示板として要る画面 (詳細・投稿・マイページ) が
+最後まで残った。** 各段階が API を作ったところで完了になり、
+画面は「最後の工程」として毎回積み残されたため。
+まとめて入れたのが [ADR 0021](docs/adr/0021-frontend-screens.md) で、
+そこで**取得の経路が画面ごとに違う**ことになった ——
+一覧はサーバから、詳細はブラウザから取る。
+`GET /threads/{id}` が閲覧を計上し、その識別子が未ログインだと IP になるため、
+サーバから取ると **Next.js のコンテナが全利用者を代表する**
+([ADR 0006](docs/adr/0006-view-count-and-popularity.md))。
+
 ### 設計ドキュメント
 
 | | |
@@ -704,6 +734,7 @@ api/openapi.yaml を書く
 | [ADR 0018](docs/adr/0018-opaque-cursor.md) | カーソルを不透明トークン (base64url + JSON) にする |
 | [ADR 0019](docs/adr/0019-comment-concurrency.md) | コメント投稿の並行制御 —— レス番号を題材に据える |
 | [ADR 0020](docs/adr/0020-frontend-testing.md) | フロントの検査は「状態遷移」を対象にする |
+| [ADR 0021](docs/adr/0021-frontend-screens.md) | 画面を揃える —— 取得の経路と、見た目の持ち方 |
 | [インフラ構成](docs/infrastructure.md) | AWS 理想構成 (実際にはデプロイしない) |
 
 [ADR 0015](docs/adr/0015-idempotency.md) と

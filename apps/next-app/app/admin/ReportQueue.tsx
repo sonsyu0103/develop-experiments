@@ -14,6 +14,7 @@
 // そのまま削除になり、誤操作が投稿に届きます。
 // 画面でも 2 つのボタンに分けて、片方を押しても他方は起きません。
 import { useCallback, useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
 
 import {
   ApiError,
@@ -26,8 +27,8 @@ import {
   type ReportStatus,
   type Thread,
 } from '../lib/api';
-import { button, card, colors, dangerButton, formatTime, input, label } from '../lib/ui';
-import { describe } from './AdminGate';
+import { describe } from '../lib/errors';
+import { formatTime } from '../lib/ui';
 
 const pageSize = 20;
 
@@ -265,15 +266,15 @@ export function ReportQueue() {
 
   return (
     <div>
-      <div style={{ margin: '1rem 0' }}>
-        <label htmlFor="status" style={{ color: colors.dim, marginRight: '0.5rem' }}>
+      <div className="field">
+        <label className="field__label" htmlFor="status">
           絞り込み
         </label>
         <select
           id="status"
+          className="select"
           value={status}
           onChange={(e) => setStatus(e.target.value as ReportStatus)}
-          style={input}
         >
           <option value="open">未処理</option>
           <option value="resolved">対処した</option>
@@ -284,13 +285,15 @@ export function ReportQueue() {
           解決済みは全体の走査になるので、調査用と割り切っています。
         */}
         {status !== 'open' && (
-          <span style={{ color: colors.warn, marginLeft: '1rem' }}>
-            未処理以外は全走査になります (調査用)
-          </span>
+          <span className="field__hint">未処理以外は全走査になります (調査用)</span>
         )}
       </div>
 
-      {error !== null && <p style={{ color: colors.danger }}>{error}</p>}
+      {error !== null && (
+        <p className="alert alert--error" role="alert">
+          {error}
+        </p>
+      )}
 
       {/*
         **失敗しているときは出しません** (レビュー指摘)。
@@ -299,62 +302,63 @@ export function ReportQueue() {
         「未処理は無い」と読める**表示になります。
       */}
       {reports.length === 0 && !loading && error === null && (
-        <p style={{ color: colors.dim }}>この状態の通報はありません。</p>
+        <p className="muted">この状態の通報はありません。</p>
       )}
 
-      <ul style={{ listStyle: 'none', padding: 0 }}>
+      <ul className="list">
         {reports.map((r) => {
           const threadID = threadIdOf(r);
           const thread = threadID === undefined ? undefined : threads[threadID];
           return (
-            <li key={r.id} style={card}>
-              <p style={{ margin: 0 }}>
-                #{r.id} / {r.targetType === 'thread' ? 'スレッド' : 'コメント'}{' '}
-                {r.targetId} / {reasonLabel[r.reason]} /{' '}
-                <span style={{ color: r.status === 'open' ? colors.warn : colors.dim }}>
-                  {statusLabel[r.status]}
-                </span>
+            <li key={r.id} className="card">
+              <p>
+                #{r.id} / {r.targetType === 'thread' ? 'スレッド' : 'コメント'} {r.targetId} /{' '}
+                {reasonLabel[r.reason]} / <span className="badge">{statusLabel[r.status]}</span>
               </p>
-              <p style={{ color: colors.dim, margin: '0.3rem 0' }}>
-                {formatTime(r.createdAt)}
-                {r.resolvedAt !== null && ` → ${formatTime(r.resolvedAt)}`}
+              <p className="meta">
+                <time dateTime={r.createdAt}>{formatTime(r.createdAt)}</time>
+                {r.resolvedAt !== null && <span>→ {formatTime(r.resolvedAt)}</span>}
               </p>
 
               {/* **通報者は出しません。** 誰が通報したかが見えると報復の材料になります。 */}
-              {r.note !== null && <p style={{ margin: '0.3rem 0' }}>補足: {r.note}</p>}
+              {r.note !== null && <p className="body-text">補足: {r.note}</p>}
 
-              <p style={{ color: colors.dim, margin: '0.3rem 0' }}>
+              <p className="muted">
                 {thread === undefined && '対象のスレッドを取得しています...'}
                 {thread === 'missing' && '対象のスレッドは既に削除されています'}
                 {thread === 'failed' && '対象のスレッドを取得できませんでした'}
                 {thread !== undefined && thread !== 'missing' && thread !== 'failed' && (
                   <>
-                    スレッド: {thread.title}
+                    スレッド:{' '}
                     {/*
-                      **コメント本文はここに出せません。** コメントを 1 件だけ
-                      引く API が無く、一覧を辿るしかないためです。
-                      スレッド詳細の画面ができたら、そこへ繋ぎます。
+                      **詳細へ繋ぎます。** コメントを 1 件だけ引く API は
+                      無いままなので、コメントの通報では対象そのものではなく
+                      「そのコメントがあるスレッド」へ飛びます。
+                      数字だけを見て判断するよりは近づけます。
                     */}
-                    {r.targetType === 'comment' && '（コメント本文は未表示）'}
+                    <Link href={`/threads/${thread.id}`}>{thread.title}</Link>
+                    {r.targetType === 'comment' && '（対象のコメント本文は未表示）'}
                   </>
                 )}
               </p>
 
-              <label style={label} htmlFor={`reason-${r.id}`}>
-                削除の理由 (任意・監査記録に残る)
-              </label>
-              <input
-                id={`reason-${r.id}`}
-                style={{ ...input, width: '100%', maxWidth: '32rem' }}
-                value={reasons[r.id] ?? ''}
-                maxLength={500}
-                onChange={(e) => setReasons((prev) => ({ ...prev, [r.id]: e.target.value }))}
-              />
+              <div className="field">
+                <label className="field__label" htmlFor={`reason-${r.id}`}>
+                  削除の理由 (任意・監査記録に残る)
+                </label>
+                <input
+                  id={`reason-${r.id}`}
+                  className="input"
+                  value={reasons[r.id] ?? ''}
+                  maxLength={500}
+                  onChange={(e) => setReasons((prev) => ({ ...prev, [r.id]: e.target.value }))}
+                />
+              </div>
 
-              <p style={{ margin: '0.8rem 0 0' }}>
+              <div className="actions">
                 <button
                   type="button"
-                  style={dangerButton}
+                  className="btn btn--danger"
                   disabled={busy.has(r.id)}
                   onClick={() => void onDelete(r)}
                 >
@@ -362,7 +366,7 @@ export function ReportQueue() {
                 </button>
                 <button
                   type="button"
-                  style={button}
+                  className="btn"
                   disabled={busy.has(r.id) || r.status !== 'open'}
                   onClick={() => void onResolve(r, 'resolved')}
                 >
@@ -370,32 +374,40 @@ export function ReportQueue() {
                 </button>
                 <button
                   type="button"
-                  style={button}
+                  className="btn"
                   disabled={busy.has(r.id) || r.status !== 'open'}
                   onClick={() => void onResolve(r, 'rejected')}
                 >
                   対処不要
                 </button>
-              </p>
+              </div>
 
               {results[r.id] !== undefined && (
-                <p style={{ color: colors.warn, margin: '0.5rem 0 0' }}>{results[r.id]}</p>
+                <p className="alert alert--warn" role="status">
+                  {results[r.id]}
+                </p>
               )}
             </li>
           );
         })}
       </ul>
 
-      {loading && <p style={{ color: colors.dim }}>読み込んでいます...</p>}
+      {loading && (
+        <p className="muted" aria-live="polite">
+          読み込んでいます...
+        </p>
+      )}
 
       {/*
         **`nextCursor` をそのまま渡します** —— 中身は不透明で、
         クライアントは解釈も生成も改変もしません (ADR 0018)。
       */}
       {cursor !== null && !loading && (
-        <button type="button" style={button} onClick={() => void load({ cursor, reset: false })}>
-          次のページ
-        </button>
+        <div className="actions">
+          <button type="button" className="btn" onClick={() => void load({ cursor, reset: false })}>
+            次のページ
+          </button>
+        </div>
       )}
     </div>
   );
