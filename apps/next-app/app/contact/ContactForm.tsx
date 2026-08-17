@@ -36,6 +36,13 @@ export function ContactForm() {
   // honeypot (ADR 0008 決定 4)。**人間は触りません。**
   const [website, setWebsite] = useState('');
   const [phase, setPhase] = useState<Phase>({ kind: 'editing' });
+  // 控えの届き先 (ADR 0008 決定 2)。**未ログインなら null。**
+  //
+  // **上の `email` とは別に持ちます。** あちらは入力欄で、利用者が
+  // 書き換えられます —— 書き換えられた値を「控えはここへ届きます」と
+  // 表示すると、**嘘の案内**になります。控えが届くのは常に
+  // アカウントに登録されているアドレスのほうです。
+  const [accountEmail, setAccountEmail] = useState<string | null>(null);
 
   // ログイン済みなら氏名とアドレスを埋めます (決定 4)。
   //
@@ -52,6 +59,9 @@ export function ContactForm() {
         // 先に打ち始めていた文字を消してしまいます。
         setName((v) => (v === '' ? me.displayName : v));
         setEmail((v) => (v === '' ? me.email : v));
+        // **こちらは入力済みでも上書きします。** 入力欄と違って
+        // 利用者が触る値ではなく、「控えがどこへ届くか」という事実です。
+        setAccountEmail(me.email);
       })
       .catch(() => undefined);
     return () => {
@@ -84,11 +94,23 @@ export function ContactForm() {
           (ADR 0008 決定 1)。ここを正確に書くことが、
           202 を返すことにした理由そのものになります。
         */}
-        <p className="muted measure">
-          運営への通知は順に送られます。<strong>自動返信は届きません</strong> ——
-          入力されたアドレスは検証していないため、そこへメールを送らない設計です
-          (返信は担当者が手で行います)。
-        </p>
+        {/*
+          **入力欄の値は使わない。** ここに表示するのは accountEmail で、
+          利用者が書き換えられる email 欄ではありません (ADR 0008 決定 2)。
+        */}
+        {accountEmail === null ? (
+          <p className="muted measure">
+            運営への通知は順に送られます。<strong>控えのメールは届きません</strong> ——
+            入力されたアドレスは検証していないため、そこへメールを送らない設計です
+            (返信は担当者が手で行います)。
+          </p>
+        ) : (
+          <p className="muted measure">
+            運営への通知は順に送られます。控えを <strong>{accountEmail}</strong> 宛に
+            お送りします —— アカウントに登録されているアドレスで、
+            入力されたアドレスへは送りません。
+          </p>
+        )}
         <div className="actions">
           <button type="button" className="btn" onClick={() => setPhase({ kind: 'editing' })}>
             もう 1 件送る
@@ -126,8 +148,9 @@ export function ContactForm() {
           onChange={(e) => setEmail(e.target.value)}
         />
         <span className="field__hint">
-          このアドレスへ自動返信は送りません (検証していないアドレスへ送ると、
-          このシステムが踏み台になるためです)。
+          {accountEmail === null
+            ? 'このアドレスへメールは送りません (検証していないアドレスへ送ると、このシステムが踏み台になるためです)。担当者からの返信先として記録します。'
+            : `このアドレスへメールは送りません。控えは登録アドレス (${accountEmail}) 宛にお送りします。`}
         </span>
       </div>
 

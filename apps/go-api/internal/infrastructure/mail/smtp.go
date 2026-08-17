@@ -7,11 +7,21 @@
 // 閉じ込めているのと同じ形になります。
 //
 // 【この実装が守っているもの】
-// 決定 3「メールヘッダにユーザー入力を入れない」。差出人・宛先・件名は
+// 決定 3「メールヘッダにユーザー入力を入れない」。差出人・件名は
 // すべてこの中で組み立て、渡されるのは本文だけです。
 // ヘッダ値に改行 (`\r\n`) を注入されると任意のヘッダを追加でき
 // (**メールヘッダインジェクション**)、`Bcc` を足せばこのシステムが
 // 迷惑メールの踏み台になります。
+//
+// **宛先だけが 2 通りあります** (決定 2)。
+//
+//	Send           運営の固定アドレス (設定値)
+//	SendAutoReply  本人の検証済みアドレス (model.VerifiedEmail)
+//
+// どちらも**任意の文字列を宛先に取りません。** 後者の引数の型が
+// VerifiedEmail であることが、「入力されたアドレスへは送らない」を
+// 約束ではなく型として持っている場所になります ——
+// 生成できるのは users.email を読むアダプタ 1 か所だけです。
 //
 // 【テストは実際に送りません】
 // 送信の検査はメッセージの組み立て (buildMessage) に対して行います。
@@ -83,7 +93,7 @@ func parseFixedAddress(raw, key string) (*netmail.Address, error) {
 	return addr, nil
 }
 
-// Send は 1 通送ります。
+// Send は運営へ 1 通送ります。
 //
 // **ここでの失敗は一時的なものとして扱われます。** 呼び出し側
 // (contact の Dispatcher) がバックオフして再送し、上限を超えたら
@@ -91,7 +101,53 @@ func parseFixedAddress(raw, key string) (*netmail.Address, error) {
 // SMTP の応答からそれを見分けるのが実質不可能なためです ——
 // 5xx でも中継の一時的な設定ミスということがあります。
 func (s *SMTPSender) Send(ctx context.Context, n repository.Notification) error {
-	msg := buildMessage(s.from, s.to, subjectFor(n.ContactID), n.Body, time.Now())
+	return s.deliver(ctx, n.ContactID, envelope{
+		from:    s.from,
+		to:      s.to,
+		subject: subjectFor(n.ContactID),
+		body:    n.Body,
+		// **人が書いたメールではありません** (RFC 3834)。
+		// 受け取り側の不在通知などの自動応答を止められます。
+		autoSubmitted: "auto-generated",
+	})
+}
+
+// SendAutoReply は問い合わせをくれた本人へ控えを 1 通送ります。
+//
+// **宛先はこのメソッドでしか差し替わりません。** 引数の型が
+// model.VerifiedEmail なので、**利用者が入力したアドレスをここへ
+// 渡す経路はコンパイルを通りません** (ADR 0008 決定 2)。
+//
+// 差出人は運営の固定アドレス (MAIL_FROM) のままです。
+// **返信可能なアドレスにしておくこと**を運用の前提にしています ——
+// 控えを見て「これは自分の問い合わせではない」と気づいた人が、
+// 返す先を持たないのは筋が悪い。
+func (s *SMTPSender) SendAutoReply(ctx context.Context, r repository.AutoReply) error {
+	return s.deliver(ctx, r.ContactID, envelope{
+		from: s.from,
+		// **表示名を付けません。** 値は検証済み (model.VerifiedEmail が
+		// 表示名つきの形式も制御文字も通していない) ですが、
+		// ヘッダに入る値の作り方を 1 通りに保ちます
+		// (parseFixedAddress が設定値に対してしているのと同じ判断)。
+		to:      netmail.Address{Address: r.To.String()},
+		subject: autoReplySubjectFor(r.ContactID),
+		body:    r.Body,
+		// **auto-generated ではなく auto-replied です** (RFC 3834)。
+		// これは受け取った問い合わせに対する応答なので、こちらが正確な値に
+		// なります。どちらでも自動応答の停止という効果は同じですが、
+		// **メールのループを止める根拠がこのヘッダしか無い**以上、
+		// 意味の合うほうを載せます。
+		autoSubmitted: "auto-replied",
+	})
+}
+
+// deliver は 1 通を SMTP で送り届けます。
+//
+// **Send と SendAutoReply の違いは envelope だけ**で、接続・認証・
+// DATA の扱いは同じです。分けて書くと、片方にだけ入る修正
+// (QUIT の扱いのような) が生まれます。
+func (s *SMTPSender) deliver(ctx context.Context, contactID int64, e envelope) error {
+	msg := buildMessage(e, time.Now())
 
 	client, err := s.connect(ctx)
 	if err != nil {
@@ -106,10 +162,15 @@ func (s *SMTPSender) Send(ctx context.Context, n repository.Notification) error 
 		return authErr
 	}
 
-	if mailErr := client.Mail(s.from.Address); mailErr != nil {
+	if mailErr := client.Mail(e.from.Address); mailErr != nil {
 		return fmt.Errorf("mail: MAIL FROM に失敗しました: %w", mailErr)
 	}
-	if rcptErr := client.Rcpt(s.to.Address); rcptErr != nil {
+	// **宛先を自分では書きません** が、`rcptErr` にはサーバの応答文が入り、
+	// そこに宛先が載ることがあります (`550 ... <a@example.com> rejected`)。
+	// 控えの宛先は個人データなので、**これがログに流れうる**ことは
+	// 引き受けているコストになります (ADR 0008 の該当項)。
+	// 消す側に倒すと、送れない理由が運用から見えなくなります。
+	if rcptErr := client.Rcpt(e.to.Address); rcptErr != nil {
 		return fmt.Errorf("mail: RCPT TO に失敗しました: %w", rcptErr)
 	}
 
@@ -144,7 +205,7 @@ func (s *SMTPSender) Send(ctx context.Context, n repository.Notification) error 
 	// 記録は残します。頻発するなら経路の問題なので、気づけるようにします。
 	if err := client.Quit(); err != nil {
 		slog.InfoContext(ctx, "mail_quit_failed",
-			slog.Int64("contact_id", n.ContactID),
+			slog.Int64("contact_id", contactID),
 			slog.String("error", err.Error()),
 		)
 	}
@@ -223,6 +284,36 @@ func subjectFor(contactID int64) string {
 	return fmt.Sprintf("[お問い合わせ] #%d", contactID)
 }
 
+// autoReplySubjectFor は控えの件名を組み立てます。
+//
+// **こちらも利用者の入力を使いません** (ADR 0008 決定 3)。
+// 「入力された件名を差し込んだほうが分かりやすい」は成り立ちますが、
+// **本人宛だから安全、にはなりません** —— ヘッダに入力が入る経路を
+// 1 つでも作ると、それが後から他の宛先へ流用されます。
+// 入力の件名は本文の「お預かりした内容」に載ります。
+func autoReplySubjectFor(contactID int64) string {
+	return fmt.Sprintf("[お問い合わせ] #%d を受け付けました", contactID)
+}
+
+// envelope は 1 通ぶんの組み立てに要るものです。
+//
+// **構造体にしているのは引数の取り違えを防ぐため**です。
+// from / to / subject / body / autoSubmitted はすべて同じ型で並ぶので、
+// 位置引数だと **from と to を入れ替えても通ります。**
+type envelope struct {
+	from netmail.Address
+	to   netmail.Address
+	// subject は件名です。**利用者の入力は入りません** (決定 3)。
+	subject string
+	// body は本文です。**ここだけが利用者の入力を含みます。**
+	body string
+	// autoSubmitted は Auto-Submitted ヘッダの値です (RFC 3834)。
+	//
+	//	auto-generated  こちら発のメール (運営への通知)
+	//	auto-replied    受け取ったものへの応答 (本人への控え)
+	autoSubmitted string
+}
+
 // buildMessage は RFC 5322 のメッセージを組み立てます。
 //
 // **この関数がヘッダを組み立てる唯一の場所です。** 引数のうち
@@ -242,21 +333,26 @@ func subjectFor(contactID int64) string {
 // 2 については Go の `smtp.Client.Data()` (textproto の DotWriter) が
 // ドット詰めを行うため、実は素通しでも壊れません。**それでも base64 に
 // するのは、正しさが送信ライブラリの実装依存にならないようにするため**です。
-func buildMessage(from, to netmail.Address, subject, body string, now time.Time) []byte {
+func buildMessage(e envelope, now time.Time) []byte {
 	var b strings.Builder
 
 	// ヘッダの順序に意味はありませんが、読む人のために
 	// 「誰から誰へ・いつ・何を」の順に並べます。
-	writeHeader(&b, "From", from.Address)
-	writeHeader(&b, "To", to.Address)
+	writeHeader(&b, "From", e.from.Address)
+	writeHeader(&b, "To", e.to.Address)
 	writeHeader(&b, "Date", now.Format(time.RFC1123Z))
 	// **RFC 2047 で符号化します。** 件名は日本語を含むので、
 	// 生のまま載せると US-ASCII しか許さないヘッダの規定に反します。
-	writeHeader(&b, "Subject", mime.QEncoding.Encode("utf-8", subject))
-	writeHeader(&b, "Message-ID", messageID(from.Address, now))
+	writeHeader(&b, "Subject", mime.QEncoding.Encode("utf-8", e.subject))
+	writeHeader(&b, "Message-ID", messageID(e.from.Address, now))
 	// **Auto-Submitted を付けます** (RFC 3834)。これは人が書いたメールでは
 	// ないので、受け取り側の自動応答 (不在通知など) を止められます。
-	writeHeader(&b, "Auto-Submitted", "auto-generated")
+	//
+	// **控えではこれが唯一のループ止めになります。** 宛先が自動応答を
+	// 返す設定の場合、このヘッダを見ない実装が相手だと往復しえます ——
+	// こちらの受信箱は運営の固定アドレスなので、増えるのは運営側の
+	// 受信であって送信ではありません (踏み台にはなりません)。
+	writeHeader(&b, "Auto-Submitted", e.autoSubmitted)
 	writeHeader(&b, "MIME-Version", "1.0")
 	writeHeader(&b, "Content-Type", `text/plain; charset="UTF-8"`)
 	writeHeader(&b, "Content-Transfer-Encoding", "base64")
@@ -264,7 +360,7 @@ func buildMessage(from, to netmail.Address, subject, body string, now time.Time)
 
 	// **ヘッダと本文の境界より後は、何を書いても新しいヘッダになりません。**
 	// base64 の出力に改行を含めても本文のままです。
-	b.WriteString(wrapBase64(body))
+	b.WriteString(wrapBase64(e.body))
 
 	return []byte(b.String())
 }

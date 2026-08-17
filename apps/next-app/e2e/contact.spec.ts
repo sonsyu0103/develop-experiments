@@ -66,7 +66,33 @@ test.describe('問い合わせフォーム', () => {
     // **202 は受理までしか終わっていません。**
     // メールは定期処理が後から送るので、ここで完了を名乗ってはいけません。
     await expect(page.getByText('送信しました')).toHaveCount(0);
-    await expect(page.getByText('自動返信は届きません')).toBeVisible();
+    // 未ログインなので控えも届きません (ADR 0008 決定 2)。
+    await expect(page.getByText('控えのメールは届きません')).toBeVisible();
+  });
+
+  // **控えの届き先が、入力欄の値ではないと分かること** (ADR 0008 決定 2)。
+  //
+  // 入力欄は書き換えられるので、そこに書かれたアドレスを
+  // 「控えはここへ届きます」と案内すると**嘘の案内**になります。
+  // 画面が示すのは常にアカウントに登録されているアドレスです。
+  test('ログイン済みなら控えの届き先が登録アドレスだと分かる', async ({ page }) => {
+    await mockMe(page, moderator);
+    await mockContact(page, 'accepted');
+    await page.goto('/contact');
+
+    await fillForm(page);
+    // **入力欄を他人のアドレスへ書き換えても、案内は登録アドレスのまま。**
+    // ここが入力欄に追従したら、決定 2 が画面の上で破れています。
+    await page.getByLabel('メールアドレス').fill('someone-else@example.com');
+    await expect(
+      page.getByText(`控えは登録アドレス (${moderator.email}) 宛にお送りします。`),
+    ).toBeVisible();
+
+    await page.getByRole('button', { name: '送信する' }).click();
+
+    // 受理後の案内も登録アドレス。入力した他人のアドレスは出てこない。
+    await expect(page.getByText(moderator.email)).toBeVisible();
+    await expect(page.getByText('someone-else@example.com')).toHaveCount(0);
   });
 
   test('ログイン済みなら氏名とアドレスが埋まる', async ({ page }) => {

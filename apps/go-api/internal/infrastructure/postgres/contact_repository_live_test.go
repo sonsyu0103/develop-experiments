@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"develop-experiments/apps/go-api/internal/contact/domain/model"
@@ -49,6 +50,111 @@ func insertContact(t *testing.T, pool *pgxpool.Pool, subject string) int64 {
 		t.Fatalf("問い合わせを作れませんでした: %v", err)
 	}
 	return id
+}
+
+// seedContactUser は問い合わせの送信者となる利用者を 1 人作ります。
+//
+// deleted が true なら退会済み (deleted_at が非 NULL) にします。
+func seedContactUser(t *testing.T, pool *pgxpool.Pool, email string, deleted bool) int64 {
+	t.Helper()
+
+	var id int64
+	err := pool.QueryRow(t.Context(), `
+		INSERT INTO users (public_id, google_sub, email, display_name, deleted_at)
+		VALUES (gen_random_uuid(), $1, $2, 'live テスト',
+		        CASE WHEN $3::bool THEN now() ELSE NULL END)
+		RETURNING id`,
+		"live-contact-sub-"+uuid.NewString(), email, deleted).Scan(&id)
+	if err != nil {
+		t.Fatalf("利用者を作れませんでした: %v", err)
+	}
+
+	t.Cleanup(func() {
+		ctx := context.Background()
+		// **問い合わせを先に消します。** contact_messages.user_id が
+		// users を参照しているので、逆順だと外部キーで落ちます。
+		// t.Cleanup は後入れ先出しなので、登録の順序に頼れません。
+		_, _ = pool.Exec(ctx, `DELETE FROM contact_messages WHERE user_id = $1`, id)
+		_, _ = pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, id)
+	})
+	return id
+}
+
+// insertContactFor は送信者を指定して問い合わせを 1 件作ります。
+// userID が nil なら匿名です。
+func insertContactFor(t *testing.T, pool *pgxpool.Pool, subject string, userID *int64) int64 {
+	t.Helper()
+
+	var id int64
+	err := pool.QueryRow(t.Context(), `
+		INSERT INTO contact_messages (user_id, name, email, subject, body)
+		VALUES ($1, 'live テスト', 'typed-in@example.com', $2, '本文')
+		RETURNING id`, userID, subject).Scan(&id)
+	if err != nil {
+		t.Fatalf("問い合わせを作れませんでした: %v", err)
+	}
+	return id
+}
+
+// **確保が自動返信の宛先を解決すること** (ADR 0008 決定 2)。
+//
+// **フェイクでは測れません。** 見たいのは LEFT JOIN の挙動そのもので、
+// 落とし穴が 3 つあります。
+//
+//   - INNER にすると**匿名の行が確保されなくなる** ——
+//     匿名の問い合わせだけが永久に pending のまま残ります。
+//     しかも「送信が止まった」ようには見えません
+//   - `deleted_at IS NULL` を WHERE に書くと LEFT が INNER に化け、
+//     退会済みの利用者の問い合わせが同じように消えます
+//   - sqlc が NULL 許容を取り違えると、匿名の行を 1 件確保しただけで
+//     「NULL を string に読めない」で**確保ごと落ちます**
+//
+// どれも「ログイン済みの 1 件」だけを見ていると通ってしまいます。
+func TestContactRepository_ClaimResolvesVerifiedEmail_Live(t *testing.T) {
+	pool := liveDB(t)
+	const subject = "live-contact-verified-email"
+	cleanupContacts(t, pool, subject)
+
+	activeID := seedContactUser(t, pool, "active@example.net", false)
+	goneID := seedContactUser(t, pool, "gone@example.net", true)
+
+	loggedIn := insertContactFor(t, pool, subject, &activeID)
+	withdrawn := insertContactFor(t, pool, subject, &goneID)
+	anonymous := insertContactFor(t, pool, subject, nil)
+
+	claimed, err := NewContactRepository(pool).ClaimPending(t.Context(), 5*time.Minute, 10)
+	if err != nil {
+		t.Fatalf("確保に失敗: %v", err)
+	}
+
+	got := map[int64]model.Message{}
+	for _, m := range claimed {
+		got[m.ID] = m
+	}
+	// **3 件とも確保されること。** 1 件でも欠けたら結合が内部結合に
+	// なっているか、NULL の読み取りで落ちています。
+	if len(claimed) != 3 {
+		t.Fatalf("確保できた件数 = %d, want 3 (取れた ID: %v)", len(claimed), got)
+	}
+
+	if m := got[loggedIn]; m.ReplyTo == nil {
+		t.Error("ログイン済みなのに宛先が解決されていない")
+	} else if m.ReplyTo.String() != "active@example.net" {
+		t.Errorf("宛先 = %q, want active@example.net", m.ReplyTo)
+	}
+
+	// **入力値ではなく users.email であること。** ここが逆になっていると
+	// 決定 2 が破れます (入力されたアドレスへ送ることになる)。
+	if m := got[loggedIn]; m.Email != "typed-in@example.com" {
+		t.Errorf("入力値が保たれていない: %q", m.Email)
+	}
+
+	if m := got[withdrawn]; m.ReplyTo != nil {
+		t.Errorf("退会済みの利用者に控えを送ろうとしている: %q", m.ReplyTo)
+	}
+	if m := got[anonymous]; m.ReplyTo != nil {
+		t.Errorf("匿名の問い合わせに控えを送ろうとしている: %q", m.ReplyTo)
+	}
 }
 
 // **ロック中の行を、待たずに飛ばすこと。**

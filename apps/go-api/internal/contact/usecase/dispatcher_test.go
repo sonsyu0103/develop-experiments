@@ -133,6 +133,7 @@ func TestComposeBody(t *testing.T) {
 	t.Parallel()
 
 	userID := int64(42)
+	verified := mustVerified(t, "account@example.net")
 	body := composeBody(model.Message{
 		ID:        7,
 		UserID:    &userID,
@@ -141,13 +142,18 @@ func TestComposeBody(t *testing.T) {
 		Subject:   "ログインできません",
 		Body:      "画面が戻ってきます。",
 		CreatedAt: time.Unix(1700000000, 0).UTC(),
+		ReplyTo:   &verified,
 	})
 
 	for _, want := range []string{
 		"問い合わせ番号: 7",
 		"ログイン: あり (user_id=42)",
 		"氏名: ホシノ",
-		"メールアドレス (未検証): hoshino@example.com",
+		// **2 つのアドレスが両方載ること。** 食い違っていること自体が
+		// 対応する人にとっての情報になります (他人のアドレスを入力した
+		// 問い合わせが目に見える)。
+		"メールアドレス (入力値・未検証): hoshino@example.com",
+		"メールアドレス (検証済み・控えの送付先): account@example.net",
 		"件名: ログインできません",
 		"画面が戻ってきます。",
 	} {
@@ -175,6 +181,140 @@ func TestComposeBody_Anonymous(t *testing.T) {
 	if !strings.Contains(body, "ログイン: なし (匿名)") {
 		t.Errorf("匿名と分からない:\n%s", body)
 	}
+	// **控えを送っていないことが運営に分かること。** 分からないと、
+	// 「控えが届いているはず」という前提で対応が進みます。
+	if !strings.Contains(body, "控えは送っていません") {
+		t.Errorf("控えの有無が分からない:\n%s", body)
+	}
+}
+
+// **匿名の問い合わせに控えを送らないこと** (ADR 0008 決定 2)。
+//
+// **この 1 件が決定 2 そのものになります。** 入力されたアドレスへ
+// 落とすフォールバックを書いた瞬間に落ちます ——
+// 他人のアドレスを入力するだけで、このシステムが踏み台になります。
+func TestDispatch_NoAutoReplyWithoutVerifiedAddress(t *testing.T) {
+	t.Parallel()
+
+	// pendingMessage は ReplyTo を持たない (= 匿名 / 退会済み)。
+	repo := &fakeRepo{pending: []model.Message{pendingMessage(1, 1)}}
+	sender := &fakeSender{}
+
+	got, err := NewDispatcher(repo, sender).Dispatch(t.Context())
+	if err != nil {
+		t.Fatalf("Dispatch がエラーになった: %v", err)
+	}
+	if got.Sent != 1 {
+		t.Errorf("結果 = %+v, want Sent = 1", got)
+	}
+	if len(sender.autoReplies) != 0 {
+		t.Fatalf("検証されていないのに控えを送った: %+v", sender.autoReplies)
+	}
+}
+
+// **検証済みアドレスがあれば控えを送ること。**
+func TestDispatch_SendsAutoReplyToVerifiedAddress(t *testing.T) {
+	t.Parallel()
+
+	m := pendingMessage(9, 1)
+	m.Subject = "ログインできません"
+	m.Body = "画面が戻ってきます。"
+	verified := mustVerified(t, "account@example.net")
+	m.ReplyTo = &verified
+
+	repo := &fakeRepo{pending: []model.Message{m}}
+	sender := &fakeSender{}
+
+	if _, err := NewDispatcher(repo, sender).Dispatch(t.Context()); err != nil {
+		t.Fatalf("Dispatch がエラーになった: %v", err)
+	}
+
+	if len(sender.autoReplies) != 1 {
+		t.Fatalf("控えの件数 = %d, want 1", len(sender.autoReplies))
+	}
+	r := sender.autoReplies[0]
+	if r.ContactID != 9 {
+		t.Errorf("ContactID = %d, want 9", r.ContactID)
+	}
+	if r.To.String() != "account@example.net" {
+		t.Errorf("宛先 = %q, want account@example.net", r.To)
+	}
+	// 控えとして中身が入っていること。
+	for _, want := range []string{"問い合わせ番号: 9", "件名: ログインできません", "画面が戻ってきます。"} {
+		if !strings.Contains(r.Body, want) {
+			t.Errorf("控えに %q が無い:\n%s", want, r.Body)
+		}
+	}
+	// **入力されたアドレスを控えに書き写さないこと。**
+	// 入力欄には他人のアドレスが書かれていることがあり、
+	// それを本人以外に見せる経路を作らないためです。
+	if strings.Contains(r.Body, m.Email) {
+		t.Errorf("控えに入力されたアドレスが載っている:\n%s", r.Body)
+	}
+}
+
+// **控えの送信に失敗しても、問い合わせを送り直さないこと** (best-effort)。
+//
+// この時点で運営への通知は確定済みです。控えのために行を pending へ
+// 戻すと、**同じ問い合わせが上限まで運営に届きます** ——
+// 決定 1 が守ると決めたのは運営への通知だけになります。
+func TestDispatch_AutoReplyFailureDoesNotRetryTheContact(t *testing.T) {
+	t.Parallel()
+
+	m := pendingMessage(3, 1)
+	verified := mustVerified(t, "account@example.net")
+	m.ReplyTo = &verified
+
+	repo := &fakeRepo{pending: []model.Message{m}}
+	sender := &fakeSender{autoReplyErr: errSMTP}
+
+	got, err := NewDispatcher(repo, sender).Dispatch(t.Context())
+	if err != nil {
+		t.Fatalf("控えの失敗が Dispatch のエラーになった: %v", err)
+	}
+	if got.Sent != 1 || got.Retried != 0 || got.Failed != 0 {
+		t.Errorf("結果 = %+v, want Sent = 1 のみ", got)
+	}
+	if len(repo.sentIDs) != 1 || repo.sentIDs[0] != 3 {
+		t.Errorf("送信済みとして確定されていない: %v", repo.sentIDs)
+	}
+	if len(repo.rescheduled) != 0 || len(repo.failed) != 0 {
+		t.Errorf("控えの失敗で行が差し戻された: rescheduled = %v, failed = %v",
+			repo.rescheduled, repo.failed)
+	}
+}
+
+// **運営への通知が失敗したら、控えも送らないこと。**
+//
+// 送ってしまうと「受け付けました」と本人に伝えたのに運営には
+// 届いていない状態になり、しかも次の周回でもう 1 通控えが届きます。
+func TestDispatch_NoAutoReplyWhenNotificationFails(t *testing.T) {
+	t.Parallel()
+
+	m := pendingMessage(5, 1)
+	verified := mustVerified(t, "account@example.net")
+	m.ReplyTo = &verified
+
+	sender := &fakeSender{err: errSMTP}
+	repo := &fakeRepo{pending: []model.Message{m}}
+
+	if _, err := NewDispatcher(repo, sender).Dispatch(t.Context()); err != nil {
+		t.Fatalf("Dispatch がエラーになった: %v", err)
+	}
+	if len(sender.autoReplies) != 0 {
+		t.Errorf("運営に届いていないのに控えを送った: %+v", sender.autoReplies)
+	}
+}
+
+// mustVerified はテスト用に検証済みアドレスを作ります。
+func mustVerified(t *testing.T, raw string) model.VerifiedEmail {
+	t.Helper()
+
+	v, err := model.NewVerifiedEmail(raw)
+	if err != nil {
+		t.Fatalf("NewVerifiedEmail(%q) が失敗した: %v", raw, err)
+	}
+	return v
 }
 
 // **失敗理由がルーン境界で切り詰められること。**

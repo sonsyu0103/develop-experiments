@@ -276,9 +276,21 @@ deps:
   # **テストでもここだけが SMTP を知る。** ただしテストは
   # メッセージの組み立て (buildMessage) だけを見るので、
   # 実際に SMTP を話す相手は要らない
+  #
+  # 【contact-model をテストにだけ許している理由】
+  # 控えの宛先 (repository.AutoReply.To) が model.VerifiedEmail で、
+  # **入力されたアドレスをここへ渡せないこと**が決定 2 の防御そのもの
+  # (ADR 0008)。値を作れるのが contact-model なので、
+  # 控えの送信を検査するテストはこれを import せざるをえない。
+  #
+  # **本体コードは今も contact-model を知らない。** 受け取った値の
+  # String() を呼ぶだけで、型名を書く場所が 1 つも無い ——
+  # 本体用の .go-arch-lint.yml は緩和していないので、
+  # 知り始めた日にそちらが落ちる。
   mail-sender:
     mayDependOn:
       - contact-repository
+      - contact-model
       - shared-config
 
   # 外側のアダプタ。usecase が定義した Provider を実装する
