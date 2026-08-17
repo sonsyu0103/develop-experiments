@@ -69,6 +69,20 @@ var (
 	// —— クライアントはキーを作り直す必要があります。
 	ErrFailedPrecondition = errors.New("要求が現在の状態と噛み合いません")
 
+	// ErrResourceExhausted はレート制限に当たったことを表します (HTTP 429)。
+	//
+	// **問い合わせの投稿で使います** (docs/adr/0008-contact-and-mail.md 決定 4)。
+	// 外部に開いた書き込み口なので、放置すると必ず荒らされます。
+	//
+	// **名前は gRPC の体系に合わせています** (docs/adr/0013-http-defense.md
+	// 決定 3 の表)。TooManyRequests にしたくなりますが、他のコードが
+	// INVALID_ARGUMENT / PERMISSION_DENIED と gRPC 側の名前で揃っており、
+	// 1 つだけ HTTP 側の名前にすると対応表が読めなくなります。
+	//
+	// ErrConflict (409) と分けるのは、**すぐ再試行しても解決しない**ためです。
+	// クライアントは時間をおく必要があります。
+	ErrResourceExhausted = errors.New("要求の回数が多すぎます")
+
 	// ErrUnavailable は依存する外部要素の設定や疎通が無く、
 	// その経路だけが使えないことを表します (HTTP 503)。
 	//

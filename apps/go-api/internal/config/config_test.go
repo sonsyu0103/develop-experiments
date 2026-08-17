@@ -361,3 +361,111 @@ func TestLoad_StorageUsePathStyle(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 問い合わせ (docs/adr/0008-contact-and-mail.md)
+// ---------------------------------------------------------------------------
+
+// loadWithMinimalEnv は必須の環境変数だけを与えて Load を呼びます。
+func loadWithMinimalEnv(t *testing.T) *Config {
+	t.Helper()
+
+	t.Setenv("DATABASE_URL", "postgres://app:password@localhost:5432/bbs")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load が失敗した: %v", err)
+	}
+	return cfg
+}
+
+// **メールの設定が無くても起動すること** (ADR 0008 決定 1)。
+//
+// 揃っていない場合に止まるのは送信ワーカーだけで、受付は動きます。
+// 503 で断ると、その間に来た問い合わせがそのまま失われます ——
+// 画像やログインと違い、利用者はもう一度送りに来てくれません。
+func TestLoad_MailIsOptional(t *testing.T) {
+	cfg := loadWithMinimalEnv(t)
+	if cfg.Contact.Mail.Enabled() {
+		t.Error("設定が無いのに有効と判定された")
+	}
+}
+
+// **必要な値に既定を持たせないこと** (AuthConfig.RedirectURL と同じ理由)。
+//
+// 既定を入れると、設定を忘れた本番が Enabled() を満たし、
+// どこにも届かないメールを送り続けます。
+func TestMailConfig_Enabled(t *testing.T) {
+	full := MailConfig{Host: "mailpit", Port: 1025, From: "a@example.com", To: "b@example.com"}
+	if !full.Enabled() {
+		t.Fatal("揃っているのに無効と判定された")
+	}
+
+	for name, mutate := range map[string]func(*MailConfig){
+		"host なし": func(m *MailConfig) { m.Host = "" },
+		"port なし": func(m *MailConfig) { m.Port = 0 },
+		"from なし": func(m *MailConfig) { m.From = "" },
+		"to なし":   func(m *MailConfig) { m.To = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := full
+			mutate(&cfg)
+			if cfg.Enabled() {
+				t.Error("欠けているのに有効と判定された")
+			}
+		})
+	}
+
+	// **資格情報は判定に含めない。** Mailpit は認証を要求しないので、
+	// 必須にすると手元で経路を確認できなくなります。
+	noCreds := full
+	noCreds.Username = ""
+	noCreds.Password = ""
+	if !noCreds.Enabled() {
+		t.Error("資格情報が無いだけで無効と判定された")
+	}
+}
+
+// **レート制限を実質無効にする設定を作れないこと** (ADR 0008 決定 4)。
+//
+//	窓 0 秒   数える対象が常に空になり、実質無制限
+//	上限 0 件 誰も送れない
+//
+// どちらも「無効化したつもりはないのに無効」という形で静かに壊れます。
+func TestLoad_ContactRateLimitRejectsZero(t *testing.T) {
+	for _, key := range []string{"CONTACT_RATE_LIMIT_WINDOW_SECONDS", "CONTACT_RATE_LIMIT_MAX"} {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://app:password@localhost:5432/bbs")
+			t.Setenv(key, "0")
+			if _, err := Load(); err == nil {
+				t.Errorf("%s=0 が通ってしまった", key)
+			}
+		})
+	}
+}
+
+// **送信間隔に 0 を許さないこと** (VIEW_COUNT_FLUSH_SECONDS と同じ理由)。
+//
+// 0 だとスケジューラが既定値 (10 分) へ丸めるので、
+// 「速くするつもりで 0 にしたら、いちばん遅くなった」が起きます。
+func TestLoad_ContactDispatchIntervalRejectsZero(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://app:password@localhost:5432/bbs")
+	t.Setenv("CONTACT_DISPATCH_INTERVAL_SECONDS", "0")
+	if _, err := Load(); err == nil {
+		t.Error("CONTACT_DISPATCH_INTERVAL_SECONDS=0 が通ってしまった")
+	}
+}
+
+// **既定値が ADR と揃っていること。**
+//
+// client_ip の保持期間はログの保持期間 (ADR 0010 決定 6 の 400 日) と揃えます。
+// 同じ IP がログ側にも出ているので、片方だけ短くしても消したことになりません。
+func TestLoad_ContactDefaults(t *testing.T) {
+	cfg := loadWithMinimalEnv(t)
+
+	if got := cfg.Contact.IPRetention.Hours() / 24; got != 400 {
+		t.Errorf("IPRetention = %v 日, want 400 日", got)
+	}
+	if cfg.Contact.RateLimitMax != 5 || cfg.Contact.RateLimitWindow.Hours() != 1 {
+		t.Errorf("レート制限の既定 = %d 件 / %v", cfg.Contact.RateLimitMax, cfg.Contact.RateLimitWindow)
+	}
+}

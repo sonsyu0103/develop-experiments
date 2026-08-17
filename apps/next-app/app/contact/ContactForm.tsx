@@ -1,0 +1,213 @@
+'use client';
+
+// 問い合わせフォーム (docs/adr/0008-contact-and-mail.md)。
+//
+// 【なぜ Client Component なのか】
+// 2 つあります。
+//
+//   - **書き込みはブラウザから直接叩く** (ADR 0013 の「実装して分かったこと 7」)。
+//     Server Actions から叩くと `Origin` が付かず、csrfGuard に 403 で弾かれます
+//   - **ログイン済みの初期値を引くため。** サーバ側で引くと、この画面の
+//     出力が利用者ごとに変わり、ADR 0005 の 4 層キャッシュを全部
+//     確認する必要が出ます (AdminLink と同じ理由)
+//
+// 【この画面が「送信しました」と言わない理由】
+// API が返すのは `202 Accepted` で、**受理までしか終わっていません。**
+// メールは定期処理が後から送ります。ここで「送信しました」と書くと、
+// 送れなかった場合に利用者は成功したと思ったままになります。
+import { useEffect, useState } from 'react';
+
+import { ApiError, getMe, submitContact } from '../lib/api';
+import { button, card, colors, input, label } from '../lib/ui';
+
+// **仕様書の maxLength と同じ値です** (api/openapi.yaml の CreateContactRequest)。
+// ここは入力の途中で気づけるようにするためのもので、検査の正は API 側
+// (さらに DB の CHECK 制約) にあります。
+const limits = { name: 100, email: 254, subject: 200, body: 5000 } as const;
+
+/** 送信の状態。**`sent` ではなく `accepted`** —— 送信は終わっていません。 */
+type Phase = { kind: 'editing' } | { kind: 'sending' } | { kind: 'accepted' } | { kind: 'error'; message: string };
+
+export function ContactForm() {
+  const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
+  const [subject, setSubject] = useState('');
+  const [body, setBody] = useState('');
+  // honeypot (ADR 0008 決定 4)。**人間は触りません。**
+  const [website, setWebsite] = useState('');
+  const [phase, setPhase] = useState<Phase>({ kind: 'editing' });
+
+  // ログイン済みなら氏名とアドレスを埋めます (決定 4)。
+  //
+  // **未ログインは失敗ではありません。** 匿名でも問い合わせできる ——
+  // むしろ「ログインできない」という問い合わせが来る前提なので、
+  // 401 は黙って無視します。
+  useEffect(() => {
+    let alive = true;
+    getMe()
+      .then((me) => {
+        if (!alive) return;
+        // **入力済みの値は上書きしません。** 取得は非同期なので、
+        // 先に打ち始めていた文字を消してしまいます。
+        setName((v) => (v === '' ? me.displayName : v));
+        setEmail((v) => (v === '' ? me.email : v));
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const filled = name.trim() !== '' && email.trim() !== '' && subject.trim() !== '' && body.trim() !== '';
+
+  async function onSubmit() {
+    setPhase({ kind: 'sending' });
+    try {
+      await submitContact({ name, email, subject, body, website });
+      setPhase({ kind: 'accepted' });
+      setName('');
+      setEmail('');
+      setSubject('');
+      setBody('');
+    } catch (e) {
+      setPhase({ kind: 'error', message: describeContactError(e) });
+    }
+  }
+
+  if (phase.kind === 'accepted') {
+    return (
+      <div style={card}>
+        <p>問い合わせを受け付けました。</p>
+        {/*
+          **「送信しました」と書かない。** 受理までしか終わっていません
+          (ADR 0008 決定 1)。ここを正確に書くことが、
+          202 を返すことにした理由そのものになります。
+        */}
+        <p style={{ color: colors.dim }}>
+          運営への通知は順に送られます。<strong>自動返信は届きません</strong> ——
+          入力されたアドレスは検証していないため、そこへメールを送らない設計です
+          (返信は担当者が手で行います)。
+        </p>
+        <p>
+          <button type="button" style={button} onClick={() => setPhase({ kind: 'editing' })}>
+            もう 1 件送る
+          </button>
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div style={card}>
+      <label style={label} htmlFor="contact-name">
+        お名前
+      </label>
+      <input
+        id="contact-name"
+        style={{ ...input, width: '100%', maxWidth: '40rem' }}
+        value={name}
+        maxLength={limits.name}
+        onChange={(e) => setName(e.target.value)}
+      />
+
+      <label style={label} htmlFor="contact-email">
+        メールアドレス
+      </label>
+      <input
+        id="contact-email"
+        type="email"
+        style={{ ...input, width: '100%', maxWidth: '40rem' }}
+        value={email}
+        maxLength={limits.email}
+        onChange={(e) => setEmail(e.target.value)}
+      />
+
+      <label style={label} htmlFor="contact-subject">
+        件名
+      </label>
+      <input
+        id="contact-subject"
+        style={{ ...input, width: '100%', maxWidth: '40rem' }}
+        value={subject}
+        maxLength={limits.subject}
+        onChange={(e) => setSubject(e.target.value)}
+      />
+
+      <label style={label} htmlFor="contact-body">
+        お問い合わせ内容
+      </label>
+      <textarea
+        id="contact-body"
+        style={{ ...input, width: '100%', maxWidth: '40rem', height: '12rem' }}
+        value={body}
+        maxLength={limits.body}
+        onChange={(e) => setBody(e.target.value)}
+      />
+
+      {/*
+        honeypot (ADR 0008 決定 4)。**画面には出しません。**
+
+        `display: none` で消したうえで、次の 3 つを付けています。
+          tabIndex={-1}      Tab キーで到達しない (キーボード操作でも埋まらない)
+          autoComplete="off" **ブラウザの自動入力に埋められないため**
+          aria-hidden        スクリーンリーダーに読ませない
+
+        2 つ目が要点です。埋まっていると API 側で**黙って破棄される**ので、
+        自動入力に埋められると人間の問い合わせが消えます。
+        honeypot を選ぶ以上ここは 0 にはできませんが、確率は下げられます。
+      */}
+      <div style={{ display: 'none' }} aria-hidden="true">
+        <label htmlFor="contact-website">この欄は入力しないでください</label>
+        <input
+          id="contact-website"
+          name="website"
+          tabIndex={-1}
+          autoComplete="off"
+          value={website}
+          onChange={(e) => setWebsite(e.target.value)}
+        />
+      </div>
+
+      <p style={{ margin: '1rem 0 0' }}>
+        <button
+          type="button"
+          style={button}
+          disabled={!filled || phase.kind === 'sending'}
+          onClick={() => void onSubmit()}
+        >
+          {phase.kind === 'sending' ? '送信中…' : '送信する'}
+        </button>
+      </p>
+
+      {phase.kind === 'error' && (
+        <p style={{ color: colors.danger, margin: '0.5rem 0 0' }}>{phase.message}</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * エラーを利用者向けの文言にします。
+ *
+ * **`code` で分岐します** —— `message` は人間向けで予告なく変わります
+ * (仕様書の `Error` スキーマ)。
+ */
+function describeContactError(e: unknown): string {
+  if (!(e instanceof ApiError)) {
+    return '送信できませんでした。通信環境を確かめて、もう一度お試しください。';
+  }
+  switch (e.code) {
+    // 429。**何件までなら通るかは API も返しません** (攻撃側にだけ有用なため)。
+    // 画面でも上限を書かず、「時間をおく」とだけ伝えます。
+    case 'RESOURCE_EXHAUSTED':
+      return '短時間に送りすぎています。しばらく時間をおいてからお試しください。';
+    case 'INVALID_ARGUMENT':
+      return `入力を確認してください: ${e.message}`;
+    // 403 は CSRF の検査 (ADR 0013 決定 1)。利用者の入力の問題ではないので、
+    // 「入力を確認」とは書きません。
+    case 'PERMISSION_DENIED':
+      return '送信が拒否されました。ページを開き直してからお試しください。';
+    default:
+      return '送信できませんでした。時間をおいてもう一度お試しください。';
+  }
+}

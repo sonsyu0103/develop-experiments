@@ -93,13 +93,14 @@ flowchart TB
 | `go-api` | ECS Fargate サービス | |
 | `next-app` | ECS Fargate サービス | |
 | **MinIO** (追加予定) | S3 (画像 / ログ) | [ADR 0007](adr/0007-image-storage.md) |
-| **Mailpit** (追加予定) | Amazon SES | [ADR 0008](adr/0008-contact-and-mail.md) |
+| **Mailpit** | Amazon SES | [ADR 0008](adr/0008-contact-and-mail.md)。**SES の初期状態はサンドボックス**で、検証済みアドレス以外へは送れない (解除申請が前提) |
 | **Fluent Bit** (追加予定) | FireLens サイドカー | [ADR 0010](adr/0010-log-pipeline.md) |
 | (DuckDB でログを読む) | Athena | 同上。Athena の代替にはならないが、クエリとパーティション設計は検証できる |
 | 環境変数 (`.env`) | Secrets Manager | 下記 |
 | — | CloudFront / WAF / ALB / NAT | ローカルには対応物がない |
 
 **MinIO / Mailpit / Fluent Bit の 3 つを `compose.yaml` に追加する必要がある。**
+(Mailpit は Phase 8 で追加済み。受信箱は http://localhost:8025 で開く)
 いずれも「本番の外部サービスをローカルで代替する」役割で、
 中身を目で確認できるものを選んでいる。
 

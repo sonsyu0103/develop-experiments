@@ -439,6 +439,72 @@ export interface paths {
         patch: operations["changeUserRole"];
         trace?: never;
     };
+    "/contact": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 問い合わせを送る
+         * @description 問い合わせを受け付けます (docs/adr/0008-contact-and-mail.md)。
+         *
+         *     ### `202` は「送信完了」ではありません
+         *
+         *     受理した時点で返します。**メールの送信はこのリクエストの中で
+         *     行いません。**
+         *
+         *     ```
+         *     POST /contact
+         *          ├─▶ contact_messages に INSERT (status = 'pending')
+         *          └─▶ 202 Accepted            ← ここで外部サービスを待たない
+         *          ⋮
+         *     ワーカー (一定間隔)
+         *          ├─▶ pending を取り出す (FOR UPDATE SKIP LOCKED)
+         *          ├─▶ メール送信
+         *          └─▶ status = 'sent' / 'failed'
+         *     ```
+         *
+         *     同期で送ると、**メールプロバイダの障害がそのまま問い合わせの喪失に
+         *     なります** —— 利用者には 500 が返り、書いた内容は失われます。
+         *     問い合わせフォームは「送れなかったことに気づけない」のが
+         *     最悪の失敗なので、保存を先に確定させます (決定 1)。
+         *
+         *     `200 OK` を返さないのは、それが「送信完了」を含意するためです。
+         *
+         *     ### ログインは不要です
+         *
+         *     「ログインできない」という問い合わせが来る以上、ログインを必須に
+         *     すると詰みます (決定 4)。ログイン済みの場合は投稿者を記録し、
+         *     フォームの初期値も埋まりますが、**API の動作は変わりません。**
+         *
+         *     ### 自動返信は送りません
+         *
+         *     入力されたアドレスは検証されていないため、そこへ返信すると
+         *     **このシステムを踏み台にして任意のアドレスへメールを送れます**
+         *     (決定 2)。送信先は運営の固定アドレスだけで、返信は人間が行います。
+         *
+         *     ### スパム対策
+         *
+         *     | 対策 | 内容 |
+         *     | --- | --- |
+         *     | レート制限 | 同一 IP から一定時間あたりの件数を制限します (超過は `429`) |
+         *     | 長さ制限 | このスキーマの `maxLength` と DB の CHECK 制約が同じ値で縛ります |
+         *     | honeypot | `website` を空のまま送ってください (下記) |
+         *
+         *     CAPTCHA は入れていません。外部サービス依存とプライバシーの話が
+         *     別途発生し、この規模では honeypot + レート制限で足ります。
+         */
+        post: operations["createContact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/healthz": {
         parameters: {
             query?: never;
@@ -1139,6 +1205,90 @@ export interface components {
              */
             createdAt: string;
         };
+        /**
+         * @description 問い合わせの入力 (docs/adr/0008-contact-and-mail.md)。
+         *
+         *     **`maxLength` は DB の CHECK 制約と同じ値です。**
+         *     `contact_name_length` / `contact_email_length` /
+         *     `contact_subject_length` / `contact_body_length` の 4 本が
+         *     最後の砦になります。3 か所 (仕様書・ドメイン・DB) が揃っていることは
+         *     `internal/contact/domain/model` のテストが実際にファイルを読んで検査します。
+         */
+        CreateContactRequest: {
+            /**
+             * @description 氏名。**検証はしていません** —— 本文中のテキストとして記録します
+             * @example 小鳥遊 ホシノ
+             */
+            name: string;
+            /**
+             * Format: email
+             * @description 返信先のアドレス。
+             *
+             *     **このアドレスへ自動返信は送りません** (決定 2)。
+             *     検証されていないアドレスへ送ると、他人のアドレスを入力するだけで
+             *     このシステムを踏み台にできます。
+             *
+             *     **メールヘッダにも入りません** (決定 3)。`Reply-To` に設定すると
+             *     改行の注入で任意のヘッダを足せるため、本文中のテキストとしてだけ
+             *     扱います。
+             *
+             *     上限の 254 は RFC 5321 のアドレス長の上限です。
+             * @example hoshino@example.com
+             */
+            email: string;
+            /**
+             * @description 件名。**メールの Subject には入りません** (決定 3)
+             * @example ログインできません
+             */
+            subject: string;
+            /**
+             * @description 本文
+             * @example Google でログインしようとすると画面が戻ってきてしまいます。
+             */
+            body: string;
+            /**
+             * @description **honeypot です。空のまま送ってください。**
+             *
+             *     **`maxLength` を置いていません。** 置くと、長い値を入れた要求が
+             *     検証ミドルウェアに `400 INVALID_ARGUMENT` で弾かれ、
+             *     **応答に `website` というフィールド名が載ります** ——
+             *     この設計が伏せようとしている情報を、名指しで返すことになります
+             *     (レビュー指摘)。要求全体の大きさは本文サイズの上限が抑えます。
+             *
+             *     画面上は非表示にしてあり、人間が埋めることはありません。
+             *     値が入っている要求は**破棄されます** —— DB にも書かれず、
+             *     メールも送られません。
+             *
+             *     それでも `202` を返すのは、`400` にすると
+             *     **「この項目が引き金だ」とボット側に教える**ためです。
+             *     成功と区別がつかないほうが、対策として長持ちします。
+             * @example
+             */
+            website?: string;
+        };
+        /**
+         * @description 受理の応答。**問い合わせの ID を返しません。**
+         *
+         *     内部 ID を外に出さない方針 (docs/adr/0003-open-questions.md 未決 #11)
+         *     に加えて、**honeypot に引っかかった要求と区別できなくなる**ためです ——
+         *     あちらは行を作らないので、返せる ID がありません。
+         *     片方だけ ID が付けば、それが判定結果の合図になります。
+         */
+        ContactAccepted: {
+            /**
+             * @description **常に `accepted` です。** 「送信済み」を表す値はありません ——
+             *     この時点で完了しているのは受理までだからです。
+             * @example accepted
+             * @enum {string}
+             */
+            status: "accepted";
+            /**
+             * Format: date-time
+             * @description 受理した時刻。サーバの時刻です
+             * @example 2026-08-17T12:00:00Z
+             */
+            receivedAt: string;
+        };
         Error: {
             error: {
                 /**
@@ -1146,7 +1296,7 @@ export interface components {
                  * @example NOT_FOUND
                  * @enum {string}
                  */
-                code: "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "PERMISSION_DENIED" | "PAYLOAD_TOO_LARGE" | "FAILED_PRECONDITION" | "UNAVAILABLE" | "INTERNAL";
+                code: "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "PERMISSION_DENIED" | "PAYLOAD_TOO_LARGE" | "FAILED_PRECONDITION" | "RESOURCE_EXHAUSTED" | "UNAVAILABLE" | "INTERNAL";
                 /**
                  * @description 人間向けの説明。文言は予告なく変わるため分岐に使わないでください。
                  * @example 対象のリソースが見つかりません
@@ -1195,6 +1345,26 @@ export interface components {
          *     サーバ側でも検証します。
          */
         Forbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /**
+         * @description `code` は `RESOURCE_EXHAUSTED` です
+         *     (docs/adr/0013-http-defense.md 決定 3)。
+         *
+         *     同一 IP からの問い合わせが一定時間あたりの上限を超えました
+         *     ([ADR 0008](../docs/adr/0008-contact-and-mail.md) 決定 4 のスパム対策)。
+         *
+         *     **`Retry-After` は付けません。** 窓は移動窓なので、正確な待ち時間を
+         *     出すには「窓の中で最も古い 1 件」を引く問い合わせが 1 本増えます。
+         *     弾かれた要求のために追加のクエリを打つのは、レート制限として
+         *     本末転倒になります。時間をおいて送り直してください。
+         */
+        TooManyRequests: {
             headers: {
                 [name: string]: unknown;
             };
@@ -1860,6 +2030,39 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createContact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateContactRequest"];
+            };
+        };
+        responses: {
+            /**
+             * @description **受理しました。送信完了ではありません。**
+             *
+             *     honeypot に引っかかった要求も、区別できないよう
+             *     同じ応答を返します (`CreateContactRequest.website` の説明を参照)。
+             */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContactAccepted"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            429: components["responses"]["TooManyRequests"];
             500: components["responses"]["InternalError"];
         };
     };
