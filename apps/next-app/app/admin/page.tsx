@@ -11,7 +11,6 @@
 import { AdminGate } from './AdminGate';
 import { ImageDeleteForm } from './ImageDeleteForm';
 import { ReportQueue } from './ReportQueue';
-import { colors } from '../lib/ui';
 
 export default function AdminPage() {
   return (
@@ -19,8 +18,8 @@ export default function AdminPage() {
       {() => (
         <>
           <ReportQueue />
-          <h2 style={{ color: colors.dim, marginTop: '2.5rem' }}>画像の削除</h2>
-          <p style={{ color: colors.dim }}>
+          <h2>画像の削除</h2>
+          <p className="muted measure">
             投稿を消しても画像は残ります。通報は画像を対象にできないため、ここから消します。
           </p>
           <ImageDeleteForm />

@@ -39,6 +39,15 @@ export type ReportStatus = Schemas['ReportStatus'];
 export type ReportReason = Schemas['ReportReason'];
 export type ReportTargetType = Schemas['ReportTargetType'];
 export type Thread = Schemas['Thread'];
+export type ThreadList = Schemas['ThreadList'];
+export type Comment = Schemas['Comment'];
+export type CommentList = Schemas['CommentList'];
+export type CreateThreadRequest = Schemas['CreateThreadRequest'];
+export type CreateCommentRequest = Schemas['CreateCommentRequest'];
+export type CreateReportRequest = Schemas['CreateReportRequest'];
+export type Author = Schemas['Author'];
+export type Image = Schemas['Image'];
+export type ImageKind = Schemas['ImageKind'];
 export type ModerationAction = Schemas['ModerationAction'];
 export type ModerationDeleteAction = Schemas['ModerationDeleteAction'];
 export type CreateContactRequest = Schemas['CreateContactRequest'];
@@ -171,6 +180,152 @@ export function getMe(): Promise<Me> {
  */
 export function getThread(id: number): Promise<Thread> {
   return request<Thread>(`/threads/${id}`);
+}
+
+/**
+ * ログアウトします。**セッションは即座に無効になります**
+ * (実体を DB に持つため。ADR 0005 決定 1)。
+ *
+ * 呼んだあとは `invalidateMe()` を必ず通してください ——
+ * こちらは Cookie を捨てるだけで、画面が握っている `Me` は残ります。
+ */
+export function logout(): Promise<void> {
+  return request<void>('/auth/logout', { method: 'POST' });
+}
+
+/**
+ * プロフィール画像を設定します。**`null` で解除**します
+ * (Google のプロフィール画像に戻ります)。
+ *
+ * **他人の画像 ID は 404** です —— 403 だと「その ID の画像が
+ * 存在すること」自体が漏れるためです (ADR 0013)。
+ */
+export function setMyAvatar(imageId: string | null): Promise<Me> {
+  return request<Me>('/me/avatar', jsonBody('PUT', { imageId }));
+}
+
+/**
+ * 画像をアップロードします。**添付は別の操作です** ——
+ * ここで得た `id` を投稿側に渡してください。
+ *
+ * 【`Content-Type` を自分で付けません】
+ * `multipart/form-data` は境界文字列 (boundary) をヘッダに含む必要があり、
+ * それを知っているのは `FormData` を組み立てたブラウザだけです。
+ * 手で `multipart/form-data` と書くと boundary が落ち、
+ * **サーバは本文を 1 つも読めません。** `jsonBody` と分けてあるのはこのためです。
+ *
+ * 【`Idempotency-Key` は送りません】
+ * 仕様がこの経路だけ受け付けません (ADR 0015 決定 3 の要求を
+ * DB とストレージにまたがる操作では満たせないため)。二重アップロードで
+ * 起きるのは「使われない画像が 1 枚増える」ことだけです。
+ */
+export function uploadImage(file: File, kind: ImageKind): Promise<Image> {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('kind', kind);
+  return request<Image>('/images', { method: 'POST', body: form });
+}
+
+/**
+ * スレッドを立てます。**未ログインでも立てられます** (匿名投稿)。
+ *
+ * ただし `iconImageId` を付ける場合はログインが要ります
+ * (画像の投稿にログインが要るため。401)。
+ */
+export function createThread(body: CreateThreadRequest): Promise<Thread> {
+  return request<Thread>('/threads', jsonBody('POST', body));
+}
+
+/**
+ * 自分のスレッドを削除します。論理削除です。
+ *
+ * **匿名で立てたスレッドは消せません** (403)。`author_id` が NULL で、
+ * 本人であることを示せないためです (ADR 0005 決定 2)。
+ */
+export function deleteThread(id: number): Promise<void> {
+  return request<void>(`/threads/${id}`, { method: 'DELETE' });
+}
+
+/**
+ * コメント一覧を取得します。**新しい順**です。
+ *
+ * `cursor` は不透明トークンなので、解釈も生成もせず往復させます (ADR 0018)。
+ */
+export function listComments(
+  threadId: number,
+  params: { cursor?: string; size?: number } = {},
+): Promise<CommentList> {
+  const q = new URLSearchParams();
+  if (params.cursor) q.set('cursor', params.cursor);
+  if (params.size) q.set('size', String(params.size));
+  const search = q.size === 0 ? '' : `?${q.toString()}`;
+
+  return request<CommentList>(`/threads/${threadId}/comments${search}`);
+}
+
+/**
+ * コメントを投稿します。
+ *
+ * 【`idempotencyKey` は再送のあいだ変えないでください】
+ * 二重投稿を防ぐのはボタンの無効化ではなく**このキー**です
+ * (ADR 0015 決定 1)。「タイムアウトしたが実は成功していた」場合、
+ * 画面には失敗と出ますが、サーバには 1 件入っています。
+ * 同じキーで送り直せば前回の結果がそのまま返り、2 件目は作られません。
+ *
+ * **内容を変えたら新しいキーにしてください。** 同じキーで別の本文を送ると
+ * 422 になります —— 黙って前回の結果を返すと、クライアントのバグが
+ * 見えなくなるためです。
+ *
+ * **未ログインでは無視されます** (同 決定 4)。匿名にはキーの名前空間を
+ * 分ける手段が無く、IP で分けると NAT の背後で他人と衝突します。
+ */
+export function createComment(
+  threadId: number,
+  body: CreateCommentRequest,
+  idempotencyKey?: string,
+): Promise<Comment> {
+  // **`jsonBody` を展開しません。** `RequestInit['headers']` は
+  // `Headers` や配列も取りうる型なので、展開すると型が合いません。
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (idempotencyKey !== undefined && idempotencyKey !== '') {
+    headers['Idempotency-Key'] = idempotencyKey;
+  }
+
+  return request<Comment>(`/threads/${threadId}/comments`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * 自分のコメントを削除します。
+ *
+ * **`threadId` が要ります。** `comments` は `thread_id` による
+ * HASH パーティションで主キーが `(thread_id, id)` なので、
+ * コメント ID だけでは 8 パーティションすべてを走査します。
+ *
+ * 削除しても `seq` (レス番号) は再利用されません ——
+ * 再利用すると過去の `>>5` が別の投稿を指すようになります
+ * (ADR 0019 決定 5)。
+ */
+export function deleteComment(threadId: number, commentId: number): Promise<void> {
+  return request<void>(`/threads/${threadId}/comments/${commentId}`, { method: 'DELETE' });
+}
+
+/**
+ * 投稿を通報します。**ログインが必要です** (ADR 0011 決定 4)。
+ *
+ * 投稿は匿名を許すのに通報は許さないのは、投稿が表現であるのに対し
+ * 通報は他人への申し立てだからです。匿名で受け付けると、
+ * 通報そのものがキューを埋める荒らしの手段になります。
+ *
+ * **同じ対象への 2 回目はエラーになりません** —— 最初の通報が
+ * 200 でそのまま返ります。返り値の `status` が `open` でなければ、
+ * その通報は既に処理済みです (キューには積まれていません)。
+ */
+export function createReport(body: CreateReportRequest): Promise<Report> {
+  return request<Report>('/reports', jsonBody('POST', body));
 }
 
 /**

@@ -19,8 +19,7 @@
 import { useState } from 'react';
 
 import { ApiError, createModerationAction } from '../lib/api';
-import { card, colors, dangerButton, input, label } from '../lib/ui';
-import { describe } from './AdminGate';
+import { describe } from '../lib/errors';
 
 // 画像の URL は `.../{uuid}.jpg` の形なので、貼り付けた URL から拾えます。
 // **UUID をそのまま入れてもよい**ようにしています ——
@@ -67,49 +66,55 @@ export function ImageDeleteForm() {
   }
 
   return (
-    <div style={card}>
-      <label style={label} htmlFor="image-id">
-        画像の URL または ID
-      </label>
-      <input
-        id="image-id"
-        style={{ ...input, width: '100%', maxWidth: '40rem' }}
-        value={raw}
-        placeholder="https://.../018f2c00-0000-7000-8000-000000000001.jpg"
-        onChange={(e) => setRaw(e.target.value)}
-      />
-      {raw !== '' && imageID === null && (
-        <p style={{ color: colors.danger, margin: '0.3rem 0' }}>
-          UUID を読み取れません。画像の URL をそのまま貼っても構いません。
-        </p>
-      )}
-      {imageID !== null && (
-        <p style={{ color: colors.dim, margin: '0.3rem 0' }}>対象: {imageID}</p>
-      )}
+    <div className="card">
+      <div className="field">
+        <label className="field__label" htmlFor="image-id">
+          画像の URL または ID
+        </label>
+        <input
+          id="image-id"
+          className="input"
+          value={raw}
+          placeholder="https://.../018f2c00-0000-7000-8000-000000000001.jpg"
+          onChange={(e) => setRaw(e.target.value)}
+        />
+        {raw !== '' && imageID === null && (
+          <p className="alert alert--error" role="alert">
+            UUID を読み取れません。画像の URL をそのまま貼っても構いません。
+          </p>
+        )}
+        {imageID !== null && <span className="field__hint">対象: {imageID}</span>}
+      </div>
 
-      <label style={label} htmlFor="image-reason">
-        削除の理由 (任意・監査記録に残る)
-      </label>
-      <input
-        id="image-reason"
-        style={{ ...input, width: '100%', maxWidth: '40rem' }}
-        value={reason}
-        maxLength={500}
-        onChange={(e) => setReason(e.target.value)}
-      />
+      <div className="field">
+        <label className="field__label" htmlFor="image-reason">
+          削除の理由 (任意・監査記録に残る)
+        </label>
+        <input
+          id="image-reason"
+          className="input"
+          value={reason}
+          maxLength={500}
+          onChange={(e) => setReason(e.target.value)}
+        />
+      </div>
 
-      <p style={{ margin: '0.8rem 0 0' }}>
+      <div className="actions">
         <button
           type="button"
-          style={dangerButton}
+          className="btn btn--danger"
           disabled={busy || imageID === null}
           onClick={() => void onSubmit()}
         >
           画像を削除
         </button>
-      </p>
+      </div>
 
-      {result !== null && <p style={{ color: colors.warn, margin: '0.5rem 0 0' }}>{result}</p>}
+      {result !== null && (
+        <p className="alert alert--warn" role="status">
+          {result}
+        </p>
+      )}
     </div>
   );
 }

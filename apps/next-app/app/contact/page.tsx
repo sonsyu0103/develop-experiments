@@ -1,8 +1,8 @@
-import Link from 'next/link';
-
-import { colors, heading, page } from '../lib/ui';
+import type { Metadata } from 'next';
 
 import { ContactForm } from './ContactForm';
+
+export const metadata: Metadata = { title: 'お問い合わせ' };
 
 // 問い合わせ画面 (docs/adr/0008-contact-and-mail.md)。
 //
@@ -12,26 +12,20 @@ import { ContactForm } from './ContactForm';
 // 静的なまま配れるのは、中身が空だからです。
 export default function ContactPage() {
   return (
-    <div style={page}>
-      <h1 style={heading}>お問い合わせ</h1>
-
-      <p>
-        <Link href="/" style={{ color: colors.dim }}>
-          ← スレッド一覧へ戻る
-        </Link>
-      </p>
+    <>
+      <h1>お問い合わせ</h1>
 
       {/*
         **ログインを求めません** (ADR 0008 決定 4)。
         「ログインできない」という問い合わせが来る以上、
         必須にすると詰みます。ログイン済みなら初期値が埋まるだけです。
       */}
-      <p style={{ color: colors.dim }}>
+      <p className="muted measure">
         ログインしていなくても送れます。ログイン中の場合は、お名前と
         メールアドレスが初期値として埋まります。
       </p>
 
       <ContactForm />
-    </div>
+    </>
   );
 }

@@ -7,9 +7,9 @@
 import { useState } from 'react';
 
 import { AdminGate } from '../AdminGate';
-import { describe } from '../AdminGate';
 import { ApiError, changeUserRole, type Me, type Role } from '../../lib/api';
-import { button, card, colors, formatTime, input, label } from '../../lib/ui';
+import { describe } from '../../lib/errors';
+import { formatTime } from '../../lib/ui';
 
 const roles: Role[] = ['user', 'moderator', 'admin'];
 
@@ -57,67 +57,77 @@ function RoleForm({ me }: { me: Me }) {
   }
 
   return (
-    <div style={card}>
-      <p style={{ color: colors.dim, marginTop: 0 }}>
+    <div className="card">
+      <p className="muted">
         受け付けるのは公開 ID (UUID) だけです。内部 ID は API に渡せません。
       </p>
 
-      <label style={label} htmlFor="public-id">
-        対象の公開 ID
-      </label>
-      <input
-        id="public-id"
-        style={{ ...input, width: '100%', maxWidth: '32rem' }}
-        value={publicID}
-        placeholder="0192f0a0-0000-7000-8000-000000000001"
-        onChange={(e) => setPublicID(e.target.value)}
-      />
-      {isSelf && (
-        <p style={{ color: colors.danger, margin: '0.3rem 0' }}>
-          自分のロールは変更できません。最後の admin が自分を降格させると、
-          誰もロールを配れなくなります。
-        </p>
-      )}
+      <div className="field">
+        <label className="field__label" htmlFor="public-id">
+          対象の公開 ID
+        </label>
+        <input
+          id="public-id"
+          className="input"
+          value={publicID}
+          placeholder="0192f0a0-0000-7000-8000-000000000001"
+          onChange={(e) => setPublicID(e.target.value)}
+        />
+        {isSelf && (
+          <p className="alert alert--error" role="alert">
+            自分のロールは変更できません。最後の admin が自分を降格させると、
+            誰もロールを配れなくなります。
+          </p>
+        )}
+      </div>
 
-      <label style={label} htmlFor="role">
-        新しいロール
-      </label>
-      <select
-        id="role"
-        style={input}
-        value={role}
-        onChange={(e) => setRole(e.target.value as Role)}
-      >
-        {roles.map((r) => (
-          <option key={r} value={r}>
-            {r}
-          </option>
-        ))}
-      </select>
+      <div className="field">
+        <label className="field__label" htmlFor="role">
+          新しいロール
+        </label>
+        <select
+          id="role"
+          className="select"
+          value={role}
+          onChange={(e) => setRole(e.target.value as Role)}
+        >
+          {roles.map((r) => (
+            <option key={r} value={r}>
+              {r}
+            </option>
+          ))}
+        </select>
+      </div>
 
-      <label style={label} htmlFor="role-reason">
-        変更の理由 (任意・監査記録に残る)
-      </label>
-      <input
-        id="role-reason"
-        style={{ ...input, width: '100%', maxWidth: '32rem' }}
-        value={reason}
-        maxLength={500}
-        onChange={(e) => setReason(e.target.value)}
-      />
+      <div className="field">
+        <label className="field__label" htmlFor="role-reason">
+          変更の理由 (任意・監査記録に残る)
+        </label>
+        <input
+          id="role-reason"
+          className="input"
+          value={reason}
+          maxLength={500}
+          onChange={(e) => setReason(e.target.value)}
+        />
+      </div>
 
-      <p style={{ margin: '0.8rem 0 0' }}>
+      <div className="actions">
         <button
           type="button"
-          style={button}
+          className="btn"
           disabled={busy || publicID.trim() === '' || isSelf}
           onClick={() => void onSubmit()}
         >
           変更する
         </button>
-      </p>
+      </div>
 
-      {result !== null && <p style={{ color: colors.warn, margin: '0.5rem 0 0' }}>{result}</p>}
+      {result !== null && (
+        <p className="alert alert--warn" role="status">
+          {result}
+        </p>
+      )}
     </div>
   );
 }
