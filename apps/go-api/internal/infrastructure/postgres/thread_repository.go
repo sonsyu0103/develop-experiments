@@ -2,8 +2,10 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"develop-experiments/apps/go-api/internal/infrastructure/postgres/sqlcgen"
@@ -241,7 +243,7 @@ func (r *ThreadRepository) SoftDeleteOwn(ctx context.Context, id, actorID int64)
 
 // ListThreadsOnly はコメント数を含めずにスレッドだけを取得します (ベンチマーク用)。
 func (r *ThreadRepository) ListThreadsOnly(ctx context.Context, page pagination.Page) ([]model.Thread, error) {
-	rows, err := r.q.ListThreadIDs(ctx, sqlcgen.ListThreadIDsParams{
+	rows, err := r.q.ListThreadsOnly(ctx, sqlcgen.ListThreadsOnlyParams{
 		CursorID: page.CursorID(),
 		PageSize: page.Size,
 	})
@@ -251,12 +253,34 @@ func (r *ThreadRepository) ListThreadsOnly(ctx context.Context, page pagination.
 
 	threads := make([]model.Thread, 0, len(rows))
 	for _, row := range rows {
-		// ベンチマーク専用の経路。投稿者は引かないので nil のままにする。
-		// 閲覧数も引かない —— N+1 の比較に要らず、
-		// **列を増やすほど「単一クエリ側だけが重い」比較になる**ため。
-		threads = append(threads, *model.Reconstruct(row.ID, row.Title, nil, nil, row.CreatedAt, 0))
+		// ベンチマーク専用の経路。投稿者はここでは引かず、
+		// FindThreadAuthor が 1 件ずつ解決する (それが N+1 の再現)。
+		//
+		// **閲覧数は引く。** 以前はここも 0 固定にしていたが、
+		// 単一クエリ版は view_count まで返すため、揃えないと
+		// 「N+1 側だけが読む列が少ない」比較になっていた。
+		threads = append(threads,
+			*model.Reconstruct(row.ID, row.Title, nil, nil, row.CreatedAt, row.ViewCount))
 	}
 	return threads, nil
+}
+
+// FindThreadAuthor は 1 スレッド分の投稿者を解決します (ベンチマーク用)。
+//
+// **匿名投稿では (nil, nil) を返します。** JOIN が空振りして 0 行になるのは
+// 正常な結果であり、apperr.ErrNotFound に翻訳すると
+// 「投稿者がいない」と「スレッドが無い」を呼び出し側が区別できなくなります。
+func (r *ThreadRepository) FindThreadAuthor(
+	ctx context.Context, threadID int64,
+) (*model.Author, error) {
+	row, err := r.q.FindThreadAuthor(ctx, threadID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, translateError("ThreadRepository.FindThreadAuthor", err)
+	}
+	return toThreadAuthor(&row.PublicID, &row.DisplayName, row.AvatarUrl, row.DeletedAt), nil
 }
 
 // CountComments は 1 スレッド分のコメント数を数えます (ベンチマーク用)。

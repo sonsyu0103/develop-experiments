@@ -402,6 +402,95 @@ query-probe: ## 一覧・検索・ページ送りのクエリを実測する (Ph
 	SQL_EXEC="docker compose exec -T postgres psql -U app -d bbs -X -q" \
 	python3 .github/scripts/query-probe.py
 
+# ベンチマークから見た DB の接続先。ホストから直接繋ぐ
+# (probe と違って psql 越しではなく、Go が往復するところまで測るため)。
+BENCH_DATABASE_URL ?= postgres://app:password@localhost:5432/bbs?sslmode=disable
+BENCH_MAX_CONNS ?= 16
+
+.PHONY: nplus1-probe
+nplus1-probe: ## N+1 と単一クエリを実 DB で比較計測する (Phase 4 / ADR 0014)
+	# **query-probe では測れないものを測る。** あちらは EXPLAIN ANALYZE なので
+	# サーバ側の実行時間しか見えず、N+1 のコストの本体である
+	# **往復回数とプール待ち**が数字に出ない。ここは Go から実際に往復させる。
+	#
+	# **先に make bench-dataset が要る。** 開発シードの 5 スレッドでは
+	# 1 ページぶんの往復すら発生しない。
+	#
+	# 先に「2 つの実装が同じ結果を返すこと」を検査してから測る ——
+	# 片方が投稿者を解決していなければ、速いのは当たり前で
+	# 意味のある数字にならない (ADR 0014)。
+	#
+	# **CI には載せない** (concurrency-probe / viewcount-probe と同じ理由)。
+	cd $(GO_API_DIR) && DATABASE_TEST_URL="$(BENCH_DATABASE_URL)" \
+		go test ./internal/thread/usecase/ -run TestNPlusOneMatchesSingleQuery -v -count=1
+	cd $(GO_API_DIR) && DATABASE_TEST_URL="$(BENCH_DATABASE_URL)" \
+		BENCH_MAX_CONNS=$(BENCH_MAX_CONNS) \
+		go test ./internal/thread/usecase/ -run='^$$' \
+			-bench='BenchmarkThreadList' -benchmem -benchtime=3s -count=1
+
+# 段と変種。既定は 20 万 → 200 万 → 2,000 万行、分割なしと HASH 8。
+PROBE_SCALES ?= 200000,2000000,20000000
+PROBE_PARTITIONS ?= 0,8
+
+.PHONY: partition-probe
+partition-probe: ## comments の 8 分割がどの規模から効き始めるかを実測する (Phase 4)
+	# **本番の comments は触らない。** bench_part スキーマに
+	# 同じ列・同じ索引の表を「分割なし」と「HASH 8 分割」で作り、
+	# 同一データを入れて同じクエリを流す。
+	#
+	# **数十分かかる。** 2,000 万行を 2 変種ぶん投入するため。
+	# 途中経過を出しながら進む。空き容量が足りない段は測らずに報告して止まる。
+	#
+	# **CI には載せない** (他の probe と同じ理由)。
+	SQL_EXEC="docker compose exec -T postgres psql -U app -d bbs -X -q" \
+	PROBE_SCALES=$(PROBE_SCALES) \
+	PROBE_PARTITIONS=$(PROBE_PARTITIONS) \
+	python3 -u .github/scripts/partition-probe.py
+
+# 負荷の段。HTTP は並列数、DB は接続数。
+PROBE_LEVELS ?= 1,2,4,8,16,32,64,128
+PROBE_DB_LEVELS ?= 1,2,4,8,16,32,64
+PROBE_DURATION ?= 5s
+# 接続プール上限の段。**この段だけコンテナを作り直す**ので時間がかかる。
+PROBE_POOL_LEVELS ?= 4,8,12,16,20,32,64
+PROBE_POOL_TEST_LEVELS ?= 16,64
+
+.PHONY: scale-probe
+scale-probe: ## 読み取りのスケール限界を実測する (Phase 4 / ADR 0009)
+	# **負荷生成側の天井を先に測る。** compose の単一マシンでは
+	# 生成側が先に飽和しうるので、校正なしの RPS は解釈できない。
+	# /healthz (DB を触らない) の天井と /threads を比べて、
+	# **どちら側が飽和したか**を数字で出す。
+	#
+	# 負荷生成は go-api コンテナの中で走らせる ——
+	# ホストから叩くと Docker のポート転送が先に律速になる。
+	#
+	# **先に make bench-dataset が要る。**
+	# **CI には載せない** (他の probe と同じ理由)。
+	@$(MAKE) --no-print-directory up
+	@echo "API の起動を待っています..."
+	@for i in $$(seq 1 30); do \
+		curl -sf -o /dev/null http://localhost:8080/healthz && break || sleep 2; \
+	done
+	# **待つだけでは失敗を検出できない。** ループを抜けても起動していない場合、
+	# 先へ進んで Python 側の無関係なエラーで落ちるので原因が読めない。
+	@curl -sf -o /dev/null http://localhost:8080/healthz || { \
+		echo "API が起動しませんでした。docker compose logs go-api を見てください。"; \
+		exit 1; \
+	}
+	PROBE_LEVELS=$(PROBE_LEVELS) \
+	PROBE_DB_LEVELS=$(PROBE_DB_LEVELS) \
+	PROBE_DURATION=$(PROBE_DURATION) \
+	PROBE_POOL_LEVELS=$(PROBE_POOL_LEVELS) \
+	PROBE_POOL_TEST_LEVELS=$(PROBE_POOL_TEST_LEVELS) \
+	python3 -u .github/scripts/scale-probe.py
+
+.PHONY: partition-probe-clean
+partition-probe-clean: ## partition-probe が作った表を消す
+	# **数 GB 残る。** 測り終わったら流すこと。
+	docker compose exec -T postgres psql -U app -d bbs -X -q \
+		-c "DROP SCHEMA IF EXISTS bench_part CASCADE;"
+
 .PHONY: verify-generated
 verify-generated: generate ## 生成物がコミット済みの内容と一致するか検査する
 	@git diff --exit-code -- \

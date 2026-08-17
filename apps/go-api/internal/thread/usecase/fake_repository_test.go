@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	"develop-experiments/apps/go-api/internal/apperr"
 	"develop-experiments/apps/go-api/internal/pagination"
 	"develop-experiments/apps/go-api/internal/thread/domain/model"
@@ -31,6 +33,11 @@ type fakeRepo struct {
 	// countDelay は CountComments 1 回あたりの疑似レイテンシです。
 	// 並列度の検証に使います。
 	countDelay time.Duration
+
+	// authorCalls は FindThreadAuthor の呼び出し回数です。
+	// **CountComments とは別に数えます** —— N+1 版は 1 スレッドあたり
+	// 2 往復するので、片方だけ数えると往復回数を半分に見誤ります。
+	authorCalls atomic.Int64
 
 	// 以下は観測用。
 	// listCalls は ListSummaries の呼び出し回数です。
@@ -260,6 +267,28 @@ func (f *fakeRepo) CountComments(ctx context.Context, threadID int64) (int64, er
 	}
 
 	return f.counts[threadID], nil
+}
+
+// FindThreadAuthor は投稿者を 1 件ずつ返します (ベンチマーク用の N+1 経路)。
+//
+// **偶数 ID にだけ投稿者を付けます。** 全件に付けると匿名の分岐
+// (行が無い = nil を返す) が一度も通らず、
+// 「投稿者が nil のスレッドで落ちる」実装ミスを検査できません。
+func (f *fakeRepo) FindThreadAuthor(ctx context.Context, threadID int64) (*model.Author, error) {
+	f.authorCalls.Add(1)
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.countErr != nil && f.countErrForID != nil && *f.countErrForID == threadID {
+		return nil, f.countErr
+	}
+	if threadID%2 != 0 {
+		return nil, nil
+	}
+
+	id := uuid.NewSHA1(uuid.Nil, []byte(fmt.Sprintf("author-%d", threadID)))
+	return model.NewAuthor(id, fmt.Sprintf("投稿者 %d", threadID), nil, nil), nil
 }
 
 // newFakeRepoWithTitles は指定したタイトルのスレッドを持つフェイクを作ります。

@@ -115,6 +115,44 @@ func (q *Queries) CreateThread(ctx context.Context, arg CreateThreadParams) (Cre
 	return i, err
 }
 
+const findThreadAuthor = `-- name: FindThreadAuthor :one
+SELECT u.public_id, u.display_name, u.avatar_url, u.deleted_at
+FROM threads t
+JOIN users u ON u.id = t.author_id
+WHERE t.id = $1
+`
+
+type FindThreadAuthorRow struct {
+	PublicID    uuid.UUID
+	DisplayName string
+	AvatarUrl   *string
+	DeletedAt   *time.Time
+}
+
+// 1 スレッド分の投稿者を引く (ADR 0014 の選択肢 C「素朴に 1 件ずつ引く」)。
+//
+// **threads を経由して引く。** users.id を直接受け取る形にすると、
+// 内部 ID がユースケース層まで出てくる。ADR 0014 は
+// 「内部 ID は運ばない」と決めているので、ベンチマーク用の経路でも破らない。
+// 往復回数は変わらないため、測りたいものは変わらない。
+//
+// **匿名投稿では 0 行になる** (JOIN が空振りする)。
+// 呼び出し側は「行が無い = 匿名」として扱う。
+//
+// 単一クエリ版の LEFT JOIN users と同じ列を返す。
+// 退会済みも返し、表示の差し替えはドメイン (model.NewAuthor) が行う。
+func (q *Queries) FindThreadAuthor(ctx context.Context, threadID int64) (FindThreadAuthorRow, error) {
+	row := q.db.QueryRow(ctx, findThreadAuthor, threadID)
+	var i FindThreadAuthorRow
+	err := row.Scan(
+		&i.PublicID,
+		&i.DisplayName,
+		&i.AvatarUrl,
+		&i.DeletedAt,
+	)
+	return i, err
+}
+
 const getThreadWithCommentCount = `-- name: GetThreadWithCommentCount :one
 SELECT
     t.id,
@@ -369,9 +407,9 @@ func (q *Queries) ListPopularThreadsWithCommentCount(ctx context.Context, arg Li
 	return items, nil
 }
 
-const listThreadIDs = `-- name: ListThreadIDs :many
+const listThreadsOnly = `-- name: ListThreadsOnly :many
 
-SELECT id, title, created_at
+SELECT id, title, created_at, view_count
 FROM threads
 WHERE deleted_at IS NULL
   AND ($1::bigint IS NULL OR id < $1::bigint)
@@ -379,31 +417,52 @@ ORDER BY id DESC
 LIMIT $2
 `
 
-type ListThreadIDsParams struct {
+type ListThreadsOnlyParams struct {
 	CursorID *int64
 	PageSize int32
 }
 
-type ListThreadIDsRow struct {
+type ListThreadsOnlyRow struct {
 	ID        int64
 	Title     string
 	CreatedAt time.Time
+	ViewCount int64
 }
 
 // -----------------------------------------------------------------------------
-// 以下 2 つは Phase 4 のベンチマーク専用 (N+1 実装の再現用)。
+// 以下 3 つは Phase 4 のベンチマーク専用 (N+1 実装の再現用)。
 // 本番経路では使わない。
+//
+// 【この 3 つで「同じ仕事」を組み立てられること】
+// 単一クエリ版 (ListThreadsWithCommentCount) は 1 往復で
+// 「スレッド + コメント数 + 投稿者」を返す。N+1 版が返す情報が
+// それより少ないと、**同じ仕事をしていない 2 つを比べる**ことになる
+// (ADR 0014「測定の前提が 1 つ崩れている」)。
+// 3 つを合わせて単一クエリ版と同じ列が揃うようにしてある。
 // -----------------------------------------------------------------------------
-func (q *Queries) ListThreadIDs(ctx context.Context, arg ListThreadIDsParams) ([]ListThreadIDsRow, error) {
-	rows, err := q.db.Query(ctx, listThreadIDs, arg.CursorID, arg.PageSize)
+// コメント数も投稿者も引かずにスレッドだけを取得する。
+//
+// **view_count まで引く。** 単一クエリ版の内側 CTE と同じ列を読む形にして、
+// ヒープから取り出す幅を揃える。1 列足りないだけで
+// 「N+1 側のほうが読む量が少ない」比較になる。
+//
+// **旧称は ListThreadIDs。** id しか引いていなかった頃の名前が
+// 列を足したあとも残っていた。リポジトリ側のメソッド名 (ListThreadsOnly) に揃える。
+func (q *Queries) ListThreadsOnly(ctx context.Context, arg ListThreadsOnlyParams) ([]ListThreadsOnlyRow, error) {
+	rows, err := q.db.Query(ctx, listThreadsOnly, arg.CursorID, arg.PageSize)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []ListThreadIDsRow{}
+	items := []ListThreadsOnlyRow{}
 	for rows.Next() {
-		var i ListThreadIDsRow
-		if err := rows.Scan(&i.ID, &i.Title, &i.CreatedAt); err != nil {
+		var i ListThreadsOnlyRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.CreatedAt,
+			&i.ViewCount,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
