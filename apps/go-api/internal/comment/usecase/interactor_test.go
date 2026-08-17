@@ -37,6 +37,14 @@ type fakeCommentRepo struct {
 	createCalls int
 	// gotRequest は永続化層まで届いた冪等キーの情報。
 	gotRequest idempotency.Request
+
+	// myComments は ListByAuthor が返す「自分のコメント」です。
+	// **comments とは別に持ちます** —— model.MyComment は投稿者を持たず
+	// スレッドの情報を持つ、別の形だからです。
+	myComments []model.MyComment
+	// gotAuthorID は ListByAuthor に渡された投稿者 ID です。
+	// **他人の ID で呼ばれていないこと**を見るために記録します。
+	gotAuthorID int64
 }
 
 var _ repository.CommentRepository = (*fakeCommentRepo)(nil)
@@ -72,6 +80,36 @@ func (f *fakeCommentRepo) ListByThreadID(
 		if c.ThreadID != threadID {
 			continue
 		}
+		if cursorID := page.CursorID(); cursorID != nil && c.ID >= *cursorID {
+			continue
+		}
+		out = append(out, c)
+		if int32(len(out)) == page.Size {
+			break
+		}
+	}
+	return out, nil
+}
+
+// ListByAuthor は投稿者で絞ったコメントを返します (GET /me/comments)。
+//
+// **絞り込みそのものは再現しません。** model.MyComment は投稿者を持たない
+// ので、フェイク側で「誰のものか」を持たせようがありません。
+// 代わりに渡された投稿者 ID を記録し、用意した myComments を
+// カーソルと件数だけ適用して返します ——
+// 検証したいのはユースケース層のページ送りと詰め替えで、
+// 投稿者による絞り込みが効くことは SQL 側の責務です。
+func (f *fakeCommentRepo) ListByAuthor(
+	_ context.Context, authorID int64, page pagination.Page,
+) ([]model.MyComment, error) {
+	f.gotAuthorID = authorID
+	f.gotPage = page
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+
+	out := make([]model.MyComment, 0, len(f.myComments))
+	for _, c := range f.myComments {
 		if cursorID := page.CursorID(); cursorID != nil && c.ID >= *cursorID {
 			continue
 		}
@@ -146,11 +184,15 @@ func (f *fakeCommentRepo) SoftDeleteOwn(_ context.Context, threadID, id, actorID
 type fakeThreadChecker struct {
 	exists bool
 	err    error
+	// calls は Exists の呼び出し回数です。
+	// **「呼ばれないこと」を見る検査**があるので数えます (FetchMyComments)。
+	calls int
 }
 
 var _ repository.ThreadExistenceChecker = (*fakeThreadChecker)(nil)
 
 func (f *fakeThreadChecker) Exists(context.Context, int64) (bool, error) {
+	f.calls++
 	return f.exists, f.err
 }
 
@@ -682,5 +724,150 @@ func TestDeleteOwnComment_PassesKeys(t *testing.T) {
 	}
 	if len(repo.deleteCalls) != 1 || repo.deleteCalls[0] != [3]int64{1, 10, 42} {
 		t.Errorf("渡された値 = %v, want [{1 10 42}]", repo.deleteCalls)
+	}
+}
+
+// マイページの「自分のコメント」(GET /me/comments) の検査。
+//
+// **スレッドの存在確認をしないこと**がスレッド内一覧との一番の違いです。
+// 絞り込みの軸が利用者なので、0 件は「まだ書いていない」という正しい答えになります。
+
+// newMyComments は id が大きい順の MyComment を n 件作ります。
+func newMyComments(n int) []model.MyComment {
+	out := make([]model.MyComment, 0, n)
+	for id := int64(n); id >= 1; id-- {
+		out = append(out, model.MyComment{
+			ID: id, ThreadID: id, ThreadTitle: fmt.Sprintf("スレッド %d", id),
+			Seq: int32(id), Body: fmt.Sprintf("本文 %d", id),
+			CreatedAt: time.Unix(id, 0).UTC(),
+		})
+	}
+	return out
+}
+
+// TestFetchMyComments_PassesAuthorAndMapsThread は、投稿者 ID が永続化層まで届き、
+// スレッドの情報が DTO に載ることを確かめます。
+func TestFetchMyComments_PassesAuthorAndMapsThread(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	repo.myComments = []model.MyComment{{
+		ID: 10, ThreadID: 3, ThreadTitle: "眠いスレ", ThreadDeleted: true,
+		Seq: 5, Body: "ふぁ〜", CreatedAt: time.Unix(10, 0).UTC(),
+	}}
+	uc := NewCommentInteractor(repo, &fakeThreadChecker{}, nil)
+
+	got, err := uc.FetchMyComments(context.Background(), 42, mustPage(t, nil, 10))
+	if err != nil {
+		t.Fatalf("FetchMyComments が失敗した: %v", err)
+	}
+
+	if repo.gotAuthorID != 42 {
+		t.Errorf("永続化層に届いた投稿者 ID = %d, want 42", repo.gotAuthorID)
+	}
+	if len(got.Comments) != 1 {
+		t.Fatalf("件数 = %d, want 1", len(got.Comments))
+	}
+
+	c := got.Comments[0]
+	if c.ID != 10 || c.ThreadID != 3 || c.Seq != 5 {
+		t.Errorf("識別子が詰め替えられていない: %+v", c)
+	}
+	// **一覧として成立させるための 2 項目。**
+	if c.ThreadTitle != "眠いスレ" {
+		t.Errorf("ThreadTitle = %q, want 眠いスレ", c.ThreadTitle)
+	}
+	if !c.ThreadDeleted {
+		t.Error("ThreadDeleted = false, want true (削除済みでも落とさず印をつける)")
+	}
+}
+
+// TestFetchMyComments_DoesNotCheckThreadExistence は、
+// **親スレッドの存在確認を行わない**ことを確かめます。
+//
+// FetchComments と取り違えて Exists を挟むと、
+// スレッド ID を持たないこの経路では確認しようがなく、
+// 実装が壊れるか無意味な問い合わせが増えます。
+func TestFetchMyComments_DoesNotCheckThreadExistence(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	repo.myComments = newMyComments(2)
+	checker := &fakeThreadChecker{}
+	uc := NewCommentInteractor(repo, checker, nil)
+
+	if _, err := uc.FetchMyComments(context.Background(), 1, mustPage(t, nil, 10)); err != nil {
+		t.Fatalf("FetchMyComments が失敗した: %v", err)
+	}
+
+	if checker.calls != 0 {
+		t.Errorf("スレッドの存在確認が %d 回呼ばれた, want 0", checker.calls)
+	}
+}
+
+// TestFetchMyComments_Paginates はカーソルが効くことを確かめます。
+func TestFetchMyComments_Paginates(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	repo.myComments = newMyComments(5)
+	uc := NewCommentInteractor(repo, &fakeThreadChecker{}, nil)
+	ctx := context.Background()
+
+	first, err := uc.FetchMyComments(ctx, 1, mustPage(t, nil, 3))
+	if err != nil {
+		t.Fatalf("1 ページ目が失敗した: %v", err)
+	}
+	if len(first.Comments) != 3 || first.Comments[0].ID != 5 {
+		t.Fatalf("1 ページ目 = %+v, want id 5,4,3", first.Comments)
+	}
+	if first.NextCursor == nil {
+		t.Fatal("NextCursor = nil, want トークン (まだ続きがある)")
+	}
+
+	next, err := pagination.DecodeCursor(*first.NextCursor)
+	if err != nil {
+		t.Fatalf("NextCursor が復号できない: %v", err)
+	}
+	second, err := uc.FetchMyComments(ctx, 1, mustPage(t, &next.ID, 3))
+	if err != nil {
+		t.Fatalf("2 ページ目が失敗した: %v", err)
+	}
+	if len(second.Comments) != 2 || second.Comments[0].ID != 2 {
+		t.Fatalf("2 ページ目 = %+v, want id 2,1", second.Comments)
+	}
+	// 返しきったので次は無い。
+	if second.NextCursor != nil {
+		t.Errorf("NextCursor = %v, want nil", *second.NextCursor)
+	}
+}
+
+// TestFetchMyComments_EmptyIsNotNil は 0 件が nil スライスにならないことを確かめます。
+func TestFetchMyComments_EmptyIsNotNil(t *testing.T) {
+	t.Parallel()
+
+	uc := NewCommentInteractor(newFakeCommentRepo(0), &fakeThreadChecker{}, nil)
+
+	got, err := uc.FetchMyComments(context.Background(), 1, mustPage(t, nil, 10))
+	if err != nil {
+		t.Fatalf("FetchMyComments が失敗した: %v", err)
+	}
+	if got.Comments == nil {
+		t.Error("Comments = nil, want 空スライス (JSON で null にしないため)")
+	}
+}
+
+// TestFetchMyComments_PropagatesRepositoryError はエラーがそのまま伝わることを確かめます。
+func TestFetchMyComments_PropagatesRepositoryError(t *testing.T) {
+	t.Parallel()
+
+	sentinel := errors.New("DB がダウンしています")
+	repo := newFakeCommentRepo(0)
+	repo.listErr = sentinel
+	uc := NewCommentInteractor(repo, &fakeThreadChecker{}, nil)
+
+	_, err := uc.FetchMyComments(context.Background(), 1, mustPage(t, nil, 10))
+	if !errors.Is(err, sentinel) {
+		t.Errorf("err = %v, want %v", err, sentinel)
 	}
 }

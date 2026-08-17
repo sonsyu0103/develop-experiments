@@ -26,6 +26,24 @@ type CommentRepository interface {
 	// thread_id を等値で指定するため、HASH パーティションの pruning が効きます。
 	ListByThreadID(ctx context.Context, threadID int64, page pagination.Page) ([]model.Comment, error)
 
+	// ListByAuthor は 1 人が書いたコメントを新しい順に取得します
+	// (GET /me/comments)。
+	//
+	// **このメソッドだけは HASH パーティションの pruning が効きません。**
+	// 分割キーは thread_id で、author_id には含まれないため、
+	// 8 区画すべてに索引スキャンが走ります (ADR 0016)。
+	// 実測では ListByThreadID の 9.6 倍 (1.53 ms / 0.16 ms) ですが、
+	// 絶対値としては一覧に耐えるため、索引は足していません
+	// (db/query/comments.sql に数字を残してあります)。
+	//
+	// **匿名で書かれたコメントは返りません。** author_id が NULL の行は
+	// 等値条件で落ちます。投稿時にログインしていなければ、
+	// 後から本人だと突き合わせる手段がありません (ADR 0005 決定 2)。
+	//
+	// 削除済みのスレッドへのコメントも返します。判別は
+	// model.MyComment.ThreadDeleted で行ってください。
+	ListByAuthor(ctx context.Context, authorID int64, page pagination.Page) ([]model.MyComment, error)
+
 	// Create はコメントを保存し、採番済みの値を返します。
 	// 親スレッドが存在しない、または論理削除済みの場合は
 	// apperr.ErrNotFound を返します (判定は SQL 側で完結します)。

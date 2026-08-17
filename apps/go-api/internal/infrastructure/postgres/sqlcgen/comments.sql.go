@@ -446,6 +446,157 @@ func (q *Queries) ListCommentsByThreadID(ctx context.Context, arg ListCommentsBy
 	return items, nil
 }
 
+const listMyComments = `-- name: ListMyComments :many
+WITH page AS (
+    SELECT id, thread_id, seq, body, created_at, image_id
+    FROM comments
+    WHERE comments.author_id = $1
+      AND deleted_at IS NULL
+      AND ($2::bigint IS NULL OR id < $2::bigint)
+    ORDER BY id DESC
+    LIMIT $3
+)
+SELECT
+    p.id,
+    p.thread_id,
+    p.seq,
+    p.body,
+    p.created_at,
+    t.title AS thread_title,
+    (t.deleted_at IS NOT NULL)::boolean AS thread_deleted,
+    i.id         AS image_id,
+    i.object_key AS image_object_key,
+    i.width      AS image_width,
+    i.height     AS image_height
+FROM page p
+JOIN threads t ON t.id = p.thread_id
+LEFT JOIN images i ON i.id = p.image_id
+    AND i.status <> 'deleted' AND i.object_reclaimed_at IS NULL
+ORDER BY p.id DESC
+`
+
+type ListMyCommentsParams struct {
+	ActorID  *int64
+	CursorID *int64
+	PageSize int32
+}
+
+type ListMyCommentsRow struct {
+	ID             int64
+	ThreadID       int64
+	Seq            int32
+	Body           string
+	CreatedAt      time.Time
+	ThreadTitle    string
+	ThreadDeleted  bool
+	ImageID        *uuid.UUID
+	ImageObjectKey *string
+	ImageWidth     *int32
+	ImageHeight    *int32
+}
+
+// 自分が書いたコメントの一覧 (GET /me/comments)。
+//
+// 【このクエリは 8 区画すべてを走る。このリポジトリで唯一の形】
+// comments は HASH(thread_id) の 8 分割で、**author_id には区画キーが
+// 含まれない**。ListCommentsByThreadID が 1 区画で済むのに対し、
+// こちらは pruning が効かず 8 区画すべてに索引スキャンが走る
+// (ADR 0016 のインデックス設計)。
+//
+// 【実測して、索引は足さないと決めた】 make query-probe の 5 番。
+// 20 万コメント / 投稿数が最多の利用者 (1,600 件)、5 回の中央値:
+//
+//	自分のコメント 先頭ページ      1.53 ms / buffers 78 / 区画 8
+//	自分のコメント 深いページ      1.06 ms / buffers 57 / 区画 8
+//	スレッド内のコメント一覧 (比較) 0.16 ms / buffers  6 / 区画 1
+//
+// **9.6 倍・バッファ 13 倍**の差があり、ADR 0016 の「桁で違う」は当たっていた。
+// **が、絶対値 1.5 ms は一覧として問題にならない。**
+// comments_author_id_desc_idx (000002 で外部キー用に作成済み) で足りる。
+//
+// 深いページのほうが速いのは、カーソルで各区画の走査が短くなるため。
+// 先頭ページは 8 区画それぞれから 20 件読んで併合し、20 件だけ残す。
+//
+// 【実際に流して分かったこと 1: 効くのは実行時間だけではない】
+// この文を実 DB で EXPLAIN すると、**計画時間が実行時間を上回る。**
+//
+//	このクエリ (8 区画)          計画 6.0 ms / 実行 1.44 ms
+//	ListCommentsByThreadID (1 区画) 計画 2.6 ms / 実行 0.20 ms
+//
+// 区画を絞れないと**計画の段階でも 8 枚ぶんを見に行く** (計画時の
+// バッファ読み取り 1,630)。3 回流しても値は動かないので、
+// カタログのキャッシュ待ちではない。
+//
+// **アプリ経路では問題にならない。** pgx が拡張問い合わせプロトコルで
+// 文をキャッシュするため、計画は接続ごとに 1 回で済む。
+// ただし「1.5 ms の一覧」という理解は実行時間だけの話であり、
+// 計画を含めた初回は数 ms 高い。psql で測ると両方が乗る。
+//
+// 【実際に流して分かったこと 2: threads の結合は全走査になる】
+// 下の JOIN は「20 件に絞ってから」掛かるが、**planner は threads の
+// 主キーを 20 回引かず、2,000 行を Seq Scan して Hash Join する**
+// (buffers 25。全体 78 のうち約 3 分の 1)。
+//
+// この規模では 20 回のランダムアクセスより連続読みのほうが安い、
+// という判断で、**誤りではない。** ただしこの部分の costs は
+// ページの件数ではなく **threads の行数に比例して増える。**
+// スレッドが桁で増えたら、ここは nested loop + 主キーに変わるはずで、
+// 変わらなければ結合のヒントか分割の見直しを考える。
+// **次に測るならここになる。**
+//
+// 【threads は INNER JOIN でよい】
+// 投稿者や画像の LEFT JOIN と事情が違う。thread_id は NOT NULL の
+// 外部キーで、スレッドは論理削除しかしない (行は消えない)。
+// **削除済みのスレッドも結合する** —— 除外すると、自分のコメントが
+// 「消えた」のか「元から無い」のか本人に区別できなくなる。
+// 代わりに deleted_at の有無を thread_deleted として返し、
+// 画面側で「このスレッドは削除されています」と出す。
+//
+// 【JOIN は 20 件に絞ったあとに掛ける】
+// 内側の CTE に混ぜると、絞り込む前の全行に対して結合が走る
+// (一覧クエリと同じ)。
+//
+// 【author_name / author は返さない】
+// 投稿者は常に自分なので、行ごとに持たせる意味が無い。
+// API 側も MyComment には author を置いていない。
+//
+// 【author_id を表名で修飾しているのは sqlc の都合】
+// 裸で書くと sqlc の生成が「ambiguous」で落ちる。
+// 理由は threads.sql の ListMyThreadsWithCommentCount に書いた。
+// **外すと make generate が落ちる。**
+// 実体が無い画像は結合しない (ListCommentsByThreadID と同じ理由)。
+func (q *Queries) ListMyComments(ctx context.Context, arg ListMyCommentsParams) ([]ListMyCommentsRow, error) {
+	rows, err := q.db.Query(ctx, listMyComments, arg.ActorID, arg.CursorID, arg.PageSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListMyCommentsRow{}
+	for rows.Next() {
+		var i ListMyCommentsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.ThreadID,
+			&i.Seq,
+			&i.Body,
+			&i.CreatedAt,
+			&i.ThreadTitle,
+			&i.ThreadDeleted,
+			&i.ImageID,
+			&i.ImageObjectKey,
+			&i.ImageWidth,
+			&i.ImageHeight,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockThreadForUpdate = `-- name: LockThreadForUpdate :one
 SELECT id
 FROM threads

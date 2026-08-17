@@ -77,6 +77,39 @@ func (r *CommentRepository) ListByThreadID(
 	return comments, nil
 }
 
+// ListByAuthor は 1 人が書いたコメントを新しい順に取得します
+// (GET /me/comments)。
+//
+// **このメソッドは 8 区画すべてを走ります。** 分割キー (thread_id) を
+// 指定しないため pruning が効きません。数字と、索引を足さないと決めた
+// 経緯は db/query/comments.sql に書いてあります。
+func (r *CommentRepository) ListByAuthor(
+	ctx context.Context, authorID int64, page pagination.Page,
+) ([]model.MyComment, error) {
+	rows, err := r.q.ListMyComments(ctx, sqlcgen.ListMyCommentsParams{
+		// **ポインタなのは author_id が NULL 許容列だから**で、
+		// 「匿名も対象」という意味ではありません。
+		// nil を渡すと `author_id = NULL` になり、常に 0 件になります。
+		ActorID:  &authorID,
+		CursorID: page.CursorID(),
+		PageSize: page.Size,
+	})
+	if err != nil {
+		return nil, translateError("CommentRepository.ListByAuthor", err)
+	}
+
+	comments := make([]model.MyComment, 0, len(rows))
+	for _, row := range rows {
+		comments = append(comments, *model.ReconstructMyComment(
+			row.ID, row.ThreadID, row.ThreadTitle, row.ThreadDeleted,
+			row.Seq, row.Body,
+			toCommentImage(row.ImageID, row.ImageObjectKey, row.ImageWidth, row.ImageHeight),
+			row.CreatedAt,
+		))
+	}
+	return comments, nil
+}
+
 // Create はコメントを保存し、採番済みの値を返します。
 //
 // 実際の並行制御は config.CommentPostMode が決めます。

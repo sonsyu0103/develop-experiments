@@ -120,3 +120,41 @@ func toWireCommentList(r commentusecase.CommentListResult) oapigen.CommentList {
 		NextCursor: r.NextCursor,
 	}
 }
+
+// toWireMyComment はマイページ用のコメントをワイヤ型へ変換します。
+//
+// **投稿者は載せません** —— 常に自分なので、仕様書の MyComment にも
+// 項目がありません。画像は toWireComment と同じ理由で必ず写します。
+func toWireMyComment(d commentusecase.MyCommentDTO) oapigen.MyComment {
+	var img *oapigen.Image
+	if d.Image != nil {
+		img = &oapigen.Image{
+			Id:     d.Image.ID,
+			Url:    d.Image.URL,
+			Width:  d.Image.Width,
+			Height: d.Image.Height,
+		}
+	}
+
+	return oapigen.MyComment{
+		Id:            d.ID,
+		ThreadId:      d.ThreadID,
+		ThreadTitle:   d.ThreadTitle,
+		ThreadDeleted: d.ThreadDeleted,
+		Seq:           d.Seq,
+		Image:         img,
+		Body:          d.Body,
+		CreatedAt:     d.CreatedAt,
+	}
+}
+
+func toWireMyCommentList(r commentusecase.MyCommentListResult) oapigen.MyCommentList {
+	comments := make([]oapigen.MyComment, 0, len(r.Comments))
+	for _, d := range r.Comments {
+		comments = append(comments, toWireMyComment(d))
+	}
+	return oapigen.MyCommentList{
+		Comments:   comments,
+		NextCursor: r.NextCursor,
+	}
+}

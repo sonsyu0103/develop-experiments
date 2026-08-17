@@ -335,6 +335,77 @@ LEFT JOIN images img ON img.id = p.icon_image_id
     AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL
 ORDER BY p.id DESC;
 
+-- name: ListMyThreadsWithCommentCount :many
+-- 自分が立てたスレッドの一覧 (GET /me/threads)。
+--
+-- ListThreadsWithCommentCount に author_id の等値条件を足しただけの形。
+-- 並び順もカーソルの意味も同じなので、ページ送りの扱いは変わらない。
+--
+-- 【索引は足していない】
+-- threads_author_id_desc_idx (author_id, id DESC) が 000002 で
+-- **外部キー用**として既に入っている (ADR 0016)。
+-- make query-probe の 5 番で実測した: 2,000 スレッドで先頭ページ
+-- 0.37 ms / buffers 18。threads は分割していないので区画の走査も起きない。
+--
+-- **ただしこの実測は下の相関サブクエリを含んでいない。**
+-- 測ったのは threads を author_id で絞る部分だけで、
+-- コメント数の集計を含む形はまだ測っていない。
+--
+-- 【匿名で立てたスレッドは出てこない】
+-- author_id IS NULL の行は等値条件で落ちる。これは仕様
+-- (ADR 0005 決定 2)。投稿時にログインしていなければ、
+-- 後から本人だと突き合わせる手段が無い。
+--
+-- 【users の LEFT JOIN は残す】
+-- author_id = $1 で絞ったあとなので必ず 1 行に当たり、実質 INNER になる。
+-- それでも LEFT のままにしてあるのは、**一覧の他のクエリと行の形を
+-- 揃えるため** —— リポジトリ側の詰め替えが 1 本で済む。
+-- 主キーの参照 1 回ぶんの差しかない。
+--
+-- 【author_id を表名で修飾しているのは sqlc の都合】
+-- 裸で `WHERE author_id = ...` と書くと **sqlc の生成が
+-- 「column reference "author_id" is ambiguous」で落ちる。**
+-- CTE の中からは threads しか見えないので PostgreSQL は通るが、
+-- sqlc の解析器は外側のスコープ (page と users) を CTE の中まで
+-- 持ち込んでしまう。**外すと make generate が落ちる。**
+--
+-- なお、報告される行番号は当てにならない (この節のような
+-- 日本語コメントがあると、無関係な行を指す)。
+WITH page AS (
+    SELECT id, title, created_at, view_count, author_id, icon_image_id
+    FROM threads
+    WHERE threads.author_id = sqlc.arg('actor_id')
+      AND deleted_at IS NULL
+      AND (sqlc.narg('cursor_id')::bigint IS NULL OR id < sqlc.narg('cursor_id')::bigint)
+    ORDER BY id DESC
+    LIMIT sqlc.arg('page_size')
+)
+SELECT
+    p.id,
+    p.title,
+    p.created_at,
+    p.view_count,
+    (
+        SELECT count(*)
+        FROM comments c
+        WHERE c.thread_id = p.id
+          AND c.deleted_at IS NULL
+    )::bigint AS comment_count,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS icon_id,
+    img.object_key AS icon_object_key,
+    img.width      AS icon_width,
+    img.height     AS icon_height
+FROM page p
+LEFT JOIN users u ON u.id = p.author_id
+-- 実体が無い画像は結合しない (ListThreadsWithCommentCount と同じ理由)。
+LEFT JOIN images img ON img.id = p.icon_image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL
+ORDER BY p.id DESC;
+
 -- name: GetThreadWithCommentCount :one
 -- 一覧と同じ理由で、JOIN + GROUP BY ではなく相関サブクエリで数える。
 SELECT

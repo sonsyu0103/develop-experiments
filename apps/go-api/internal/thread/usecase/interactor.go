@@ -170,6 +170,29 @@ func (i *ThreadInteractor) FetchThreadList(
 	return i.buildListResult(summaries, page.Size, order)
 }
 
+// FetchMyThreadList は 1 人が立てたスレッドの一覧を取得します
+// (GET /me/threads)。
+//
+// 一覧の組み立て (buildListResult) は FetchThreadList と共用です ——
+// 並び順が新着順で同じなので、カーソルの意味も変わりません。
+//
+// **検索も人気順も受け付けません。** 自分の投稿は件数が桁違いに少なく、
+// 絞り込みや並べ替えの必要が薄いためです。必要になったら、
+// そのときカーソルの並び順の検査ごと足します
+// (FetchThreadList が既にその形を持っています)。
+//
+// **カーソルの並び順は検査しません。** 発行するのも受け取るのも
+// 新着順のトークンだけで、取り違えようがないためです。
+func (i *ThreadInteractor) FetchMyThreadList(
+	ctx context.Context, authorID int64, page pagination.Page,
+) (ThreadListResult, error) {
+	summaries, err := i.repo.ListSummariesByAuthor(ctx, authorID, page)
+	if err != nil {
+		return ThreadListResult{}, err
+	}
+	return i.buildListResult(summaries, page.Size, model.ListOrderNew)
+}
+
 // FetchThread は 1 件のスレッドをコメント数つきで取得します。
 // 存在しない場合は apperr.ErrNotFound を返します。
 func (i *ThreadInteractor) FetchThread(ctx context.Context, id int64) (ThreadDTO, error) {

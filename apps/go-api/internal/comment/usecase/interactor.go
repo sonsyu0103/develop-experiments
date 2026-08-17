@@ -87,6 +87,33 @@ type CommentListResult struct {
 	NextCursor *string      `json:"nextCursor"`
 }
 
+// MyCommentDTO はマイページに返す「自分のコメント」です。
+//
+// CommentDTO と分けている理由は model.MyComment に書いてあります。
+// **投稿者は持ちません** —— 常に自分だからです。
+type MyCommentDTO struct {
+	ID       int64 `json:"id"`
+	ThreadID int64 `json:"threadId"`
+	// ThreadTitle は投稿先のスレッドのタイトルです。
+	// 削除済みのスレッドのタイトルもそのまま返します。
+	ThreadTitle string `json:"threadTitle"`
+	// ThreadDeleted は投稿先のスレッドが削除済みかどうかです。
+	// 真なら threadId へのリンクは 404 になります。
+	ThreadDeleted bool `json:"threadDeleted"`
+	// Seq はスレッド内のレス番号です。欠番が出ます。
+	Seq int32 `json:"seq"`
+	// Image は添付画像です。画像がなければ nil になります。
+	Image     *ImageDTO `json:"image"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// MyCommentListResult は自分のコメント一覧と、次ページ取得用のカーソルです。
+type MyCommentListResult struct {
+	Comments   []MyCommentDTO `json:"comments"`
+	NextCursor *string        `json:"nextCursor"`
+}
+
 // CommentInteractor は「コメントを取得・投稿する」ユースケースを担当します。
 type CommentInteractor struct {
 	repo    repository.CommentRepository
@@ -154,6 +181,43 @@ func (i *CommentInteractor) FetchComments(
 	}
 
 	return CommentListResult{Comments: dtos, NextCursor: next}, nil
+}
+
+// FetchMyComments は 1 人が書いたコメントを新しい順に取得します
+// (GET /me/comments)。
+//
+// **存在確認は要りません。** FetchComments が親スレッドの存在を確かめるのは
+// 「存在しないスレッドに 0 件の 200 を返す」のを防ぐためですが、
+// こちらの絞り込みの軸は利用者で、その利用者はセッションが解決済みです。
+// 0 件は「まだ何も書いていない」という正しい答えになります。
+//
+// **削除済みのスレッドへのコメントも返します。** 落とすと、自分の投稿が
+// 「消えた」のか「元から無い」のかを本人が区別できません。
+// 判別は MyCommentDTO.ThreadDeleted で行います。
+func (i *CommentInteractor) FetchMyComments(
+	ctx context.Context, authorID int64, page pagination.Page,
+) (MyCommentListResult, error) {
+	comments, err := i.repo.ListByAuthor(ctx, authorID, page)
+	if err != nil {
+		return MyCommentListResult{}, err
+	}
+
+	dtos := make([]MyCommentDTO, 0, len(comments))
+	for _, c := range comments {
+		dtos = append(dtos, i.toMyDTO(c))
+	}
+
+	var lastID int64
+	if len(dtos) > 0 {
+		lastID = dtos[len(dtos)-1].ID
+	}
+
+	next, err := pagination.NextToken(lastID, len(dtos), page.Size)
+	if err != nil {
+		return MyCommentListResult{}, err
+	}
+
+	return MyCommentListResult{Comments: dtos, NextCursor: next}, nil
 }
 
 // PostComment はコメントを投稿します。
@@ -286,6 +350,21 @@ func (i *CommentInteractor) toDTO(c model.Comment) CommentDTO {
 		Image:      i.toImageDTO(c.Image),
 		Body:       c.Body,
 		CreatedAt:  c.CreatedAt,
+	}
+}
+
+// toMyDTO はマイページ用のコメントを詰め替えます。
+// 画像の URL の組み立ては toDTO と共通です。
+func (i *CommentInteractor) toMyDTO(c model.MyComment) MyCommentDTO {
+	return MyCommentDTO{
+		ID:            c.ID,
+		ThreadID:      c.ThreadID,
+		ThreadTitle:   c.ThreadTitle,
+		ThreadDeleted: c.ThreadDeleted,
+		Seq:           c.Seq,
+		Image:         i.toImageDTO(c.Image),
+		Body:          c.Body,
+		CreatedAt:     c.CreatedAt,
 	}
 }
 

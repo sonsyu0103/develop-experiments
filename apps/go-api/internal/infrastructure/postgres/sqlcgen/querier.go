@@ -509,6 +509,114 @@ type Querier interface {
 	// 区別するために行を残すと決めているが、**その区別を表す API の項目がまだ無い。**
 	// Phase 10 後半で削除の UI を入れるとき、ここを status の受け渡しに変える。
 	ListCommentsByThreadID(ctx context.Context, arg ListCommentsByThreadIDParams) ([]ListCommentsByThreadIDRow, error)
+	// 自分が書いたコメントの一覧 (GET /me/comments)。
+	//
+	// 【このクエリは 8 区画すべてを走る。このリポジトリで唯一の形】
+	// comments は HASH(thread_id) の 8 分割で、**author_id には区画キーが
+	// 含まれない**。ListCommentsByThreadID が 1 区画で済むのに対し、
+	// こちらは pruning が効かず 8 区画すべてに索引スキャンが走る
+	// (ADR 0016 のインデックス設計)。
+	//
+	// 【実測して、索引は足さないと決めた】 make query-probe の 5 番。
+	// 20 万コメント / 投稿数が最多の利用者 (1,600 件)、5 回の中央値:
+	//
+	//   自分のコメント 先頭ページ      1.53 ms / buffers 78 / 区画 8
+	//   自分のコメント 深いページ      1.06 ms / buffers 57 / 区画 8
+	//   スレッド内のコメント一覧 (比較) 0.16 ms / buffers  6 / 区画 1
+	//
+	// **9.6 倍・バッファ 13 倍**の差があり、ADR 0016 の「桁で違う」は当たっていた。
+	// **が、絶対値 1.5 ms は一覧として問題にならない。**
+	// comments_author_id_desc_idx (000002 で外部キー用に作成済み) で足りる。
+	//
+	// 深いページのほうが速いのは、カーソルで各区画の走査が短くなるため。
+	// 先頭ページは 8 区画それぞれから 20 件読んで併合し、20 件だけ残す。
+	//
+	// 【実際に流して分かったこと 1: 効くのは実行時間だけではない】
+	// この文を実 DB で EXPLAIN すると、**計画時間が実行時間を上回る。**
+	//
+	//   このクエリ (8 区画)          計画 6.0 ms / 実行 1.44 ms
+	//   ListCommentsByThreadID (1 区画) 計画 2.6 ms / 実行 0.20 ms
+	//
+	// 区画を絞れないと**計画の段階でも 8 枚ぶんを見に行く** (計画時の
+	// バッファ読み取り 1,630)。3 回流しても値は動かないので、
+	// カタログのキャッシュ待ちではない。
+	//
+	// **アプリ経路では問題にならない。** pgx が拡張問い合わせプロトコルで
+	// 文をキャッシュするため、計画は接続ごとに 1 回で済む。
+	// ただし「1.5 ms の一覧」という理解は実行時間だけの話であり、
+	// 計画を含めた初回は数 ms 高い。psql で測ると両方が乗る。
+	//
+	// 【実際に流して分かったこと 2: threads の結合は全走査になる】
+	// 下の JOIN は「20 件に絞ってから」掛かるが、**planner は threads の
+	// 主キーを 20 回引かず、2,000 行を Seq Scan して Hash Join する**
+	// (buffers 25。全体 78 のうち約 3 分の 1)。
+	//
+	// この規模では 20 回のランダムアクセスより連続読みのほうが安い、
+	// という判断で、**誤りではない。** ただしこの部分の costs は
+	// ページの件数ではなく **threads の行数に比例して増える。**
+	// スレッドが桁で増えたら、ここは nested loop + 主キーに変わるはずで、
+	// 変わらなければ結合のヒントか分割の見直しを考える。
+	// **次に測るならここになる。**
+	//
+	// 【threads は INNER JOIN でよい】
+	// 投稿者や画像の LEFT JOIN と事情が違う。thread_id は NOT NULL の
+	// 外部キーで、スレッドは論理削除しかしない (行は消えない)。
+	// **削除済みのスレッドも結合する** —— 除外すると、自分のコメントが
+	// 「消えた」のか「元から無い」のか本人に区別できなくなる。
+	// 代わりに deleted_at の有無を thread_deleted として返し、
+	// 画面側で「このスレッドは削除されています」と出す。
+	//
+	// 【JOIN は 20 件に絞ったあとに掛ける】
+	// 内側の CTE に混ぜると、絞り込む前の全行に対して結合が走る
+	// (一覧クエリと同じ)。
+	//
+	// 【author_name / author は返さない】
+	// 投稿者は常に自分なので、行ごとに持たせる意味が無い。
+	// API 側も MyComment には author を置いていない。
+	//
+	// 【author_id を表名で修飾しているのは sqlc の都合】
+	// 裸で書くと sqlc の生成が「ambiguous」で落ちる。
+	// 理由は threads.sql の ListMyThreadsWithCommentCount に書いた。
+	// **外すと make generate が落ちる。**
+	// 実体が無い画像は結合しない (ListCommentsByThreadID と同じ理由)。
+	ListMyComments(ctx context.Context, arg ListMyCommentsParams) ([]ListMyCommentsRow, error)
+	// 自分が立てたスレッドの一覧 (GET /me/threads)。
+	//
+	// ListThreadsWithCommentCount に author_id の等値条件を足しただけの形。
+	// 並び順もカーソルの意味も同じなので、ページ送りの扱いは変わらない。
+	//
+	// 【索引は足していない】
+	// threads_author_id_desc_idx (author_id, id DESC) が 000002 で
+	// **外部キー用**として既に入っている (ADR 0016)。
+	// make query-probe の 5 番で実測した: 2,000 スレッドで先頭ページ
+	// 0.37 ms / buffers 18。threads は分割していないので区画の走査も起きない。
+	//
+	// **ただしこの実測は下の相関サブクエリを含んでいない。**
+	// 測ったのは threads を author_id で絞る部分だけで、
+	// コメント数の集計を含む形はまだ測っていない。
+	//
+	// 【匿名で立てたスレッドは出てこない】
+	// author_id IS NULL の行は等値条件で落ちる。これは仕様
+	// (ADR 0005 決定 2)。投稿時にログインしていなければ、
+	// 後から本人だと突き合わせる手段が無い。
+	//
+	// 【users の LEFT JOIN は残す】
+	// author_id = $1 で絞ったあとなので必ず 1 行に当たり、実質 INNER になる。
+	// それでも LEFT のままにしてあるのは、**一覧の他のクエリと行の形を
+	// 揃えるため** —— リポジトリ側の詰め替えが 1 本で済む。
+	// 主キーの参照 1 回ぶんの差しかない。
+	//
+	// 【author_id を表名で修飾しているのは sqlc の都合】
+	// 裸で `WHERE author_id = ...` と書くと **sqlc の生成が
+	// 「column reference "author_id" is ambiguous」で落ちる。**
+	// CTE の中からは threads しか見えないので PostgreSQL は通るが、
+	// sqlc の解析器は外側のスコープ (page と users) を CTE の中まで
+	// 持ち込んでしまう。**外すと make generate が落ちる。**
+	//
+	// なお、報告される行番号は当てにならない (この節のような
+	// 日本語コメントがあると、無関係な行を指す)。
+	// 実体が無い画像は結合しない (ListThreadsWithCommentCount と同じ理由)。
+	ListMyThreadsWithCommentCount(ctx context.Context, arg ListMyThreadsWithCommentCountParams) ([]ListMyThreadsWithCommentCountRow, error)
 	// スレッド一覧を閲覧数の多い順に取得する (Phase 7 / ADR 0006)。
 	//
 	// 【なぜ ListThreadsWithCommentCount と 1 本にまとめないか】
