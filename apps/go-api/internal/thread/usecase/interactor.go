@@ -181,11 +181,23 @@ func (i *ThreadInteractor) FetchThreadList(
 // そのときカーソルの並び順の検査ごと足します
 // (FetchThreadList が既にその形を持っています)。
 //
-// **カーソルの並び順は検査しません。** 発行するのも受け取るのも
-// 新着順のトークンだけで、取り違えようがないためです。
+// **カーソルの並び順は検査します。** 発行するのは新着順のトークンだけですが、
+// **受け取る側は選べません** —— 利用者は `GET /threads?sort=popular` が返した
+// トークン (view_count を含む) をそのまま `/me/threads?cursor=` に貼れます。
+// 検査しないと view_count 成分が黙って捨てられ、`id < cursorID` だけが効いた
+// 「要求していない位置のページ」が 400 も出さずに返ります (ADR 0018)。
+//
+// **先頭ページは検査しません。** カーソルが無いので発行元も無く、
+// ここを外すと 1 ページ目が必ず 400 になります (FetchThreadList と同じ)。
 func (i *ThreadInteractor) FetchMyThreadList(
 	ctx context.Context, authorID int64, page pagination.Page,
 ) (ThreadListResult, error) {
+	if page.Cursor != nil && page.CursorSort() != model.ListOrderNew.CursorSort() {
+		return ThreadListResult{}, fmt.Errorf(
+			"cursor は別の並び順で発行されたものです。先頭ページから取得し直してください: %w",
+			apperr.ErrInvalidArgument)
+	}
+
 	summaries, err := i.repo.ListSummariesByAuthor(ctx, authorID, page)
 	if err != nil {
 		return ThreadListResult{}, err

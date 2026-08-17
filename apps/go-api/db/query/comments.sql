@@ -74,10 +74,10 @@ ORDER BY p.id DESC;
 -- (ADR 0016 のインデックス設計)。
 --
 -- 【実測して、索引は足さないと決めた】 make query-probe の 5 番。
--- 20 万コメント / 投稿数が最多の利用者 (1,600 件)、5 回の中央値:
+-- 20 万コメント / 投稿数が最多の利用者 (1,600 件) の中央値:
 --
---   自分のコメント 先頭ページ      1.53 ms / buffers 78 / 区画 8
---   自分のコメント 深いページ      1.06 ms / buffers 57 / 区画 8
+--   自分のコメント 先頭ページ      1.52 ms / buffers 78 / 区画 8
+--   自分のコメント 深いページ      1.10 ms / buffers 57 / 区画 8
 --   スレッド内のコメント一覧 (比較) 0.16 ms / buffers  6 / 区画 1
 --
 -- **9.6 倍・バッファ 13 倍**の差があり、ADR 0016 の「桁で違う」は当たっていた。
@@ -114,13 +114,42 @@ ORDER BY p.id DESC;
 -- 変わらなければ結合のヒントか分割の見直しを考える。
 -- **次に測るならここになる。**
 --
--- 【threads は INNER JOIN でよい】
--- 投稿者や画像の LEFT JOIN と事情が違う。thread_id は NOT NULL の
--- 外部キーで、スレッドは論理削除しかしない (行は消えない)。
--- **削除済みのスレッドも結合する** —— 除外すると、自分のコメントが
--- 「消えた」のか「元から無い」のか本人に区別できなくなる。
--- 代わりに deleted_at の有無を thread_deleted として返し、
--- 画面側で「このスレッドは削除されています」と出す。
+-- 【threads は「生きているものだけ」を LEFT JOIN する】
+-- **コメント自体は削除済みスレッドのものも返す。** 除外すると、自分の
+-- コメントが「消えた」のか「元から無い」のか本人に区別できなくなる。
+--
+-- **ただしタイトルは返さない (レビュー指摘)。**
+-- 初版は INNER JOIN で t.title をそのまま返していた。「伏せると自分が
+-- 何に書いたのか分からなくなる」という理由だったが、**モデレーションの
+-- 経路を見落としていた。**
+--
+-- タイトル自体が誹謗中傷や個人情報だったためにスレッドを消した場合、
+-- この API はそのタイトルを**書き込んだ全員のマイページに残し続ける。**
+-- GET /threads/{id} が 404 を返すので、**ここが削除後にタイトルを
+-- 読める唯一の経路**になってしまう。
+--
+-- 表示の都合より、消したものが消えることを優先する ——
+-- 画像を status = 'deleted' で結合しないのと同じ姿勢になる。
+-- 本人が失うのは「どのスレッドか」だけで、自分が書いた本文は残る。
+--
+-- **アプリ層ではなく SQL で落とすこと。** 上の層で捨てる形にすると、
+-- 別の呼び出し口が増えたときに漏れる経路が残る。
+--
+-- 【なぜ CASE ではなく ON の条件でやるか】
+-- `CASE WHEN t.deleted_at IS NULL THEN t.title END` でも同じ値になるが、
+-- **sqlc の型推論がそれを扱えない。**
+--
+--   CASE のまま      -> interface{} (型が付かない)
+--   ::text を付ける  -> string (**非 NULL。NULL が来ると Scan が実行時に落ちる**)
+--
+-- これはこのファイルの冒頭で警告している罠と同じもの。
+-- 一方 LEFT JOIN の列は *string と推論される (投稿者・画像と同じ)。
+-- **結合の条件で表現するほうが、型として安全な形になる。**
+--
+-- 削除の判定も同じ結合から採れるので、threads を 2 回引く必要もない
+-- (t.id IS NULL がそのまま「削除済み」を意味する)。
+-- thread_id は NOT NULL の外部キーで、スレッドは論理削除しかしない
+-- (行は消えない) ため、**結合が空振りする原因は削除以外に無い。**
 --
 -- 【JOIN は 20 件に絞ったあとに掛ける】
 -- 内側の CTE に混ぜると、絞り込む前の全行に対して結合が走る
@@ -149,14 +178,17 @@ SELECT
     p.seq,
     p.body,
     p.created_at,
+    -- 生きているスレッドのタイトルだけ。削除済みでは NULL になる
+    -- (結合が空振りするため)。上記「タイトルは返さない」を参照。
     t.title AS thread_title,
-    (t.deleted_at IS NOT NULL)::boolean AS thread_deleted,
+    -- 結合が空振りした = 削除済み。IS NULL は NULL を返さないので非 NULL。
+    (t.id IS NULL)::boolean AS thread_deleted,
     i.id         AS image_id,
     i.object_key AS image_object_key,
     i.width      AS image_width,
     i.height     AS image_height
 FROM page p
-JOIN threads t ON t.id = p.thread_id
+LEFT JOIN threads t ON t.id = p.thread_id AND t.deleted_at IS NULL
 -- 実体が無い画像は結合しない (ListCommentsByThreadID と同じ理由)。
 LEFT JOIN images i ON i.id = p.image_id
     AND i.status <> 'deleted' AND i.object_reclaimed_at IS NULL

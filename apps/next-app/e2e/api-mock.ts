@@ -198,6 +198,9 @@ export async function mockThread(
  * **`Comment` とは別の型です。** 投稿者は持たず (常に自分なので)、
  * 代わりに投稿先のスレッド (`threadTitle` / `threadDeleted`) が載ります。
  * `image` は必須なので省けません。
+ *
+ * **削除済みを作るときは `deletedThreadComment` を使ってください** ——
+ * `threadDeleted: true` と `threadTitle: null` は API 側で必ず対になります。
  */
 export function myComment(over: Partial<MyComment> = {}): MyComment {
   return {
@@ -212,6 +215,17 @@ export function myComment(over: Partial<MyComment> = {}): MyComment {
     image: null,
     ...over,
   };
+}
+
+/**
+ * 削除済みスレッドへのコメント。
+ *
+ * **`threadTitle` は必ず `null` になります。** API が返さないためで
+ * (タイトル自体が理由で消された場合に残り続けるのを防ぐ)、
+ * ここで手書きの文字列を入れると**実際には来ない応答を検査する**ことになります。
+ */
+export function deletedThreadComment(over: Partial<MyComment> = {}): MyComment {
+  return myComment({ threadDeleted: true, ...over, threadTitle: null });
 }
 
 export function myComments(items: MyComment[], nextCursor: string | null = null): MyCommentList {

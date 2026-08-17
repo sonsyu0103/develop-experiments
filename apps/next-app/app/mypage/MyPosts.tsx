@@ -10,7 +10,9 @@
 //     一覧の脇に必ず添えます
 //   - **削除済みスレッドへのコメントも出ます** (`threadDeleted`)。
 //     落とすと「消えた」のか「元から無い」のかを本人が区別できません。
-//     ただしリンクにはしません —— 押した先は 404 です
+//     ただしリンクにはしません —— 押した先は 404 です。
+//     **タイトルも API から返りません** (`null`)。タイトル自体が理由で
+//     消された場合に残り続けるためで、画面では代わりの文言を出します
 //   - コメント側の取得は `comments` の 8 区画すべてを走ります
 //     (分割キーが `thread_id` で、`author_id` に含まれないため。ADR 0016)。
 //     実測 1.5 ms で一覧としては問題にならないと判断しています
@@ -332,11 +334,14 @@ function MyCommentRow({ comment }: { comment: MyComment }) {
         <span className="comment__seq">&gt;&gt;{comment.seq}</span>
         {/*
           **削除済みスレッドはリンクにしません。** 押した先は 404 です。
-          タイトルは伏せません —— 伏せると、自分が何に書いたのか
-          本人にも分からなくなります。
+
+          **タイトルも API から返ってきません** (`null`)。
+          タイトル自体が理由で消された場合に、書き込んだ全員のマイページへ
+          残り続けてしまうためです。ここでは代わりの文言を出します ——
+          `null` をそのまま描くと「空のタイトル」に見えます。
         */}
-        {comment.threadDeleted ? (
-          <span>{comment.threadTitle}</span>
+        {comment.threadDeleted || comment.threadTitle === null ? (
+          <span className="muted">削除されたスレッド</span>
         ) : (
           <Link href={`/threads/${comment.threadId}`}>{comment.threadTitle}</Link>
         )}

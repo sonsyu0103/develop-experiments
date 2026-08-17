@@ -8,6 +8,7 @@
 import { expect, test } from '@playwright/test';
 
 import {
+  deletedThreadComment,
   fail,
   mockMe,
   mockMyComments,
@@ -161,7 +162,8 @@ test.describe('自分の投稿', () => {
       ok(
         route,
         myComments([
-          myComment({ id: 1, threadId: 100, threadTitle: '消されたスレッド', threadDeleted: true }),
+          // **タイトルは API から来ません** (`null`)。
+          deletedThreadComment({ id: 1, threadId: 100, body: '消された先に書いた本文' }),
           myComment({ id: 2, threadId: 101, threadTitle: '生きているスレッド' }),
         ]),
       ),
@@ -172,11 +174,16 @@ test.describe('自分の投稿', () => {
 
     // **落としません。** 落とすと、自分の投稿が「消えた」のか
     // 「元から無い」のかを本人が区別できなくなります。
-    await expect(page.getByText('消されたスレッド')).toBeVisible();
     await expect(page.getByText('このスレッドは削除されています')).toBeVisible();
+    // 自分が書いた本文は残ること。
+    await expect(page.getByText('消された先に書いた本文')).toBeVisible();
 
+    // **タイトルの代わりの文言を出します。** `null` をそのまま描くと
+    // 「空のタイトル」に見えます。
+    await expect(page.getByText('削除されたスレッド')).toBeVisible();
     // **リンクにはしません。** 押した先は 404 です。
-    await expect(page.getByRole('link', { name: '消されたスレッド' })).toHaveCount(0);
+    await expect(page.getByRole('link', { name: '削除されたスレッド' })).toHaveCount(0);
+
     // 生きているほうは辿れること (両方ともリンクを外していないか)。
     await expect(page.getByRole('link', { name: '生きているスレッド' })).toBeVisible();
   });

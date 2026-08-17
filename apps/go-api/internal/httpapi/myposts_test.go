@@ -88,7 +88,7 @@ func TestListMyComments_PassesSessionUserToRepository(t *testing.T) {
 	env := newAuthEnv(t, false)
 	env.comments.myComments = []commentmodel.MyComment{
 		{
-			ID: 10, ThreadID: 1, ThreadTitle: "スレッド", ThreadDeleted: false,
+			ID: 10, ThreadID: 1, ThreadTitle: strptr("スレッド"), ThreadDeleted: false,
 			Seq: 3, Body: "ふぁ〜、眠いよ〜", CreatedAt: time.Unix(10, 0).UTC(),
 		},
 	}
@@ -115,26 +115,32 @@ func TestListMyComments_PassesSessionUserToRepository(t *testing.T) {
 		t.Errorf("識別子が詰め替えられていない: %+v", got)
 	}
 	// **スレッドのタイトルが載ること。** これが無いと一覧として成立しません。
-	if got.ThreadTitle != "スレッド" {
-		t.Errorf("ThreadTitle = %q, want %q", got.ThreadTitle, "スレッド")
+	if got.ThreadTitle == nil || *got.ThreadTitle != "スレッド" {
+		t.Errorf("ThreadTitle = %v, want %q", got.ThreadTitle, "スレッド")
 	}
 	if got.ThreadDeleted {
 		t.Error("ThreadDeleted = true, want false")
 	}
 }
 
-// TestListMyComments_DeletedThreadIsMarkedNotHidden は、
-// **削除済みスレッドへのコメントが「消えず、印がつく」**ことを確かめます。
+// TestListMyComments_DeletedThreadIsMarkedAndTitleWithheld は、
+// **削除済みスレッドへのコメントが「消えず、印がつき、タイトルは出ない」**
+// ことを確かめます。
 //
 // 落とす実装にすると、自分の投稿が「消えた」のか「元から無い」のかを
 // 本人が区別できなくなります。件数だけ見ていると気づけない差です。
-func TestListMyComments_DeletedThreadIsMarkedNotHidden(t *testing.T) {
+//
+// 一方でタイトルを運ぶと、**削除後もタイトルを読める唯一の経路**になります
+// (GET /threads/{id} は 404)。タイトル自体が理由で消された場合に、
+// 書き込んだ全員のマイページへ残り続けることになります。
+func TestListMyComments_DeletedThreadIsMarkedAndTitleWithheld(t *testing.T) {
 	t.Parallel()
 
 	env := newAuthEnv(t, false)
 	env.comments.myComments = []commentmodel.MyComment{
 		{
-			ID: 11, ThreadID: 2, ThreadTitle: "消されたスレッド", ThreadDeleted: true,
+			// **削除済みではタイトルを運ばない** (SQL 側が LEFT JOIN の空振りで nil にする)。
+			ID: 11, ThreadID: 2, ThreadTitle: nil, ThreadDeleted: true,
 			Seq: 1, Body: "本文", CreatedAt: time.Unix(11, 0).UTC(),
 		},
 	}
@@ -154,9 +160,14 @@ func TestListMyComments_DeletedThreadIsMarkedNotHidden(t *testing.T) {
 	if !body.Comments[0].ThreadDeleted {
 		t.Error("ThreadDeleted = false, want true")
 	}
-	// タイトルは伏せない。伏せると自分が何に書いたのか分からなくなる。
-	if body.Comments[0].ThreadTitle != "消されたスレッド" {
-		t.Errorf("ThreadTitle = %q, want 伏せずにそのまま", body.Comments[0].ThreadTitle)
+	// **タイトルは運ばない。** ここが漏れると、消したタイトルが
+	// 書き込んだ全員のマイページに残り続ける。
+	if got := body.Comments[0].ThreadTitle; got != nil {
+		t.Errorf("ThreadTitle = %q, want null (削除済みのタイトルは返さない)", *got)
+	}
+	// 自分が書いた本文は残る。
+	if body.Comments[0].Body != "本文" {
+		t.Errorf("Body = %q, want 本文がそのまま", body.Comments[0].Body)
 	}
 }
 
@@ -172,7 +183,7 @@ func TestListMyComments_ImageIsCarried(t *testing.T) {
 	env := newAuthEnv(t, false)
 	env.comments.myComments = []commentmodel.MyComment{
 		{
-			ID: 12, ThreadID: 1, ThreadTitle: "スレッド", Seq: 1,
+			ID: 12, ThreadID: 1, ThreadTitle: strptr("スレッド"), Seq: 1,
 			Body: "画像つき", CreatedAt: time.Unix(12, 0).UTC(),
 			Image: commentmodel.NewImage(imageID, "objects/ff.webp", 640, 480),
 		},
@@ -244,3 +255,8 @@ func TestListMyPosts_RejectsBrokenCursor(t *testing.T) {
 		}
 	}
 }
+
+// strptr は文字列へのポインタを返します。
+// **MyComment.ThreadTitle は削除済みで nil になる**ため、
+// 生きているスレッドを書くのに要ります。
+func strptr(s string) *string { return &s }

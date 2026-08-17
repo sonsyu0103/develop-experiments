@@ -17,14 +17,18 @@ type MyComment struct {
 	ThreadID int64
 	// ThreadTitle は投稿先のスレッドのタイトルです。
 	//
-	// **削除済みのスレッドのタイトルもそのまま入ります。** 伏せると、
-	// 自分が何に書いたのか本人にも分からなくなります。
-	ThreadTitle string
+	// **削除済みのスレッドでは nil になります。** タイトル自体が
+	// 誹謗中傷や個人情報だったために消された場合、ここで返すと
+	// 書き込んだ全員のマイページに残り続けます (db/query/comments.sql)。
+	// 判別は ThreadDeleted で行ってください。
+	ThreadTitle *string
 	// ThreadDeleted は投稿先のスレッドが論理削除済みかどうかです。
 	//
 	// **削除済みでもコメントは一覧から落としません。** 落とすと、
 	// 自分の投稿が「消えた」のか「元から無い」のかを本人が区別できません。
 	// リンク先は 404 になるので、画面側でその旨を出します。
+	//
+	// 真のとき ThreadTitle は必ず nil です。
 	ThreadDeleted bool
 	// Seq はスレッド内のレス番号です (Comment.Seq と同じ意味)。
 	Seq int32
@@ -39,7 +43,7 @@ type MyComment struct {
 // **検証は行いません。** 保存済みの値であり、
 // 書き込み時 (NewComment) に検証を通ったものだからです。
 func ReconstructMyComment(
-	id, threadID int64, threadTitle string, threadDeleted bool,
+	id, threadID int64, threadTitle *string, threadDeleted bool,
 	seq int32, body string, image *Image, createdAt time.Time,
 ) *MyComment {
 	return &MyComment{

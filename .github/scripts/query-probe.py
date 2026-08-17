@@ -47,7 +47,14 @@ EXEC_TIME = re.compile(r"Execution Time: ([\d.]+) ms")
 # **この数え方は途中で直している。** 以前は全行を足していたため、
 # 節が深いクエリほど大きく出ていた (パーティションを跨ぐクエリで 3 倍近く膨らんだ)。
 # db/query/threads.sql に残した実測値は、直したあとの数字に更新済み。
-BUFFERS = re.compile(r"Buffers: shared hit=(\d+)(?: read=(\d+))?")
+#
+# **hit= を必須にしないこと。** PostgreSQL は 0 の成分を出力しないので、
+# キャッシュが冷えた実行では根が `Buffers: shared read=N` だけになる。
+# `hit=` 必須の正規表現はそこに一致せず、**次に一致した子孫の行を
+# 「クエリ全体の値」として拾う** —— 全行を足していた頃は取りこぼしても
+# 総和が少し減るだけだったが、「最初の 1 つを採る」に変えたことで、
+# 失敗の質が「無関係に小さい値を全体として記録する」に変わっている。
+BUFFERS = re.compile(r"Buffers: shared(?: hit=(\d+))?(?: read=(\d+))?")
 
 # **走査を見る対象の表を指定できるようにする。** 計画木の先頭を取ると、
 # 200 行の users への Seq Scan (それ自体は正しい選択) が出てしまい、
@@ -83,8 +90,16 @@ def explain(sql: str, force_index: bool = False, table: str = "threads") -> tupl
     m = EXEC_TIME.search(text)
     ms = float(m.group(1)) if m else 0.0
 
-    b = BUFFERS.search(text)
-    buffers = 0 if b is None else int(b.group(1)) + int(b.group(2) or 0)
+    # **hit も read も無い一致は捨てる。** 上の正規表現は両方を省略可能に
+    # したので、`Buffers: shared` だけの行 (実際には出ないが) や、
+    # local / temp しか持たない節に引っかかると 0 を返してしまう。
+    # 値を持つ最初の行 = 根の合計になる。
+    buffers = 0
+    for b in BUFFERS.finditer(text):
+        if b.group(1) is None and b.group(2) is None:
+            continue
+        buffers = int(b.group(1) or 0) + int(b.group(2) or 0)
+        break
 
     # 索引を使ったかどうかが要点。索引名まで出す ——
     # 「索引を使った」だけでは、**意図した索引かどうか**が分からない。
@@ -239,36 +254,70 @@ ORDER BY view_count DESC, id DESC LIMIT 20;
 
 
 def my_threads(author_id: int, cursor_id: int | None = None) -> str:
-    cursor = "" if cursor_id is None else f"  AND id < {cursor_id}\n"
+    """自分のスレッド一覧。
+
+    **db/query/threads.sql の ListMyThreadsWithCommentCount と同じ文にすること。**
+    以前ここは `SELECT id, title, created_at, view_count` だけの素の走査で、
+    出荷するクエリ (コメント数の相関サブクエリ + users / images の LEFT JOIN) と
+    **別物を測っていた** (レビュー指摘)。
+    別物を測ると、実クエリを変えてもこの数字が動かず、退行が見えない。
+    """
+    cursor = "" if cursor_id is None else f"      AND id < {cursor_id}\n"
     return f"""
-SELECT id, title, created_at, view_count
-FROM threads
-WHERE author_id = {author_id}
-  AND deleted_at IS NULL
-{cursor}ORDER BY id DESC LIMIT 20;
+WITH page AS (
+    SELECT id, title, created_at, view_count, author_id, icon_image_id
+    FROM threads
+    WHERE threads.author_id = {author_id}
+      AND deleted_at IS NULL
+{cursor}    ORDER BY id DESC
+    LIMIT 20
+)
+SELECT
+    p.id, p.title, p.created_at, p.view_count,
+    (
+        SELECT count(*)
+        FROM comments c
+        WHERE c.thread_id = p.id
+          AND c.deleted_at IS NULL
+    )::bigint AS comment_count,
+    u.public_id, u.display_name, u.avatar_url, u.deleted_at,
+    img.id, img.object_key, img.width, img.height
+FROM page p
+LEFT JOIN users u ON u.id = p.author_id
+LEFT JOIN images img ON img.id = p.icon_image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL
+ORDER BY p.id DESC;
 """
 
 
 def my_comments(author_id: int, cursor_id: int | None = None) -> str:
     """自分のコメント一覧。**8 区画すべてを走る側。**
 
-    一覧にはスレッドのタイトルが要る (どのスレッドへの投稿か分からないと
-    画面として成立しない) ので、threads との JOIN を含めた形で測る。
+    **db/query/comments.sql の ListMyComments と同じ文にすること。**
+    以前は images の LEFT JOIN も選択列も欠けた簡略形を測っていた
+    (レビュー指摘)。threads は「生きているものだけ」を LEFT JOIN する形で、
+    削除済みではタイトルが NULL になる。
     """
-    cursor = "" if cursor_id is None else f"      AND c.id < {cursor_id}\n"
+    cursor = "" if cursor_id is None else f"      AND comments.id < {cursor_id}\n"
     return f"""
 WITH page AS (
-    SELECT c.id, c.thread_id, c.seq, c.body, c.created_at
-    FROM comments c
-    WHERE c.author_id = {author_id}
-      AND c.deleted_at IS NULL
-{cursor}    ORDER BY c.id DESC
+    SELECT id, thread_id, seq, body, created_at, image_id
+    FROM comments
+    WHERE comments.author_id = {author_id}
+      AND deleted_at IS NULL
+{cursor}    ORDER BY id DESC
     LIMIT 20
 )
-SELECT p.id, p.thread_id, p.seq, p.body, p.created_at,
-       t.title, t.deleted_at IS NOT NULL AS thread_deleted
+SELECT
+    p.id, p.thread_id, p.seq, p.body, p.created_at,
+    t.title AS thread_title,
+    (t.id IS NULL)::boolean AS thread_deleted,
+    i.id AS image_id, i.object_key AS image_object_key,
+    i.width AS image_width, i.height AS image_height
 FROM page p
-JOIN threads t ON t.id = p.thread_id
+LEFT JOIN threads t ON t.id = p.thread_id AND t.deleted_at IS NULL
+LEFT JOIN images i ON i.id = p.image_id
+    AND i.status <> 'deleted' AND i.object_reclaimed_at IS NULL
 ORDER BY p.id DESC;
 """
 
@@ -375,7 +424,10 @@ def main() -> int:
     report(f"5. 投稿者で絞る (利用者 {author}: スレッド {n_threads} 件 / "
            f"コメント {n_comments} 件)", [
         measure("自分のスレッド 先頭ページ", my_threads(author),
-                "threads は分割していないので 1 表を索引で辿るだけ"),
+                # **threads 自体は分割していないが、区画は走る。**
+                # コメント数の相関サブクエリが comments を引くため。
+                # 簡略形 (素の走査) を測っていた頃は「区画 -」に見えていた。
+                "コメント数の相関サブクエリが comments の区画を触る"),
         measure("自分のコメント 先頭ページ", my_comments(author),
                 "**8 区画すべてに索引スキャンが走る**", table="comments"),
         measure("自分のコメント 深いページ", my_comments(author, deep_comment),

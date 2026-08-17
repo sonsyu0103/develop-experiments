@@ -732,12 +732,17 @@ func TestDeleteOwnComment_PassesKeys(t *testing.T) {
 // **スレッドの存在確認をしないこと**がスレッド内一覧との一番の違いです。
 // 絞り込みの軸が利用者なので、0 件は「まだ書いていない」という正しい答えになります。
 
+// strptr は文字列へのポインタを返します。
+// ThreadTitle は削除済みで nil になるため、生きている側を書くのに要ります。
+func strptr(s string) *string { return &s }
+
 // newMyComments は id が大きい順の MyComment を n 件作ります。
+// **すべて生きているスレッド**への投稿です。
 func newMyComments(n int) []model.MyComment {
 	out := make([]model.MyComment, 0, n)
 	for id := int64(n); id >= 1; id-- {
 		out = append(out, model.MyComment{
-			ID: id, ThreadID: id, ThreadTitle: fmt.Sprintf("スレッド %d", id),
+			ID: id, ThreadID: id, ThreadTitle: strptr(fmt.Sprintf("スレッド %d", id)),
 			Seq: int32(id), Body: fmt.Sprintf("本文 %d", id),
 			CreatedAt: time.Unix(id, 0).UTC(),
 		})
@@ -752,7 +757,7 @@ func TestFetchMyComments_PassesAuthorAndMapsThread(t *testing.T) {
 
 	repo := newFakeCommentRepo(0)
 	repo.myComments = []model.MyComment{{
-		ID: 10, ThreadID: 3, ThreadTitle: "眠いスレ", ThreadDeleted: true,
+		ID: 10, ThreadID: 3, ThreadTitle: strptr("眠いスレ"), ThreadDeleted: false,
 		Seq: 5, Body: "ふぁ〜", CreatedAt: time.Unix(10, 0).UTC(),
 	}}
 	uc := NewCommentInteractor(repo, &fakeThreadChecker{}, nil)
@@ -774,11 +779,52 @@ func TestFetchMyComments_PassesAuthorAndMapsThread(t *testing.T) {
 		t.Errorf("識別子が詰め替えられていない: %+v", c)
 	}
 	// **一覧として成立させるための 2 項目。**
-	if c.ThreadTitle != "眠いスレ" {
-		t.Errorf("ThreadTitle = %q, want 眠いスレ", c.ThreadTitle)
+	if c.ThreadTitle == nil || *c.ThreadTitle != "眠いスレ" {
+		t.Errorf("ThreadTitle = %v, want 眠いスレ", c.ThreadTitle)
+	}
+	if c.ThreadDeleted {
+		t.Error("ThreadDeleted = true, want false")
+	}
+}
+
+// TestFetchMyComments_DeletedThreadKeepsCommentButDropsTitle は、
+// **削除済みスレッドのタイトルを運ばない**ことを確かめます。
+//
+// タイトル自体が誹謗中傷や個人情報だったために消された場合、ここで運ぶと
+// 書き込んだ全員のマイページに残り続けます。GET /threads/{id} は 404 なので、
+// この API が削除後にタイトルを読める唯一の経路になってしまいます。
+//
+// **コメント自体は落としません。** 落とすと「消えた」のか
+// 「元から無い」のかを本人が区別できなくなります。
+func TestFetchMyComments_DeletedThreadKeepsCommentButDropsTitle(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeCommentRepo(0)
+	// 永続化層が返す形。SQL 側が LEFT JOIN の空振りで nil を返します。
+	repo.myComments = []model.MyComment{{
+		ID: 11, ThreadID: 4, ThreadTitle: nil, ThreadDeleted: true,
+		Seq: 1, Body: "自分が書いた本文は残る", CreatedAt: time.Unix(11, 0).UTC(),
+	}}
+	uc := NewCommentInteractor(repo, &fakeThreadChecker{}, nil)
+
+	got, err := uc.FetchMyComments(context.Background(), 1, mustPage(t, nil, 10))
+	if err != nil {
+		t.Fatalf("FetchMyComments が失敗した: %v", err)
+	}
+
+	if len(got.Comments) != 1 {
+		t.Fatalf("件数 = %d, want 1 (削除済みでもコメントは落とさない)", len(got.Comments))
+	}
+	c := got.Comments[0]
+	if c.ThreadTitle != nil {
+		t.Errorf("ThreadTitle = %q, want nil (削除済みのタイトルは運ばない)", *c.ThreadTitle)
 	}
 	if !c.ThreadDeleted {
-		t.Error("ThreadDeleted = false, want true (削除済みでも落とさず印をつける)")
+		t.Error("ThreadDeleted = false, want true")
+	}
+	// 本人が書いた本文は残る。
+	if c.Body != "自分が書いた本文は残る" {
+		t.Errorf("Body = %q, want 本文がそのまま", c.Body)
 	}
 }
 

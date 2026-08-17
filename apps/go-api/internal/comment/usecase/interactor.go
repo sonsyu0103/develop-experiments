@@ -95,10 +95,10 @@ type MyCommentDTO struct {
 	ID       int64 `json:"id"`
 	ThreadID int64 `json:"threadId"`
 	// ThreadTitle は投稿先のスレッドのタイトルです。
-	// 削除済みのスレッドのタイトルもそのまま返します。
-	ThreadTitle string `json:"threadTitle"`
+	// **削除済みのスレッドでは nil になります** (db/query/comments.sql)。
+	ThreadTitle *string `json:"threadTitle"`
 	// ThreadDeleted は投稿先のスレッドが削除済みかどうかです。
-	// 真なら threadId へのリンクは 404 になります。
+	// 真なら threadId へのリンクは 404 で、ThreadTitle は nil です。
 	ThreadDeleted bool `json:"threadDeleted"`
 	// Seq はスレッド内のレス番号です。欠番が出ます。
 	Seq int32 `json:"seq"`

@@ -838,3 +838,75 @@ func TestThreadInteractor_FetchMyThreadList_EmptyIsNotNil(t *testing.T) {
 }
 
 func ptrInt64(v int64) *int64 { return &v }
+
+// TestThreadInteractor_FetchMyThreadList_RejectsForeignSortCursor は、
+// **別の並び順で発行されたカーソルを拒む**ことを確かめます (レビュー指摘)。
+//
+// 利用者は `GET /threads?sort=popular` が返したトークンを、そのまま
+// `/me/threads?cursor=` に貼れます。検査しないと view_count 成分が黙って
+// 捨てられ、`id < cursorID` だけが効いた「要求していない位置のページ」が
+// 400 も出さずに返ります (ADR 0018 が防ごうとしている形そのもの)。
+func TestThreadInteractor_FetchMyThreadList_RejectsForeignSortCursor(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepo(5)
+	repo.owners = map[int64]int64{5: 1, 4: 1, 3: 1}
+	uc := NewThreadInteractor(repo, nil)
+
+	// 人気順が発行する形のトークン (並び順の印と view_count を含む)。
+	token, err := pagination.NewCursor(4).
+		WithSort(model.ListOrderPopular.CursorSort()).
+		WithViewCount(10).
+		Encode()
+	if err != nil {
+		t.Fatalf("カーソルの符号化が失敗した: %v", err)
+	}
+	page, err := pagination.NewPage(&token, 10)
+	if err != nil {
+		t.Fatalf("pagination.NewPage が失敗した: %v", err)
+	}
+
+	_, err = uc.FetchMyThreadList(context.Background(), 1, page)
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
+	}
+	// **弾いたなら DB を引かない。**
+	if len(repo.authorListCalls) != 0 {
+		t.Errorf("リポジトリが呼ばれた: %v, want 呼ばれない", repo.authorListCalls)
+	}
+}
+
+// TestThreadInteractor_FetchMyThreadList_AcceptsOwnCursor は、
+// 自分が発行したトークンは通ること (先頭ページも含む) を確かめます。
+//
+// **この検査が無いと、上の拒否を「常に 400」にしても気づけません。**
+func TestThreadInteractor_FetchMyThreadList_AcceptsOwnCursor(t *testing.T) {
+	t.Parallel()
+
+	repo := newFakeRepo(5)
+	repo.owners = map[int64]int64{5: 1, 4: 1, 3: 1, 2: 1, 1: 1}
+	uc := NewThreadInteractor(repo, nil)
+	ctx := context.Background()
+
+	// 先頭ページ (カーソル無し) は検査の対象外。
+	first, err := uc.FetchMyThreadList(ctx, 1, mustPage(t, nil, 2))
+	if err != nil {
+		t.Fatalf("先頭ページが失敗した: %v", err)
+	}
+	if first.NextCursor == nil {
+		t.Fatal("NextCursor = nil, want トークン")
+	}
+
+	// 返したトークンをそのまま渡す経路が通ること。
+	page, err := pagination.NewPage(first.NextCursor, 2)
+	if err != nil {
+		t.Fatalf("pagination.NewPage が失敗した: %v", err)
+	}
+	second, err := uc.FetchMyThreadList(ctx, 1, page)
+	if err != nil {
+		t.Fatalf("2 ページ目が失敗した: %v", err)
+	}
+	if len(second.Threads) != 2 || second.Threads[0].ID != 3 {
+		t.Fatalf("2 ページ目 = %+v, want id 3,2", second.Threads)
+	}
+}
