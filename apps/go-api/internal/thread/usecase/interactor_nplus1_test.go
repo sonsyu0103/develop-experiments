@@ -40,10 +40,28 @@ func TestNPlusOneInteractor_AggregatesCorrectlyInParallel(t *testing.T) {
 		}
 	}
 
-	// N+1 なので、スレッド件数ぶんだけ COUNT が飛んでいるはず。
-	// これが本命実装 (0 回) との差であり、ベンチマークで比較する対象。
+	// 投稿者も 1 件ずつ解決するため、添字との対応は 2 本目の往復でも崩れない。
+	// **偶数 ID にだけ投稿者が付く** (fakeRepo)。取り違えれば奇数側に付く。
+	for i, th := range got.Threads {
+		wantID := int64(50 - i)
+		switch {
+		case wantID%2 == 0 && th.Author == nil:
+			t.Fatalf("threads[%d] (ID=%d) の投稿者が nil (解決結果が取り違えられている)", i, wantID)
+		case wantID%2 != 0 && th.Author != nil:
+			t.Fatalf("threads[%d] (ID=%d) は匿名のはずが投稿者が付いている", i, wantID)
+		}
+	}
+
+	// N+1 なので、スレッド件数ぶんだけ COUNT と投稿者の解決が飛んでいるはず。
+	// これが本命実装 (どちらも 0 回) との差であり、ベンチマークで比較する対象。
 	if n := repo.countCalls.Load(); n != 50 {
 		t.Errorf("CountComments の呼び出し回数 = %d, want 50", n)
+	}
+	// **ここを数えないと往復回数を半分に見誤る。** 投稿者の解決を足した
+	// 時点で 1 スレッドあたり 2 往復になっており、
+	// それが単一クエリ版との比較の前提になる (ADR 0014)。
+	if n := repo.authorCalls.Load(); n != 50 {
+		t.Errorf("FindThreadAuthor の呼び出し回数 = %d, want 50", n)
 	}
 }
 

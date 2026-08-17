@@ -469,3 +469,44 @@ func TestLoad_ContactDefaults(t *testing.T) {
 		t.Errorf("レート制限の既定 = %d 件 / %v", cfg.Contact.RateLimitMax, cfg.Contact.RateLimitWindow)
 	}
 }
+
+// **接続プールの既定は実測で決めた値であること** (ADR 0009 の「実測」3-2)。
+//
+// 20 から 8 に下げてある。20 は測らずに置いた数字で、
+// 実測すると 8 以降はスループットが伸びず、
+// **遅い側の応答だけが悪化していた** (並列 64 の p95 が 36ms → 122ms)。
+//
+// ここで固定しているのは「8 が唯一の正解だから」ではありません。
+// 適正値は DB のコア数に比例し、アプリからは見えないので、
+// **どの数字も推測になります。** 検査があると、次に変えるときに
+// 「また測らずに戻す」ができなくなります —— それがこのテストの役目です。
+func TestLoad_PoolDefaults(t *testing.T) {
+	cfg := loadWithMinimalEnv(t)
+
+	if cfg.MaxConns != 8 {
+		t.Errorf("MaxConns の既定 = %d, want 8 "+
+			"(変えるなら make scale-probe で測り直し、ADR 0009 を更新すること)",
+			cfg.MaxConns)
+	}
+	if cfg.MinConns != 2 {
+		t.Errorf("MinConns の既定 = %d, want 2", cfg.MinConns)
+	}
+	if cfg.MinConns > cfg.MaxConns {
+		t.Errorf("MinConns (%d) が MaxConns (%d) を超えている", cfg.MinConns, cfg.MaxConns)
+	}
+}
+
+// 上書きが実際に効くこと。**compose から振れることが測定の前提**になります
+// (make scale-probe の 5 番が DB_MAX_CONNS を差し替えて計測します)。
+func TestLoad_PoolOverride(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://app:password@localhost:5432/bbs")
+	t.Setenv("DB_MAX_CONNS", "32")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load が失敗した: %v", err)
+	}
+	if cfg.MaxConns != 32 {
+		t.Errorf("MaxConns = %d, want 32 (DB_MAX_CONNS が効いていない)", cfg.MaxConns)
+	}
+}

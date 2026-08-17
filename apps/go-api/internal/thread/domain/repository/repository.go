@@ -69,10 +69,21 @@ type ThreadRepository interface {
 // 「N+1 クエリ + goroutine 並列集計」を再現するための実装用インターフェースです。
 // 本番経路では使いません。
 type BenchmarkRepository interface {
-	// ListThreadsOnly はコメント数を含めずにスレッドだけを取得します。
+	// ListThreadsOnly はコメント数も投稿者も含めずにスレッドだけを取得します。
 	ListThreadsOnly(ctx context.Context, page pagination.Page) ([]model.Thread, error)
 
 	// CountComments は 1 スレッド分のコメント数を数えます。
 	// スレッド件数ぶん呼ばれることを前提とした、意図的な N+1 用メソッドです。
 	CountComments(ctx context.Context, threadID int64) (int64, error)
+
+	// FindThreadAuthor は 1 スレッド分の投稿者を解決します。
+	// CountComments と同じく、スレッド件数ぶん呼ばれる前提の N+1 用メソッドです。
+	//
+	// **匿名投稿では (nil, nil) を返します。** 「投稿者がいない」は
+	// 正常な結果であり、エラーではありません (ADR 0005 決定 2)。
+	//
+	// このメソッドが無いと、単一クエリ版だけが LEFT JOIN users を持つ状態になり、
+	// **同じ仕事をしていない 2 つを比べる**ことになります
+	// (ADR 0014「測定の前提が 1 つ崩れている」)。
+	FindThreadAuthor(ctx context.Context, threadID int64) (*model.Author, error)
 }

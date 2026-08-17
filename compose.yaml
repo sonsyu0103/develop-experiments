@@ -363,6 +363,16 @@ services:
       LOG_FORMAT: ${LOG_FORMAT:-json}
       ADDR: ":8080"
       DATABASE_URL: postgres://app:password@postgres:5432/bbs?sslmode=disable
+      # 接続プールの上限 (docs/adr/0009-scaling-strategy.md の「実測」)。
+      #
+      # **既定値をここに書かない。** config 側が既定を持つ。
+      # COMMENT_POST_MODE と同じで、両方に書くと二重管理になる。
+      #
+      # 外へ出しているのは、**スループットが接続数のどこで折り返すかを
+      # 実測するため** (make scale-probe)。VIEW_COUNT_FLUSH_SECONDS を
+      # 出しているのと同じ理由になる。
+      DB_MAX_CONNS: ${DB_MAX_CONNS:-}
+      DB_MIN_CONNS: ${DB_MIN_CONNS:-}
       CORS_ALLOWED_ORIGINS: http://localhost:3000
       # コメント投稿の並行制御の方式 (docs/adr/0019-comment-concurrency.md 決定 2)。
       # ssi / pessimistic / unique / naive。

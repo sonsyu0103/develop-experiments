@@ -364,6 +364,19 @@ type Querier interface {
 	// 「対象が今 admin か」と「他に admin が残るか」の 2 つで決まるため、
 	// ロックを取ったあとの値を読む必要がある。
 	FindRoleByPublicID(ctx context.Context, publicID uuid.UUID) (FindRoleByPublicIDRow, error)
+	// 1 スレッド分の投稿者を引く (ADR 0014 の選択肢 C「素朴に 1 件ずつ引く」)。
+	//
+	// **threads を経由して引く。** users.id を直接受け取る形にすると、
+	// 内部 ID がユースケース層まで出てくる。ADR 0014 は
+	// 「内部 ID は運ばない」と決めているので、ベンチマーク用の経路でも破らない。
+	// 往復回数は変わらないため、測りたいものは変わらない。
+	//
+	// **匿名投稿では 0 行になる** (JOIN が空振りする)。
+	// 呼び出し側は「行が無い = 匿名」として扱う。
+	//
+	// 単一クエリ版の LEFT JOIN users と同じ列を返す。
+	// 退会済みも返し、表示の差し替えはドメイン (model.NewAuthor) が行う。
+	FindThreadAuthor(ctx context.Context, threadID int64) (FindThreadAuthorRow, error)
 	// 確保できなかったときに、既存の記録を読む。
 	//
 	// request_hash が違えば「同じキーで別の内容」なので 422 にする。
@@ -599,10 +612,25 @@ type Querier interface {
 	// 解決済みを引く場合は全体の走査になる (件数が増え続けるので調査用と割り切る)。
 	ListReports(ctx context.Context, arg ListReportsParams) ([]ListReportsRow, error)
 	// -----------------------------------------------------------------------------
-	// 以下 2 つは Phase 4 のベンチマーク専用 (N+1 実装の再現用)。
+	// 以下 3 つは Phase 4 のベンチマーク専用 (N+1 実装の再現用)。
 	// 本番経路では使わない。
+	//
+	// 【この 3 つで「同じ仕事」を組み立てられること】
+	// 単一クエリ版 (ListThreadsWithCommentCount) は 1 往復で
+	// 「スレッド + コメント数 + 投稿者」を返す。N+1 版が返す情報が
+	// それより少ないと、**同じ仕事をしていない 2 つを比べる**ことになる
+	// (ADR 0014「測定の前提が 1 つ崩れている」)。
+	// 3 つを合わせて単一クエリ版と同じ列が揃うようにしてある。
 	// -----------------------------------------------------------------------------
-	ListThreadIDs(ctx context.Context, arg ListThreadIDsParams) ([]ListThreadIDsRow, error)
+	// コメント数も投稿者も引かずにスレッドだけを取得する。
+	//
+	// **view_count まで引く。** 単一クエリ版の内側 CTE と同じ列を読む形にして、
+	// ヒープから取り出す幅を揃える。1 列足りないだけで
+	// 「N+1 側のほうが読む量が少ない」比較になる。
+	//
+	// **旧称は ListThreadIDs。** id しか引いていなかった頃の名前が
+	// 列を足したあとも残っていた。リポジトリ側のメソッド名 (ListThreadsOnly) に揃える。
+	ListThreadsOnly(ctx context.Context, arg ListThreadsOnlyParams) ([]ListThreadsOnlyRow, error)
 	// スレッド一覧 + コメント数を「1 往復」で取得する。
 	//
 	// 【なぜ LEFT JOIN + GROUP BY にしないか】

@@ -58,6 +58,13 @@ components:
   main:
     in: cmd/api
 
+  # 負荷生成 (Phase 4 / .github/scripts/scale-probe.py)。
+  # **本番バイナリには入らない。** Dockerfile の本番ターゲットは
+  # cmd/api だけをビルドする。標準ライブラリしか使わないので deps は書かない
+  # (プロジェクトのどの層にも依存しない = 依存の向きを壊しようがない)。
+  loadgen:
+    in: tools/loadgen
+
   shared-apperr:
     in: internal/apperr
   shared-pagination:
