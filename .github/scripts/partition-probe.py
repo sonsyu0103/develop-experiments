@@ -60,23 +60,41 @@ SQL_EXEC = os.environ.get(
 # 空き容量の確認だけは psql では取れないので、別に持つ。
 DF_EXEC = os.environ.get(
     "DF_EXEC", "docker compose exec -T postgres df -P /var/lib/postgresql/data")
-RUNS = int(os.environ.get("PROBE_RUNS", "5"))
+RUNS = int(os.environ.get("PROBE_RUNS", "5").strip() or "5")
+# **1 番の 5 回では足りなかった。** 2,000 万行で分割ありが勝ったように見え、
+# 40 回に増やすと逆転した。結論を出す 1-2 番は標本を厚くする。
+WARM_RUNS = int(os.environ.get("PROBE_WARM_RUNS", "30").strip() or "30")
+PREPARED_RUNS = int(os.environ.get("PROBE_PREPARED_RUNS", "60").strip() or "60")
+
+def int_list(key: str, fallback: str) -> list[int]:
+    """カンマ区切りの環境変数を整数の並びとして読む。
+
+    **空文字を未設定として扱う。** `make partition-probe PROBE_SCALES=`
+    や、空で export された変数で、素の ValueError を出さないため。
+    """
+    raw = os.environ.get(key, "").strip() or fallback
+    try:
+        return [int(x) for x in raw.split(",") if x.strip()]
+    except ValueError as err:
+        raise SystemExit(f"{key} の書式が不正です (カンマ区切りの整数): {raw!r}") from err
+
 
 # 段。**小さいほうから測る。** 大きい段でディスクが尽きても、
 # それまでの結果は残る。
-SCALES = [int(s) for s in os.environ.get(
-    "PROBE_SCALES", "200000,2000000,20000000").split(",")]
+SCALES = int_list("PROBE_SCALES", "200000,2000000,20000000")
 
 # 0 は「分割なし」を意味する。
-PARTITIONS = [int(p) for p in os.environ.get("PROBE_PARTITIONS", "0,8").split(",")]
+PARTITIONS = int_list("PROBE_PARTITIONS", "0,8")
 
 # 1 スレッドあたりのコメント数。本番のベンチデータセット
 # (2,000 スレッド / 20 万コメント) と同じ 100 件に揃える。
 COMMENTS_PER_THREAD = int(os.environ.get("PROBE_COMMENTS_PER_THREAD", "100"))
 
-# 1 行あたりのディスク使用量の見積もり (ヒープ + 索引 3 本)。
+# 1 行あたりのディスク使用量の見積もり (ヒープ + 索引 5 本)。
 # 実測から出した概算で、投入前の空き容量チェックにだけ使う。
-BYTES_PER_ROW = 220
+# **本番と同じ列・索引に揃えたぶん増えている** (author_id / image_id と
+# それぞれの部分索引)。20 万行で 44 MB ≒ 1 行あたり 220 バイト + 余裕。
+BYTES_PER_ROW = 260
 
 EXEC_TIME = re.compile(r"Execution Time: ([\d.]+) ms")
 PLAN_TIME = re.compile(r"Planning Time: ([\d.]+) ms")
@@ -90,6 +108,9 @@ PLAN_BUFFERS = re.compile(r"Planning:\s*\n\s*Buffers: shared hit=(\d+)(?: read=(
 # 実際に触ったパーティションを数える。**「除外が効いた」を数字で示す**ため。
 # 計画木に出ないパーティションは走査されていない。
 SCANNED_PART = re.compile(r"on (c_h\d+_p\d+|c_flat)\b")
+# ジェネリックプランでの実行時除外。**プランには全区画が載り、実行時に落ちる**ので、
+# 触った区画数ではなくこの行が証拠になる。
+SUBPLANS_REMOVED = re.compile(r"Subplans Removed: (\d+)")
 
 
 def psql(statement: str, quiet: bool = False) -> str:
@@ -99,6 +120,19 @@ def psql(statement: str, quiet: bool = False) -> str:
     if out.returncode != 0:
         if not quiet:
             print(out.stderr.strip(), file=sys.stderr)
+        raise RuntimeError(f"psql が失敗しました: {out.stderr.strip()[:400]}")
+    return out.stdout
+
+
+def psql_script(script: str) -> str:
+    """複数の文を **1 セッション**で流す。
+
+    PREPARE / EXECUTE は接続をまたげないので、-c を並べる形では測れない。
+    """
+    out = subprocess.run(shlex.split(SQL_EXEC) + ["-v", "ON_ERROR_STOP=1"],
+                         input=script, capture_output=True, text=True)
+    if out.returncode != 0:
+        print(out.stderr.strip(), file=sys.stderr)
         raise RuntimeError(f"psql が失敗しました: {out.stderr.strip()[:400]}")
     return out.stdout
 
@@ -121,6 +155,15 @@ def progress(msg: str) -> None:
 # **索引まで揃えないと意味が無い** —— 測っているのは索引の大きさの差なので、
 # 索引の構成が違えば何を比べたのか分からなくなる。
 
+# **マイグレーション 000001 だけを見て書かないこと。** comments は
+# あとから列が増えている:
+#
+#   000002  author_id BIGINT   + comments_author_id_desc_idx
+#   000006  image_id  UUID     + comments_image_id_idx
+#
+# 列を落とすと 1 行が狭くなり、同じ行数でもページ数が減る。
+# **「8 分割しても B-tree の段数が変わらない」という結論は行幅に効く**ので、
+# ここを削ると測定が有利側に転ぶ。
 COLUMNS = """
     id          BIGINT      NOT NULL DEFAULT nextval('bench_part.c_id_seq'),
     thread_id   BIGINT      NOT NULL,
@@ -128,8 +171,26 @@ COLUMNS = """
     body        TEXT        NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at  TIMESTAMPTZ,
-    seq         INTEGER     NOT NULL
+    seq         INTEGER     NOT NULL,
+    author_id   BIGINT,
+    image_id    UUID
 """
+
+# 本番 comments の索引 5 本のうち、PK 以外の 4 本。
+# **外部キーは張らない。** users / images を作る話ではなく、
+# 測りたいのは索引の大きさと除外の効きになる。
+# 索引の本数と形は揃える (INSERT のコストがここで決まる)。
+SECONDARY_INDEXES = [
+    # 生存コメントのみの部分索引 (comments_alive_thread_id_desc_idx)
+    ("alive_idx", "(thread_id, id DESC) WHERE deleted_at IS NULL"),
+    # レス番号の一意制約 (000004)
+    ("seq_idx", "(thread_id, seq)", "UNIQUE"),
+    # 投稿者での検索 (comments_author_id_desc_idx)。
+    # **パーティションキーを含まないので除外が効かない**索引になる
+    ("author_idx", "(author_id, id DESC) WHERE author_id IS NOT NULL"),
+    # 画像の逆引き (comments_image_id_idx)
+    ("image_idx", "(image_id) WHERE image_id IS NOT NULL"),
+]
 
 
 def table_name(parts: int) -> str:
@@ -137,11 +198,15 @@ def table_name(parts: int) -> str:
 
 
 def create_tables() -> None:
-    """スキーマと表を作り直す。"""
-    psql("CREATE SCHEMA IF NOT EXISTS bench_part;")
-    for parts in PARTITIONS:
-        psql(f"DROP TABLE IF EXISTS bench_part.{table_name(parts)} CASCADE;")
-    psql("DROP SEQUENCE IF EXISTS bench_part.c_id_seq;")
+    """スキーマと表を作り直す。
+
+    **スキーマごと落とす。** 今回の PARTITIONS に載っている表だけを消す形だと、
+    前回 PROBE_PARTITIONS=0,8,32 で回したあとに既定 (0,8) で回したとき、
+    残った c_h32 がシーケンスに依存したままで
+    DROP SEQUENCE が "other objects depend on it" で落ちる。
+    """
+    psql("DROP SCHEMA IF EXISTS bench_part CASCADE;")
+    psql("CREATE SCHEMA bench_part;")
     psql("CREATE SEQUENCE bench_part.c_id_seq AS BIGINT;")
 
     for parts in PARTITIONS:
@@ -170,11 +235,10 @@ def create_tables() -> None:
 def create_indexes(parts: int) -> None:
     """投入後に索引を張る。**先に張ると投入が数倍遅くなる。**"""
     name = table_name(parts)
-    # 生存コメントのみの部分索引 (本番の comments_alive_thread_id_desc_idx)。
-    psql(f"CREATE INDEX {name}_alive_idx ON bench_part.{name} (thread_id, id DESC) "
-         f"WHERE deleted_at IS NULL;")
-    # レス番号の一意制約 (本番の 000004)。**INSERT のコストに効く**ので外さない。
-    psql(f"CREATE UNIQUE INDEX {name}_seq_idx ON bench_part.{name} (thread_id, seq);")
+    for spec in SECONDARY_INDEXES:
+        suffix, definition = spec[0], spec[1]
+        unique = "UNIQUE " if len(spec) > 2 else ""
+        psql(f"CREATE {unique}INDEX {name}_{suffix} ON bench_part.{name} {definition};")
 
 
 def load(rows: int) -> None:
@@ -190,7 +254,8 @@ def load(rows: int) -> None:
     started = time.time()
     progress(f"{rows:,} 行を bench_part.{source} に生成中...")
     psql(f"""
-        INSERT INTO bench_part.{source} (thread_id, seq, author_name, body, created_at, deleted_at)
+        INSERT INTO bench_part.{source}
+            (thread_id, seq, author_name, body, created_at, deleted_at, author_id, image_id)
         SELECT
             ((n - 1) / {COMMENTS_PER_THREAD}) + 1,
             ((n - 1) % {COMMENTS_PER_THREAD}) + 1,
@@ -200,7 +265,12 @@ def load(rows: int) -> None:
             -- 測るとき、全行が同じ時刻だと範囲指定が全件か 0 件になる。
             now() - ((n % 2592000) || ' seconds')::interval,
             -- 本番のベンチデータセットと同じく 10% を論理削除する。
-            CASE WHEN n % 10 = 0 THEN now() ELSE NULL END
+            CASE WHEN n % 10 = 0 THEN now() ELSE NULL END,
+            -- 3 件に 1 件は匿名 (db/bench/dataset.sql と同じ比率)。
+            -- **部分索引 comments_author_id_desc_idx の大きさに効く。**
+            CASE WHEN n % 3 = 0 THEN NULL ELSE (n % 200) + 1 END,
+            -- 画像つきは少数。こちらも部分索引の大きさに効く。
+            CASE WHEN n % 50 = 0 THEN gen_random_uuid() ELSE NULL END
         FROM generate_series(1, {rows}) AS n;
     """)
     progress(f"生成完了 ({time.time() - started:.0f} 秒)")
@@ -211,10 +281,10 @@ def load(rows: int) -> None:
             continue
         started = time.time()
         progress(f"bench_part.{name} へコピー中...")
-        psql(f"INSERT INTO bench_part.{name} "
-             f"(id, thread_id, author_name, body, created_at, deleted_at, seq) "
-             f"SELECT id, thread_id, author_name, body, created_at, deleted_at, seq "
-             f"FROM bench_part.{source};")
+        cols = ("id, thread_id, author_name, body, created_at, deleted_at, "
+                "seq, author_id, image_id")
+        psql(f"INSERT INTO bench_part.{name} ({cols}) "
+             f"SELECT {cols} FROM bench_part.{source};")
         progress(f"コピー完了 ({time.time() - started:.0f} 秒)")
 
     for parts in PARTITIONS:
@@ -247,12 +317,20 @@ def explain(sql: str, parallel: bool = False) -> dict:
     # 同じ区画が複数ノードに出ることがあるので、集合にして数える。
     scanned = len(set(SCANNED_PART.findall(text)))
 
+    # **読み取れなかったら落とす。** 既定値 0.0 で先へ進めると、
+    # 表には「0.000 ms」= 一瞬で終わったように出る。
+    # 出力の形が変わったときに**エラーではなく誤った結論**が出るのが一番まずい。
+    if exec_m is None or plan_m is None:
+        raise RuntimeError(
+            "EXPLAIN の実行時間 / 計画時間を読み取れませんでした。"
+            f"psql の出力形式が変わった可能性があります:\n{text[:400]}")
+
     def total(m) -> int:
         return 0 if m is None else int(m.group(1)) + int(m.group(2) or 0)
 
     return {
-        "exec": float(exec_m.group(1)) if exec_m else 0.0,
-        "plan": float(plan_m.group(1)) if plan_m else 0.0,
+        "exec": float(exec_m.group(1)),
+        "plan": float(plan_m.group(1)),
         "buffers": total(buf_m),
         "plan_buffers": total(plan_buf_m),
         "scanned": scanned,
@@ -354,8 +432,69 @@ WHERE created_at > now() - interval '1 hour' AND deleted_at IS NULL;
 """
 
 
+def prepared_measure(name: str, thread_ids: list[int]) -> dict:
+    """プリペアドステートメントで 1 スレッドの一覧を測る。
+
+    **本番の pgx はこちらの経路になる** (QueryExecModeCacheStatement)。
+    EXPLAIN を毎回投げる測り方だと、実行のたびにプランを作り直すので
+    **パーティション側だけがプランニングのぶん重く見える** ——
+    本番には存在しないコストで結論が決まってしまう。
+
+    PostgreSQL は 6 回目の実行からジェネリックプランに切り替える
+    (custom plan の見積もりコストと比べて決める)。
+    切り替わる前の実行が混ざらないよう、先に空打ちする。
+
+    **1 セッションの中で完結させる。** psql を呼び直すと
+    PREPARE も接続も作り直しになり、償却を測れない。
+    """
+    lines = [
+        f"PREPARE p(bigint) AS SELECT id, seq, body FROM bench_part.{name} "
+        f"WHERE thread_id = $1 AND deleted_at IS NULL ORDER BY id DESC LIMIT 50;",
+        "SET max_parallel_workers_per_gather = 0;",
+    ]
+    # ジェネリックプランへ移行させる (6 回目から)。
+    lines += [f"EXECUTE p({t});" for t in thread_ids[:8]]
+    for t in thread_ids:
+        lines.append(f"EXECUTE p({t});")                      # ウォーム
+        lines.append(f"EXPLAIN (ANALYZE) EXECUTE p({t});")     # 計測
+    text = psql_script("\n".join(lines))
+
+    execs = [float(x) for x in EXEC_TIME.findall(text)]
+    plans = [float(x) for x in PLAN_TIME.findall(text)]
+    if not execs:
+        raise RuntimeError(
+            f"{name}: プリペアド経路の実行時間を 1 つも読み取れませんでした")
+
+    # 除外が効いた証拠を拾う。**「速い / 遅い」より先に確かめること** ——
+    # 除外が効いていない状態の数字を「効いている前提」で読むと、
+    # 結論が逆向きになる。
+    removed = SUBPLANS_REMOVED.search(text)
+    return {
+        "exec": statistics.median(execs),
+        "plan": statistics.median(plans) if plans else 0.0,
+        "samples": len(execs),
+        "removed": int(removed.group(1)) if removed else 0,
+    }
+
+
+def warm_measure(name: str, thread_ids: list[int]) -> dict:
+    """同じスレッドを空打ちしてから測る (EXPLAIN 経路)。
+
+    1 回目はディスクから読むので、毎回別のスレッドを引く測り方だと
+    **索引の深さの差ではなく I/O のばらつき**を測ってしまう。
+    """
+    execs, plans = [], []
+    for t in thread_ids:
+        explain(q_thread_page(name, t))  # ウォーム (捨てる)
+        samples = [explain(q_thread_page(name, t)) for _ in range(3)]
+        execs.append(statistics.median(s["exec"] for s in samples))
+        plans.append(statistics.median(s["plan"] for s in samples))
+    return {"exec": statistics.median(execs), "plan": statistics.median(plans),
+            "samples": len(execs)}
+
+
 def q_insert(name: str, thread_id: int, seq: int) -> str:
-    """1 行 INSERT。索引 3 本の更新を含む。"""
+    """1 行 INSERT。索引 5 本 (PK + 副索引 4 本) の更新を含む。"""
     return f"""
 INSERT INTO bench_part.{name} (thread_id, seq, body)
 VALUES ({thread_id}, {seq}, 'プローブ');
@@ -399,14 +538,18 @@ def run_scale(rows: int) -> bool:
     print(f"規模: {rows:,} 行 / {threads:,} スレッド (各クエリ {RUNS} 回の中央値)")
     print(f"{'=' * 72}")
 
+    # **先に前の段を落としてから空き容量を見る。** 順序が逆だと、
+    # 2 段目以降は前段のデータを「使用中」のまま数えるので、
+    # 実際には入る段を「足りない」と誤判定して止まる。
+    create_tables()
+
     need = rows * BYTES_PER_ROW * len(PARTITIONS)
     free = free_bytes()
     if 0 < free < need:
-        print(f"\n**空き容量が足りないので、この段は測れませんでした。**")
+        print("\n**空き容量が足りないので、この段は測れませんでした。**")
         print(f"  必要 約 {need / 1e9:.1f} GB / 空き {free / 1e9:.1f} GB")
         return False
 
-    create_tables()
     load(rows)
 
     # **スレッド ID は毎回振り直す。** 同じ 1 件を繰り返すと、
@@ -424,8 +567,32 @@ def run_scale(rows: int) -> bool:
         print(f"{label(parts):<10}{total:>12}{idx:>12}")
 
     compare("■ 1. 1 スレッドのコメント一覧 (LIMIT 50)",
-            "除外が最も効く形。本番の主経路",
+            "除外が最も効く形。本番の主経路。**毎回プランを作り直す測り方**",
             lambda name: [q_thread_page(name, t) for t in picks])
+
+    # **本番はプリペアドステートメントを使う** (pgx の既定)。
+    # 上の 1 番はプランを毎回作り直すので、パーティション側だけが
+    # 本番には存在しないコストを払っている。結論はこちらで出す。
+    warm_picks = [rng.randint(1, threads) for _ in range(WARM_RUNS)]
+    prep_picks = [rng.randint(1, threads) for _ in range(PREPARED_RUNS)]
+
+    print("\n■ 1-2. 同じクエリを「本番と同じ測り方」で測り直す")
+    print("  ウォーム = 同じスレッドを空打ちしてから 3 回 (EXPLAIN 経路)")
+    print("  プリペアド = PREPARE + EXECUTE。**本番の pgx はこちら**")
+    print(f"{'変種':<10}{'ウォーム計画':>13}{'ウォーム実行':>13}"
+          f"{'プリペアド実行':>15}{'実行時除外':>11}")
+    print("-" * 63)
+    for parts in PARTITIONS:
+        name = table_name(parts)
+        warm = warm_measure(name, warm_picks)
+        prep = prepared_measure(name, prep_picks)
+        # 分割なしでは除外そのものが無いので「-」。
+        removed = str(prep["removed"]) if parts else "-"
+        print(f"{label(parts):<10}{warm['plan']:>13.3f}{warm['exec']:>13.3f}"
+              f"{prep['exec']:>15.4f}{removed:>11}")
+    print(f"  (ウォーム n={WARM_RUNS} / プリペアド n={PREPARED_RUNS}、いずれも中央値)")
+    print("  実行時除外 = Subplans Removed。**除外が効いた証拠**で、")
+    print("  ここが 0 のまま「効いていない」と読むと結論が逆になる。")
 
     compare("■ 2. 1 スレッドのコメント数",
             "一覧の相関サブクエリと同じ形",
@@ -446,7 +613,7 @@ def run_scale(rows: int) -> bool:
     # seq は (thread_id, seq) が一意なので、変種ごとに同じ値を使ってよい
     # (表が別なので衝突しない)。スレッド 1 の末尾に足していく。
     seq_base = COMMENTS_PER_THREAD + 1
-    compare("■ 6. 1 行 INSERT (索引 3 本の更新を含む)",
+    compare("■ 6. 1 行 INSERT (索引 5 本の更新を含む)",
             "**UNLOGGED なので絶対値は楽観的。** 比べるのは変種どうしの比",
             lambda name: [q_insert(name, 1, seq_base + i) for i in range(RUNS)])
 

@@ -38,6 +38,13 @@ import (
 	"time"
 )
 
+// errorBackoff は接続に失敗したときに待つ時間です。
+//
+// **正常時のスループットには影響しません** (成功した要求は通らない経路)。
+// 短すぎると空回りが止まらず、長すぎると「本当に落ちている」ことの
+// 検出が遅れます。
+const errorBackoff = 10 * time.Millisecond
+
 func main() {
 	var (
 		url         = flag.String("url", "http://localhost:8080/healthz", "叩く URL")
@@ -143,6 +150,12 @@ func run(url string, concurrency int, duration, warmup time.Duration) Result {
 					if counting {
 						errors.Add(1)
 					}
+					// **少しだけ待つ。** API が落ちている・接続を拒否している場合
+					// client.Do は即座に返るので、待たないと計測時間いっぱい
+					// フルスピードで空回りする。errors が桁違いに膨らむうえ、
+					// **loadgen は go-api コンテナの中で動く**ため、
+					// 測定対象から CPU を奪う。
+					time.Sleep(errorBackoff)
 					continue
 				}
 				// **本文を最後まで読んで閉じる。** 読み捨てないと

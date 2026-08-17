@@ -48,22 +48,31 @@ API_SERVICE = os.environ.get("API_SERVICE", "go-api")
 DB_SERVICE = os.environ.get("DB_SERVICE", "postgres")
 BASE_URL = os.environ.get("PROBE_BASE_URL", "http://localhost:8080")
 
-DURATION = os.environ.get("PROBE_DURATION", "5s")
-LEVELS = [int(c) for c in os.environ.get(
-    "PROBE_LEVELS", "1,2,4,8,16,32,64,128").split(",")]
+def int_list(key: str, fallback: str) -> list[int]:
+    """カンマ区切りの環境変数を整数の並びとして読む。
+
+    **空文字を未設定として扱う。** `make scale-probe PROBE_LEVELS=` や、
+    空で export された変数で、素の ValueError を出さないため。
+    """
+    raw = os.environ.get(key, "").strip() or fallback
+    try:
+        return [int(x) for x in raw.split(",") if x.strip()]
+    except ValueError as err:
+        raise SystemExit(f"{key} の書式が不正です (カンマ区切りの整数): {raw!r}") from err
+
+
+DURATION = os.environ.get("PROBE_DURATION", "").strip() or "5s"
+LEVELS = int_list("PROBE_LEVELS", "1,2,4,8,16,32,64,128")
 # pgbench は接続を並列数ぶん張るので、max_connections を超えられない。
-DB_LEVELS = [int(c) for c in os.environ.get(
-    "PROBE_DB_LEVELS", "1,2,4,8,16,32,64").split(",")]
+DB_LEVELS = int_list("PROBE_DB_LEVELS", "1,2,4,8,16,32,64")
 
 LOADGEN_BIN = "/tmp/loadgen"
 # コンテナを作り直すと /tmp が消えるので、ホスト側に実体を置いておく。
 HOST_BIN = os.environ.get("PROBE_LOADGEN_BIN", "/tmp/bbs-loadgen")
 
 # 接続プールの上限を振る段 (5 番)。コンテナを作り直すので時間がかかる。
-POOL_LEVELS = [int(x) for x in os.environ.get(
-    "PROBE_POOL_LEVELS", "4,8,12,16,20,32,64").split(",")]
-POOL_TEST_LEVELS = [int(x) for x in os.environ.get(
-    "PROBE_POOL_TEST_LEVELS", "16,64").split(",")]
+POOL_LEVELS = int_list("PROBE_POOL_LEVELS", "4,8,12,16,20,32,64")
+POOL_TEST_LEVELS = int_list("PROBE_POOL_TEST_LEVELS", "16,64")
 
 TPS = re.compile(r"^tps = ([\d.]+)", re.MULTILINE)
 LATENCY = re.compile(r"^latency average = ([\d.]+) ms", re.MULTILINE)
@@ -129,16 +138,32 @@ def build_loadgen() -> None:
     compose_exec(API_SERVICE, f"go build -o {LOADGEN_BIN} ./tools/loadgen")
     # **ホストに退避しておく。** プール上限を振るときにコンテナを作り直すと
     # /tmp ごと消え、ビルドキャッシュも消えているので毎回 1 分かかる。
-    sh(f"{DOCKER} cp {container_id()}:{LOADGEN_BIN} {HOST_BIN}")
+    docker_cp(f"{container_id()}:{LOADGEN_BIN}", HOST_BIN)
 
 
 def container_id() -> str:
-    return sh(f"{COMPOSE} ps -q {API_SERVICE}").stdout.strip()
+    """go-api コンテナの ID。空なら落とす。
+
+    **空のまま docker cp に渡すと `:/tmp/loadgen` になり、黙って失敗する。**
+    表面化するのは数十秒あとの「loadgen が失敗しました」で、原因が読めない。
+    """
+    cid = sh(f"{COMPOSE} ps -q {API_SERVICE}").stdout.strip()
+    if not cid:
+        raise RuntimeError(
+            f"{API_SERVICE} コンテナが見つかりません。make up を先に流してください")
+    return cid
+
+
+def docker_cp(src: str, dst: str) -> None:
+    out = sh(f"{DOCKER} cp {src} {dst}")
+    if out.returncode != 0:
+        raise RuntimeError(f"docker cp に失敗しました ({src} → {dst}): "
+                           f"{out.stderr.strip()[:300]}")
 
 
 def restore_loadgen() -> None:
     """作り直したコンテナに負荷生成を戻す。"""
-    sh(f"{DOCKER} cp {HOST_BIN} {container_id()}:{LOADGEN_BIN}")
+    docker_cp(HOST_BIN, f"{container_id()}:{LOADGEN_BIN}")
 
 
 def recreate_api(pool: int | None) -> None:
@@ -166,9 +191,13 @@ def open_connections() -> str:
     **設定が届いているかを毎回確かめる。** 環境変数の渡し忘れは
     エラーにならず、「上限を振ったのに全部同じ数字」という形で出る。
     """
+    # **自分自身を除く。** この問い合わせを投げている psql も
+    # datname='bbs' の client backend なので、必ず +1 されて数えられる。
+    # 「上限 4 なのに 5 接続」がきれいに全行で出ていて気づいた。
     out = sh(f"{COMPOSE} exec -T {DB_SERVICE} psql -U app -d bbs -X -t -A -c "
              f"\"SELECT count(*) FROM pg_stat_activity "
-             f"WHERE datname='bbs' AND backend_type='client backend'\"")
+             f"WHERE datname='bbs' AND backend_type='client backend' "
+             f"AND pid <> pg_backend_pid()\"")
     return out.stdout.strip()
 
 
@@ -177,8 +206,14 @@ def pool_ladder() -> list[dict]:
     print("\n■ 5. API の接続プール上限 vs スループット (/threads?size=20)")
     print("  **DB_MAX_CONNS の既定を決めるための測定。**")
     print("  上の 3 で pgbench が示した最適点が、API 経由でも同じ位置に出るかを見る")
-    print(f"{'上限':>5}{'並列':>5}{'RPS':>9}{'p50ms':>8}{'p95ms':>8}{'接続':>6}  postgres CPU")
-    print("-" * 62)
+    # **err / 非2xx を必ず出す。** loadgen は 5xx も requests に数えるので
+    # (Errors から除かれるのは接続失敗だけ)、**速く失敗する条件ほど
+    # RPS が高く出る**。列が無いと、500 を返し始めた上限が
+    # 「スループットが落ちていない」として最適点に選ばれる ——
+    # そしてそれがそのまま本番の既定になる。
+    print(f"{'上限':>5}{'並列':>5}{'RPS':>9}{'p50ms':>8}{'p95ms':>8}"
+          f"{'err':>5}{'非2xx':>6}{'接続':>6}  postgres CPU")
+    print("-" * 73)
 
     rows = []
     try:
@@ -189,7 +224,8 @@ def pool_ladder() -> list[dict]:
                 conns = open_connections()
                 pg = next((v for n, v in r["cpu"].items() if "postgres" in n), 0.0)
                 print(f"{pool:>5}{c:>5}{r['rps']:>9.0f}{r['p50_ms']:>8.2f}"
-                      f"{r['p95_ms']:>8.2f}{conns:>6}  {pg:.0f}%")
+                      f"{r['p95_ms']:>8.2f}{r['errors']:>5}{r['non2xx']:>6}"
+                      f"{conns:>6}  {pg:.0f}%")
                 rows.append({"pool": pool, "concurrency": c, **r})
     finally:
         # **既定に戻してから抜ける。** 途中で落ちても、
@@ -331,7 +367,12 @@ def pgbench_ladder(title: str, note: str, script: str) -> list[dict]:
 
         tps_m = TPS.search(stdout)
         lat_m = LATENCY.search(stdout)
-        tps = float(tps_m.group(1)) if tps_m else 0.0
+        # **読み取れなかったら落とす。** 0.0 で先へ進めると
+        # 「TPS 0」が表に並び、pgbench が壊れたのか DB が遅いのか読めない。
+        if tps_m is None:
+            raise RuntimeError(
+                f"pgbench の tps を読み取れませんでした:\n{stdout[:400]}")
+        tps = float(tps_m.group(1))
         lat = float(lat_m.group(1)) if lat_m else 0.0
         top = sorted(cpu.items(), key=lambda kv: -kv[1])[:2]
         cpu_text = "  ".join(f"{short(n)} {v:.0f}%" for n, v in top)
@@ -399,19 +440,46 @@ def summarize(calib: list[dict], api: list[dict], db: list[dict],
 
     if not pool:
         return
-    # 上限ごとに最良の RPS を取り、頭打ちになる位置を出す。
+
+    # **失敗を含む条件は最適点の候補から外す。** 5xx は requests に数えられる
+    # ので、速く失敗した条件ほど RPS が高く出る。除かずに最大値を取ると、
+    # 「500 を返し始めた上限」が既定に選ばれうる。
+    clean = [r for r in pool if r["errors"] == 0 and r["non2xx"] == 0]
+    dropped = sorted({r["pool"] for r in pool} - {r["pool"] for r in clean})
+    if dropped:
+        print()
+        print(f"  **失敗が出た上限を候補から外した: {dropped}** "
+              f"(err または非 2xx が 1 件以上)")
+    if not clean:
+        print("\n  すべての条件で失敗が出たため、最適点を判定できません。")
+        return
+
+    # 上限ごとに「最良の RPS」と「最悪の p95」を並べる。
+    #
+    # **RPS だけで最適点を決めない。** 走らせるたびに最大値の位置が動く
+    # ほど差が小さく (実測で 2 回まわして 8 と 64 に割れた)、
+    # 一方で **p95 は上限を上げるほど一貫して悪化する**。
+    # スクリプトが片方だけ見て「最適点はここ」と言い切ると、
+    # データが支えていない結論を出すことになる。
     best: dict[int, float] = {}
-    for r in pool:
+    worst_p95: dict[int, float] = {}
+    for r in clean:
         best[r["pool"]] = max(best.get(r["pool"], 0.0), r["rps"])
+        worst_p95[r["pool"]] = max(worst_p95.get(r["pool"], 0.0), r["p95_ms"])
     top = max(best.values())
-    # **「ピーク」ではなく「ピークの 98% に最初に届いた上限」を採る。**
-    # 測定のばらつきで最大値の位置が動くので、最大値そのものを
-    # 既定にすると走らせるたびに結論が変わる。
-    knee = min(p for p, v in best.items() if v >= top * 0.98)
+
     print()
-    print(f"  接続プール上限ごとの最良 RPS: "
-          f"{', '.join(f'{p}={v:.0f}' for p, v in sorted(best.items()))}")
-    print(f"  **上限 {knee} でピークの 98% に届く。** ここから先は増やしても伸びない。")
+    print("  接続プール上限ごとの折り合い (RPS は最良、p95 は最悪の条件):")
+    print(f"    {'上限':>5}{'最良RPS':>9}{'ピーク比':>9}{'最悪p95':>9}")
+    for p in sorted(best):
+        print(f"    {p:>5}{best[p]:>9.0f}{best[p] / top * 100:>8.0f}%"
+              f"{worst_p95[p]:>9.1f}")
+    print()
+    print("  **スループットだけでは決まらない。** 上限を上げても RPS は"
+          f" {top / min(best.values()):.2f} 倍にしかならず、")
+    print("  その差は実行ごとのばらつきと同程度になる。一方で p95 は"
+          f" {max(worst_p95.values()) / min(worst_p95.values()):.1f} 倍に開く。")
+    print("  既定はこのトレードオフで決める (docs/adr/0009-scaling-strategy.md)。")
 
 
 def main() -> int:

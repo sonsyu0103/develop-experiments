@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -247,10 +248,6 @@ func TestNPlusOneMatchesSingleQuery(t *testing.T) {
 			t.Errorf("threads[%d] (ID=%d) のコメント数 = %d, want %d",
 				i, want.ID, got.CommentCount, want.CommentCount)
 		}
-		if got.ViewCount != want.ViewCount {
-			t.Errorf("threads[%d] (ID=%d) の閲覧数 = %d, want %d",
-				i, want.ID, got.ViewCount, want.ViewCount)
-		}
 		// **投稿者は「いる / いない」まで一致させる。** ここが食い違うと
 		// 匿名投稿の分だけ N+1 側の往復が減り、比較が歪みます。
 		switch {
@@ -261,5 +258,20 @@ func TestNPlusOneMatchesSingleQuery(t *testing.T) {
 			t.Errorf("threads[%d] (ID=%d) の投稿者名 = %q, want %q",
 				i, want.ID, got.Author.DisplayName, want.Author.DisplayName)
 		}
+	}
+
+	// **閲覧数は 2 つの結果で突き合わせない。**
+	// 2 つの実装を別の瞬間に投げているので、その間に閲覧数のフラッシュ
+	// (ADR 0006) が挟まると値がずれる。ずれても実装の誤りではないのに、
+	// probe 全体が止まってしまう。
+	//
+	// 確かめたいのは「N+1 側が view_count を引いていること」なので、
+	// **0 以外が 1 件でも返っているか**で見る。列を引かなければ全件 0 になる
+	// (ベンチデータセットは閲覧数を歪んだ分布で入れてある)。
+	if !slices.ContainsFunc(gotResult.Threads, func(d ThreadDTO) bool {
+		return d.ViewCount > 0
+	}) {
+		t.Error("N+1 側の閲覧数が全件 0。view_count を引いていない可能性がある " +
+			"(make bench-dataset を流したか確認すること)")
 	}
 }

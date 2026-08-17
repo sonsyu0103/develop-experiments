@@ -472,6 +472,12 @@ scale-probe: ## 読み取りのスケール限界を実測する (Phase 4 / ADR 
 	@for i in $$(seq 1 30); do \
 		curl -sf -o /dev/null http://localhost:8080/healthz && break || sleep 2; \
 	done
+	# **待つだけでは失敗を検出できない。** ループを抜けても起動していない場合、
+	# 先へ進んで Python 側の無関係なエラーで落ちるので原因が読めない。
+	@curl -sf -o /dev/null http://localhost:8080/healthz || { \
+		echo "API が起動しませんでした。docker compose logs go-api を見てください。"; \
+		exit 1; \
+	}
 	PROBE_LEVELS=$(PROBE_LEVELS) \
 	PROBE_DB_LEVELS=$(PROBE_DB_LEVELS) \
 	PROBE_DURATION=$(PROBE_DURATION) \
