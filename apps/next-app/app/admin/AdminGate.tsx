@@ -18,10 +18,10 @@
 //
 // 取り違えると、権限のない利用者がログイン画面に飛ばされ続けます。
 import Link from 'next/link';
-import { useMemo, type ReactNode } from 'react';
+import { useEffect, useMemo, type ReactNode } from 'react';
 
 import { loginUrl, type Me, type Role } from '../lib/api';
-import { useMe } from '../lib/me';
+import { revalidateMe, useMe } from '../lib/me';
 
 /** ロールの強さ。**数値の大小で比較します** (仕様書の Role と同じ 3 値)。 */
 const rank: Record<Role, number> = { user: 0, moderator: 1, admin: 2 };
@@ -46,6 +46,24 @@ export function AdminGate({
   // ログイン状態そのものは `useMe` が持ちます (ヘッダのナビと共有するため)。
   // **ここが決めるのは「その状態でこの画面を開けるか」だけ**になります。
   const { state: meState } = useMe();
+
+  // **管理画面に入るときは、必ず引き直します** (レビュー指摘)。
+  //
+  // 控えはタブが開いているあいだ残るので、`/mypage` から `/admin` へ
+  // クライアント遷移した場合、**セッションが切れていてもロールを剥奪されていても
+  // 古い控えのままゲートを通ります。** API が 403 を返すので権限の穴では
+  // ありませんが、この部品の役目 (押しても失敗する UI を見せない) が緩みます。
+  //
+  // 代償は「管理画面を開くたびに `GET /me` が 1 回増える」こと。
+  // 管理画面は滅多に開かないので、こちらを払います。
+  // **画面を直接開いた場合は増えません** —— `revalidateMe` は
+  // 取得中の控えには触らないので、そのときの 1 本がそのまま使われます。
+  //
+  // 控えを捨てると購読側 (ヘッダのナビ) にも伝わるので、
+  // 表示がずれることはありません。
+  useEffect(() => {
+    revalidateMe();
+  }, []);
 
   // **効果で状態を作り直しません。** ログイン状態から一意に決まるので、
   // 複製すると 2 つの真実ができ、片方だけ古い瞬間が生まれます。

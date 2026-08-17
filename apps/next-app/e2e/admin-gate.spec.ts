@@ -9,7 +9,7 @@
 // (docs/adr/0013-http-defense.md 決定 3)。
 import { expect, test } from '@playwright/test';
 
-import { admin, mockMe, moderator, plainUser } from './api-mock';
+import { admin, mockMe, moderator, ok, plainUser } from './api-mock';
 
 test.describe('管理画面の入口', () => {
   test('未ログイン (401) にはログインの導線を出す', async ({ page }) => {
@@ -60,6 +60,34 @@ test.describe('管理画面の入口', () => {
 
     await expect(page.getByText('この画面を開く権限がありません')).toBeVisible();
     await expect(page.getByText('必要なロール: admin / 現在のロール: moderator')).toBeVisible();
+  });
+
+  test('管理画面に入るときは、ロールを引き直す', async ({ page }) => {
+    // **控えはタブが開いているあいだ残ります。** クライアント遷移では
+    // セッション切れやロール剥奪が反映されないので、管理画面に入る時点で
+    // 一度引き直します —— この部品の役目は「押しても失敗する UI を
+    // 見せない」ことなので、古い控えのまま通すと役目を果たしません。
+    let calls = 0;
+    await page.route('**/me', (route) => {
+      calls += 1;
+      return ok(route, moderator);
+    });
+    await page.route('**/moderation/reports*', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: '{"reports":[],"nextCursor":null}',
+      }),
+    );
+
+    await page.goto('/mypage');
+    await expect(page.getByRole('heading', { name: moderator.displayName })).toBeVisible();
+    const beforeNavigation = calls;
+
+    await page.getByRole('link', { name: '管理' }).click();
+    await expect(page.getByRole('heading', { name: '通報キュー' })).toBeVisible();
+
+    expect(calls).toBeGreaterThan(beforeNavigation);
   });
 
   test('/me が 500 のときは未ログイン扱いにしない', async ({ page }) => {

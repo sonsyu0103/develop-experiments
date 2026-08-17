@@ -101,7 +101,7 @@ export function CommentForm({
       setPhase({ kind: 'editing' });
       onPosted(posted);
     } catch (e) {
-      setPhase({ kind: 'error', message: describePostError(e) });
+      setPhase({ kind: 'error', message: describePostError(e, signedIn) });
       // **422 のときだけキーを捨てます。** 前回と内容が食い違ったという
       // 申告なので、同じキーのままでは何度送っても 422 のままになります。
       if (e instanceof ApiError && e.code === 'FAILED_PRECONDITION') {
@@ -203,14 +203,21 @@ export function CommentForm({
  * (レス番号の直列化失敗、または同じキーの処理が進行中) で、
  * **再試行できる**種類の失敗になります (ADR 0019)。
  * 「時間をおいて」と書くと、押せば通るものを諦めさせます。
+ *
+ * **ログインの有無で文言を変えます** (レビュー指摘)。
+ * 冪等キーは**未ログインでは無視される**ので (ADR 0015 決定 4)、
+ * 匿名の利用者に「二重には投稿されません」と案内すると嘘になります ——
+ * 「タイムアウトしたが実は成功していた」場合、押し直すと本当に 2 件目ができます。
  */
-function describePostError(e: unknown): string {
+function describePostError(e: unknown, signedIn: boolean): string {
   if (!(e instanceof ApiError)) {
     return '投稿できませんでした。通信環境を確かめて、もう一度お試しください。';
   }
   switch (e.code) {
     case 'CONFLICT':
-      return '同時に投稿が重なりました。もう一度「投稿する」を押してください (同じ内容として扱われるので、二重には投稿されません)。';
+      return signedIn
+        ? '同時に投稿が重なりました。もう一度「投稿する」を押してください (同じ内容として扱われるので、二重には投稿されません)。'
+        : '同時に投稿が重なりました。もう一度「投稿する」を押してください。ただし未ログインの投稿は二重送信を防ぐ仕組みが働かないので、押し直す前に一覧を確認してください (先ほどの投稿が入っていることがあります)。';
     case 'FAILED_PRECONDITION':
       return '前回の送信と内容が食い違いました。もう一度「投稿する」を押してください。';
     case 'NOT_FOUND':

@@ -15,7 +15,17 @@
 // 内容を変えたらキーを変える**」ことになります。
 import { expect, test, type Page } from '@playwright/test';
 
-import { comment, comments, created, fail, mockMe, mockThread, ok, plainUser, thread } from './api-mock';
+import {
+  comment,
+  comments,
+  created,
+  fail,
+  mockMe,
+  mockThread,
+  ok,
+  plainUser,
+  thread,
+} from './api-mock';
 
 const url = '/threads/100';
 
@@ -110,6 +120,58 @@ test.describe('コメントの投稿', () => {
     await expect(page.getByText('もう一度「投稿する」を押してください')).toBeVisible();
     await expect(page.getByText('時間をおいて')).toHaveCount(0);
     await expect(page.getByRole('button', { name: '投稿する' })).toBeEnabled();
+  });
+
+  test('未ログインの 409 では「二重には投稿されません」と言わない', async ({ page }) => {
+    const sent: Sent = [];
+    await mockMe(page, null);
+    await mockCommentApi(page, 'conflict', sent);
+    await open(page);
+
+    await page.getByLabel('コメント').fill('匿名で競合する本文');
+    await page.getByRole('button', { name: '投稿する' }).click();
+
+    // **冪等キーは未ログインでは無視されます** (ADR 0015 決定 4)。
+    // 匿名にはキーの名前空間を分ける手段が無く、IP で分けると NAT の背後で
+    // 他人と衝突するため。つまり**匿名の押し直しは本当に 2 件目を作りうる。**
+    // ログイン中と同じ文言を出すと、そこを嘘で埋めることになります。
+    await expect(page.getByText('二重には投稿されません')).toHaveCount(0);
+    await expect(page.getByText('押し直す前に一覧を確認してください')).toBeVisible();
+  });
+
+  test('アップロードに失敗しても、添付済みの画像は外さない', async ({ page }) => {
+    const sent: Sent = [];
+    await mockMe(page, plainUser);
+    await mockCommentApi(page, 'created', sent);
+
+    let uploads = 0;
+    await page.route('**/images', (route) => {
+      uploads += 1;
+      return uploads === 1
+        ? created(route, {
+            id: '018f2c00-0000-7000-8000-000000000001',
+            url: '/images/ok.png',
+            width: 800,
+            height: 600,
+          })
+        : fail(route, 500, 'INTERNAL', '想定外のエラー');
+    });
+    // プレビューの読み込み先。中身は見ないので 1x1 でよい。
+    await page.route('**/images/ok.png', (route) =>
+      route.fulfill({ status: 200, contentType: 'image/png', body: '' }),
+    );
+
+    await open(page);
+
+    const file = { name: 'a.png', mimeType: 'image/png', buffer: Buffer.from('dummy') };
+    await page.getByLabel('画像を添付').setInputFiles(file);
+    await expect(page.getByText('添付しました (800×600)')).toBeVisible();
+
+    // 2 枚目の選択が失敗しても、**下書きから 1 枚目が消えてはいけません。**
+    // 消えると、文言はアップロードの話しかしないので気づけません。
+    await page.getByLabel('画像を添付').setInputFiles(file);
+    await expect(page.getByText('アップロードできませんでした')).toBeVisible();
+    await expect(page.getByText('添付しました (800×600)')).toBeVisible();
   });
 
   test('投稿すると一覧の先頭に出て、入力欄が空になる', async ({ page }) => {

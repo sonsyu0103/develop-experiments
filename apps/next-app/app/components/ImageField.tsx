@@ -72,8 +72,12 @@ export function ImageField({ kind, label, hint, value, onChange, canUpload, disa
     try {
       onChange(await uploadImage(file, kind));
     } catch (e) {
+      // **既に添付済みのものは外しません** (レビュー指摘)。
+      // 画像 A を添付した状態で B を選んで失敗したとき、A まで消すと
+      // 下書きから黙って添付が消えます —— しかも文言は
+      // 「アップロードできませんでした」としか言わないので、気づけません。
+      // 5 MiB 超過の経路 (上) と挙動を揃えました。
       setError(describeUploadError(e));
-      onChange(null);
     } finally {
       setBusy(false);
       // **選び直せるようにします。** 値を残すと、同じファイルを選んでも
@@ -86,33 +90,41 @@ export function ImageField({ kind, label, hint, value, onChange, canUpload, disa
     if (inputRef.current !== null) inputRef.current.value = '';
   }
 
+  if (!canUpload) {
+    // **入力欄を無効にして置くのではなく、理由を書きます。**
+    // 押せない欄だけがあると、壊れているのか権限が無いのかが分かりません。
+    //
+    // **`<label>` は使いません** (レビュー指摘)。結び付ける相手が
+    // `<p>` になり、ラベル付けできない要素を指すことになります ——
+    // 関連付けが成立せず、読み上げから孤立します。
+    return (
+      <div className="field">
+        <span className="field__label">{label}</span>
+        <p className="muted">画像を使うにはログインが必要です。</p>
+        {hint !== undefined && <span className="field__hint">{hint}</span>}
+      </div>
+    );
+  }
+
   return (
     <div className="field">
       <label className="field__label" htmlFor={inputId}>
         {label}
       </label>
 
-      {canUpload ? (
-        <input
-          id={inputId}
-          ref={inputRef}
-          type="file"
-          className="input"
-          accept={accept}
-          disabled={disabled === true || busy}
-          aria-describedby={statusId}
-          onChange={(e) => {
-            const file = e.target.files?.[0];
-            if (file !== undefined) void onPick(file);
-          }}
-        />
-      ) : (
-        // **入力欄を無効にして置くのではなく、理由を書きます。**
-        // 押せない欄だけがあると、壊れているのか権限が無いのかが分かりません。
-        <p className="muted" id={inputId}>
-          画像を使うにはログインが必要です。
-        </p>
-      )}
+      <input
+        id={inputId}
+        ref={inputRef}
+        type="file"
+        className="input"
+        accept={accept}
+        disabled={disabled === true || busy}
+        aria-describedby={statusId}
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file !== undefined) void onPick(file);
+        }}
+      />
 
       {hint !== undefined && <span className="field__hint">{hint}</span>}
 

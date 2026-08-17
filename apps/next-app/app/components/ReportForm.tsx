@@ -87,12 +87,11 @@ export function ReportForm({ targetType, targetId, threadId, signedIn }: Props) 
 
   if (phase.kind === 'closed') {
     return (
-      <button
-        type="button"
-        className="btn btn--quiet"
-        aria-expanded={false}
-        onClick={() => setPhase({ kind: 'open' })}
-      >
+      // **`aria-expanded` は付けません** (レビュー指摘)。
+      // 押すとボタン自体がフォームに置き換わる作りなので、開閉する領域が
+      // 存在しません。定数の `false` を付けると「常に閉じている展開ボタン」
+      // としか伝わらず、事実と違うものを読み上げることになります。
+      <button type="button" className="btn btn--quiet" onClick={() => setPhase({ kind: 'open' })}>
         通報する
       </button>
     );

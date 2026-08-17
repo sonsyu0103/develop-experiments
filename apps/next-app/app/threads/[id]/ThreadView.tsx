@@ -67,6 +67,10 @@ export function ThreadView({ threadId }: { threadId: number }) {
   const { state: meState } = useMe();
   const me = meState.kind === 'ready' ? meState.me : null;
   const signedIn = me !== null;
+  // **ログイン状態が決まるまで、投稿ごとの操作を出しません** (レビュー指摘)。
+  // 決まる前は `me` が null なので、自分の投稿にも「通報する」が出て、
+  // 一拍あとに「削除」へ化けます —— 押そうとした先が変わるのは事故のもとになります。
+  const meResolved = meState.kind !== 'loading';
 
   const [threadState, setThreadState] = useState<ThreadState>({ kind: 'loading' });
   const [commentsState, setCommentsState] = useState<CommentsState>({ kind: 'loading' });
@@ -97,6 +101,11 @@ export function ThreadView({ threadId }: { threadId: number }) {
     setNextCursor(null);
     setMoreError(null);
     setRowErrors(new Map());
+    // **進行中の印も戻す** (レビュー指摘)。世代が変わった時点で
+    // 前の「もっと読む」は捨てるので、その完了を待つ理由がない ——
+    // 戻さないと、新しい一覧に続きがあってもボタンが
+    // 「取得しています...」のまま押せない。
+    setLoadingMore(false);
 
     getThread(threadId)
       .then((thread) => {
@@ -144,7 +153,8 @@ export function ThreadView({ threadId }: { threadId: number }) {
       if (gen !== generation.current) return;
       setMoreError(describe(e));
     } finally {
-      setLoadingMore(false);
+      // 世代が変わっている場合、この印は `load` が既に戻している。
+      if (gen === generation.current) setLoadingMore(false);
     }
   }
 
@@ -176,6 +186,13 @@ export function ThreadView({ threadId }: { threadId: number }) {
           : s,
       );
     } catch (e) {
+      // **404 は「既に消えている」なので、行も消します** (レビュー指摘)。
+      // 別の端末やモデレーターが先に消した場合がこれに当たります。
+      // 残すと、何度押しても 404 になる行が画面に居座ります。
+      if (isCode(e, 'NOT_FOUND')) {
+        setComments((prev) => prev.filter((c) => c.id !== comment.id));
+        return;
+      }
       setRowErrors((prev) => new Map(prev).set(comment.id, describeWriteError(e)));
     } finally {
       setDeletingIds((prev) => {
@@ -274,7 +291,7 @@ export function ThreadView({ threadId }: { threadId: number }) {
         </div>
 
         <div className="actions">
-          {ownThread && threadDelete.kind !== 'confirming' && (
+          {meResolved && ownThread && threadDelete.kind !== 'confirming' && (
             <button
               type="button"
               className="btn btn--danger"
@@ -289,7 +306,9 @@ export function ThreadView({ threadId }: { threadId: number }) {
             **自分の投稿には通報を出しません。** 自分で消せるものを
             モデレーターのキューに積む理由がなく、押せば積まれてしまいます。
           */}
-          {!ownThread && <ReportForm targetType="thread" targetId={thread.id} signedIn={signedIn} />}
+          {meResolved && !ownThread && (
+            <ReportForm targetType="thread" targetId={thread.id} signedIn={signedIn} />
+          )}
         </div>
 
         {threadDelete.kind === 'confirming' && (
@@ -327,14 +346,28 @@ export function ThreadView({ threadId }: { threadId: number }) {
       </article>
 
       <h2>コメントを書く</h2>
-      {!signedIn && (
-        <p className="muted">
-          ログインしなくても投稿できます。
-          <a href={loginUrl()}>Google でログイン</a>
-          すると、画像の添付と、自分の投稿の削除ができます。
+      {/*
+        **フォームもログイン状態が決まってから出します。**
+        先に出すと、名前欄と画像欄と案内文が、決まった瞬間に入れ替わります ——
+        書き始めた欄が消えるのは、操作を取り違えさせる形になります。
+        コメントの読み取りは待たせないので、遅れるのはここだけです。
+      */}
+      {!meResolved ? (
+        <p className="muted" aria-live="polite">
+          ログイン状態を確認しています...
         </p>
+      ) : (
+        <>
+          {!signedIn && (
+            <p className="muted">
+              ログインしなくても投稿できます。
+              <a href={loginUrl()}>Google でログイン</a>
+              すると、画像の添付と、自分の投稿の削除ができます。
+            </p>
+          )}
+          <CommentForm threadId={threadId} signedIn={signedIn} onPosted={onPosted} />
+        </>
       )}
-      <CommentForm threadId={threadId} signedIn={signedIn} onPosted={onPosted} />
 
       <div className="section-head">
         <h2>コメント {thread.commentCount} 件</h2>
@@ -390,8 +423,12 @@ export function ThreadView({ threadId }: { threadId: number }) {
                 <Attachment image={comment.image} alt={`>>${comment.seq} の添付画像`} />
               )}
 
+              {/*
+                **ログイン状態が決まるまで出しません。** 決まる前に出すと、
+                自分の投稿にも「通報する」が並び、一拍あとに「削除」へ化けます。
+              */}
               <div className="actions">
-                {isMine(comment.author, me) ? (
+                {!meResolved ? null : isMine(comment.author, me) ? (
                   confirmingId === comment.id ? (
                     <>
                       <span className="muted">このコメントを削除しますか?</span>

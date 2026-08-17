@@ -37,6 +37,14 @@ export type MeState =
  */
 let inflight: Promise<Me | null> | null = null;
 
+/**
+ * いまの控えが**解決済みか**。
+ *
+ * 取得中の控えは「いま取りに行っている最中」なので、鮮度を疑う必要がない。
+ * `revalidateMe()` がこれを見て、無駄な 2 本目を出さないようにする。
+ */
+let settled = false;
+
 /** 控えが変わったことを知りたい部品。**マウント中のものだけが入る。** */
 const listeners = new Set<() => void>();
 
@@ -53,19 +61,42 @@ function notify(): void {
  * 未ログインは `null` で、例外にはならない。
  */
 export function loadMe(): Promise<Me | null> {
-  inflight ??= getMe()
-    .then((me): Me | null => me)
+  if (inflight !== null) {
+    return inflight;
+  }
+
+  // **自分の控えかどうかを見てから捨てる** (レビュー指摘)。
+  //
+  // `inflight = null` を無条件に書くと、次の経路で**他人の結果を捨てる。**
+  //
+  //   1. この取得 (P1) の最中にログアウトして `invalidateMe()` が走る
+  //   2. 新しい取得 (P2) が控えに入る
+  //   3. **遅れて P1 が失敗し**、その catch が控え (= P2) を消す
+  //
+  // 結果、P2 は誰にも使われず、次のマウントで 3 本目が飛ぶ。
+  // `primeMe()` で置いた値も同じ経路で消える。
+  const attempt: Promise<Me | null> = getMe()
+    .then((me): Me | null => {
+      if (inflight === attempt) settled = true;
+      return me;
+    })
     .catch((e: unknown) => {
       // **401 は失敗ではない。** 未ログインという既定の状態なので、
       // `null` として控える (毎回問い合わせ直す必要はない)。
       if (e instanceof ApiError && e.code === 'UNAUTHENTICATED') {
+        if (inflight === attempt) settled = true;
         return null;
       }
-      inflight = null;
+      if (inflight === attempt) {
+        inflight = null;
+        settled = false;
+      }
       throw e;
     });
 
-  return inflight;
+  inflight = attempt;
+  settled = false;
+  return attempt;
 }
 
 /**
@@ -76,7 +107,26 @@ export function loadMe(): Promise<Me | null> {
  */
 export function invalidateMe(): void {
   inflight = null;
+  settled = false;
   notify();
+}
+
+/**
+ * **鮮度が要る画面に入るときに呼ぶ。** 解決済みの控えだけを捨てる。
+ *
+ * 控えはタブが開いているあいだ残るので、クライアント遷移では
+ * セッション切れやロール剥奪が反映されない。管理画面のように
+ * 「押しても失敗する UI を見せない」ことが役目の画面では、
+ * そこで一度引き直す必要がある。
+ *
+ * **取得中なら何もしない。** その結果はいま取りに行っているものなので、
+ * 捨てると同じ要求が 2 本出るだけになる (画面を開いた直後がこれに当たる)。
+ */
+export function revalidateMe(): void {
+  if (inflight !== null && !settled) {
+    return;
+  }
+  invalidateMe();
 }
 
 /**
@@ -88,6 +138,7 @@ export function invalidateMe(): void {
  */
 export function primeMe(me: Me): void {
   inflight = Promise.resolve(me);
+  settled = true;
   notify();
 }
 

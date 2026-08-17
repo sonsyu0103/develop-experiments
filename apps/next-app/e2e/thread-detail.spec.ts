@@ -155,6 +155,72 @@ test.describe('スレッド詳細', () => {
     ).toBeDisabled();
   });
 
+  test('更新したら「もっと読む」を押せる状態に戻す', async ({ page }) => {
+    await mockMe(page, null);
+    await mockThreadOk(page);
+
+    await mockComments(page, async (route, cursor) => {
+      if (cursor !== null) {
+        // 続きは返ってこないまま (この間に更新する)。
+        await delay(2000);
+        return ok(route, comments([]));
+      }
+      return ok(route, comments([comment({ id: 1, seq: 1, body: '1 件目' })], 'CURSOR'));
+    });
+
+    await page.goto(url);
+    await page.getByRole('button', { name: 'もっと読む' }).click();
+    await expect(page.getByRole('button', { name: '取得しています...' })).toBeVisible();
+
+    await page.getByRole('button', { name: '最新の状態にする' }).click();
+
+    // **進行中の印も戻します。** 戻さないと、更新後の一覧に続きがあっても
+    // 遅い応答が届くまでボタンが押せません。
+    await expect(page.getByRole('button', { name: 'もっと読む' })).toBeEnabled();
+  });
+
+  test('削除が 404 なら、その行を残さない', async ({ page }) => {
+    await mockMe(page, plainUser);
+    await mockThreadOk(page);
+    await mockComments(page, (route) =>
+      ok(route, comments([byUser(plainUser, { id: 1, seq: 1, body: '先に消された投稿' })])),
+    );
+    // 別の端末やモデレーターが先に消した場合がこれに当たります。
+    await page.route(/\/threads\/\d+\/comments\/\d+$/, (route) =>
+      fail(route, 404, 'NOT_FOUND', '見つかりません'),
+    );
+
+    await page.goto(url);
+    await page.getByRole('button', { name: '削除' }).click();
+    await page.getByRole('button', { name: '削除する' }).click();
+
+    // **残すと、何度押しても 404 になる行が居座ります。**
+    await expect(page.getByText('先に消された投稿')).toHaveCount(0);
+  });
+
+  test('ログイン状態が決まるまで、投稿ごとの操作を出さない', async ({ page }) => {
+    // `/me` だけを遅らせます。コメントは先に届きます。
+    await page.route('**/me', async (route) => {
+      await delay(1500);
+      return ok(route, plainUser);
+    });
+    await mockThreadOk(page);
+    await mockComments(page, (route) =>
+      ok(route, comments([byUser(plainUser, { id: 1, seq: 1, body: '本人の書き込み' })])),
+    );
+
+    await page.goto(url);
+    // **コメントの読み取りは待たせません。** 遅れるのは投稿ごとの操作だけです。
+    await expect(page.getByText('本人の書き込み')).toBeVisible();
+
+    // **この時点で「通報する」を出してはいけません。** 自分の投稿なので、
+    // ログイン状態が決まった瞬間に「削除」へ化けます ——
+    // 押そうとした先が変わるのは事故のもとになります。
+    await expect(page.getByRole('button', { name: '通報する' })).toHaveCount(0);
+
+    await expect(page.getByRole('button', { name: '削除' })).toBeVisible();
+  });
+
   test('匿名で立てたスレッドには削除を出さない', async ({ page }) => {
     await mockMe(page, plainUser);
     // `author` が null = 匿名。**ログインしていても消せません**

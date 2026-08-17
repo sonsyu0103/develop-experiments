@@ -9,8 +9,17 @@ import { formatTime, machineTime } from './lib/ui';
 type Thread = components['schemas']['Thread'];
 type ThreadList = components['schemas']['ThreadList'];
 
-/** 取得結果。`rejected` は「絞り込みや位置を API が受け付けなかった」ことを表す。 */
-type FetchResult = { list: ThreadList; rejected: boolean };
+/**
+ * 取得結果。
+ *
+ * `rejected` は「絞り込みや位置を API が受け付けなかった」ことを表す。
+ *
+ * `effective` は**実際に使われた条件**になる。拒否されたときは
+ * 引き直したほうの条件が入る —— 画面のリンクはすべてこちらから組み立てる。
+ * 要求した条件のまま組み立てると、**「次のページへ」がまた 400 を踏んで
+ * 1 ページ目に戻り、そこから抜けられなくなる** (レビュー指摘)。
+ */
+type FetchResult = { list: ThreadList; rejected: boolean; effective: Query };
 
 /** 並び順。仕様書の `sort` パラメータと対になる。 */
 type Sort = 'new' | 'popular';
@@ -78,16 +87,17 @@ async function fetchThreads({ q, sort, cursor }: Query): Promise<Response> {
 async function getThreads(query: Query): Promise<FetchResult> {
   const res = await fetchThreads(query);
   if (res.ok) {
-    return { list: (await res.json()) as ThreadList, rejected: false };
+    return { list: (await res.json()) as ThreadList, rejected: false, effective: query };
   }
 
   if (res.status === 400 && (query.q !== '' || query.cursor !== '')) {
     // **並び順も一緒に落とす。** 原因が検索語とは限らない ——
     // 検索と人気順の同時指定も 400 になり、カーソルは並び順ごとに
     // 意味が変わるため、1 つずつ落とすと同じ 400 を何度も踏む。
-    const retry = await fetchThreads({ q: '', sort: 'new', cursor: '' });
+    const fallback: Query = { q: '', sort: 'new', cursor: '' };
+    const retry = await fetchThreads(fallback);
     if (retry.ok) {
-      return { list: (await retry.json()) as ThreadList, rejected: true };
+      return { list: (await retry.json()) as ThreadList, rejected: true, effective: fallback };
     }
     throw new Error(`Failed to fetch threads: ${retry.status} ${retry.statusText}`);
   }
@@ -211,17 +221,22 @@ function SortLinks({ q, sort }: { q: string; sort: Sort }) {
 
   return (
     <nav className="actions" aria-label="並び順">
+      {/*
+        **`aria-current` の値は `page` に揃える** (レビュー指摘)。
+        これもページ遷移で、ヘッダのナビと種類が同じになる。
+        `true` と `page` が混ざると、CSS の当たり方も 2 系統になる。
+      */}
       <Link
         className="btn"
         href={href({ q, sort: 'new', cursor: '' })}
-        aria-current={sort === 'new'}
+        aria-current={sort === 'new' ? 'page' : undefined}
       >
         新着順
       </Link>
       <Link
         className="btn"
         href={href({ q, sort: 'popular', cursor: '' })}
-        aria-current={sort === 'popular'}
+        aria-current={sort === 'popular' ? 'page' : undefined}
       >
         人気順
       </Link>
@@ -272,6 +287,11 @@ export default async function Page({
   const {
     list: { threads, nextCursor },
     rejected,
+    // **要求した条件ではなく、実際に使われた条件で画面を組む** (レビュー指摘)。
+    // 拒否された `q` を持ち回ると、「次のページへ」がまた 400 を踏んで
+    // 1 ページ目へ戻り、**そこから抜けられなくなる。**
+    // 検索欄と並び順の表示が実際の結果と食い違うのも同じ理由になる。
+    effective,
   } = await getThreads(query);
 
   return (
@@ -284,9 +304,9 @@ export default async function Page({
         </Link>
       </div>
 
-      <SearchForm q={query.q} sort={query.sort} />
+      <SearchForm q={effective.q} sort={effective.sort} />
 
-      <SortLinks q={query.q} sort={query.sort} />
+      <SortLinks q={effective.q} sort={effective.sort} />
 
       {rejected && (
         <p className="alert alert--warn" role="status">
@@ -301,12 +321,12 @@ export default async function Page({
         // 掲示板が空だと読めてしまう。
         <p className="muted">
           {/*
-            **rejected のときは絞り込んでいない。**
-            「一致しません」と出すと、検索語が使われたように読める。
+            **`effective` を見る。** 拒否された条件では絞り込んでいないので、
+            「一致しません」と出すと検索語が使われたように読める。
           */}
-          {query.q === '' || rejected
+          {effective.q === ''
             ? 'スレッドがまだありません。最初のスレッドを立ててみてください。'
-            : `「${query.q}」に一致するスレッドはありません。`}
+            : `「${effective.q}」に一致するスレッドはありません。`}
         </p>
       ) : (
         <ul className="list">
@@ -320,19 +340,24 @@ export default async function Page({
         **「前のページ」は作らない。** カーソルは不透明で前方向にしか進めず、
         戻る位置を作るには、辿ってきたカーソルを URL に積むことになる
         (ADR 0018)。ブラウザの戻るで足りる範囲なので、先頭へ戻る導線だけ置く。
+
+        **中身が無いときは要素ごと出さない** (レビュー指摘) ——
+        空のランドマークが、支援技術のランドマーク一覧に並ぶ。
       */}
-      <nav className="actions" aria-label="ページ送り">
-        {nextCursor !== null && (
-          <Link className="btn" href={href({ ...query, cursor: nextCursor })}>
-            次のページへ
-          </Link>
-        )}
-        {query.cursor !== '' && (
-          <Link className="btn btn--quiet" href={href({ ...query, cursor: '' })}>
-            先頭に戻る
-          </Link>
-        )}
-      </nav>
+      {(nextCursor !== null || effective.cursor !== '') && (
+        <nav className="actions" aria-label="ページ送り">
+          {nextCursor !== null && (
+            <Link className="btn" href={href({ ...effective, cursor: nextCursor })}>
+              次のページへ
+            </Link>
+          )}
+          {effective.cursor !== '' && (
+            <Link className="btn btn--quiet" href={href({ ...effective, cursor: '' })}>
+              先頭に戻る
+            </Link>
+          )}
+        </nav>
+      )}
     </>
   );
 }
