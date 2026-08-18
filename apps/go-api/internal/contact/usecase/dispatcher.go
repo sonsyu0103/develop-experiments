@@ -160,6 +160,8 @@ func NewDispatcher(
 func (d *Dispatcher) Dispatch(ctx context.Context) (DispatchResult, error) {
 	var result DispatchResult
 
+	claimedAt := time.Now()
+
 	messages, err := d.repo.ClaimPending(ctx, d.lease, d.batchSize)
 	if err != nil {
 		return result, err
@@ -172,6 +174,34 @@ func (d *Dispatcher) Dispatch(ctx context.Context) (DispatchResult, error) {
 		// 打ち切っても失われません。逆に、シャットダウン中に
 		// 残り全件の SMTP を待つと猶予を使い切ります。
 		if isDone(ctx) {
+			break
+		}
+
+		// **リースを使い切る前に止めます** (レビュー指摘)。
+		//
+		// リースは確保の時点でバッチ全件に一括で掛かります。周回の所要が
+		// リースを超えると、**まだ処理していない行が他のレプリカから
+		// 見えるようになり**、こちらが送っている最中に同じ行を送られます。
+		//
+		// 超えうる量は設定次第です。MAIL_TIMEOUT_SECONDS = 10 の場合、
+		// 1 接続あたり最悪 20 秒 (DialContext 10 秒 + SetDeadline 10 秒)。
+		// 控えを足したことで **1 件あたり 2 接続**になったので、
+		//
+		//	20 件 x 2 接続 x 20 秒 = 800 秒 > リース 300 秒
+		//
+		// **バッチサイズやリースの既定値をいじって釣り合わせません。**
+		// どちらも「速い相手」を前提に選んだ値で、釣り合いは
+		// MAIL_TIMEOUT_SECONDS にも依存します —— 3 つの設定の積が
+		// 4 つ目を超えない、という不変条件を人が守り続ける形になります。
+		//
+		// 残りを次の周回に任せるほうが安全です。**何も失われません** ——
+		// 未処理の行はリースが切れれば拾い直されます。
+		if elapsed := time.Since(claimedAt); elapsed >= d.leaseBudget() {
+			slog.InfoContext(ctx, "contact_lease_budget_reached",
+				slog.Int64("elapsed_ms", elapsed.Milliseconds()),
+				slog.Int("handled", result.Total()),
+				slog.Int("claimed", len(messages)),
+			)
 			break
 		}
 
@@ -245,6 +275,19 @@ func (d *Dispatcher) sendAutoReply(ctx context.Context, m model.Message) {
 		return
 	}
 
+	// **空の宛先も送りません** (レビュー指摘)。
+	//
+	// nil と違い、これは**起きてはいけない状態**です ——
+	// VerifiedEmail のゼロ値はどのパッケージからでも書けるので、
+	// 型だけでは防げません。素通しすると `RCPT TO:<>` になり、
+	// **結線の誤りが SMTP の失敗として現れます。**
+	// 匿名 (nil) と同じ扱いで黙って飛ばすと、今度は誰も気づきません。
+	if m.ReplyTo.IsZero() {
+		slog.ErrorContext(ctx, "contact_auto_reply_address_empty",
+			slog.Int64("contact_id", m.ID))
+		return
+	}
+
 	// **中断中は送りません。** シャットダウンの猶予は運営への通知に使います。
 	// 送らなかった控えは次回に持ち越されません (上のとおりリトライしない)。
 	if isDone(ctx) {
@@ -270,6 +313,20 @@ func (d *Dispatcher) sendAutoReply(ctx context.Context, m model.Message) {
 	}
 
 	slog.InfoContext(ctx, "contact_auto_reply_sent", slog.Int64("contact_id", m.ID))
+}
+
+// leaseBudget は 1 周回で使ってよい時間を返します。
+//
+// **リースより短くします。** ちょうどリースぶん使うと、最後の 1 件を
+// 送っている最中にリースが切れます。残す余白は「1 件ぶんの最悪」より
+// 大きい必要があり、1 件は最悪 2 接続 (通知 + 控え) ぶんかかります。
+//
+// 4 分の 3 にすると、既定のリース 5 分に対して余白が 75 秒 ——
+// MAIL_TIMEOUT_SECONDS = 10 での 1 件ぶん (最悪 40 秒) を上回ります。
+// タイムアウトを 20 秒より長くすると足りなくなりますが、そのときは
+// **超えるのが最後の 1 件だけ**になります (超える前に必ず break する)。
+func (d *Dispatcher) leaseBudget() time.Duration {
+	return d.lease / 4 * 3
 }
 
 // isDone は ctx が終了しているかを返します。
@@ -436,14 +493,23 @@ func composeBody(m model.Message) string {
 	// 文字列であって、書いた人の持ち物である保証がありません。
 	fmt.Fprintf(&b, "メールアドレス (入力値・未検証): %s\n", m.Email)
 	// **返信してよいのはこちらです。** IdP が検証し、ログインのたびに
-	// 更新しているアドレス (ADR 0005 決定 3)。控えもここへ送っています。
+	// 更新しているアドレス (ADR 0005 決定 3)。
 	//
 	// 2 つ並べて出すのは、**食い違っていること自体が情報**だからです ——
 	// 他人のアドレスを入力した問い合わせが、対応する人の目に見えます。
+	//
+	// **「控えを送った」とは書きません** (レビュー指摘)。この本文は
+	// 控えを試みる**前**に組み立てて送っており、成否を知りようがありません。
+	// 控えは best-effort (リトライ無し・行に痕跡を残さない) なので、
+	// **「届いているはず」と読ませると、届いていない前提の対応ができません。**
+	// 実際に送れたかは contact_auto_reply_sent / _failed にしかありません。
 	if m.ReplyTo != nil {
-		fmt.Fprintf(&b, "メールアドレス (検証済み・控えの送付先): %s\n", m.ReplyTo)
+		fmt.Fprintf(&b, "メールアドレス (検証済み・返信先): %s\n", m.ReplyTo)
+		b.WriteString("  控え: このアドレス宛に送付を試みます" +
+			" (best-effort。届いたかは contact_id でログを参照)\n")
 	} else {
-		b.WriteString("メールアドレス (検証済み): なし —— 控えは送っていません\n")
+		b.WriteString("メールアドレス (検証済み): なし (匿名または退会済み)\n")
+		b.WriteString("  控え: 送っていません\n")
 	}
 	fmt.Fprintf(&b, "件名: %s\n", m.Subject)
 	b.WriteString("\n---\n")

@@ -131,10 +131,24 @@ func TestContactRepository_ClaimResolvesVerifiedEmail_Live(t *testing.T) {
 	for _, m := range claimed {
 		got[m.ID] = m
 	}
-	// **3 件とも確保されること。** 1 件でも欠けたら結合が内部結合に
-	// なっているか、NULL の読み取りで落ちています。
-	if len(claimed) != 3 {
-		t.Fatalf("確保できた件数 = %d, want 3 (取れた ID: %v)", len(claimed), got)
+
+	// **積んだ 3 件が「3 件とも」確保されること。** 1 件でも欠けたら、
+	// 結合が内部結合になっているか、NULL の読み取りで落ちています。
+	//
+	// **件数の一致では見ません** (レビュー指摘)。ClaimPending は DB 内の
+	// pending を無差別に確保するので、前回の実行を中断して残った行が
+	// あると `len(claimed) == 3` は成立しません ——
+	// **DB を手で掃除するまで、この検査が恒久的に落ちます。**
+	// 見たいのは「この 3 件がどう扱われたか」なので、そちらを直接見ます。
+	for name, id := range map[string]int64{
+		"ログイン済み": loggedIn,
+		"退会済み":   withdrawn,
+		"匿名":     anonymous,
+	} {
+		if _, ok := got[id]; !ok {
+			t.Fatalf("%sの問い合わせ (id = %d) が確保されなかった "+
+				"(確保できたのは %d 件)", name, id, len(claimed))
+		}
 	}
 
 	if m := got[loggedIn]; m.ReplyTo == nil {

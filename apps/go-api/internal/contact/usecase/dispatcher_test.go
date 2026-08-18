@@ -153,7 +153,7 @@ func TestComposeBody(t *testing.T) {
 		// 対応する人にとっての情報になります (他人のアドレスを入力した
 		// 問い合わせが目に見える)。
 		"メールアドレス (入力値・未検証): hoshino@example.com",
-		"メールアドレス (検証済み・控えの送付先): account@example.net",
+		"メールアドレス (検証済み・返信先): account@example.net",
 		"件名: ログインできません",
 		"画面が戻ってきます。",
 	} {
@@ -183,7 +183,7 @@ func TestComposeBody_Anonymous(t *testing.T) {
 	}
 	// **控えを送っていないことが運営に分かること。** 分からないと、
 	// 「控えが届いているはず」という前提で対応が進みます。
-	if !strings.Contains(body, "控えは送っていません") {
+	if !strings.Contains(body, "控え: 送っていません") {
 		t.Errorf("控えの有無が分からない:\n%s", body)
 	}
 }
@@ -303,6 +303,70 @@ func TestDispatch_NoAutoReplyWhenNotificationFails(t *testing.T) {
 	}
 	if len(sender.autoReplies) != 0 {
 		t.Errorf("運営に届いていないのに控えを送った: %+v", sender.autoReplies)
+	}
+}
+
+// **リースを使い切る前に周回を打ち切ること** (レビュー指摘)。
+//
+// リースは確保の時点でバッチ全件に一括で掛かります。周回の所要が
+// リースを超えると、**まだ処理していない行が他のレプリカから見え**、
+// 送信中の行を二重に送られます。
+//
+// 遅い送信器で 1 件あたりリースの半分を使わせると、2 件目までで
+// 予算 (リースの 3/4) に届くので、3 件目以降は次の周回に回ります。
+func TestDispatch_StopsBeforeTheLeaseExpires(t *testing.T) {
+	t.Parallel()
+
+	const lease = 200 * time.Millisecond
+
+	repo := &fakeRepo{pending: []model.Message{
+		pendingMessage(1, 1), pendingMessage(2, 1), pendingMessage(3, 1), pendingMessage(4, 1),
+	}}
+	sender := &fakeSender{delay: lease / 2}
+
+	d := NewDispatcher(repo, sender)
+	d.lease = lease
+
+	got, err := d.Dispatch(t.Context())
+	if err != nil {
+		t.Fatalf("Dispatch がエラーになった: %v", err)
+	}
+
+	// 4 件確保しているが、全件は処理しない。
+	if got.Total() == 4 {
+		t.Error("リースを使い切っても周回を続けた (4 件すべて処理した)")
+	}
+	if got.Total() == 0 {
+		t.Fatal("1 件も処理していない (予算が最初から尽きている)")
+	}
+	// **残りは失われません。** 次の周回で拾い直されるので、
+	// 差し戻しも打ち切りも起きていないこと。
+	if len(repo.rescheduled) != 0 || len(repo.failed) != 0 {
+		t.Errorf("打ち切った行が失敗として扱われた: rescheduled = %v, failed = %v",
+			repo.rescheduled, repo.failed)
+	}
+}
+
+// **空の宛先で控えを送ろうとしないこと** (レビュー指摘)。
+//
+// VerifiedEmail はゼロ値を作れてしまうので、型だけでは防げません。
+func TestDispatch_SkipsAutoReplyWithZeroAddress(t *testing.T) {
+	t.Parallel()
+
+	m := pendingMessage(1, 1)
+	// **書き忘れを模します。** model.VerifiedEmail{} は
+	// フィールドが非公開でもパッケージ外から書けます。
+	var zero model.VerifiedEmail
+	m.ReplyTo = &zero
+
+	sender := &fakeSender{}
+	if _, err := NewDispatcher(&fakeRepo{pending: []model.Message{m}}, sender).
+		Dispatch(t.Context()); err != nil {
+		t.Fatalf("Dispatch がエラーになった: %v", err)
+	}
+
+	if len(sender.autoReplies) != 0 {
+		t.Errorf("空の宛先へ控えを送ろうとした: %+v", sender.autoReplies)
 	}
 }
 

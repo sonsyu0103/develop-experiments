@@ -18,7 +18,7 @@
 import { useEffect, useState } from 'react';
 
 import { ApiError, submitContact } from '../lib/api';
-import { loadMe } from '../lib/me';
+import { loadMe, revalidateMe } from '../lib/me';
 
 // **仕様書の maxLength と同じ値です** (api/openapi.yaml の CreateContactRequest)。
 // ここは入力の途中で気づけるようにするためのもので、検査の正は API 側
@@ -75,6 +75,28 @@ export function ContactForm() {
     setPhase({ kind: 'sending' });
     try {
       await submitContact({ name, email, subject, body, website });
+
+      // **控えの届き先を、受理の直後に引き直します** (レビュー指摘)。
+      //
+      // マウント時に引いた値のままだと、**画面を開いたまま放置して
+      // セッションが切れた場合に嘘の案内になります** —— API 側は
+      // user_id を NULL として受け取るので控えは送られないのに、
+      // 画面は「登録アドレス宛に送ります」と言い続けます。
+      //
+      // **送信の応答からは分かりません。** 202 の本文は受理時刻だけで、
+      // ログイン済みだったかを含みません (ADR 0008 決定 1 / 内部 ID を
+      // 出さない方針)。引き直すのが、こちらから確かめられる唯一の手になります。
+      //
+      // 失敗は「ログインしていない」に倒します。**届かない側に倒すほうが
+      // 安全**で、届いたぶんには案内より良い結果にしかなりません。
+      //
+      // **revalidateMe() を先に呼ぶ必要があります。** loadMe() は
+      // タブに残った控えをそのまま返すので、これが無いと
+      // **引き直したつもりでマウント時の値をもう一度読むだけ**になります
+      // (= 直したい不具合がそのまま残る)。
+      revalidateMe();
+      setAccountEmail(await loadMe().then((me) => me?.email ?? null).catch(() => null));
+
       setPhase({ kind: 'accepted' });
       setName('');
       setEmail('');

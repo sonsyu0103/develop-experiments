@@ -123,6 +123,16 @@ func (s *SMTPSender) Send(ctx context.Context, n repository.Notification) error 
 // 控えを見て「これは自分の問い合わせではない」と気づいた人が、
 // 返す先を持たないのは筋が悪い。
 func (s *SMTPSender) SendAutoReply(ctx context.Context, r repository.AutoReply) error {
+	// **空の宛先を弾きます** (レビュー指摘)。
+	//
+	// 型は「中身が入った値の作り方」を 1 か所に絞りますが、
+	// **ゼロ値まではふさげません** —— `AutoReply` の To を書き忘れても
+	// コンパイルは通ります。素通しすると `RCPT TO:<>` を送ることになり、
+	// **結線の誤りが「相手のサーバが悪い」ように見えます。**
+	if r.To.IsZero() {
+		return fmt.Errorf("mail: 控えの宛先が空です (contact_id = %d)", r.ContactID)
+	}
+
 	return s.deliver(ctx, r.ContactID, envelope{
 		from: s.from,
 		// **表示名を付けません。** 値は検証済み (model.VerifiedEmail が

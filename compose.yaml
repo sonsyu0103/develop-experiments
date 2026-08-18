@@ -431,9 +431,13 @@ services:
       # **STARTTLS は付けない。** Mailpit は平文で受ける。
       # 本番 (SES) では MAIL_SMTP_STARTTLS=true と資格情報が要る。
       MAIL_SMTP_STARTTLS: "false"
-      # 差出人と宛先は**こちら側の固定値**。利用者が入力したアドレスは
+      # 差出人と運営の宛先は**こちら側の固定値**。利用者が入力したアドレスは
       # ヘッダに入らない (決定 2・決定 3)。
-      MAIL_FROM: no-reply@bbs.example.com
+      #
+      # **no-reply@ にしない。** ログイン済みの問い合わせには
+      # 登録アドレス宛に控えが飛ぶので、差出人が返信不可だと
+      # 「自分の問い合わせではない」と気づいた人の返す先が無くなる。
+      MAIL_FROM: contact@bbs.example.com
       MAIL_TO: ops@bbs.example.com
       # 送信の間隔。**既定 (60 秒) より短くしてある** ——
       # 手元で確認するときに 1 分待つのは長い。

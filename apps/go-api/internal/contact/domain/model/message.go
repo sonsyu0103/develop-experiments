@@ -281,6 +281,20 @@ func NewVerifiedEmail(raw string) (VerifiedEmail, error) {
 // (運営の固定アドレスを除く)。
 func (v VerifiedEmail) String() string { return v.addr }
 
+// IsZero は「まだ何も入っていない」かを返します。
+//
+// **型だけでは空を防げません** (レビュー指摘)。フィールドが非公開でも
+// `model.VerifiedEmail{}` はどのパッケージからでも書けるので、
+// `AutoReply{ContactID: 1, Body: ...}` のように **To を書き忘れた
+// 呼び出しがコンパイルを通ります。**
+//
+// 「生成できるのはアダプタ 1 か所だけ」が守れているのは
+// **中身が入った値**についてであって、空の値はその外側にあります。
+// 送信側はこれを使って入口で弾いてください ——
+// 弾かないと `RCPT TO:<>` を送って SMTP の失敗として現れ、
+// **書き忘れが「相手のサーバが悪い」ように見えます。**
+func (v VerifiedEmail) IsZero() bool { return v.addr == "" }
+
 // Message は保存された問い合わせです。
 //
 // **client_ip を持ちません。** 保存したあとにこの値を読む必要があるのは
