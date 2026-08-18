@@ -157,17 +157,25 @@ CREATE EXTERNAL TABLE IF NOT EXISTS go_api_logs (
     -- ログの保持期間 (決定 6 の 400 日) が DB 側の消し込みと揃っている
     -- ことが前提になる。
     `client_ip`   string,
-    -- **どちらも予約語。** DDL のバッククォートでは通るが、
-    -- クエリ側では二重引用符で囲む必要がある ("limit")。
-    -- 罠 3 のように「宣言できない」わけではないので改名はしていないが、
-    -- 素で書くと構文エラーになる。
     `count`       bigint,
+    -- **limit だけが予約語。** DDL のバッククォートでは通るが、
+    -- クエリ側では二重引用符で囲まないと構文エラーになる ("limit")。
+    -- count は Trino / Athena engine v3 の予約語ではない (レビュー指摘)。
+    -- 罠 3 のように「宣言できない」わけではないので改名はしていない。
     `limit`       bigint,
     -- 送信ワーカーが 1 周回で確保した件数と、実際に扱った件数。
     -- **食い違いはリース予算で打ち切ったことを意味する** ——
     -- 常に食い違うなら、バッチが送信の速さに追いついていない。
     `claimed`     int,
     `handled`     int,
+    -- **未送信の最古の行の滞留時間** (contact_pending_age)。
+    -- 送信ワーカーが詰まっていることを示す本命の信号で、
+    -- 「一定時間このイベントが出ていないこと」も監視の対象になる
+    -- (ADR 0008「実装して分かったこと 9」)。
+    -- **この節を足した時点でこれも漏らしていた** (レビュー指摘) ——
+    -- 手作業の洗い出しは取りこぼす、を地で行った形になる。
+    -- 以後は verify-log-events.py が DDL との差分を CI で見る。
+    `oldest_age_ms` bigint,
 
     -- =========================================================================
     -- 起動時と防御層
@@ -176,6 +184,11 @@ CREATE EXTERNAL TABLE IF NOT EXISTS go_api_logs (
     `bucket`          string,
     `endpoint`        string,
     `bootstrap_admin` boolean,
+    -- メール送信の結線 (contact_mail_enabled)。**起動時に 1 回だけ出る。**
+    -- 「控えが 1 通も出ていない」ときに、設定が入っているかを
+    -- 先に切り分けられる (ADR 0008 決定 2)。
+    `smtp_host`       string,
+    `starttls`        boolean,
     -- csrf_rejected が「なぜ弾いたか」(ADR 0013)。
     -- **value に入るのは Origin ヘッダの値**で、利用者の入力ではない。
     `reason`          string,
