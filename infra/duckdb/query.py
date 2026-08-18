@@ -37,34 +37,52 @@ def read_sql(argv: list[str]) -> str:
     return arg
 
 
+def explain(e: duckdb.Error) -> None:
+    """失敗をそのまま見せ、思い当たる原因だけを補足します。
+
+    **原因を決めつけない。** ここは以前「S3 にログがまだ 1 件もありません」と
+    言い切っていたが、実際には 10,000 件以上あるのにポートが枯れて
+    落ちていた (logs_source の「接続の話」)。**嘘の説明は切り分けをそこで
+    止める** —— 中の例外を読むまで、誰も本当の原因に辿り着けなかった。
+
+    補足は**当てはまるときだけ**出す。無関係な候補を毎回並べると、
+    今度は読み飛ばされるようになる。
+    """
+    print(f"ログを読めませんでした: {e}", file=sys.stderr)
+    text = str(e)
+    if "Could not establish connection" in text or "Cannot assign" in text:
+        print(
+            "  → 接続を張り切っている可能性が高い。"
+            "compose の logs-query に sysctls net.ipv4.tcp_tw_reuse=1 が"
+            "効いているか確認する (logs_source の「接続の話」)",
+            file=sys.stderr,
+        )
+    elif "No files found" in text or "IO Error" in text:
+        print(
+            "  → S3 にまだ着地していない可能性がある "
+            "(fluent-bit のアップロード契機 LOG_UPLOAD_TIMEOUT を待つ)",
+            file=sys.stderr,
+        )
+
+
 def main() -> int:
     sql = read_sql(sys.argv[1:])
     try:
         con = open_logs()
+        # **1 行も無いときに「クエリが 0 行を返した」と区別する。**
+        # ログ基盤の検証では、この 2 つを取り違えると
+        # 「クエリが間違っている」と「そもそも届いていない」を
+        # 同じ結果として見てしまう。
+        #
+        # **ここも同じ try に入れる。** ビューを作る時点では S3 に
+        # 触らなくなった (推論をやめたため) ので、**読み取りの失敗は
+        # 最初にここで出る。** 説明を open_logs() だけに付けていると、
+        # 肝心の場面で素の traceback しか出ない。
+        total = con.execute(f"SELECT count(*) FROM {VIEW_NAME}").fetchone()[0]
     except duckdb.Error as e:
-        # **原因を決めつけない。** ここは以前
-        # 「S3 にログがまだ 1 件もありません」と言い切っていたが、
-        # 実際には 10,000 件以上あるのにポートが枯れて落ちていた
-        # (logs_source の「接続の話」)。**嘘の説明は切り分けを止める** ——
-        # 中の例外を読むまで、誰も本当の原因に辿り着けなかった。
-        print(f"ログのビューを作れませんでした: {e}", file=sys.stderr)
-        print(
-            "  - S3 にまだ 1 件も着地していない "
-            "(fluent-bit のアップロード契機 LOG_UPLOAD_TIMEOUT を待っていない)",
-            file=sys.stderr,
-        )
-        print(
-            "  - 接続を張れない (Could not establish connection): "
-            "compose の logs-query に sysctls net.ipv4.tcp_tw_reuse=1 が効いているか",
-            file=sys.stderr,
-        )
+        explain(e)
         return 1
 
-    # **1 行も無いときに「クエリが 0 行を返した」と区別する。**
-    # ログ基盤の検証では、この 2 つを取り違えると
-    # 「クエリが間違っている」と「そもそも届いていない」を
-    # 同じ結果として見てしまう。
-    total = con.execute(f"SELECT count(*) FROM {VIEW_NAME}").fetchone()[0]
     if total == 0:
         print(
             "ログが 1 件も見つかりません。"
@@ -73,7 +91,13 @@ def main() -> int:
         )
         return 1
 
-    con.sql(sql).show(max_rows=100)
+    try:
+        con.sql(sql).show(max_rows=100)
+    except duckdb.Error as e:
+        # **クエリの誤りと、読み取りの失敗を混ぜない。**
+        # explain() は原因が読み取り側に見えるときだけ補足を足す。
+        explain(e)
+        return 1
     return 0
 
 

@@ -75,6 +75,11 @@ ATHENA_DDL_PATH = os.environ.get("ATHENA_DDL_PATH", "/athena/table.sql")
 
 # Hive / Athena の型 → DuckDB の型。
 # DDL に出てくるものだけを持つ (増えたらここに足す)。
+#
+# **知らない型は黙って捨てず、落とす** (athena_columns)。
+# この表がそのままビューのスキーマになるので、載っていない型を
+# 読み飛ばすと「Athena では見えるのに手元では見えない」列が生まれる ——
+# このモジュールが防ぐために書かれたもの、そのものになる。
 _TYPE_MAP = {
     "string": "VARCHAR",
     "bigint": "BIGINT",
@@ -82,6 +87,15 @@ _TYPE_MAP = {
     "double": "DOUBLE",
     "boolean": "BOOLEAN",
 }
+
+# DDL の列宣言。**`名前` 型, だけの行**に限る。
+#
+# **行頭と行末に錨を打つ。** これが無いと、コメント中の
+# バッククォート付きの語 (「`contact_id` は」など) まで列として拾う ——
+# 実際、table.sql の日本語コメントから contact_id が偽の型つきで
+# 拾えてしまっていた。.github/scripts/verify-log-events.py が
+# 同じ理由で同じ錨を打っており、**両者がずれると検査の意味が消える。**
+_DDL_COLUMN = re.compile(r"^\s*`([a-z_0-9]+)`\s+(\w+)\s*,?\s*$", re.M)
 
 # 検査用。**パーティション列を起こさず、スキーマを推論する。**
 #
@@ -123,10 +137,16 @@ def athena_columns(path: str = ATHENA_DDL_PATH) -> dict[str, str]:
     body = body.split("PARTITIONED BY", 1)[0]
 
     columns: dict[str, str] = {}
-    for name, raw_type in re.findall(r"`(\w+)`\s+(\w+)", body):
+    for name, raw_type in _DDL_COLUMN.findall(body):
         duck_type = _TYPE_MAP.get(raw_type.lower())
-        if duck_type:
-            columns[name] = duck_type
+        if duck_type is None:
+            # **黙って捨てない。** ここで捨てると、その列は分析用の
+            # ビューから消え、Athena にだけ在る状態になる (上の _TYPE_MAP)。
+            raise ValueError(
+                f"DDL の列 `{name}` の型 {raw_type} を DuckDB の型に写せません。"
+                f" {__name__} の _TYPE_MAP に追加してください。"
+            )
+        columns[name] = duck_type
     return columns
 
 
@@ -209,6 +229,18 @@ def create_view(con: duckdb.DuckDBPyConnection) -> None:
             '{_glob()}',
             -- **Athena の DDL がスキーマ。** 推論しない。
             columns = {{{declared}}},
+            -- **宣言と型が食い違う値を、行ごと落とさず NULL にする。**
+            --
+            -- Athena の SerDe の ignore.malformed.json='true' と同じ挙動に揃える
+            -- (infra/athena/table.sql)。これが無いと、`status` に文字列が
+            -- 1 つ着地しただけで **その列を触るクエリが全部落ちる** ——
+            -- 本番は動き続けるのに手元だけ死ぬ、という**逆さまの差**になる。
+            -- 実測: 壊れた行だけが NULL になり、同じファイルの他の行は残る。
+            --
+            -- 引き受けるコスト: 型の食い違いが**静かに** NULL になる。
+            -- 気づく経路は別に用意してある ——
+            -- 検査用ビュー (推論) と .github/scripts/verify-log-events.py。
+            ignore_errors = true,
             -- パスの dt= / hour= / service= を列として起こす。
             -- **Athena の partition projection に相当するものではない** ——
             -- こちらは全ファイルを開いてから列を足すだけで、
