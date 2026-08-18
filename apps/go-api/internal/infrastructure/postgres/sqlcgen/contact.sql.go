@@ -20,32 +20,44 @@ WITH claimed AS (
       AND next_attempt_at <= now()
     ORDER BY next_attempt_at, id
     FOR UPDATE SKIP LOCKED
-    LIMIT $2
+    LIMIT $1
+), updated AS (
+    UPDATE contact_messages
+    SET attempt_count   = attempt_count + 1,
+        next_attempt_at = now() + $2::interval
+    FROM claimed
+    WHERE contact_messages.id = claimed.id
+    RETURNING contact_messages.id, contact_messages.user_id, contact_messages.name,
+              contact_messages.email, contact_messages.subject, contact_messages.body,
+              contact_messages.attempt_count, contact_messages.created_at
 )
-UPDATE contact_messages
-SET attempt_count   = attempt_count + 1,
-    next_attempt_at = now() + $1::interval
-FROM claimed
-WHERE contact_messages.id = claimed.id
-RETURNING contact_messages.id, contact_messages.user_id, contact_messages.name,
-          contact_messages.email, contact_messages.subject, contact_messages.body,
-          contact_messages.attempt_count, contact_messages.created_at
+SELECT updated.id, updated.user_id, updated.name,
+       updated.email, updated.subject, updated.body,
+       updated.attempt_count, updated.created_at,
+       -- **検証済みのアドレス。** updated.email (利用者の入力値・未検証) とは
+       -- 別物なので、取り違えないよう別名を付けてある。
+       -- NULL = 自動返信を送らない (匿名 / 退会済み)。
+       u.email AS verified_email
+FROM updated
+LEFT JOIN users u ON u.id = updated.user_id
+                 AND u.deleted_at IS NULL
 `
 
 type ClaimPendingContactsParams struct {
-	Lease     pgtype.Interval
 	BatchSize int32
+	Lease     pgtype.Interval
 }
 
 type ClaimPendingContactsRow struct {
-	ID           int64
-	UserID       *int64
-	Name         string
-	Email        string
-	Subject      string
-	Body         string
-	AttemptCount int32
-	CreatedAt    time.Time
+	ID            int64
+	UserID        *int64
+	Name          string
+	Email         string
+	Subject       string
+	Body          string
+	AttemptCount  int32
+	CreatedAt     time.Time
+	VerifiedEmail *string
 }
 
 // 送信する行を確保する。**このリポジトリで唯一の SKIP LOCKED。**
@@ -113,8 +125,45 @@ type ClaimPendingContactsRow struct {
 // インライン展開されない** (ロックという副作用を持つため) ので、
 // ここは実装依存ではなく規定の挙動になる。
 // ジョブキューを DB で作るときの定石として知られた形でもある。
+//
+// 【users を LEFT JOIN する理由 —— 自動返信の宛先】
+// ADR 0008 決定 2 は「入力されたアドレスへは送らない」。それでも
+// **ログイン済みの利用者には控えを返せる** —— users.email は IdP が
+// email_verified = true として渡した値で、ログインのたびに
+// UpsertUser が書き直している (ADR 0005 決定 3)。所有権が確認済みの
+// アドレスは、このシステムにはこれしか無い。
+//
+// **JOIN をここに書くのが ADR 0014 の結論。** contact モジュールは
+// user モジュールを import できないが、アダプタは両方を知ってよい
+// (外側が内側を知る)。列を足して受付時に写し取る手もあるが、
+//   - マイグレーションが要る
+//   - 退会した利用者へ送ってしまう (写した時点では在籍していた)
+//   - 同じアドレスが 2 か所に載り、ずれる余地ができる
+//
+// ので、送信の直前に引くほうを採る。リトライ中 (最長 91 分) に
+// アドレスが変われば新しいほうへ届く —— 控えの宛先としてはそれが正しい。
+//
+// **INNER ではなく LEFT。** 匿名の問い合わせは user_id が NULL なので、
+// INNER にすると**その行が確保されなくなる** —— 匿名の問い合わせだけが
+// 永久に pending のまま残り、しかも「送信が止まった」ようには見えない
+// (件数が 0 なので observePending 以外は何も鳴らない)。
+//
+// **deleted_at IS NULL を ON 側に置く。** WHERE に書くと LEFT が INNER に
+// 化けて、退会済みの利用者の問い合わせが同じように消える
+// (threads.sql の画像の結合で同じ注意書きがある)。
+//
+// 【結合を UPDATE の FROM ではなく外側の SELECT に置く理由】
+// 初版は `UPDATE ... FROM claimed LEFT JOIN users` と書いていた。
+// SQL としては動くが、**sqlc が verified_email を string (NULL 不可) で
+// 生成する** —— UPDATE ... RETURNING の経路では外部結合の NULL 許容を
+// 追わないため。匿名の問い合わせを 1 件でも確保した時点で
+// 「NULL を string に読めない」で確保ごと落ちる。
+// 平の SELECT なら追える (threads.sql の author_display_name が *string)。
+//
+// 副産物として、**確保の UPDATE 文は結合を 1 つも持たないまま**になる。
+// 上の INNER / LEFT の取り違えが、そもそも書ける場所から消える。
 func (q *Queries) ClaimPendingContacts(ctx context.Context, arg ClaimPendingContactsParams) ([]ClaimPendingContactsRow, error) {
-	rows, err := q.db.Query(ctx, claimPendingContacts, arg.Lease, arg.BatchSize)
+	rows, err := q.db.Query(ctx, claimPendingContacts, arg.BatchSize, arg.Lease)
 	if err != nil {
 		return nil, err
 	}
@@ -131,6 +180,7 @@ func (q *Queries) ClaimPendingContacts(ctx context.Context, arg ClaimPendingCont
 			&i.Body,
 			&i.AttemptCount,
 			&i.CreatedAt,
+			&i.VerifiedEmail,
 		); err != nil {
 			return nil, err
 		}

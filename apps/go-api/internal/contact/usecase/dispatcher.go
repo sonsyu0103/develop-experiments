@@ -160,6 +160,8 @@ func NewDispatcher(
 func (d *Dispatcher) Dispatch(ctx context.Context) (DispatchResult, error) {
 	var result DispatchResult
 
+	claimedAt := time.Now()
+
 	messages, err := d.repo.ClaimPending(ctx, d.lease, d.batchSize)
 	if err != nil {
 		return result, err
@@ -172,6 +174,34 @@ func (d *Dispatcher) Dispatch(ctx context.Context) (DispatchResult, error) {
 		// 打ち切っても失われません。逆に、シャットダウン中に
 		// 残り全件の SMTP を待つと猶予を使い切ります。
 		if isDone(ctx) {
+			break
+		}
+
+		// **リースを使い切る前に止めます** (レビュー指摘)。
+		//
+		// リースは確保の時点でバッチ全件に一括で掛かります。周回の所要が
+		// リースを超えると、**まだ処理していない行が他のレプリカから
+		// 見えるようになり**、こちらが送っている最中に同じ行を送られます。
+		//
+		// 超えうる量は設定次第です。MAIL_TIMEOUT_SECONDS = 10 の場合、
+		// 1 接続あたり最悪 20 秒 (DialContext 10 秒 + SetDeadline 10 秒)。
+		// 控えを足したことで **1 件あたり 2 接続**になったので、
+		//
+		//	20 件 x 2 接続 x 20 秒 = 800 秒 > リース 300 秒
+		//
+		// **バッチサイズやリースの既定値をいじって釣り合わせません。**
+		// どちらも「速い相手」を前提に選んだ値で、釣り合いは
+		// MAIL_TIMEOUT_SECONDS にも依存します —— 3 つの設定の積が
+		// 4 つ目を超えない、という不変条件を人が守り続ける形になります。
+		//
+		// 残りを次の周回に任せるほうが安全です。**何も失われません** ——
+		// 未処理の行はリースが切れれば拾い直されます。
+		if elapsed := time.Since(claimedAt); elapsed >= d.leaseBudget() {
+			slog.InfoContext(ctx, "contact_lease_budget_reached",
+				slog.Int64("elapsed_ms", elapsed.Milliseconds()),
+				slog.Int("handled", result.Total()),
+				slog.Int("claimed", len(messages)),
+			)
 			break
 		}
 
@@ -191,6 +221,12 @@ func (d *Dispatcher) Dispatch(ctx context.Context) (DispatchResult, error) {
 				slog.Int("attempt", int(m.AttemptCount)),
 			)
 			result.Sent++
+			// **MarkSent の「後」に送ります。** 前に置くと、控えの SMTP の
+			// 往復ぶんだけ「運営には届いたが行は pending」の窓が広がり、
+			// そこで落ちると**運営への通知がもう 1 通届きます。**
+			// 決定 1 が守ると決めたのは運営への通知だけなので、
+			// 控えのために重複の窓を広げません。
+			d.sendAutoReply(ctx, m)
 			continue
 		}
 
@@ -208,6 +244,89 @@ func (d *Dispatcher) Dispatch(ctx context.Context) (DispatchResult, error) {
 
 	d.observePending(ctx)
 	return result, nil
+}
+
+// sendAutoReply は問い合わせをくれた本人へ控えを返します (ADR 0008 決定 2)。
+//
+// **戻り値がありません。失敗しても行の状態を変えません。**
+// この時点で運営への通知は確定済み (MarkSent 済み) で、控えのために
+// 問い合わせをもう一度送るのは本末転倒になります。
+//
+// 【リトライしない理由】
+// 行に「控えを送ったか」を持たせればできますが、
+//
+//   - 列が増える (マイグレーション)
+//   - 「運営には届いたが控えは未送信」という 3 つ目の状態が生まれ、
+//     status = 'sent' が何を意味するのかが 1 行では言えなくなる
+//   - 確保のクエリ (contact_pending_idx で引いている) の条件が増える
+//
+// のに対し、届かないことの実害は「受け付けたことの再確認ができない」
+// だけです。それは 202 を受けた画面が既に伝えています。
+//
+// **リトライしない代わりに、送れなかったことは必ず記録します。**
+// 静かに消えるのが一番まずい形になります。
+func (d *Dispatcher) sendAutoReply(ctx context.Context, m model.Message) {
+	// **nil なら送りません。** 匿名の問い合わせ、退会済みの利用者、
+	// users.email が形式不正、の 3 つがここに来ます。
+	//
+	// **入力されたアドレス (m.Email) へ落とすフォールバックは書きません** ——
+	// それが決定 2 が禁じたことそのものになります。
+	if m.ReplyTo == nil {
+		return
+	}
+
+	// **空の宛先も送りません** (レビュー指摘)。
+	//
+	// nil と違い、これは**起きてはいけない状態**です ——
+	// VerifiedEmail のゼロ値はどのパッケージからでも書けるので、
+	// 型だけでは防げません。素通しすると `RCPT TO:<>` になり、
+	// **結線の誤りが SMTP の失敗として現れます。**
+	// 匿名 (nil) と同じ扱いで黙って飛ばすと、今度は誰も気づきません。
+	if m.ReplyTo.IsZero() {
+		slog.ErrorContext(ctx, "contact_auto_reply_address_empty",
+			slog.Int64("contact_id", m.ID))
+		return
+	}
+
+	// **中断中は送りません。** シャットダウンの猶予は運営への通知に使います。
+	// 送らなかった控えは次回に持ち越されません (上のとおりリトライしない)。
+	if isDone(ctx) {
+		return
+	}
+
+	if err := d.sender.SendAutoReply(ctx, repository.AutoReply{
+		ContactID: m.ID,
+		To:        *m.ReplyTo,
+		Body:      composeAutoReplyBody(m),
+	}); err != nil {
+		// **WARN です** (ADR 0010 の 4-3)。届かなくても問い合わせは
+		// 運営に届いており、人がすぐ対応するものではありません。
+		// 頻発するなら送信経路の問題なので、数えられるようにします。
+		//
+		// **宛先は載せません。** ただしサーバの応答文が error に入るため、
+		// 宛先が混じることはあります (smtp.go の RCPT TO の注記)。
+		slog.WarnContext(ctx, "contact_auto_reply_failed",
+			slog.Int64("contact_id", m.ID),
+			slog.String("error", truncate(err.Error(), maxLastErrorLength)),
+		)
+		return
+	}
+
+	slog.InfoContext(ctx, "contact_auto_reply_sent", slog.Int64("contact_id", m.ID))
+}
+
+// leaseBudget は 1 周回で使ってよい時間を返します。
+//
+// **リースより短くします。** ちょうどリースぶん使うと、最後の 1 件を
+// 送っている最中にリースが切れます。残す余白は「1 件ぶんの最悪」より
+// 大きい必要があり、1 件は最悪 2 接続 (通知 + 控え) ぶんかかります。
+//
+// 4 分の 3 にすると、既定のリース 5 分に対して余白が 75 秒 ——
+// MAIL_TIMEOUT_SECONDS = 10 での 1 件ぶん (最悪 40 秒) を上回ります。
+// タイムアウトを 20 秒より長くすると足りなくなりますが、そのときは
+// **超えるのが最後の 1 件だけ**になります (超える前に必ず break する)。
+func (d *Dispatcher) leaseBudget() time.Duration {
+	return d.lease / 4 * 3
 }
 
 // isDone は ctx が終了しているかを返します。
@@ -370,11 +489,68 @@ func composeBody(m model.Message) string {
 	b.WriteString("\n")
 
 	fmt.Fprintf(&b, "氏名: %s\n", m.Name)
-	// **このアドレスへ自動返信は送られていません** (決定 2)。
-	// 返信は人間が手で行います。
-	fmt.Fprintf(&b, "メールアドレス (未検証): %s\n", m.Email)
+	// **このアドレスへは何も送っていません** (決定 2)。利用者が入力した
+	// 文字列であって、書いた人の持ち物である保証がありません。
+	fmt.Fprintf(&b, "メールアドレス (入力値・未検証): %s\n", m.Email)
+	// **返信してよいのはこちらです。** IdP が検証し、ログインのたびに
+	// 更新しているアドレス (ADR 0005 決定 3)。
+	//
+	// 2 つ並べて出すのは、**食い違っていること自体が情報**だからです ——
+	// 他人のアドレスを入力した問い合わせが、対応する人の目に見えます。
+	//
+	// **「控えを送った」とは書きません** (レビュー指摘)。この本文は
+	// 控えを試みる**前**に組み立てて送っており、成否を知りようがありません。
+	// 控えは best-effort (リトライ無し・行に痕跡を残さない) なので、
+	// **「届いているはず」と読ませると、届いていない前提の対応ができません。**
+	// 実際に送れたかは contact_auto_reply_sent / _failed にしかありません。
+	if m.ReplyTo != nil {
+		fmt.Fprintf(&b, "メールアドレス (検証済み・返信先): %s\n", m.ReplyTo)
+		b.WriteString("  控え: このアドレス宛に送付を試みます" +
+			" (best-effort。届いたかは contact_id でログを参照)\n")
+	} else {
+		b.WriteString("メールアドレス (検証済み): なし (匿名または退会済み)\n")
+		b.WriteString("  控え: 送っていません\n")
+	}
 	fmt.Fprintf(&b, "件名: %s\n", m.Subject)
 	b.WriteString("\n---\n")
+	b.WriteString(m.Body)
+	b.WriteString("\n")
+
+	return b.String()
+}
+
+// composeAutoReplyBody は本人へ返す控えの本文を組み立てます。
+//
+// **入力されたアドレスを載せません。** このメールは登録アドレス宛で、
+// 入力欄には他人のアドレスが書かれていることがあります ——
+// それをそのまま書き写すと、**「他人のアドレス」を本人以外に
+// 見せる経路**を作ることになります。何が食い違っているかは
+// 運営宛のほう (composeBody) にだけ出します。
+//
+// **問い合わせ番号を載せます。** 本人が後から照会するときの手掛かりで、
+// これはこちら側が採番した整数です (外部識別子の方針 ADR 0003 未決 #11 は
+// URL に出す ID の話で、本人宛のメールはその対象になりません)。
+func composeAutoReplyBody(m model.Message) string {
+	var b strings.Builder
+
+	b.WriteString("お問い合わせを受け付けました。担当者が内容を確認します。\n")
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "問い合わせ番号: %d\n", m.ID)
+	fmt.Fprintf(&b, "受付日時: %s\n", m.CreatedAt.UTC().Format(time.RFC3339))
+	b.WriteString("\n")
+	// **なぜこのアドレスに届いたのかを書きます。** 書かないと、
+	// フォームに別のアドレスを入力した人が「なぜここに来たのか」
+	// 分からないままになります。
+	b.WriteString("このメールは自動送信で、ご利用のアカウントに登録されている\n")
+	b.WriteString("アドレス宛にお送りしています。フォームに入力されたアドレスへは\n")
+	b.WriteString("送っていません (入力された値は、こちらで確認できないためです)。\n")
+	b.WriteString("\n")
+	b.WriteString("心当たりが無い場合、このメールは破棄してください。\n")
+	b.WriteString("\n--- お預かりした内容 ---\n")
+
+	fmt.Fprintf(&b, "氏名: %s\n", m.Name)
+	fmt.Fprintf(&b, "件名: %s\n", m.Subject)
+	b.WriteString("\n")
 	b.WriteString(m.Body)
 	b.WriteString("\n")
 

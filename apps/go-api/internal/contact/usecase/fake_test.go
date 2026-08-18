@@ -133,19 +133,50 @@ func (f *fakeRepo) ScrubClientIPs(context.Context, time.Duration, int32) (int64,
 type fakeSender struct {
 	mu   sync.Mutex
 	sent []repository.Notification
+	// autoReplies は本人へ送った控えです (ADR 0008 決定 2)。
+	autoReplies []repository.AutoReply
 	// err が非 nil なら常に失敗します。
 	err error
+	// autoReplyErr が非 nil なら控えの送信だけが失敗します。
+	// **運営への通知は成功させます** —— 控えの失敗が問い合わせ本体を
+	// 巻き込まないこと (best-effort) を測るために分けてあります。
+	autoReplyErr error
+	// delay は 1 通あたりの所要です。**遅い相手を模します** ——
+	// リースを使い切る前に周回が止まることの検査に要ります。
+	delay time.Duration
+}
+
+// sleep は送信 1 通ぶんの時間を消費します。
+//
+// **ロックの外で待ちます。** 中で待つと、並行に呼ばれたときに
+// 待ち時間が直列に積み上がり、測りたいものと別物になります。
+func (f *fakeSender) sleep() {
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
 }
 
 var _ repository.MailSender = (*fakeSender)(nil)
 
 func (f *fakeSender) Send(_ context.Context, n repository.Notification) error {
+	f.sleep()
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return f.err
 	}
 	f.sent = append(f.sent, n)
+	return nil
+}
+
+func (f *fakeSender) SendAutoReply(_ context.Context, r repository.AutoReply) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.autoReplyErr != nil {
+		return f.autoReplyErr
+	}
+	f.autoReplies = append(f.autoReplies, r)
 	return nil
 }
 

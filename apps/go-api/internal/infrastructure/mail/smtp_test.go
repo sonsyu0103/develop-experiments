@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"develop-experiments/apps/go-api/internal/config"
+	"develop-experiments/apps/go-api/internal/contact/domain/model"
 	"develop-experiments/apps/go-api/internal/contact/domain/repository"
 )
 
@@ -25,11 +26,36 @@ var (
 	testTime = time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
 )
 
+// opsEnvelope は運営宛の 1 通ぶんを組み立てます (テスト用)。
+func opsEnvelope(subject, body string) envelope {
+	return envelope{
+		from:          testFrom,
+		to:            testTo,
+		subject:       subject,
+		body:          body,
+		autoSubmitted: "auto-generated",
+	}
+}
+
+// mustVerified はテスト用に検証済みアドレスを作ります。
+//
+// **本番でこの型を作れるのはアダプタ 1 か所だけ**ですが、
+// 生成そのものは公開されているので、テストからも同じ関門を通します。
+func mustVerified(t *testing.T, raw string) model.VerifiedEmail {
+	t.Helper()
+
+	v, err := model.NewVerifiedEmail(raw)
+	if err != nil {
+		t.Fatalf("NewVerifiedEmail(%q) が失敗した: %v", raw, err)
+	}
+	return v
+}
+
 // **ヘッダがこちら側の値だけで組み立てられること** (ADR 0008 決定 3)。
 func TestBuildMessage_Headers(t *testing.T) {
 	t.Parallel()
 
-	raw := string(buildMessage(testFrom, testTo, subjectFor(7), "本文です", testTime))
+	raw := string(buildMessage(opsEnvelope(subjectFor(7), "本文です"), testTime))
 	head, _, ok := strings.Cut(raw, "\r\n\r\n")
 	if !ok {
 		t.Fatalf("ヘッダと本文の境界が無い:\n%s", raw)
@@ -81,7 +107,7 @@ func TestBuildMessage_BodyIsWrappedBase64(t *testing.T) {
 	t.Parallel()
 
 	long := strings.Repeat("あ", 3000)
-	raw := string(buildMessage(testFrom, testTo, "件名", long, testTime))
+	raw := string(buildMessage(opsEnvelope("件名", long), testTime))
 	_, body, ok := strings.Cut(raw, "\r\n\r\n")
 	if !ok {
 		t.Fatal("本文が無い")
@@ -110,7 +136,7 @@ func TestBuildMessage_BodyCannotForgeHeaders(t *testing.T) {
 	t.Parallel()
 
 	hostile := "本文\r\nBcc: victim@example.com\r\n\r\n乗っ取り\r\n.\r\nQUIT"
-	raw := string(buildMessage(testFrom, testTo, "件名", hostile, testTime))
+	raw := string(buildMessage(opsEnvelope("件名", hostile), testTime))
 	head, body, _ := strings.Cut(raw, "\r\n\r\n")
 
 	if strings.Contains(head, "Bcc") {
@@ -220,13 +246,13 @@ func headerValue(t *testing.T, head, name string) string {
 func TestSend_QuitFailureIsNotASendFailure(t *testing.T) {
 	t.Parallel()
 
-	addr, received := startFakeSMTP(t, fakeSMTPOptions{dropOnQuit: true})
-	sender := newTestSender(t, addr)
+	srv := startFakeSMTP(t, fakeSMTPOptions{dropOnQuit: true})
+	sender := newTestSender(t, srv.addr)
 
 	if err := sender.Send(t.Context(), repository.Notification{ContactID: 7, Body: "本文"}); err != nil {
 		t.Fatalf("QUIT の失敗が送信の失敗になった: %v", err)
 	}
-	if got := <-received; !strings.Contains(got, "Subject:") {
+	if got := <-srv.received; !strings.Contains(got, "Subject:") {
 		t.Errorf("サーバがメッセージを受け取っていない:\n%s", got)
 	}
 }
@@ -238,17 +264,87 @@ func TestSend_QuitFailureIsNotASendFailure(t *testing.T) {
 func TestSend_Succeeds(t *testing.T) {
 	t.Parallel()
 
-	addr, received := startFakeSMTP(t, fakeSMTPOptions{})
-	sender := newTestSender(t, addr)
+	srv := startFakeSMTP(t, fakeSMTPOptions{})
+	sender := newTestSender(t, srv.addr)
 
 	if err := sender.Send(t.Context(), repository.Notification{ContactID: 1, Body: "本文"}); err != nil {
 		t.Fatalf("送信に失敗した: %v", err)
 	}
-	got := <-received
+	got := <-srv.received
 	// **ヘッダはこちら側の値だけ** (ADR 0008 決定 3)。
 	if !strings.Contains(got, "From: no-reply@example.com") ||
 		!strings.Contains(got, "To: ops@example.com") {
 		t.Errorf("ヘッダが届いていない:\n%s", got)
+	}
+}
+
+// **控えが検証済みアドレスへ、封筒ごと届くこと** (ADR 0008 決定 2)。
+//
+// この機能の全部がこの 1 件に載っています。**封筒 (RCPT TO) を見ます** ——
+// ヘッダの To だけ正しくて封筒が運営宛だと、控えは運営に届いて
+// 本人には届きません。逆に封筒だけ本人で To が運営だと、
+// 受け取った人は自分宛だと分かりません。
+func TestSendAutoReply_GoesToTheVerifiedAddress(t *testing.T) {
+	t.Parallel()
+
+	srv := startFakeSMTP(t, fakeSMTPOptions{})
+	sender := newTestSender(t, srv.addr)
+
+	err := sender.SendAutoReply(t.Context(), repository.AutoReply{
+		ContactID: 42,
+		To:        mustVerified(t, "user@example.net"),
+		Body:      "控えの本文",
+	})
+	if err != nil {
+		t.Fatalf("控えの送信に失敗した: %v", err)
+	}
+
+	// **封筒の宛先が本人であること。** 運営の固定アドレスではない。
+	if got := <-srv.rcpt; got != "user@example.net" {
+		t.Errorf("RCPT TO = %q (検証済みアドレスへ届いていない)", got)
+	}
+
+	// **偽サーバは行末を \n に均して記録します** (serveFakeSMTP)。
+	// headerValue は \r\n を前提にしているので、戻してから渡します。
+	got := strings.ReplaceAll(<-srv.received, "\n", "\r\n")
+	head, _, _ := strings.Cut(got, "\r\n\r\n")
+	for _, want := range []string{
+		// 差出人は運営の固定アドレスのまま (利用者の入力は入らない)。
+		"From: no-reply@example.com",
+		"To: user@example.net",
+		// **auto-generated ではない** (RFC 3834)。
+		// これは受け取った問い合わせへの応答になる。
+		"Auto-Submitted: auto-replied",
+	} {
+		if !strings.Contains(head, want) {
+			t.Errorf("ヘッダに %q が無い:\n%s", want, head)
+		}
+	}
+	// **運営の宛先が混ざっていないこと。** 控えに Cc / Bcc で
+	// 運営が入ると、本人宛のメールが運営にも複製される。
+	if strings.Contains(head, "ops@example.com") {
+		t.Errorf("控えに運営の宛先が混ざっている:\n%s", head)
+	}
+
+	subject := headerValue(t, head, "Subject")
+	decoded, decErr := new(mime.WordDecoder).DecodeHeader(subject)
+	if decErr != nil {
+		t.Fatalf("Subject を復号できない (%q): %v", subject, decErr)
+	}
+	if decoded != "[お問い合わせ] #42 を受け付けました" {
+		t.Errorf("Subject = %q (復号 %q)", subject, decoded)
+	}
+}
+
+// **控えの件名にも利用者の入力が入らないこと** (ADR 0008 決定 3)。
+//
+// 「本人宛だから安全」にはしません —— ヘッダに入力が入る経路を
+// 1 つ作ると、それが後から他の宛先へ流用されます。
+func TestAutoReplySubjectFor_HasNoUserInput(t *testing.T) {
+	t.Parallel()
+
+	if got := autoReplySubjectFor(12); got != "[お問い合わせ] #12 を受け付けました" {
+		t.Errorf("autoReplySubjectFor(12) = %q", got)
 	}
 }
 
@@ -258,8 +354,8 @@ func TestSend_Succeeds(t *testing.T) {
 func TestSend_DataRejectionIsAFailure(t *testing.T) {
 	t.Parallel()
 
-	addr, _ := startFakeSMTP(t, fakeSMTPOptions{rejectData: true})
-	sender := newTestSender(t, addr)
+	srv := startFakeSMTP(t, fakeSMTPOptions{rejectData: true})
+	sender := newTestSender(t, srv.addr)
 
 	if err := sender.Send(t.Context(), repository.Notification{ContactID: 1, Body: "本文"}); err == nil {
 		t.Fatal("届いていないのに成功として扱われた")
@@ -300,7 +396,7 @@ type fakeSMTPOptions struct {
 //
 // **1 接続だけ受けて終わります。** 受け取ったメッセージ本体を
 // チャネルへ流すので、呼び出し側はそれを検査できます。
-func startFakeSMTP(t *testing.T, opts fakeSMTPOptions) (addr string, received chan string) {
+func startFakeSMTP(t *testing.T, opts fakeSMTPOptions) *fakeSMTP {
 	t.Helper()
 
 	// **ListenConfig を使います。** 素の net.Listen は ctx を取らないため
@@ -312,19 +408,37 @@ func startFakeSMTP(t *testing.T, opts fakeSMTPOptions) (addr string, received ch
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 
-	received = make(chan string, 1)
+	srv := &fakeSMTP{
+		addr:     ln.Addr().String(),
+		received: make(chan string, 1),
+		rcpt:     make(chan string, 1),
+	}
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
 		defer func() { _ = conn.Close() }()
-		serveFakeSMTP(conn, opts, received)
+		serveFakeSMTP(conn, opts, srv)
 	}()
-	return ln.Addr().String(), received
+	return srv
 }
 
-func serveFakeSMTP(conn net.Conn, opts fakeSMTPOptions, received chan<- string) {
+// fakeSMTP は偽サーバが受け取ったものの窓口です。
+type fakeSMTP struct {
+	addr string
+	// received は DATA で受け取ったメッセージ本体です。
+	received chan string
+	// rcpt は RCPT TO で受け取った**封筒の**宛先です。
+	//
+	// **ヘッダの To とは別に測ります。** 実際に配送される先は封筒側で、
+	// ヘッダしか見ないと「To は本人・封筒は運営」のような取り違えが
+	// 素通りします。決定 2 が効いているかはここに出ます。
+	rcpt chan string
+}
+
+func serveFakeSMTP(conn net.Conn, opts fakeSMTPOptions, srv *fakeSMTP) {
+	received, rcpt := srv.received, srv.rcpt
 	r := bufio.NewReader(conn)
 	write := func(s string) { _, _ = conn.Write([]byte(s + "\r\n")) }
 
@@ -359,7 +473,13 @@ func serveFakeSMTP(conn net.Conn, opts fakeSMTPOptions, received chan<- string) 
 			// **拡張は 1 つも名乗りません。** STARTTLS も AUTH も
 			// 使わない経路を検査したいためです。
 			write("250 fake")
-		case strings.HasPrefix(line, "MAIL FROM"), strings.HasPrefix(line, "RCPT TO"):
+		case strings.HasPrefix(line, "MAIL FROM"):
+			write("250 OK")
+		case strings.HasPrefix(line, "RCPT TO"):
+			// `RCPT TO:<a@example.com>` から中身だけ取り出します。
+			if addr, ok := strings.CutPrefix(line, "RCPT TO:"); ok {
+				rcpt <- strings.Trim(addr, "<>")
+			}
 			write("250 OK")
 		case strings.HasPrefix(line, "DATA"):
 			inData = true

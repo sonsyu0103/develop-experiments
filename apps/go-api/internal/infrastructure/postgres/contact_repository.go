@@ -110,9 +110,44 @@ func (r *ContactRepository) ClaimPending(
 			Body:         row.Body,
 			AttemptCount: row.AttemptCount,
 			CreatedAt:    row.CreatedAt,
+			ReplyTo:      verifiedEmailOf(ctx, row.ID, row.VerifiedEmail),
 		})
 	}
 	return messages, nil
+}
+
+// verifiedEmailOf は users.email を自動返信の宛先に変換します。
+//
+// **このシステムで VerifiedEmail が生まれる唯一の場所です**
+// (ADR 0008 決定 2)。所有権を保証しているのは users.email 自体で、
+// 根拠は 2 つあります (ADR 0005 決定 3)。
+//
+//	IdP が email_verified = true として渡した値しか受け入れていない
+//	ログインのたびに UpsertUser が書き直している (古いまま残らない)
+//
+// **利用者がフォームに入力した contact_messages.email はここへ来ません。**
+// 引数は LEFT JOIN した users 側の列だけです。
+//
+// **形式が不正なら nil を返して、自動返信を送らないだけにします。**
+// users.email に CHECK 制約は無く、IdP が返した文字列がそのまま入ります。
+// ここでエラーを返すと、**行 1 つのせいで確保ごと止まり、運営への通知が
+// 丸ごと遅れます** —— 控えが 1 通届かないほうが軽い。
+func verifiedEmailOf(ctx context.Context, contactID int64, raw *string) *model.VerifiedEmail {
+	// NULL = 匿名の問い合わせ、または退会済みの利用者。
+	if raw == nil {
+		return nil
+	}
+
+	v, err := model.NewVerifiedEmail(*raw)
+	if err != nil {
+		// **アドレスもエラー文も載せません** (ADR 0010 の 4-5)。
+		// エラー文には不正だった値そのものが含まれ、それは個人データです。
+		// 突き合わせに要るのは contact_id だけになります。
+		slog.WarnContext(ctx, "contact_verified_email_invalid",
+			slog.Int64("contact_id", contactID))
+		return nil
+	}
+	return &v
 }
 
 // MarkSent は送信できた行を確定します。

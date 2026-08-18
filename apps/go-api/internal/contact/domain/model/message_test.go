@@ -304,3 +304,34 @@ func readRepoFile(t *testing.T, rel string) string {
 	}
 	return string(b)
 }
+
+// **検証済みアドレスの関門が、ヘッダを壊す値を通さないこと** (ADR 0008 決定 2)。
+//
+// VerifiedEmail は「所有権が確認済み」を表す型ですが、
+// 中身は DB から来た文字列です (users.email に CHECK 制約は無く、
+// IdP が返した値がそのまま入っています)。
+// **出どころが信用できることと、形が正しいことは別**になります。
+func TestNewVerifiedEmail_RejectsHeaderBreakers(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		"",
+		"user@example.net\r\nBcc: victim@example.com",
+		// 表示名つきは「見えるアドレス」と「実際の宛先」がずれる。
+		"ホシノ <user@example.net>",
+		"こわれている",
+		strings.Repeat("a", 250) + "@example.com", // 254 文字の上限超え
+	} {
+		if _, err := NewVerifiedEmail(raw); err == nil {
+			t.Errorf("不正なアドレスが検証済みとして通った: %q", raw)
+		}
+	}
+
+	v, err := NewVerifiedEmail("user@example.net")
+	if err != nil {
+		t.Fatalf("正しいアドレスが弾かれた: %v", err)
+	}
+	if v.String() != "user@example.net" {
+		t.Errorf("String() = %q", v.String())
+	}
+}

@@ -168,9 +168,15 @@ func normalizeLine(raw, field string, minLen, maxLen int) (string, error) {
 // 「アドレス欄に見える文字列」と「実際のアドレス」がずれます。
 // この値は本文にそのまま載るので、読む側が別のアドレスへ返信しかねません。
 //
-// **ここでの検証は「送達できること」を保証しません。** 存在しない
-// ドメインも通ります。保証したければ確認メールを送ることになりますが、
-// それは決定 2 (自動返信を送らない) が禁じたことそのものになります。
+// **ここでの検証は「形式」だけです。** 送達できることも、
+// **書いた人がそのアドレスの持ち主であることも**保証しません。
+// 存在しないドメインも通ります。
+//
+// 所有権の確認には確認メールを送ることになりますが、
+// **その確認メール自体が未検証のアドレス宛の送信**になるため、
+// 決定 2 が禁じたものの中に入ります (循環している)。
+// このシステムが検証済みとして扱えるのは、IdP が確認したアドレス
+// (users.email / ADR 0005 決定 3) だけです —— VerifiedEmail を参照。
 func normalizeEmail(raw string) (string, error) {
 	v := strings.TrimSpace(raw)
 	if v == "" {
@@ -228,6 +234,67 @@ func isControl(r rune) bool {
 	return r < 0x20 || (r >= 0x7f && r <= 0x9f)
 }
 
+// VerifiedEmail は**所有権が確認済みの**アドレスです。
+//
+// 【なぜ string ではなく型なのか】
+// 決定 2 が禁じているのは「検証されていないアドレスへ送ること」で、
+// これは本来「送り先に利用者の入力を渡さない」という**約束**でしか
+// 守られません。約束は破られます —— Message.Email も
+// VerifiedEmail も同じ `string` なら、取り違えはコンパイルを通ります。
+//
+// 型にしておくと、`Email` を送り先へ渡す経路が**書けなくなります。**
+// normalizeLine が「ヘッダに入れない」約束と入力検査を二重にしているのと
+// 同じ考え方を、値の出どころに適用した形になります。
+//
+// 【このシステムで「検証済み」と言えるもの】
+// **1 つだけです。** IdP が `email_verified = true` として渡し、
+// ログインのたびに `users.email` へ書き直しているアドレス
+// (ADR 0005 決定 3 / db/query/users.sql の UpsertUser)。
+//
+// 利用者がフォームに入力した値は、**たまたま同じ文字列でも**
+// 検証済みにはなりません。入力欄に自分のアドレスを書いたのか
+// 他人のアドレスを書いたのかを、こちらは区別できないためです。
+type VerifiedEmail struct {
+	addr string
+}
+
+// NewVerifiedEmail は検証済みアドレスを組み立てます。
+//
+// **呼んでよいのは「所有権が確認済みだと言い切れる場所」だけです。**
+// 現在は users.email を読むアダプタ (infrastructure/postgres) の 1 か所で、
+// それ以外から呼ぶときは**何が所有権を保証しているのか**を先に書いてください。
+//
+// 形式をここでも検査するのは、**DB の値が常に正しいと仮定しないため**です。
+// users.email に入っているのは IdP が返した文字列そのままで、
+// contact_messages と違って CHECK 制約もありません。
+func NewVerifiedEmail(raw string) (VerifiedEmail, error) {
+	v, err := normalizeEmail(raw)
+	if err != nil {
+		return VerifiedEmail{}, err
+	}
+	return VerifiedEmail{addr: v}, nil
+}
+
+// String はアドレスを返します。
+//
+// **メールの宛先ヘッダに入れてよい唯一のアドレス**になります
+// (運営の固定アドレスを除く)。
+func (v VerifiedEmail) String() string { return v.addr }
+
+// IsZero は「まだ何も入っていない」かを返します。
+//
+// **型だけでは空を防げません** (レビュー指摘)。フィールドが非公開でも
+// `model.VerifiedEmail{}` はどのパッケージからでも書けるので、
+// `AutoReply{ContactID: 1, Body: ...}` のように **To を書き忘れた
+// 呼び出しがコンパイルを通ります。**
+//
+// 「生成できるのはアダプタ 1 か所だけ」が守れているのは
+// **中身が入った値**についてであって、空の値はその外側にあります。
+// 送信側はこれを使って入口で弾いてください ——
+// 弾かないと `RCPT TO:<>` を送って SMTP の失敗として現れ、
+// **書き忘れが「相手のサーバが悪い」ように見えます。**
+func (v VerifiedEmail) IsZero() bool { return v.addr == "" }
+
 // Message は保存された問い合わせです。
 //
 // **client_ip を持ちません。** 保存したあとにこの値を読む必要があるのは
@@ -249,4 +316,22 @@ type Message struct {
 	AttemptCount int32
 	// CreatedAt は受け付けた時刻です。
 	CreatedAt time.Time
+
+	// ReplyTo は自動返信 (控え) を送ってよいアドレスです。
+	// **nil なら送りません。**
+	//
+	// 入るのは `users.email` —— IdP が検証し、ログインのたびに
+	// 更新しているアドレスだけです。**上の Email (利用者が入力した値) が
+	// ここに入ることはありません** (決定 2)。
+	//
+	// nil になるのは 3 つの場合です。
+	//
+	//	匿名の問い合わせ           user_id が NULL
+	//	退会済みの利用者           users.deleted_at が非 NULL
+	//	users.email が形式不正     NewVerifiedEmail が通らなかった
+	//
+	// **保存 (Save) の戻り値では常に nil です。** 受付は自動返信を
+	// 送らないので引く必要がなく、引かないぶん受付のクエリが軽く保たれます。
+	// 値が入るのは送信ワーカーが確保した行 (ClaimPending) だけになります。
+	ReplyTo *VerifiedEmail
 }
