@@ -301,7 +301,13 @@ func (d *Dispatcher) sendAutoReply(ctx context.Context, m model.Message) {
 	}); err != nil {
 		// **WARN です** (ADR 0010 の 4-3)。届かなくても問い合わせは
 		// 運営に届いており、人がすぐ対応するものではありません。
-		// 頻発するなら送信経路の問題なので、数えられるようにします。
+		// 頻発するなら送信経路の問題なので、数えられるようにします
+		// (infra/athena/queries/contact-auto-reply.sql)。
+		//
+		// **このイベントの件数だけでは足りません。** ワーカーが止まれば
+		// 失敗すら出なくなるので、監視側は
+		// **contact_auto_reply_sent が一定時間出ていないこと**も見ます
+		// (ADR 0008 の「実装して分かったこと 9」と同じ構造)。
 		//
 		// **宛先は載せません。** ただしサーバの応答文が error に入るため、
 		// 宛先が混じることはあります (smtp.go の RCPT TO の注記)。
