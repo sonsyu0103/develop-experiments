@@ -1,0 +1,5 @@
+{
+  "env": {
+    "DATABASE_TEST_URL": "postgres://app:password@localhost:5432/bbs?sslmode=disable"
+  }
+}
