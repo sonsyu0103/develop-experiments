@@ -27,11 +27,26 @@ from logs_source import (
     VIEW_NAME,
     athena_columns,
     connect,
+    create_raw_view,
     create_view,
 )
 
 # アプリのログが S3 に着地するまで待つ上限 (秒)。
 WAIT_TIMEOUT_SECONDS = int(os.environ.get("LOG_WAIT_TIMEOUT_SECONDS", "120"))
+
+
+def has_view(con: duckdb.DuckDBPyConnection, name: str) -> bool:
+    """そのビューが既にあるかを返します。
+
+    **推論するビューを二度作らないため。** 検査用のビューは
+    全ファイルを開くので、作り直しはそのまま接続の消費になります
+    (logs_source の「接続の話」)。
+    """
+    return bool(
+        con.execute(
+            "SELECT 1 FROM duckdb_views() WHERE view_name = ?", [name]
+        ).fetchall()
+    )
 
 
 def upload_interval_seconds() -> int:
@@ -68,12 +83,16 @@ def wait_for_http_requests(con: duckdb.DuckDBPyConnection) -> bool:
 
     while True:
         try:
-            # **毎周ビューを作り直す。** read_json はビューを作る時点の
-            # ファイル集合からスキーマを推論するので、後から現れた
-            # フィールド (msg など) は作り直さないと列にならない。
+            # **毎周ビューを作り直す。** 検査用のビューはスキーマを
+            # 推論するので、後から現れたフィールド (msg など) は
+            # 作り直さないと列にならない。
             # バケットが空のときは read_json 自体が落ちるが、
             # それも「まだ来ていない」の一形態として扱う。
-            create_view(con)
+            #
+            # ここで見るのは RAW_VIEW_NAME だけなので、分析用は作らない
+            # (logs_source の「接続の話」—— 推論はファイル 1 つにつき
+            # 接続を 1 本使うので、要らないビューは作らない)。
+            create_raw_view(con)
             found = con.execute(
                 f"SELECT count(*) FROM {RAW_VIEW_NAME} WHERE msg = 'http_request'"
             ).fetchone()[0]
@@ -155,10 +174,27 @@ def main() -> int:  # noqa: PLR0915 - 検査項目を 1 本の流れで読ませ
         r.failures.append("リクエストのログが S3 に届かなかった")
 
     try:
+        # **検査は両方のビューを使う。** 分析用は DDL の列と型
+        # (本番と同じ見え方)、検査用は推論した列 (宣言し忘れの検出)。
+        #
+        # 分析用は S3 に触らないので安い。検査用は**全ファイルを推論する**ので、
+        # 待ち合わせの最後に作れていたら作り直さない
+        # (logs_source の「接続の話」—— ファイル 1 つにつき接続 1 本)。
         create_view(con)
-    except duckdb.Error as e:
-        print("NG  ログが 1 件も S3 に届いていない")
-        print(f"      fluent-bit と MinIO が起動しているか確認する ({e})")
+        if not has_view(con, RAW_VIEW_NAME):
+            create_raw_view(con)
+    except (duckdb.Error, ValueError) as e:
+        # **原因を決めつけない。** ここは以前「ログが 1 件も S3 に届いて
+        # いない」と言い切っていたが、この時点の失敗は届いていないとは
+        # 限らない —— DDL が読めない・型を写せない (logs_source の
+        # _TYPE_MAP)・**推論中にポートが枯れる**、どれでもここに来る。
+        # query.py で直したのと同じ嘘だった。
+        print(f"NG  ログのビューを作れなかった: {e}")
+        print("      思い当たるもの:")
+        print("      - S3 にまだ 1 件も着地していない (fluent-bit と MinIO を確認する)")
+        print("      - 接続を張り切っている (Could not establish connection):")
+        print("        compose の logs-query の sysctls net.ipv4.tcp_tw_reuse=1")
+        print("      - DDL の型を DuckDB に写せない (logs_source の _TYPE_MAP)")
         return 1
 
     total = con.execute(f"SELECT count(*) FROM {VIEW_NAME}").fetchone()[0]
@@ -320,6 +356,26 @@ def main() -> int:  # noqa: PLR0915 - 検査項目を 1 本の流れで読ませ
             not undeclared,
             "Athena の DDL に宣言されていない列が無い",
             f"DDL (infra/athena/table.sql) に足す: {undeclared}" if undeclared else "",
+        )
+
+    # -----------------------------------------------------------------
+    # 3-4. DDL に宣言した列が、分析用のビューに全部出ているか
+    #
+    # **3-3 の逆向き。** 3-3 は「データにあって DDL に無い列」を見るが、
+    # こちらは「DDL にあってビューに無い列」を見る。
+    #
+    # 分析用のビューは DDL をそのままスキーマにしているので、
+    # **写せない型が 1 つあると、その列だけ静かに消える。**
+    # そうなると Athena では見えるのに手元では見えない —— 
+    # logs_source がまさに防ぐために書かれた壊れ方に戻る。
+    # (_TYPE_MAP は未知の型で落ちるようにしてあるが、検査でも見ておく)
+    # -----------------------------------------------------------------
+    if declared:
+        missing_in_view = sorted(declared - set(columns))
+        r.check(
+            not missing_in_view,
+            "DDL の列が分析用のビューに全部出ている",
+            f"ビューに出ていない: {missing_in_view}" if missing_in_view else "",
         )
 
     # -----------------------------------------------------------------
