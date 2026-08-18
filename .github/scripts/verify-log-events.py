@@ -38,6 +38,21 @@ ADR は Phase 9 前半で既に 4-2 を定めていたが、**守られている
 
 **どちらも「DDL を書こうとして初めて気づいた」形**で、
 アプリだけを見ている限り誰も困らない。だから検査に落とす。
+
+【DDL との突き合わせ】
+
+**Athena はスキーマオンリード。** 宣言しなかった列はエラーにならず、
+静かに NULL になる (infra/athena/table.sql の罠 2)。
+アプリが新しいフィールドを出し始めても、DDL に足すまで**本番では見えない。**
+
+実際に起きた: Phase 8 で contact_* を出し始めたとき、DDL に
+**contact 系の列を 1 つも足していなかった。** 控えの失敗を数えようとした
+段階で気づき、そこで手作業で 6 列足したが、**その洗い出しも 3 列
+取りこぼしていた** (oldest_age_ms / smtp_host / starttls。レビュー指摘)。
+
+手で数える限り漏れる。実行時の検査 (make logs-verify) は
+**着地した列しか見られない**うえ実環境が要り、CI に載らない。
+ソース側なら全部見えるので、ここで差分を取る。
 """
 
 from __future__ import annotations
@@ -62,6 +77,25 @@ FIELD_TYPES = re.compile(r"slog\.(String|Int64|Int|Bool|Float64|Duration|Any)\(\
 
 # Athena に持っていけない slog の型 (上の説明を参照)。
 BANNED_TYPES = {"Duration", "Any"}
+
+# Athena のテーブル定義。ここに宣言が無い列は本番で見えない。
+ATHENA_DDL = pathlib.Path(__file__).resolve().parents[2] / "infra" / "athena" / "table.sql"
+
+# DDL の列宣言。`名前` 型, の形だけを拾う。
+#
+# **型名まで見る。** これが無いと、コメント中に出てくる `contact_id` のような
+# バッククォート付きの語まで列として数えてしまう。
+DDL_COLUMN = re.compile(
+    r"^\s*`([a-z_0-9]+)`\s+(?:string|bigint|int|double|boolean)\s*,?\s*$", re.M
+)
+
+# **DDL に宣言できない / しないフィールド。**
+#
+#   service  S3 のキーが logs/service=go-api/... なので Hive 形式では
+#            パーティション列に見えるが、レコードの中にも同名がある。
+#            Athena は両者の同名を許さないため、LOCATION に埋め込んで
+#            列としては宣言していない (infra/athena/table.sql の罠 1)
+DDL_EXEMPT = {"service"}
 
 # slog の呼び出しから msg を取り出す。
 #
@@ -106,6 +140,15 @@ def field_types() -> dict[str, dict[str, list[str]]]:
             where = f"{path.relative_to(ROOT.parents[1])}:{line}"
             fields.setdefault(name, {}).setdefault(kind, []).append(where)
     return fields
+
+
+def athena_columns() -> set[str]:
+    """Athena の DDL が宣言している列名を集めます。"""
+    text = ATHENA_DDL.read_text(encoding="utf-8")
+    # **CREATE 文より前は見ない。** 冒頭の解説にコメントとして
+    # 列の例が並んでおり、そこまで拾うと宣言済みとして通ってしまいます。
+    body = text[text.index("CREATE EXTERNAL TABLE") :]
+    return set(DDL_COLUMN.findall(body))
 
 
 def main() -> int:
@@ -165,6 +208,26 @@ def main() -> int:
         print()
     else:
         print("OK  Athena に載せられない型 (Duration / Any) は使っていません")
+
+    # DDL に宣言されていないフィールドが無いか。
+    missing = sorted(set(fields) - athena_columns() - DDL_EXEMPT)
+    if missing:
+        failed = True
+        print(f"NG  Athena の DDL に無いフィールドが {len(missing)} 件あります")
+        print("    宣言しない列はエラーにならず、静かに NULL になります")
+        print("    (infra/athena/table.sql の罠 2)")
+        print()
+        for name in missing:
+            kinds = ", ".join(f"slog.{k}" for k in sorted(fields[name]))
+            print(f"  {name} ({kinds})")
+            for places in fields[name].values():
+                print(f"    {places[0]}")
+        print()
+        print("infra/athena/table.sql に列を足してください。")
+        print("宣言できない事情がある場合は DDL_EXEMPT に理由つきで入れます。")
+        print()
+    else:
+        print("OK  すべてのフィールドが Athena の DDL に宣言されています")
 
     return 1 if failed else 0
 
