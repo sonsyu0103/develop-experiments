@@ -353,7 +353,9 @@ SMTP 実装と SES 実装を差し替えられるようにする。
   (`550 ... <a@example.com> rejected`)。消す側に倒すと
   送れない理由が運用から見えなくなるので、載りうることを引き受ける
 - **控えが届かないことは、行のどこにも残らない** (best-effort)。
-  ログにしか出ないので、`contact_auto_reply_failed` を数える先が要る
+  ログにしか出ないので、集計は `infra/athena/queries/contact-auto-reply.sql`
+  に置いた。**`failed` の件数ではなく `sent` の最終時刻を見る** ——
+  ワーカーが止まると失敗すら出なくなる (下記 9 と同じ構造)
 - **ワーカーのライフサイクルが増える。**
   現在 API プロセスは HTTP サーバだけを持っている。
   ここに閲覧数のフラッシュ ([ADR 0006](0006-view-count-and-popularity.md))、
@@ -687,3 +689,83 @@ LEFT JOIN users u ON u.id = updated.user_id AND u.deleted_at IS NULL;
 
 代わりに「フォームに入力されたアドレスへは送っていない」とだけ書く。
 何が食い違っているかは運営宛のほうにだけ出す。
+
+## 実配送を確認して分かったこと (2026-08-18)
+
+Mailpit (compose) に対して、ログイン済み・匿名・退会済みの 3 経路を
+実際に流した記録。**ここまでは偽 SMTP サーバに対する検査しかなかった。**
+
+### 20. Athena のテーブル定義に contact 系の列が 1 つも無かった
+
+控えの失敗を数えようとして気づいた。Phase 8 で `contact_*` のイベントを
+出し始めたとき、[ADR 0010](0010-log-pipeline.md) の DDL
+(`infra/athena/table.sql`) を更新していなかった。
+
+同じファイルの「罠 2」が警告しているとおり、**Athena はスキーマオンリードで
+エラーにならず静かに NULL になる。** `contact_id` も `client_ip` も
+`count` / `limit` も、宣言が無いので**本番では最初から見えていなかった。**
+
+「集計クエリを足す」以前に、**集計できる状態ですらなかった**ことになる。
+6 列を足した。`count` と `limit` は予約語なので、クエリ側では
+二重引用符が要る (DDL のバッククォートでは通る)。
+
+> **手元の `make logs-verify` はこれを検出できたはず**だった
+> (`verify.py` が「着地した列のうち DDL に無いもの」を見る)。
+> 実環境が要るターゲットなので CI に載っておらず、
+> 問い合わせの実装以降に回した形跡が無い。
+
+### 21. 「セッション行を直接作る」は、そのままでは通らない
+
+[ADR 0005](0005-authentication.md) の検証記録にある方法を踏襲したが、
+**`sessions.id` に生のトークンを入れても認証されない。**
+保存されているのはトークンの **SHA-256** で、`SessionToken.Hash()` が
+その変換を担っている (ADR 0005 決定 1)。
+
+素で入れた場合、`POST /contact` は **401 にならず 202 を返す** ——
+問い合わせは匿名として受理されるため。`user_id` が NULL になって初めて
+「セッションが効いていない」と分かる。
+
+**最初の実配送は、これで控えが 1 通も出なかった。** ログには
+`contact_auto_reply_sent` も `_failed` も出ず、
+「送っていない」ことだけが分かる形になっていた ——
+設計どおりではあるが、**原因の切り分けには `user_id` を見る必要がある。**
+
+### 22. 実物で確認できたこと
+
+`sha256` を通したセッションで流し直した結果。
+
+| 経路 | 運営宛 | 控え |
+| --- | --- | --- |
+| ログイン済み | 届く | **`users.email` に届く** |
+| 匿名 | 届く | 送られない |
+| 退会済み | 届く | 送られない |
+
+控えの生ヘッダで確かめたもの:
+
+```
+Return-Path: <contact@bbs.example.com>
+Received: ... for <registered@example.net>;      ← 封筒の宛先
+From: contact@bbs.example.com
+To: registered@example.net
+Auto-Submitted: auto-replied
+Content-Transfer-Encoding: base64
+```
+
+- **入力欄に書いた `someone-else@example.com` は、控えのどこにも現れない**
+  (ヘッダ・本文とも)
+- `Cc` / `Bcc` は無く、運営のアドレスも混ざらない
+- 本文の日本語が base64 の往復で壊れていない
+
+運営宛には 2 つのアドレスが並び、**食い違いが目に見える**:
+
+```
+メールアドレス (入力値・未検証): someone-else@example.com
+メールアドレス (検証済み・返信先): registered@example.net
+  控え: このアドレス宛に送付を試みます (best-effort。届いたかは contact_id でログを参照)
+```
+
+> **退会済みの経路は、通ったところが想定と違った。** セッションの照合が
+> 先に退会を弾くので、`user_id` が NULL のまま受理される ——
+> 決定 2 が用意した `LEFT JOIN ... deleted_at IS NULL` ではなく、
+> 匿名と同じ道を通っている。あちらは live テストのほうで測っている
+> (受付後に退会した場合がそれに当たる)。
