@@ -320,11 +320,25 @@ services:
       # 検査が「ログが出揃うのを待つ」間隔の元になる。
       # 出す側と同じ値を見る (冒頭のアンカーを参照)。
       LOG_UPLOAD_TIMEOUT: *log-upload-timeout
+    # **TIME_WAIT のソケットを新しい接続に使い回す。**
+    #
+    # DuckDB の httpfs は、読むファイル 1 つにつき TCP 接続を 1 本張り、
+    # 使い回さない。エフェメラルポートは 28,232 個 (32768-60999) しかないので、
+    # **ログのファイルがそれを超えると、クエリの途中でポートが枯れる** ——
+    # `IO Error: Could not establish connection` として見える。
+    #
+    # 実測: これが無いと 28,231 本目で `Cannot assign requested address`。
+    # 有効にすると 40,000 本でも頭打ちにならない (TIME_WAIT が 13,500 で飽和)。
+    #
+    # ログが溜まるほど壊れる形なので、ファイル数を減らす対策では先送りにしかならない。
+    # 詳しくは infra/duckdb/logs_source.py の「接続の話」。
+    sysctls:
+      net.ipv4.tcp_tw_reuse: "1"
     volumes:
       # 保存したクエリを流し込めるようにする。
       - ./infra/athena/queries:/queries:ro
-      # **列の単一の情報源。** DuckDB 側はここを読んで、
-      # まだデータに出ていない列を NULL で補う (infra/duckdb/logs_source.py)。
+      # **列の単一の情報源。** DuckDB 側はこれをそのまま
+      # スキーマとして read_json に渡す (infra/duckdb/logs_source.py)。
       # 写経すると、DDL に足した列を片方だけ足し忘れる。
       - ./infra/athena/table.sql:/athena/table.sql:ro
     depends_on:

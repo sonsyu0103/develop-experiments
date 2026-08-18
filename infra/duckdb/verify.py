@@ -27,6 +27,7 @@ from logs_source import (
     VIEW_NAME,
     athena_columns,
     connect,
+    create_raw_view,
     create_view,
 )
 
@@ -68,12 +69,16 @@ def wait_for_http_requests(con: duckdb.DuckDBPyConnection) -> bool:
 
     while True:
         try:
-            # **毎周ビューを作り直す。** read_json はビューを作る時点の
-            # ファイル集合からスキーマを推論するので、後から現れた
-            # フィールド (msg など) は作り直さないと列にならない。
+            # **毎周ビューを作り直す。** 検査用のビューはスキーマを
+            # 推論するので、後から現れたフィールド (msg など) は
+            # 作り直さないと列にならない。
             # バケットが空のときは read_json 自体が落ちるが、
             # それも「まだ来ていない」の一形態として扱う。
-            create_view(con)
+            #
+            # ここで見るのは RAW_VIEW_NAME だけなので、分析用は作らない
+            # (logs_source の「接続の話」—— 推論はファイル 1 つにつき
+            # 接続を 1 本使うので、要らないビューは作らない)。
+            create_raw_view(con)
             found = con.execute(
                 f"SELECT count(*) FROM {RAW_VIEW_NAME} WHERE msg = 'http_request'"
             ).fetchone()[0]
@@ -155,7 +160,10 @@ def main() -> int:  # noqa: PLR0915 - 検査項目を 1 本の流れで読ませ
         r.failures.append("リクエストのログが S3 に届かなかった")
 
     try:
+        # **検査は両方のビューを使う。** 分析用は DDL の列と型
+        # (本番と同じ見え方)、検査用は推論した列 (宣言し忘れの検出)。
         create_view(con)
+        create_raw_view(con)
     except duckdb.Error as e:
         print("NG  ログが 1 件も S3 に届いていない")
         print(f"      fluent-bit と MinIO が起動しているか確認する ({e})")

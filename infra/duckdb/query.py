@@ -42,10 +42,22 @@ def main() -> int:
     try:
         con = open_logs()
     except duckdb.Error as e:
-        # **ビューを作る時点で落ちる。** read_json は 1 件も
-        # ファイルが無いとエラーになるので、「クエリが悪い」と
-        # 見分けが付くようにここで説明を足す。
-        print(f"S3 にログがまだ 1 件もありません: {e}", file=sys.stderr)
+        # **原因を決めつけない。** ここは以前
+        # 「S3 にログがまだ 1 件もありません」と言い切っていたが、
+        # 実際には 10,000 件以上あるのにポートが枯れて落ちていた
+        # (logs_source の「接続の話」)。**嘘の説明は切り分けを止める** ——
+        # 中の例外を読むまで、誰も本当の原因に辿り着けなかった。
+        print(f"ログのビューを作れませんでした: {e}", file=sys.stderr)
+        print(
+            "  - S3 にまだ 1 件も着地していない "
+            "(fluent-bit のアップロード契機 LOG_UPLOAD_TIMEOUT を待っていない)",
+            file=sys.stderr,
+        )
+        print(
+            "  - 接続を張れない (Could not establish connection): "
+            "compose の logs-query に sysctls net.ipv4.tcp_tw_reuse=1 が効いているか",
+            file=sys.stderr,
+        )
         return 1
 
     # **1 行も無いときに「クエリが 0 行を返した」と区別する。**
