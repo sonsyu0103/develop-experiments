@@ -28,9 +28,17 @@ Go (Gin) + PostgreSQL + Next.js による掲示板アプリケーション。
 │   │       ├── apperr/          層をまたぐ番兵エラー
 │   │       ├── config/          環境変数の読み取り
 │   │       ├── httpapi/         ServerInterface の実装 + oapigen/ (生成物)
+│   │       ├── idempotency/     冪等キーによる応答の再生 (ADR 0015)
+│   │       ├── logging/         共通フィールドとリクエスト相関 (ADR 0010 決定 4)
 │   │       ├── pagination/      キーセットページネーション
+│   │       ├── scheduler/       API プロセス内で動く定期処理を束ねる (未決 #9)
+│   │       ├── viewcount/       閲覧数のバッファとフラッシュ (ADR 0006)
 │   │       ├── thread/          スレッドドメイン (model / repository / usecase)
-│   │       ├── comment/         コメントドメイン
+│   │       ├── comment/         コメントドメイン (同上)。並行制御の主題 (ADR 0019)
+│   │       ├── user/            利用者ドメイン (同上)。認証とロール
+│   │       ├── image/           画像ドメイン (同上)。添付と回収 (ADR 0007)
+│   │       ├── contact/         問い合わせドメイン (同上)。受付と送信 (ADR 0008)
+│   │       ├── moderation/      通報とモデレーション (同上) (ADR 0011)
 │   │       └── infrastructure/postgres/   pgx によるリポジトリ実装 + sqlc 生成物
 │   └── next-app/                Next.js (App Router / RSC)
 │       ├── app/                 画面。一覧だけ Server Component で取得する
