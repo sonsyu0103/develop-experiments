@@ -45,6 +45,14 @@ jobs:
   go-ci:
     name: Go Checks
     runs-on: ubuntu-latest
+    # **上限が無いと、詰まったステップが 6 時間 (GitHub の既定) 走る。**
+    #
+    # 実測の最長は 3m17s。ただし**それはツールのキャッシュが当たった実行だけ**で、
+    # Install Go tools は直近 60 run すべて skipped —— **golangci-lint を
+    # ソースからビルドする経路は一度も測れていない** (レビュー指摘)。
+    # 鍵のバージョンを上げた日・7 日で失効した日に初めて通る。
+    # 測れていない経路を締め上げると、その日の PR が永続的に赤くなるので広く取る。
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: ./apps/go-api
@@ -150,6 +158,11 @@ jobs:
   next-ci:
     name: Next.js Checks
     runs-on: ubuntu-latest
+    # **このジョブが実際に 6 時間持っていかれた** (下の Playwright の節)。
+    # 正常時は 1m30s〜2m30s。詰まる先を apt から外したうえで、
+    # **ブラウザの取得にもステップ側の上限を置く** ——
+    # ジョブの枠だけだと、詰まったときに他のステップの余地まで食う。
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: ./apps/next-app
@@ -190,18 +203,56 @@ jobs:
           version=$(node -p "require('@playwright/test/package.json').version")
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      # ブラウザは 100 MB 近くある。**バージョンを鍵にする** ——
-      # パッケージを上げたときに古いブラウザを引き当てると、
-      # Playwright が起動時に不一致で落ちる。
-      - name: Cache Playwright browsers
+      # ブラウザは 100 MB 近くある。**バージョンとブラウザ集合を鍵にする。**
+      #
+      # バージョンだけを鍵にすると、パッケージを据え置いたまま
+      # playwright.config.ts に firefox を足した日に**鍵が変わらない**。
+      # 下の取得が skip され、`Executable doesn't exist` で落ちる
+      # —— しかも 7 日の失効かパッケージ更新まで自力で直らない (レビュー指摘)。
+      #
+      # **restore と save を分けている。** 一体の actions/cache は
+      # ジョブの最後に保存するため、**この後の e2e が落ちるとブラウザを
+      # 取り直した分が捨てられる。** 取得できた時点で保存する。
+      - name: Restore Playwright browsers
         id: playwright-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-${{ hashFiles('apps/next-app/playwright.config.ts') }}
 
+      # **--with-deps を付けない。** ぶれの原因は apt だと実測で確定した。
+      #
+      # 3 桁ぶれた実行 (69s / 503s / 21,580s) は**どれもキャッシュヒット**で、
+      # ヒット時にブラウザは取得されない —— つまりその時間はすべて
+      # --with-deps が走らせる apt にかかっていた。
+      #
+      # 決め手はこのログ (run 32216157115):
+      #
+      #   Ign: http://azure.archive.ubuntu.com/ubuntu noble InRelease   ← 到達不能
+      #   ...
+      #   04:34:12 Get:5 https://archive.ubuntu.com/ubuntu noble-security InRelease
+      #   （7 分 34 秒 無音）
+      #   04:41:46 ##[error]The action has timed out after 8 minutes.
+      #
+      # **apt-get update が黙って固まり、ブラウザの取得は一度も始まらなかった。**
+      # 上限を伸ばしても、詰まる先が同じなら意味が薄い。**apt を経路から外す。**
+      #
+      # ubuntu-latest のランナーには Chromium が要る共有ライブラリが入っている。
+      # **足りなければ npx playwright test がブラウザを起動できずに落ちる**ので、
+      # この判断は下の e2e がそのまま検査になる。
       - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        run: npx playwright install chromium
+
+      # **取得できた時点で保存する。** 一体の actions/cache はジョブの最後に
+      # 保存するため、この後の e2e が落ちると取得した分が捨てられる。
+      - name: Save Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-${{ hashFiles('apps/next-app/playwright.config.ts') }}
 
       - name: Playwright (管理画面の状態遷移)
         run: npx playwright test
@@ -215,6 +266,7 @@ jobs:
   generated-ci:
     name: Generated Code Drift Check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -284,6 +336,7 @@ jobs:
   migration-ci:
     name: Migration Check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:17-alpine
