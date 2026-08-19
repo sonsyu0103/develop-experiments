@@ -128,7 +128,7 @@ gRPC のエラーコードに沿っているため、**そのまま踏襲して�
 | `METHOD_NOT_ALLOWED` | 405 | パスは存在するがメソッドが未定義 | 既存 |
 | `CONFLICT` | 409 | 直列化失敗・一意制約違反・冪等キーの処理中 | 既存 |
 | `PAYLOAD_TOO_LARGE` | **413** | 画像サイズ超過 | [ADR 0007](0007-image-storage.md) |
-| `FAILED_PRECONDITION` | **422** | 同じ冪等キーで別の内容が送られた | [ADR 0015](0015-idempotency.md) |
+| `FAILED_PRECONDITION` | **422** | 前提が満たされていない (冪等キーの不一致 / 最後の admin の降格 / 削除済み画像の確定)。**冪等キー専用ではない** | [ADR 0015](0015-idempotency.md) |
 | `RESOURCE_EXHAUSTED` | **429** | レート制限 | [ADR 0008](0008-contact-and-mail.md) |
 | `INTERNAL` | 500 | 想定外 | 既存 |
 
@@ -178,6 +178,11 @@ r.Use(
 
 **`securityHeaders` を CORS より前に置く**のは、
 エラー応答やプリフライト応答にもヘッダを付けるため。
+
+> **実装の並びはこれと違う。** `securityHeaders` は決定 2 ごと未実装で、
+> `recovery` と `requestLogger` は前後が逆、`requestID` と `bodyLimit` が
+> 増えている。**理由があって逆にしてあるので、この擬似コードに
+> 合わせ直してはいけない** —— 下の「実装して分かったこと 2」を読むこと。
 
 ## 実装して分かったこと (2026-08-14)
 

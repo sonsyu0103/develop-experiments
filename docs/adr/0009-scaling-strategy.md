@@ -225,7 +225,7 @@ RDS Proxy、リードレプリカ、Redis、CloudFront、オートスケーリ�
 | 読み書きの経路分離 | **決定 1 で今やる** —— ただし 2026-08-19 時点で**未実装** |
 | カーソルの表現 | **対応済み** ([ADR 0018](0018-opaque-cursor.md))。公開前に不透明トークンへ変更した |
 | セッションストアの抽象化 | [ADR 0005](0005-authentication.md) で対処済み |
-| ID の型 (`BIGINT` 連番) | **決着** ([ADR 0003](0003-open-questions.md) #11)。`threads` / `comments` は `BIGINT` のまま、公開用の識別子だけ UUID v7 に分けた |
+| ID の型 (`BIGINT` 連番) | **決着** ([ADR 0003](0003-open-questions.md) #11)。**用途ごとに使い分ける** —— `threads` / `comments` は `BIGINT` のまま、`users` は内部 `BIGINT` + 公開用 `public_id UUID`、`images` は主キーごと UUID v7 |
 | `comments` のパーティション数 (8) | **決着** ([ADR 0003](0003-open-questions.md) #12)。Phase 4 の実測で「8 のまま」 (下記) |
 
 下 2 つは、後から変えるとデータの再配置を伴う。
