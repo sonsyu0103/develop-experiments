@@ -92,9 +92,9 @@ flowchart TB
 | `migrate` (migrate/migrate) | ECS の単発タスクとして実行 | アプリ起動時に走らせない (下記) |
 | `go-api` | ECS Fargate サービス | |
 | `next-app` | ECS Fargate サービス | |
-| **MinIO** (追加予定) | S3 (画像 / ログ) | [ADR 0007](adr/0007-image-storage.md) |
+| **MinIO** | S3 (画像 / ログ) | [ADR 0007](adr/0007-image-storage.md) |
 | **Mailpit** | Amazon SES | [ADR 0008](adr/0008-contact-and-mail.md)。**SES の初期状態はサンドボックス**で、検証済みアドレス以外へは送れない (解除申請が前提) |
-| **Fluent Bit** (追加予定) | FireLens サイドカー | [ADR 0010](adr/0010-log-pipeline.md) |
+| **Fluent Bit** | FireLens サイドカー | [ADR 0010](adr/0010-log-pipeline.md) |
 | (DuckDB でログを読む) | Athena | 同上。Athena の代替にはならないが、クエリとパーティション設計は検証できる |
 | 環境変数 (`.env`) | Secrets Manager | 下記 |
 | — | CloudFront / WAF / ALB / NAT | ローカルには対応物がない |

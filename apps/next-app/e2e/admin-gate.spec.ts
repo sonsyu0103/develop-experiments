@@ -87,7 +87,11 @@ test.describe('管理画面の入口', () => {
     await page.getByRole('link', { name: '管理' }).click();
     await expect(page.getByRole('heading', { name: '通報キュー' })).toBeVisible();
 
-    expect(calls).toBeGreaterThan(beforeNavigation);
+    // **expect.poll で待つ。** 見出しの表示と /me の引き直しは別々の
+    // 取得なので、見出しが出た時点で引き直しが終わっている保証がない。
+    // 素の expect だと、遅い実行環境でだけ「まだ 1 回」で落ちる
+    // (CI の Playwright で実際に落ちた。手元では 57 件緑だった)。
+    await expect.poll(() => calls).toBeGreaterThan(beforeNavigation);
   });
 
   test('/me が 500 のときは未ログイン扱いにしない', async ({ page }) => {

@@ -89,6 +89,16 @@ test.describe('マイページ', () => {
     await expect(page.getByText('プロフィール画像を外しました')).toBeVisible();
     // 応答の内容が画面に反映されていること (= 控えが置き換わったこと)。
     await expect(page.getByRole('heading', { name: '画像を外した人' })).toBeVisible();
+
+    // **「増えないこと」は待ってから見る。** 素の expect だと、余分な
+    // /me が飛んでいても page.route のハンドラに届く前なら緑になる
+    // (増える側と違って、待たないほうが通りやすい = false green になる)。
+    // networkidle まで待てば、飛んでいれば必ず数えられている。
+    //
+    // **変異プローブでは、待たない版も余分な /me を捕まえた** (3/3 赤)。
+    // つまり「実際に取りこぼしていた」ことの実証ではなく、
+    // 実行環境の速さに結果を預けるのをやめる、という趣旨の変更になる。
+    await page.waitForLoadState('networkidle');
     expect(meCalls).toBe(before);
   });
 

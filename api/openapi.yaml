@@ -2367,8 +2367,11 @@ components:
                 # 413。画像のサイズ・画素数の上限を超えた
                 # (docs/adr/0007-image-storage.md 決定 2 / ADR 0013 決定 3)
                 - PAYLOAD_TOO_LARGE
-                # 422。同じ冪等キーで別の内容が送られた
-                # (docs/adr/0013-http-defense.md 決定 3)
+                # 422。前提が満たされていない。**冪等キー専用ではない**
+                # —— 同じ冪等キーで別の内容 / 最後の admin の降格 /
+                # 削除済み画像の確定 (ImageRepository.Commit) がここに来る。
+                # 固定文言で返すと、無関係な対処へ誘導することになる
+                # (docs/adr/0013-http-defense.md 決定 3、internal/httpapi/errors.go)
                 - FAILED_PRECONDITION
                 # 429。レート制限に当たった
                 # (docs/adr/0008-contact-and-mail.md 決定 4 のスパム対策)。
