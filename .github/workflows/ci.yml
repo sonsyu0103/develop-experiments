@@ -45,6 +45,9 @@ jobs:
   go-ci:
     name: Go Checks
     runs-on: ubuntu-latest
+    # **上限が無いと、詰まったステップが 6 時間 (GitHub の既定) 走る。**
+    # 実測の最長は 3m17s なので、10 分あれば遅い日でも足りる。
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: ./apps/go-api
@@ -150,6 +153,9 @@ jobs:
   next-ci:
     name: Next.js Checks
     runs-on: ubuntu-latest
+    # **このジョブが実際に 6 時間持っていかれた** (下の Playwright の節)。
+    # 正常時は 2m30s 前後。ブラウザの取得が遅い日を見込んでも 15 分で足りる。
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: ./apps/next-app
@@ -200,8 +206,24 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
 
+      # **キャッシュが当たっているなら、ブラウザを取り直さない。**
+      #
+      # 上の playwright-cache に id を振っておきながら cache-hit を見ておらず、
+      # ヒットしても毎回 100 MB 近い取得が走っていた。
+      #
+      # **このステップが CI で最も不安定な箇所になっている。** 同じ内容の
+      # 差分に対する実測で 69s / 503s / **21,580s** (6 時間で強制終了) と
+      # 3 桁ぶれた。上限 (timeout-minutes) と両方で抑える ——
+      # 取得を減らしても、詰まるときは詰まるため。
       - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: npx playwright install --with-deps chromium
+
+      # ブラウザ本体はキャッシュから戻っても、**OS の共有ライブラリは
+      # ランナーに無い。** こちらは毎回入れる (取得量は桁違いに小さい)。
+      - name: Install Playwright OS dependencies
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
 
       - name: Playwright (管理画面の状態遷移)
         run: npx playwright test
@@ -215,6 +237,7 @@ jobs:
   generated-ci:
     name: Generated Code Drift Check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -284,6 +307,7 @@ jobs:
   migration-ci:
     name: Migration Check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:17-alpine
