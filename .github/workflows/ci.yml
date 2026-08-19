@@ -159,8 +159,9 @@ jobs:
     name: Next.js Checks
     runs-on: ubuntu-latest
     # **このジョブが実際に 6 時間持っていかれた** (下の Playwright の節)。
-    # 正常時は 1m30s〜2m30s。ぶれるのは apt なので、**ステップ側にも上限を置く**
-    # (下) —— ジョブの枠だけだと、詰まったときに他のステップの余地まで食う。
+    # 正常時は 1m30s〜2m30s。詰まる先を apt から外したうえで、
+    # **ブラウザの取得にもステップ側の上限を置く** ——
+    # ジョブの枠だけだと、詰まったときに他のステップの余地まで食う。
     timeout-minutes: 20
     defaults:
       run:
@@ -219,32 +220,39 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-${{ hashFiles('apps/next-app/playwright.config.ts') }}
 
-      # **ぶれているのは apt であって、ブラウザの取得ではない** (実測)。
+      # **--with-deps を付けない。** ぶれの原因は apt だと実測で確定した。
       #
-      # 69s / 503s / 21,580s (6 時間で強制終了) と 3 桁ぶれた実行は、
-      # **どれも Post Cache が 0s = キャッシュヒット**だった。ヒット時に
-      # ブラウザは取得されないので、その時間は --with-deps の apt になる。
+      # 3 桁ぶれた実行 (69s / 503s / 21,580s) は**どれもキャッシュヒット**で、
+      # ヒット時にブラウザは取得されない —— つまりその時間はすべて
+      # --with-deps が走らせる apt にかかっていた。
       #
-      # つまり下の install-deps 側も同じ危険を持つ。**両方にステップの上限を
-      # 置く** —— ジョブの枠だけだと、詰まったときに残りのステップの余地まで食う。
+      # 決め手はこのログ (run 32216157115):
+      #
+      #   Ign: http://azure.archive.ubuntu.com/ubuntu noble InRelease   ← 到達不能
+      #   ...
+      #   04:34:12 Get:5 https://archive.ubuntu.com/ubuntu noble-security InRelease
+      #   （7 分 34 秒 無音）
+      #   04:41:46 ##[error]The action has timed out after 8 minutes.
+      #
+      # **apt-get update が黙って固まり、ブラウザの取得は一度も始まらなかった。**
+      # 上限を伸ばしても、詰まる先が同じなら意味が薄い。**apt を経路から外す。**
+      #
+      # ubuntu-latest のランナーには Chromium が要る共有ライブラリが入っている。
+      # **足りなければ npx playwright test がブラウザを起動できずに落ちる**ので、
+      # この判断は下の e2e がそのまま検査になる。
       - name: Install Playwright browsers
         if: steps.playwright-cache.outputs.cache-hit != 'true'
-        timeout-minutes: 8
-        run: npx playwright install --with-deps chromium
+        timeout-minutes: 10
+        run: npx playwright install chromium
 
+      # **取得できた時点で保存する。** 一体の actions/cache はジョブの最後に
+      # 保存するため、この後の e2e が落ちると取得した分が捨てられる。
       - name: Save Playwright browsers
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-${{ hashFiles('apps/next-app/playwright.config.ts') }}
-
-      # ブラウザ本体はキャッシュから戻っても、**OS の共有ライブラリは
-      # ランナーに無い。** こちらは毎回入れる。
-      - name: Install Playwright OS dependencies
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        timeout-minutes: 8
-        run: npx playwright install-deps chromium
 
       - name: Playwright (管理画面の状態遷移)
         run: npx playwright test
