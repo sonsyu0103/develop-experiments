@@ -46,8 +46,13 @@ jobs:
     name: Go Checks
     runs-on: ubuntu-latest
     # **上限が無いと、詰まったステップが 6 時間 (GitHub の既定) 走る。**
-    # 実測の最長は 3m17s なので、10 分あれば遅い日でも足りる。
-    timeout-minutes: 10
+    #
+    # 実測の最長は 3m17s。ただし**それはツールのキャッシュが当たった実行だけ**で、
+    # Install Go tools は直近 60 run すべて skipped —— **golangci-lint を
+    # ソースからビルドする経路は一度も測れていない** (レビュー指摘)。
+    # 鍵のバージョンを上げた日・7 日で失効した日に初めて通る。
+    # 測れていない経路を締め上げると、その日の PR が永続的に赤くなるので広く取る。
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: ./apps/go-api
@@ -154,8 +159,9 @@ jobs:
     name: Next.js Checks
     runs-on: ubuntu-latest
     # **このジョブが実際に 6 時間持っていかれた** (下の Playwright の節)。
-    # 正常時は 2m30s 前後。ブラウザの取得が遅い日を見込んでも 15 分で足りる。
-    timeout-minutes: 15
+    # 正常時は 1m30s〜2m30s。ぶれるのは apt なので、**ステップ側にも上限を置く**
+    # (下) —— ジョブの枠だけだと、詰まったときに他のステップの余地まで食う。
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: ./apps/next-app
@@ -196,33 +202,48 @@ jobs:
           version=$(node -p "require('@playwright/test/package.json').version")
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      # ブラウザは 100 MB 近くある。**バージョンを鍵にする** ——
-      # パッケージを上げたときに古いブラウザを引き当てると、
-      # Playwright が起動時に不一致で落ちる。
-      - name: Cache Playwright browsers
+      # ブラウザは 100 MB 近くある。**バージョンとブラウザ集合を鍵にする。**
+      #
+      # バージョンだけを鍵にすると、パッケージを据え置いたまま
+      # playwright.config.ts に firefox を足した日に**鍵が変わらない**。
+      # 下の取得が skip され、`Executable doesn't exist` で落ちる
+      # —— しかも 7 日の失効かパッケージ更新まで自力で直らない (レビュー指摘)。
+      #
+      # **restore と save を分けている。** 一体の actions/cache は
+      # ジョブの最後に保存するため、**この後の e2e が落ちるとブラウザを
+      # 取り直した分が捨てられる。** 取得できた時点で保存する。
+      - name: Restore Playwright browsers
         id: playwright-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-${{ hashFiles('apps/next-app/playwright.config.ts') }}
 
-      # **キャッシュが当たっているなら、ブラウザを取り直さない。**
+      # **ぶれているのは apt であって、ブラウザの取得ではない** (実測)。
       #
-      # 上の playwright-cache に id を振っておきながら cache-hit を見ておらず、
-      # ヒットしても毎回 100 MB 近い取得が走っていた。
+      # 69s / 503s / 21,580s (6 時間で強制終了) と 3 桁ぶれた実行は、
+      # **どれも Post Cache が 0s = キャッシュヒット**だった。ヒット時に
+      # ブラウザは取得されないので、その時間は --with-deps の apt になる。
       #
-      # **このステップが CI で最も不安定な箇所になっている。** 同じ内容の
-      # 差分に対する実測で 69s / 503s / **21,580s** (6 時間で強制終了) と
-      # 3 桁ぶれた。上限 (timeout-minutes) と両方で抑える ——
-      # 取得を減らしても、詰まるときは詰まるため。
+      # つまり下の install-deps 側も同じ危険を持つ。**両方にステップの上限を
+      # 置く** —— ジョブの枠だけだと、詰まったときに残りのステップの余地まで食う。
       - name: Install Playwright browsers
         if: steps.playwright-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 8
         run: npx playwright install --with-deps chromium
 
+      - name: Save Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-${{ hashFiles('apps/next-app/playwright.config.ts') }}
+
       # ブラウザ本体はキャッシュから戻っても、**OS の共有ライブラリは
-      # ランナーに無い。** こちらは毎回入れる (取得量は桁違いに小さい)。
+      # ランナーに無い。** こちらは毎回入れる。
       - name: Install Playwright OS dependencies
         if: steps.playwright-cache.outputs.cache-hit == 'true'
+        timeout-minutes: 8
         run: npx playwright install-deps chromium
 
       - name: Playwright (管理画面の状態遷移)
