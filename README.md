@@ -167,13 +167,19 @@ CI の `generated-ci` ジョブが再生成して差分を検査するため、
 | code | HTTP | 意味 |
 | --- | --- | --- |
 | `INVALID_ARGUMENT` | 400 | パラメータやボディが仕様を満たさない |
+| `UNAUTHENTICATED` | 401 | 未ログイン。**ログインすれば解決する** |
+| `PERMISSION_DENIED` | 403 | 権限がない、または Origin 検証の失敗。**ログインしても解決しない** |
 | `NOT_FOUND` | 404 | 対象が存在しない、またはパスが未定義 |
 | `METHOD_NOT_ALLOWED` | 405 | パスは存在するがそのメソッドは未定義 |
 | `CONFLICT` | 409 | 同時更新の競合。再試行可能 |
+| `PAYLOAD_TOO_LARGE` | 413 | 本文・画像のサイズ / 画素数が上限を超えた |
+| `FAILED_PRECONDITION` | 422 | 同じ冪等キーで別の内容が送られた |
+| `RESOURCE_EXHAUSTED` | 429 | レート制限に当たった |
 | `INTERNAL` | 500 | サーバ内部エラー |
+| `UNAVAILABLE` | 503 | 一時的に処理できない。再試行可能 |
 
-認証・権限・レート制限・サイズ超過のコード (401 / 403 / 413 / 429) は
-Phase 5 以降で追加する。体系は [ADR 0013](docs/adr/0013-http-defense.md)。
+体系は [ADR 0013](docs/adr/0013-http-defense.md) 決定 3 (gRPC のコード名に揃える)。
+**401 と 403 を取り違えないこと** —— フロントは 401 でログイン画面へ飛ばす。
 
 ## 設計上の判断
 
