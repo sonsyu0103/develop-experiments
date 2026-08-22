@@ -439,21 +439,40 @@ func (r *CommentRepository) claimAndInsert(
 	}
 	if affected != 1 {
 		// 自分が確保した行なので、必ず 1 行のはず。
+		// (user_id, key) が主キーなので、返るのは 0 か 1 しかない。
 		// 0 行なら「キーは確保したが応答を記録していない」状態でコミットされ、
 		// 次の再送が永久に待つ側に倒れる。**コミットさせない。**
 		//
-		// **apperr.ErrConflict を返してはいけない** (replayRecorded と同じ理由)。
-		// CreateIdempotent の retryable は IsRetryable を通すため、
-		// **原理的に解消しない不変条件違反を 12 回やり直す**ことになる。
-		// 行を消したのは自分のトランザクションの外なので、
-		// やり直しても同じ結果にしかならない。
+		// **いまの構造では 0 行にならない。** 対象は同じトランザクションが
+		// たった今 INSERT した未コミット行で、他のトランザクションからは
+		// 見えないため外から消せない (期限切れの削除も届かない)。
+		// それでも残すのは、CompleteIdempotencyKey を別の接続へ動かす、
+		// ON CONFLICT の対象を変える、といった変更でこの前提が崩れるため。
+		// **到達不能だから消してよい、ではない。**
+		//
+		// **apperr.ErrConflict を返してはいけない。** CreateIdempotent の
+		// retryable は IsRetryable を通すので、リトライ可能に分類される。
+		// ROLLBACK で claim ごと巻き戻るため**やり直し自体は白紙から動く**が、
+		// ここに来た時点で前提が壊れているので、やり直して薄めるのは誤り。
+		// 12 回空回りしたあと serialization_retry_exhausted が出て、
+		// **不変条件の違反が直列化失敗として集計される。**
+		//
+		// 分類は replayRecorded (記録が未完了だった場合) と揃える。
+		// **理由は違う** —— 向こうは「行が 24 時間残るので何度読んでも同じ」、
+		// こちらは「前提が壊れた印」になる。
 		//
 		// **メッセージに op や行数を含めない。** 422 の本文はそのまま
-		// クライアントへ返る (respondError)。切り分けに要る情報はログへ。
+		// クライアントへ返る (respondError)。切り分けに要る値はログへ。
+		//
+		// thread_id と mode を載せるのは、**発火したときのログが唯一の証拠**
+		// になるため。どのスレッドの、どの投稿モードで壊れたのかが無いと、
+		// Athena で拾ったあとの切り分けが user_id と endpoint で止まる。
 		slog.LogAttrs(ctx, slog.LevelError, "idempotency_complete_unexpected_rows",
 			slog.String("op", op),
+			slog.Int64("thread_id", comment.ThreadID),
 			slog.Int64("user_id", userID),
 			slog.String("endpoint", req.Endpoint),
+			slog.String("mode", string(r.mode)),
 			slog.Int64("affected", affected),
 		)
 		return fmt.Errorf(

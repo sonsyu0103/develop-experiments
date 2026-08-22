@@ -640,6 +640,15 @@ func TestRetrierLogAttrsKeepsSQLStateAfterTranslate(t *testing.T) {
 					"(ssi の serialization_retry_exhausted から sqlstate が消え、"+
 					"unique の 23505 と見分けられなくなる)", got, code)
 			}
+
+			// **文言は 1 行のままであること。**
+			// errors.Join で鎖を作ると Error() が
+			// a.Error() + "\n" + b.Error() になり、
+			// 1 行 1 レコードで集計するログに改行が混ざる。
+			if strings.Contains(translated.Error(), "\n") {
+				t.Errorf("翻訳後の文言に改行が入っている (ログが 1 レコードで拾えない): %q",
+					translated.Error())
+			}
 		})
 	}
 }

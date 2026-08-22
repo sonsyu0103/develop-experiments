@@ -106,13 +106,18 @@ func translateError(op string, err error) error {
 			//
 			// ssi と pessimistic は runInTx / insertWithSeq が翻訳した**あとの**
 			// エラーをリトライするため、落ちるのはこの経路だけ。
-			// unique は生の pgx エラーをやり直すので影響を受けず、
-			// **抜けが片側だけに出て気づきにくい。**
+			// unique の非冪等の経路 (createAutoSeq) は生の pgx エラーを
+			// やり直すので影響を受けず、**抜けが片側だけに出て気づきにくい**
+			// (冪等キー併用の unique は insertComment 経由でここを通るが、
+			// 23505 はどの case にも当たらず default で PgError が残る)。
+			//
 			// 直列化失敗 (40001) と採番の衝突 (23505) を同じイベント名で出す以上、
 			// sqlstate が無いと ssi と unique のログを見分けられない
 			// (ADR 0019 決定 4)。
-			return fmt.Errorf("%s: 直列化に失敗しました (%s): %w",
-				op, pgErr.Code, errors.Join(err, apperr.ErrConflict))
+			return &conflictWithSQLState{
+				msg: fmt.Sprintf("%s: 直列化に失敗しました (%s)", op, pgErr.Code),
+				pg:  err,
+			}
 		case codeCharacterNotInRepertoire:
 			// **文言に op を含めないこと** (codeCheckViolation と同じ理由)。
 			// ErrInvalidArgument のメッセージはそのままクライアントへ返ります。
@@ -125,6 +130,25 @@ func translateError(op string, err error) error {
 
 	return fmt.Errorf("%s: %w", op, err)
 }
+
+// conflictWithSQLState は「競合である」ことと「どの SQLSTATE だったか」を
+// 同時に鎖へ残すためのエラーです。
+//
+// **errors.Join を使わないのは、文言が 2 行になるためです。**
+// errors.Join(a, b).Error() は a.Error() + "\n" + b.Error() なので、
+// 書式に埋めた SQLSTATE と生エラーの "(SQLSTATE 40001)" が二重に出たうえ、
+// 1 レコードのログに改行が混ざります (ログは 1 行 1 レコードで集計します)。
+// 文言は msg だけが持ち、鎖は Unwrap が持つ形に分けます。
+type conflictWithSQLState struct {
+	msg string
+	pg  error
+}
+
+func (e *conflictWithSQLState) Error() string { return e.msg }
+
+// Unwrap は errors.Is / errors.As に両方を辿らせます (Go 1.20 以降の複数形)。
+// pg を先に置くのは、IsRetryable の errors.As の枝を先に通すためです。
+func (e *conflictWithSQLState) Unwrap() []error { return []error{e.pg, apperr.ErrConflict} }
 
 // IsRetryable は、リトライすれば成功しうる一時的なエラーかを返します。
 // SERIALIZABLE 分離レベルで動かす場合、直列化失敗は「異常」ではなく
