@@ -135,7 +135,7 @@ func TestScheduler_JittersFirstRun(t *testing.T) {
 	t.Parallel()
 
 	// 十分に長い間隔にすると、待ちが 0 に近い実行と遠い実行に分かれる。
-	// 20 個のうち少なくとも 1 つは 30ms 以内に走る、という形で見る
+	// 20 個のうち何本かは折り返しまでに走る、という形で見る
 	// (すべてが間隔の末尾に寄っていたら、ばらついていない)。
 	const interval = 200 * time.Millisecond
 
@@ -156,15 +156,22 @@ func TestScheduler_JittersFirstRun(t *testing.T) {
 	defer cancel()
 	New(jobs...).Start(ctx)
 
-	// ばらついていれば、間隔の 1/6 のうちに何本かは走る。
+	// **待つのは間隔の半分。** 初回が一様なら 1 本が走る確率も走らない確率も
+	// 1/2 になり、20 本が全部どちらかに偏る確率は 2^-20 (約 100 万分の 1) になる。
+	//
+	// **1/6 で待っていたときは 2.6% で落ちていた** ((1-1/6)^20)。
+	// 実測でも -race で 40 回中 1 回落ちた。ばらつきを見るテストが
+	// ばらつきで落ちていたので、両側の余裕が対称になる点まで下げる。
+	time.Sleep(interval / 2)
+
+	fires := fired.Load()
 	// 揃っていると (全部 interval 後) ここでは 0 本になる。
-	time.Sleep(interval / 6)
-	if fired.Load() == 0 {
-		t.Error("初回がばらついていない (間隔の 1/6 で 1 本も走らなかった)")
+	if fires == 0 {
+		t.Error("初回がばらついていない (間隔の半分で 1 本も走らなかった)")
 	}
 	// 全部が即時に走ってもばらついていない。
-	if fired.Load() >= int64(len(jobs)) {
-		t.Error("初回がばらついていない (全部が即座に走った)")
+	if fires >= int64(len(jobs)) {
+		t.Errorf("初回がばらついていない (%d 本すべてが折り返しまでに走った)", fires)
 	}
 }
 
