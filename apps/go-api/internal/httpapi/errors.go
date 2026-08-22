@@ -138,6 +138,12 @@ const securityFailureMarker = specErrorPrefix + "SecurityRequirementsError:"
 // **末尾で照合します。** 読み込みの失敗はライブラリのメッセージの
 // 一番外側に付くため必ず最後に来る一方、クライアントが決めた値は
 // 途中にしか現れません (実測した書式は spec_error_test.go に並べてあります)。
+//
+// **この前提は security 要件が 1 つのときのものです。** 1 つの操作に
+// security を複数宣言すると SecurityRequirementsError が " | " で連結するため、
+// 読み込みの失敗が末尾に来なくなりえます。
+// 現状 openapi.yaml の security はすべて `- sessionCookie: []` の単一要件なので
+// 到達しません。増やすときはここを見ること。
 const maxBytesErrorMarker = "request body too large"
 
 // respondSpecError は仕様書に基づく検証で弾かれた場合の応答です。

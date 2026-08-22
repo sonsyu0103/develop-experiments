@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -221,15 +222,25 @@ func (s *Server) GoogleLoginCallback(c *gin.Context, params oapigen.GoogleLoginC
 	//
 	// **観測は落とさない。** ログイン CSRF の検知はここだけなので、
 	// リダイレクトに変えるぶんログへ残す。
+	//
+	// **ログイン CSRF の主要な形は wantState == "" のほうに落ちる。**
+	// 攻撃者の用意した callback URL を踏まされた被害者は /auth/google を
+	// 通っていないので、そもそも oauth_state を持たない。
+	// state_mismatch に入るのは「自分でログインを始めた最中に別の state を
+	// 差し込まれた」場合だけで、そちらのほうが稀になる。
+	//
+	// **つまり失効と攻撃は見分けられない。** 利用者向けの識別子
+	// (login_expired) は多数派の「放置して失効」に寄せ、
+	// **検知に使うときは 2 つの reason を合わせて見る。**
 	if wantState == "" || wantState != params.State {
-		reason := loginErrorStateMismatch
+		reason, clientError := loginRejectStateMismatch, loginErrorStateMismatch
 		if wantState == "" {
-			reason = loginErrorExpired
+			reason, clientError = loginRejectNoStateCookie, loginErrorExpired
 		}
 		slog.WarnContext(c.Request.Context(), "login_state_rejected",
 			slog.String("reason", reason),
 		)
-		c.Redirect(http.StatusFound, s.frontendURLWithError(reason))
+		c.Redirect(http.StatusFound, s.frontendURLWithError(clientError))
 		return
 	}
 
@@ -253,9 +264,9 @@ func (s *Server) GoogleLoginCallback(c *gin.Context, params oapigen.GoogleLoginC
 		// Athena の DDL に無い列は静かに NULL になるため
 		// (infra/athena/table.sql の罠 2)。reason は防御層が
 		// 「なぜ弾いたか」に使っている既存の列で、csrf_rejected と揃う。
-		reason := "nonce_missing"
+		reason := loginRejectNoNonce
 		if nonce != "" {
-			reason = "verifier_missing"
+			reason = loginRejectNoVerifier
 		}
 		slog.WarnContext(c.Request.Context(), "login_flow_cookie_missing",
 			slog.String("reason", reason),
@@ -264,12 +275,26 @@ func (s *Server) GoogleLoginCallback(c *gin.Context, params oapigen.GoogleLoginC
 		return
 	}
 
-	// **ここだけは JSON のまま。** 退会済みの再ログインを 401 で返すことが
-	// 仕様書に書いてある (openapi.yaml の googleLoginCallback)。
-	// リダイレクトに寄せるなら仕様書を先に直す。
 	result, err := s.login.CompleteLogin(c.Request.Context(), *params.Code, verifier, nonce)
 	if err != nil {
-		respondError(c, err)
+		// **401 だけ JSON のまま。** 退会済みの再ログインを 401 で返すことが
+		// 仕様書に書いてある (openapi.yaml の googleLoginCallback)。
+		// リダイレクトに寄せるなら仕様書を先に直す。
+		if errors.Is(err, apperr.ErrUnauthenticated) {
+			respondError(c, err)
+			return
+		}
+		// **それ以外は JSON を見せない。** ここに来るのは DB の瞬断
+		// (Upsert / セッションの作成) と IdP 側の障害 (Exchange の失敗) で、
+		// **同意画面を 10 分放置するより頻度が高い。**
+		// respondError に渡すと INTERNAL の JSON が
+		// ログインの結果としてブラウザに出る。
+		//
+		// **respondError を通さないぶん、ここでログを出す。**
+		slog.ErrorContext(c.Request.Context(), "login_complete_failed",
+			slog.String("error", err.Error()),
+		)
+		c.Redirect(http.StatusFound, s.frontendURLWithError(loginErrorFailed))
 		return
 	}
 

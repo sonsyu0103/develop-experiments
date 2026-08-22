@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -131,22 +132,41 @@ func TestScheduler_RunsMultipleJobs(t *testing.T) {
 //
 // 揃えると、デプロイのたびに全レプリカが同じ瞬間へ負荷を集中させる。
 // 間隔を長くしておくと、初回は「0〜間隔」のどこかになる。
+//
+// **時刻を実測して散らばりを見る。** 「ある瞬間に何本走ったか」を数える形だと、
+// time.Sleep が**超過側にしかぶれない**ぶんが片側のリスクとして残る:
+//
+//	1/6 で待つ  -> 20 本すべてが外れる確率 (1-1/6)^20 = 2.6% で偽陽性
+//	              (実測でも -race で 40 回中 1 回落ちた)
+//	1/2 で待つ  -> 理論上は 2^-20 だが、sleep が 100ms でなく 160ms 返れば
+//	              「全部走った」側が 0.8^20 = 1.2% になる。**対称ではない**
+//
+// 初回の待ち時間そのものを測れば、sleep の伸びは測定値に等しく乗るだけで、
+// 散らばりを潰さない。
 func TestScheduler_JittersFirstRun(t *testing.T) {
 	t.Parallel()
 
-	// 十分に長い間隔にすると、待ちが 0 に近い実行と遠い実行に分かれる。
-	// 20 個のうち何本かは折り返しまでに走る、という形で見る
-	// (すべてが間隔の末尾に寄っていたら、ばらついていない)。
-	const interval = 200 * time.Millisecond
+	const (
+		interval = 200 * time.Millisecond
+		jobCount = 20
+	)
 
-	var fired atomic.Int64
-	jobs := make([]Job, 0, 20)
-	for range 20 {
+	var mu sync.Mutex
+	first := make(map[int]time.Duration, jobCount)
+
+	start := time.Now()
+	jobs := make([]Job, 0, jobCount)
+	for i := range jobCount {
 		jobs = append(jobs, Job{
 			Name:     "jitter",
 			Interval: interval,
 			Run: func(context.Context) error {
-				fired.Add(1)
+				mu.Lock()
+				defer mu.Unlock()
+				// 2 回目以降は初回のばらつきと関係がないので捨てる。
+				if _, ok := first[i]; !ok {
+					first[i] = time.Since(start)
+				}
 				return nil
 			},
 		})
@@ -156,22 +176,33 @@ func TestScheduler_JittersFirstRun(t *testing.T) {
 	defer cancel()
 	New(jobs...).Start(ctx)
 
-	// **待つのは間隔の半分。** 初回が一様なら 1 本が走る確率も走らない確率も
-	// 1/2 になり、20 本が全部どちらかに偏る確率は 2^-20 (約 100 万分の 1) になる。
-	//
-	// **1/6 で待っていたときは 2.6% で落ちていた** ((1-1/6)^20)。
-	// 実測でも -race で 40 回中 1 回落ちた。ばらつきを見るテストが
-	// ばらつきで落ちていたので、両側の余裕が対称になる点まで下げる。
-	time.Sleep(interval / 2)
-
-	fires := fired.Load()
-	// 揃っていると (全部 interval 後) ここでは 0 本になる。
-	if fires == 0 {
-		t.Error("初回がばらついていない (間隔の半分で 1 本も走らなかった)")
+	// 初回は必ず interval 未満に来る。遅い環境ぶんの余裕を足して待つ。
+	if !waitFor(t, 3*interval, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(first) == jobCount
+	}) {
+		mu.Lock()
+		got := len(first)
+		mu.Unlock()
+		t.Fatalf("初回が %d/%d 本しか走っていない", got, jobCount)
 	}
-	// 全部が即時に走ってもばらついていない。
-	if fires >= int64(len(jobs)) {
-		t.Errorf("初回がばらついていない (%d 本すべてが折り返しまでに走った)", fires)
+
+	mu.Lock()
+	lo, hi := first[0], first[0]
+	for _, d := range first {
+		lo = min(lo, d)
+		hi = max(hi, d)
+	}
+	mu.Unlock()
+
+	// **散らばりの下限を置く。** 初回が一様なら 20 本すべてが interval の
+	// 1/4 幅へ収まる確率は 20 * (1/4)^19 ≒ 10^-10 になる。
+	// 揃っている実装 (初回が全部 0、または全部 interval) では
+	// 幅がスケジューリング誤差ぶんしか出ないので、ここで落ちる。
+	if spread := hi - lo; spread < interval/4 {
+		t.Errorf("初回のばらつきが %v しかない (want >= %v, 最短 %v / 最長 %v)",
+			spread, interval/4, lo, hi)
 	}
 }
 
