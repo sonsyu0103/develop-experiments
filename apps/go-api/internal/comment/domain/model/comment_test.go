@@ -2,6 +2,10 @@ package model
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -192,4 +196,84 @@ func TestNewComment_LoggedInCanAttachImage(t *testing.T) {
 	if c.ImageID == nil || *c.ImageID != imageID {
 		t.Errorf("ImageID = %v, want %v", c.ImageID, imageID)
 	}
+}
+
+// **本文と投稿者名の上限が 3 か所で一致していること。**
+//
+//	この定数群 / DB の CHECK 制約 (000001) / 仕様書の maxLength
+//
+// 揃っていないと「アプリが通した入力を DB が拒否して 500」または
+// 「仕様書より長い入力が通る」形で表に出ます (ADR 0003 #8)。
+//
+// **DB は char_length、Go は utf8.RuneCountInString で、どちらも
+// コードポイントを数えます。** 数え方が違うと、同じ数字でも境界がずれます。
+func TestLengthLimits_AgreeAcrossSources(t *testing.T) {
+	t.Parallel()
+
+	migration := readRepoFile(t, "apps/go-api/db/migrations/000001_init_schema.up.sql")
+	spec := readRepoFile(t, "api/openapi.yaml")
+
+	cases := []struct {
+		field      string
+		declared   int
+		constraint string
+	}{
+		{"body", BodyMaxLength, `char_length\(body\)\s+BETWEEN 1 AND (\d+)`},
+		{"authorName", AuthorNameMaxLength, `char_length\(author_name\)\s+BETWEEN 1 AND (\d+)`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.field, func(t *testing.T) {
+			t.Parallel()
+
+			if got := intFrom(t, migration, tc.constraint); got != tc.declared {
+				t.Errorf("DB の CHECK 制約 (%s) = %d, Go 側 = %d", tc.field, got, tc.declared)
+			}
+			// **ブロックを切り出してから読む** (thread_test.go の blockOf と同じ理由)。
+			// 仕様書全体に `.*?` を当てると、宣言が消えたときに
+			// 後続スキーマの maxLength を拾って緑になる。
+			pattern := `(?ms)^        ` + tc.field + `:\n.*?maxLength: (\d+)`
+			if got := intFrom(t, blockOf(t, spec, "CreateCommentRequest"), pattern); got != tc.declared {
+				t.Errorf("仕様書の maxLength (%s) = %d, Go 側 = %d", tc.field, got, tc.declared)
+			}
+		})
+	}
+}
+
+// blockOf は仕様書から、字下げ 4 の宣言 1 つぶんを切り出します。
+func blockOf(t *testing.T, spec, name string) string {
+	t.Helper()
+
+	m := regexp.MustCompile(`(?ms)^    ` + name + `:\n(.*?)\n    \w+:`).
+		FindStringSubmatch(spec)
+	if m == nil {
+		t.Fatalf("openapi.yaml から %s を読み取れなかった", name)
+	}
+	return m[1]
+}
+
+func intFrom(t *testing.T, src, pattern string) int {
+	t.Helper()
+
+	m := regexp.MustCompile(pattern).FindStringSubmatch(src)
+	if m == nil {
+		t.Fatalf("%q に一致しなかった", pattern)
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("%q を整数として読めない: %v", m[1], err)
+	}
+	return n
+}
+
+// readRepoFile はリポジトリ直下からの相対パスでファイルを読みます。
+func readRepoFile(t *testing.T, rel string) string {
+	t.Helper()
+
+	// このファイルは apps/go-api/internal/comment/domain/model にある。
+	root := filepath.Join("..", "..", "..", "..", "..", "..")
+	b, err := os.ReadFile(filepath.Join(root, rel))
+	if err != nil {
+		t.Fatalf("%s を読めない: %v", rel, err)
+	}
+	return string(b)
 }

@@ -2,6 +2,10 @@ package idempotency
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -156,4 +160,60 @@ func mustNew(t *testing.T, key, endpoint string, fields ...string) *Request {
 		t.Fatalf("New が失敗した: %v", err)
 	}
 	return got
+}
+
+// **冪等キーの上限が 3 か所で一致していること。**
+//
+//	この定数 / DB の CHECK 制約 (000005) / 仕様書の maxLength
+//
+// ここがずれると、**手前で弾くはずのキーが DB まで届いて 500 になります**
+// (上の「上限超過は弾く (DB の CHECK 制約に到達させない)」が成立しなくなる)。
+// ADR 0003 #8。
+func TestMaxKeyLength_AgreesAcrossSources(t *testing.T) {
+	t.Parallel()
+
+	migration := readRepoFile(t, "apps/go-api/db/migrations/000005_add_idempotency_keys.up.sql")
+	spec := readRepoFile(t, "api/openapi.yaml")
+
+	if got := intFrom(t, migration,
+		`char_length\(key\)\s+BETWEEN 1 AND (\d+)`); got != MaxKeyLength {
+		t.Errorf("DB の CHECK 制約 = %d, Go 側 = %d", got, MaxKeyLength)
+	}
+	// **ブロックを切り出してから読む。** 仕様書全体に `.*?` を当てると、
+	// 宣言が消えたときに後続スキーマの maxLength を拾って緑になる。
+	block := regexp.MustCompile(`(?ms)^    IdempotencyKey:\n(.*?)\n    \w+:`).
+		FindStringSubmatch(spec)
+	if block == nil {
+		t.Fatal("openapi.yaml から IdempotencyKey を読み取れなかった")
+	}
+	if got := intFrom(t, block[1], `maxLength: (\d+)`); got != MaxKeyLength {
+		t.Errorf("仕様書の maxLength = %d, Go 側 = %d", got, MaxKeyLength)
+	}
+}
+
+func intFrom(t *testing.T, src, pattern string) int {
+	t.Helper()
+
+	m := regexp.MustCompile(pattern).FindStringSubmatch(src)
+	if m == nil {
+		t.Fatalf("%q に一致しなかった", pattern)
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("%q を整数として読めない: %v", m[1], err)
+	}
+	return n
+}
+
+// readRepoFile はリポジトリ直下からの相対パスでファイルを読みます。
+func readRepoFile(t *testing.T, rel string) string {
+	t.Helper()
+
+	// このファイルは apps/go-api/internal/idempotency にある。
+	root := filepath.Join("..", "..", "..", "..")
+	b, err := os.ReadFile(filepath.Join(root, rel))
+	if err != nil {
+		t.Fatalf("%s を読めない: %v", rel, err)
+	}
+	return string(b)
 }

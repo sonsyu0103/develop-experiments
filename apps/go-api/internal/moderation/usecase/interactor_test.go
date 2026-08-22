@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -377,5 +378,46 @@ func TestMaxReasonLength_AgreesAcrossSources(t *testing.T) {
 	}
 	if got, _ := strconv.Atoi(block[1]); got != maxReasonLength {
 		t.Errorf("仕様書の maxLength = %d, Go = %d", got, maxReasonLength)
+	}
+}
+
+// **target_id の上限が、こちらが作りうる最長を収められること。**
+//
+// ここは他の 3 か所検査と形が違う。**Go 側に定数が無い**ためになる ——
+// target_id は組み立てた文字列であって、入力の検証値ではない。
+// 「等しいこと」ではなく「収まること」を見る。
+//
+// 最長は**コメント**の "{thread_id}:{comment_id}"。BIGINT は 10 進で
+// 最大 19 桁なので、区切りを含めて 39 文字になる。UUID (画像・利用者) は
+// 36 文字、スレッドは 19 文字なので、いずれも短い。
+//
+// この検査が無いと、DB の上限を下げたときに**気づけるのが本番だけ**になる
+// (ADR 0003 #8)。formatCommentTarget のコメントは 64 に収まると
+// 書いているが、書いてあるだけでは 64 が変わったときに落ちない。
+func TestTargetIDLength_FitsConstraint(t *testing.T) {
+	t.Parallel()
+
+	root := filepath.Join("..", "..", "..", "..", "..")
+	b, err := os.ReadFile(filepath.Join(root,
+		"apps/go-api/db/migrations/000008_add_moderation.up.sql"))
+	if err != nil {
+		t.Fatalf("000008 を読めない: %v", err)
+	}
+	m := regexp.MustCompile(`char_length\(target_id\) BETWEEN 1 AND (\d+)`).
+		FindStringSubmatch(string(b))
+	if m == nil {
+		t.Fatal("000008 から target_id の上限を読み取れなかった")
+	}
+	limit, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("%q を整数として読めない: %v", m[1], err)
+	}
+
+	// **実際に組み立てて測る。** 桁数を数え上げた値を書くと、
+	// 区切り文字を変えたときにこの数字だけ古くなる。
+	longest := formatCommentTarget(math.MaxInt64, math.MaxInt64)
+	if len(longest) > limit {
+		t.Errorf("最長の target_id (%d 文字) が DB の上限 %d を超える: %s",
+			len(longest), limit, longest)
 	}
 }

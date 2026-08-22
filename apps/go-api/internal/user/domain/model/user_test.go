@@ -2,6 +2,8 @@ package model
 
 import (
 	"errors"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -122,5 +124,32 @@ func TestUser_IsDeleted(t *testing.T) {
 	}
 	if u.IsDeleted() {
 		t.Error("新規の利用者が退会済みと判定された")
+	}
+}
+
+// **表示名の上限が DB の CHECK 制約と一致していること。**
+//
+//	この定数 / DB の CHECK 制約 (000002)
+//
+// **仕様書には無い。** 表示名は API の入力ではなく、
+// OIDC プロバイダが返した値をそのまま受けるためです (ADR 0005)。
+// そのため 3 か所ではなく 2 か所になりますが、ずれたときの出方は同じ ——
+// **長い表示名の利用者がログインした瞬間に、保存で 500 になる**
+// (ADR 0003 #8)。
+func TestDisplayNameMaxLength_AgreesWithConstraint(t *testing.T) {
+	t.Parallel()
+
+	migration := readRepoFile(t, "apps/go-api/db/migrations/000002_add_users_and_sessions.up.sql")
+	m := regexp.MustCompile(`char_length\(display_name\)\s+BETWEEN 1 AND (\d+)`).
+		FindStringSubmatch(migration)
+	if m == nil {
+		t.Fatal("000002 から display_name の CHECK 制約を読み取れなかった")
+	}
+	got, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("%q を整数として読めない: %v", m[1], err)
+	}
+	if got != DisplayNameMaxLength {
+		t.Errorf("DB の CHECK 制約 = %d, Go 側 = %d", got, DisplayNameMaxLength)
 	}
 }

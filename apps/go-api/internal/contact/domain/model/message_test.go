@@ -335,3 +335,71 @@ func TestNewVerifiedEmail_RejectsHeaderBreakers(t *testing.T) {
 		t.Errorf("String() = %q", v.String())
 	}
 }
+
+// **条件つき制約が、こちらの知っている値だけを使っていること。**
+//
+//	contact_sent_complete  (status = 'sent' / <> 'sent')
+//
+// 列挙の CHECK 制約と違い、**値が本文に直書きされています。**
+// `StatusSent` を改名すると `contact_status_valid` 側は上の
+// TestStatuses_AgreeWithConstraint が落ちて気づけますが、
+// **こちらは古い値を参照したまま残ります。**
+//
+// そのとき壊れるのは「送信が完了した行だけ保存できない」という形になり、
+// **ワーカーが送った直後に落ちる** —— 一番気づきにくい壊れ方になります
+// (ADR 0003 #8)。
+func TestConditionalConstraints_UseKnownValues(t *testing.T) {
+	t.Parallel()
+
+	src := readRepoFile(t, "apps/go-api/db/migrations/000012_add_contact_messages.up.sql")
+
+	known := map[string]bool{}
+	for _, s := range AllStatuses {
+		known[string(s)] = true
+	}
+	for _, v := range literalsIn(t, src, "contact_sent_complete") {
+		if !known[v] {
+			t.Errorf("contact_sent_complete が知らない値 %q を使っている", v)
+		}
+	}
+}
+
+// literalsIn は名前つき CHECK 制約の本文から、引用符つきの値を全部拾います。
+//
+// **括弧の対応を数えます。** 条件つき制約は入れ子になっているため、
+// 最初の閉じ括弧までを取ると途中で切れます。
+func literalsIn(t *testing.T, sql, constraint string) []string {
+	t.Helper()
+
+	head := regexp.MustCompile(`CONSTRAINT\s+` + constraint + `\s+CHECK\s*\(`).
+		FindStringIndex(sql)
+	if head == nil {
+		t.Fatalf("%s を読み取れなかった", constraint)
+	}
+	start := head[1] - 1
+	depth, end := 0, -1
+	for i := start; i < len(sql) && end < 0; i++ {
+		switch sql[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				end = i
+			}
+		}
+	}
+	if end < 0 {
+		t.Fatalf("%s の括弧が閉じていない", constraint)
+	}
+
+	var out []string
+	for _, m := range regexp.MustCompile(`'([^']*)'`).
+		FindAllStringSubmatch(sql[start:end], -1) {
+		out = append(out, m[1])
+	}
+	if len(out) == 0 {
+		t.Fatalf("%s からリテラルを 1 つも拾えなかった", constraint)
+	}
+	return out
+}
