@@ -318,9 +318,18 @@ func TestImageDefinitions_AgreeAcrossSources(t *testing.T) {
 
 		// **Format の定数ではなく ContentType() の出力を集める。**
 		// DB に入るのはこちらであり、定数値 ("jpeg") ではない。
+		//
+		// **一覧を手で書かない** (valuesFromSource と同じ理由)。
+		// []Format{FormatJPEG, FormatWebP} と書くと、形式を足したときに
+		// この行を直さない限り古い 2 つのままになり、
+		// **新しい形式の Content-Type だけが CHECK 制約に無い**状態を
+		// 素通しする。宣言はソースから取る。
 		produced := map[string]bool{}
-		for _, f := range []Format{FormatJPEG, FormatWebP} {
-			produced[f.ContentType()] = true
+		for v := range valuesFromSource(t, src, `(?m)^\s*(\w+)\s+Format\s*=\s*"([^"]+)"`) {
+			produced[Format(v).ContentType()] = true
+		}
+		if produced[""] {
+			t.Error("ContentType() が空を返す Format がある (対応を書き忘れている)")
 		}
 		assertSameSet(t, "DB の CHECK 制約",
 			produced, valuesInList(t, migration,
@@ -389,4 +398,82 @@ func readRepoFile(t *testing.T, rel string) string {
 		t.Fatalf("%s を読めない: %v", rel, err)
 	}
 	return string(b)
+}
+
+// **条件つき制約が、こちらの知っている値だけを使っていること。**
+//
+//	images_committed_at_matches_status  (status = 'pending' ...)
+//	images_attached_at_requires_commit  (status <> 'pending')
+//
+// 列挙の CHECK 制約と違い、**値が本文に直書きされています。**
+// そのため Status を改名すると、`images_status_valid` 側は上の検査が
+// 落ちて気づけるのに、**こちらは古い値を参照したまま残ります。**
+//
+// そのとき壊れるのは「その状態の行だけが保存できない」という形になり、
+// 経路を踏むまで表に出ません (ADR 0003 #8)。
+func TestConditionalConstraints_UseKnownValues(t *testing.T) {
+	t.Parallel()
+
+	migration := readRepoFile(t, "apps/go-api/db/migrations/000006_add_images.up.sql")
+	attached := readRepoFile(t, "apps/go-api/db/migrations/000007_add_image_attached_at.up.sql")
+	src := readRepoFile(t, "apps/go-api/internal/image/domain/model/image.go")
+	known := valuesFromSource(t, src, `(?m)^\s*(\w+)\s+Status\s*=\s*"([^"]+)"`)
+
+	for _, tc := range []struct{ name, sql string }{
+		{"images_committed_at_matches_status", migration},
+		{"images_attached_at_requires_commit", attached},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			for _, v := range literalsIn(t, tc.sql, tc.name) {
+				if !known[v] {
+					t.Errorf("%s が知らない値 %q を使っている", tc.name, v)
+				}
+			}
+		})
+	}
+}
+
+// literalsIn は名前つき CHECK 制約の本文から、引用符つきの値を全部拾います。
+//
+// **括弧の対応を数えます。** 条件つき制約は入れ子になっているため、
+// 最初の閉じ括弧までを取ると途中で切れます。
+func literalsIn(t *testing.T, sql, constraint string) []string {
+	t.Helper()
+
+	head := regexp.MustCompile(`CONSTRAINT\s+` + constraint + `\s+CHECK\s*\(`).
+		FindStringIndex(sql)
+	if head == nil {
+		t.Fatalf("%s を読み取れなかった", constraint)
+	}
+	start := head[1] - 1
+	depth, end := 0, -1
+	for i := start; i < len(sql); i++ {
+		switch sql[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				end = i
+			}
+		}
+		if end >= 0 {
+			break
+		}
+	}
+	if end < 0 {
+		t.Fatalf("%s の括弧が閉じていない", constraint)
+	}
+
+	var out []string
+	for _, m := range regexp.MustCompile(`'([^']*)'`).
+		FindAllStringSubmatch(sql[start:end], -1) {
+		out = append(out, m[1])
+	}
+	if len(out) == 0 {
+		t.Fatalf("%s からリテラルを 1 つも拾えなかった", constraint)
+	}
+	return out
 }

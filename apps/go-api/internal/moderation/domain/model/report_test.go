@@ -146,3 +146,89 @@ func setOf[T ~string](values []T) map[string]bool {
 	}
 	return out
 }
+
+// **条件つき制約が、こちらの知っている値だけを使っていること。**
+//
+//	reports_resolution_complete       (status = 'open' / <> 'open')
+//	reports_thread_id_matches_target  (target_type = 'comment')
+//
+// 列挙の CHECK 制約と違い、**値が本文に直書きされています。**
+// `ReportStatusOpen` を改名すると `reports_status_valid` 側は上の
+// TestReportEnums_AgreeAcrossSources が落ちて気づけますが、
+// **こちらは古い値を参照したまま残ります。**
+//
+// そのとき壊れるのは「未対処の通報だけが保存できない」という形になり、
+// 通報が来るまで表に出ません (ADR 0003 #8)。
+func TestConditionalConstraints_UseKnownValues(t *testing.T) {
+	t.Parallel()
+
+	// **制約ごとにマイグレーションが違う。** target_thread_id は
+	// 000009 で足したもので (ADR 0016 問題 2 の反転)、000008 には無い。
+	for _, tc := range []struct {
+		constraint string
+		migration  string
+		known      map[string]bool
+	}{
+		{
+			"reports_resolution_complete",
+			"apps/go-api/db/migrations/000008_add_moderation.up.sql",
+			setOf(AllReportStatuses),
+		},
+		{
+			"reports_thread_id_matches_target",
+			"apps/go-api/db/migrations/000009_fix_reports_queue.up.sql",
+			setOf(AllReportTargetTypes),
+		},
+	} {
+		t.Run(tc.constraint, func(t *testing.T) {
+			t.Parallel()
+
+			src := readRepoFile(t, tc.migration)
+			for _, v := range literalsIn(t, src, tc.constraint) {
+				if !tc.known[v] {
+					t.Errorf("%s が知らない値 %q を使っている", tc.constraint, v)
+				}
+			}
+		})
+	}
+}
+
+// literalsIn は名前つき CHECK 制約の本文から、引用符つきの値を全部拾います。
+//
+// **括弧の対応を数えます。** 条件つき制約は入れ子になっているため、
+// 最初の閉じ括弧までを取ると途中で切れます。
+func literalsIn(t *testing.T, sql, constraint string) []string {
+	t.Helper()
+
+	head := regexp.MustCompile(`CONSTRAINT\s+` + constraint + `\s+CHECK\s*\(`).
+		FindStringIndex(sql)
+	if head == nil {
+		t.Fatalf("%s を読み取れなかった", constraint)
+	}
+	start := head[1] - 1
+	depth, end := 0, -1
+	for i := start; i < len(sql) && end < 0; i++ {
+		switch sql[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				end = i
+			}
+		}
+	}
+	if end < 0 {
+		t.Fatalf("%s の括弧が閉じていない", constraint)
+	}
+
+	var out []string
+	for _, m := range regexp.MustCompile(`'([^']*)'`).
+		FindAllStringSubmatch(sql[start:end], -1) {
+		out = append(out, m[1])
+	}
+	if len(out) == 0 {
+		t.Fatalf("%s からリテラルを 1 つも拾えなかった", constraint)
+	}
+	return out
+}

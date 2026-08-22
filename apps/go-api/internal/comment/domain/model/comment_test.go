@@ -228,13 +228,27 @@ func TestLengthLimits_AgreeAcrossSources(t *testing.T) {
 			if got := intFrom(t, migration, tc.constraint); got != tc.declared {
 				t.Errorf("DB の CHECK 制約 (%s) = %d, Go 側 = %d", tc.field, got, tc.declared)
 			}
-			pattern := `(?ms)^    CreateCommentRequest:\n.*?^        ` + tc.field +
-				`:\n.*?maxLength: (\d+)`
-			if got := intFrom(t, spec, pattern); got != tc.declared {
+			// **ブロックを切り出してから読む** (thread_test.go の blockOf と同じ理由)。
+			// 仕様書全体に `.*?` を当てると、宣言が消えたときに
+			// 後続スキーマの maxLength を拾って緑になる。
+			pattern := `(?ms)^        ` + tc.field + `:\n.*?maxLength: (\d+)`
+			if got := intFrom(t, blockOf(t, spec, "CreateCommentRequest"), pattern); got != tc.declared {
 				t.Errorf("仕様書の maxLength (%s) = %d, Go 側 = %d", tc.field, got, tc.declared)
 			}
 		})
 	}
+}
+
+// blockOf は仕様書から、字下げ 4 の宣言 1 つぶんを切り出します。
+func blockOf(t *testing.T, spec, name string) string {
+	t.Helper()
+
+	m := regexp.MustCompile(`(?ms)^    ` + name + `:\n(.*?)\n    \w+:`).
+		FindStringSubmatch(spec)
+	if m == nil {
+		t.Fatalf("openapi.yaml から %s を読み取れなかった", name)
+	}
+	return m[1]
 }
 
 func intFrom(t *testing.T, src, pattern string) int {

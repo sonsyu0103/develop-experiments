@@ -42,9 +42,21 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MIGRATIONS = ROOT / "apps" / "go-api" / "db" / "migrations"
 
-# 値を持つ CHECK 制約の形。
-LENGTH = re.compile(r"char_length\((\w+)\)\s*(?:BETWEEN\s*\d+\s*AND\s*(\d+)|<=\s*(\d+))")
-ENUM = re.compile(r"(\w+)\s+IN\s*\(((?:\s*'[^']+'\s*,?)+)\)")
+# **「値を持つ」の判定は広く取る。** 書き方を列挙する形にすると、
+# 別の書き方をした制約が「値を持たない」として静かに検出から外れる ——
+# このスクリプトは検査の不在を見つけるためだけに在るので、
+# 見逃しは存在意義そのものを失わせる。
+#
+# そこで判定は「文字列リテラルを含む」か「長さの関数を呼んでいる」の
+# どちらかにする。char_length / length / octet_length の違い、
+# BETWEEN と <= の違い、IN と = の違いのいずれにも依存しない。
+LITERAL = re.compile(r"'[^']*'")
+LENGTH_CALL = re.compile(r"\w*length\s*\(", re.I)
+
+# 下は**種別の表示に使うだけ**で、検出には使わない。
+LENGTH = re.compile(r"\w*length\s*\(", re.I)
+ENUM = re.compile(r"\w+\s+IN\s*\(\s*'")
+CONDITIONAL = re.compile(r"\w+\s*(?:=|<>)\s*'")
 
 # 制約名 -> (テストファイル, テスト名)。
 #
@@ -143,6 +155,30 @@ GUARDED: dict[str, tuple[str, str]] = {
         "apps/go-api/internal/contact/domain/model/message_test.go",
         "TestStatuses_AgreeWithConstraint",
     ),
+    # 条件つき制約。**列挙の値を本文に直書きしている**ので、
+    # 値を改名すると列挙側の検査は落ちるのにこちらは古い値を参照したまま
+    # 残る。そのとき壊れるのは「その状態の行だけが保存できない」という
+    # 見つけにくい形になる。リテラルが既知の値かどうかを見る。
+    "images_committed_at_matches_status": (
+        "apps/go-api/internal/image/domain/model/image_test.go",
+        "TestConditionalConstraints_UseKnownValues",
+    ),
+    "images_attached_at_requires_commit": (
+        "apps/go-api/internal/image/domain/model/image_test.go",
+        "TestConditionalConstraints_UseKnownValues",
+    ),
+    "reports_resolution_complete": (
+        "apps/go-api/internal/moderation/domain/model/report_test.go",
+        "TestConditionalConstraints_UseKnownValues",
+    ),
+    "reports_thread_id_matches_target": (
+        "apps/go-api/internal/moderation/domain/model/report_test.go",
+        "TestConditionalConstraints_UseKnownValues",
+    ),
+    "contact_sent_complete": (
+        "apps/go-api/internal/contact/domain/model/message_test.go",
+        "TestConditionalConstraints_UseKnownValues",
+    ),
 }
 
 # 検査を付けない制約と、その理由。**空にしておくこと自体に意味がある** ——
@@ -163,7 +199,7 @@ def constraints() -> list[tuple[str, str, str]]:
         # コメント行は落とす。制約の書き方を説明している行に
         # char_length(...) が現れるため。
         body = "\n".join(
-            line for line in path.read_text().split("\n")
+            line for line in path.read_text(encoding="utf-8").split("\n")
             if not line.strip().startswith("--")
         )
         for m in re.finditer(r"(?:CONSTRAINT\s+(\w+)\s+)?CHECK\s*\(", body):
@@ -179,19 +215,65 @@ def constraints() -> list[tuple[str, str, str]]:
                     if depth == 0:
                         inner = body[start + 1:i]
                         break
+            # 値を持たない制約 (NULL の有無だけを見るものなど) は対象外。
+            if not (LITERAL.search(inner) or LENGTH_CALL.search(inner)):
+                continue
             kinds = []
             if LENGTH.search(inner):
                 kinds.append("長さ")
             if ENUM.search(inner):
                 kinds.append("列挙")
+            if CONDITIONAL.search(inner):
+                kinds.append("条件")
             if not kinds:
-                continue
+                # リテラルはあるのに形が読めない。**素通しにしない。**
+                kinds.append("解釈できない")
             if name is None:
                 # 無名の CHECK は対応表に載せられない。名前を付けさせる。
                 found.append((path.name, "(無名)", " / ".join(kinds)))
                 continue
             found.append((path.name, name, " / ".join(kinds)))
     return found
+
+
+def func_body(src: str, name: str) -> str | None:
+    """関数 1 つの本文を切り出します。
+
+    **gofmt はトップレベルの閉じ括弧を 1 桁目に置く**ので、
+    宣言から次の "\n}" までがその関数になります。
+    """
+    for head in (f"func {name}(", f"func (t *testing.T) {name}("):
+        start = src.find(head)
+        if start >= 0:
+            end = src.find("\n}", start)
+            return src[start:end] if end >= 0 else src[start:]
+    return None
+
+
+def reach(src: str, name: str) -> str | None:
+    """テスト本文と、そこから呼んでいる**同じファイル内の関数**を連結します。
+
+    **1 段だけ辿る。** 既存の検査はマイグレーションの読み取りを
+    ヘルパに切り出しているものがあり (role_test.go の valuesFromMigration
+    など)、本文だけを見ると「読んでいない」と誤検出する。
+
+    一方でファイル全体を見るのは駄目になる —— 1 ファイルに複数の宣言が
+    あるとき、片方をリテラル比較に書き換えても、もう片方が残す
+    "db/migrations/" でファイル検査が通ってしまう。
+    **このスクリプトが見つけようとしている失敗形そのもの**なので、
+    「その検査から辿り着ける範囲」に限る。
+    """
+    body = func_body(src, name)
+    if body is None:
+        return None
+    seen = [body]
+    for callee in sorted(set(re.findall(r"\b([a-zA-Z]\w*)\s*\(", body))):
+        if callee == name:
+            continue
+        called = func_body(src, callee)
+        if called is not None:
+            seen.append(called)
+    return "\n".join(seen)
 
 
 def main() -> int:
@@ -213,6 +295,20 @@ def main() -> int:
         print()
     else:
         print("OK  値を持つ CHECK 制約はすべて名前が付いています")
+
+    unreadable = [(f, n) for f, n, k in found if "解釈できない" in k]
+    if unreadable:
+        failed = True
+        print(f"NG  リテラルを持つが形を読めない CHECK 制約が {len(unreadable)} 件あります")
+        print("    種別が分からないと、どんな検査が要るかを判断できません")
+        print()
+        for f, n in unreadable:
+            print(f"  {n}  ({f})")
+        print()
+        print("このスクリプトの ENUM / LENGTH / CONDITIONAL に形を足してください。")
+        print()
+    else:
+        print("OK  値を持つ CHECK 制約はすべて形を読み取れています")
 
     names = {n for _, n, _ in found if n != "(無名)"}
 
@@ -255,11 +351,12 @@ def main() -> int:
         if not path.exists():
             broken.append((name, rel, "ファイルが無い"))
             continue
-        src = path.read_text()
-        if f"func {test}(" not in src:
+        src = path.read_text(encoding="utf-8")
+        body = reach(src, test)
+        if body is None:
             broken.append((name, rel, f"{test} が無い"))
-        elif "db/migrations/" not in src:
-            broken.append((name, rel, "マイグレーションを読んでいない"))
+        elif "db/migrations/" not in body:
+            broken.append((name, rel, f"{test} からマイグレーションに辿り着けない"))
     if broken:
         failed = True
         print(f"NG  宣言と実物が食い違っている検査が {len(broken)} 件あります")

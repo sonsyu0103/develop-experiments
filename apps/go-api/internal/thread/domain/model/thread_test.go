@@ -160,15 +160,35 @@ func TestTitleLengthLimit_AgreesAcrossSources(t *testing.T) {
 		`char_length\(title\)\s+BETWEEN 1 AND (\d+)`); got != TitleMaxLength {
 		t.Errorf("DB の CHECK 制約 = %d, Go 側 = %d", got, TitleMaxLength)
 	}
-	if got := intFrom(t, spec,
-		`(?ms)^    CreateThreadRequest:\n.*?^        title:\n.*?maxLength: (\d+)`,
-	); got != TitleMaxLength {
+
+	// **ブロックを切り出してから読む。** `.*?` を仕様書全体に当てると、
+	// 目的の宣言が消えたときに**後続スキーマの maxLength に届いて緑になる**。
+	// 実測で確認した: SearchQuery の maxLength を消すと
+	// CreateThreadRequest.title の 200 に一致して通ってしまう。
+	// contact の検査が先にブロックを切っているのと同じ形に揃える。
+	if got := intFrom(t, blockOf(t, spec, "CreateThreadRequest"),
+		`(?ms)^        title:\n.*?maxLength: (\d+)`); got != TitleMaxLength {
 		t.Errorf("仕様書の maxLength = %d, Go 側 = %d", got, TitleMaxLength)
 	}
-	if got := intFrom(t, spec,
-		`(?ms)^    SearchQuery:\n.*?maxLength: (\d+)`); got != SearchQueryMaxLength {
+	if got := intFrom(t, blockOf(t, spec, "SearchQuery"),
+		`maxLength: (\d+)`); got != SearchQueryMaxLength {
 		t.Errorf("仕様書の SearchQuery = %d, Go 側 = %d", got, SearchQueryMaxLength)
 	}
+}
+
+// blockOf は仕様書から、字下げ 4 の宣言 1 つぶんを切り出します。
+//
+// 次の「字下げ 4 の宣言」の手前まで。これが無いと、
+// 探している宣言が消えたときに隣の宣言の値を拾ってしまいます。
+func blockOf(t *testing.T, spec, name string) string {
+	t.Helper()
+
+	m := regexp.MustCompile(`(?ms)^    ` + name + `:\n(.*?)\n    \w+:`).
+		FindStringSubmatch(spec)
+	if m == nil {
+		t.Fatalf("openapi.yaml から %s を読み取れなかった", name)
+	}
+	return m[1]
 }
 
 func intFrom(t *testing.T, src, pattern string) int {

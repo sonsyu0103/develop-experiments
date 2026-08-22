@@ -179,8 +179,14 @@ func TestMaxKeyLength_AgreesAcrossSources(t *testing.T) {
 		`char_length\(key\)\s+BETWEEN 1 AND (\d+)`); got != MaxKeyLength {
 		t.Errorf("DB の CHECK 制約 = %d, Go 側 = %d", got, MaxKeyLength)
 	}
-	if got := intFrom(t, spec,
-		`(?ms)^    IdempotencyKey:\n.*?maxLength: (\d+)`); got != MaxKeyLength {
+	// **ブロックを切り出してから読む。** 仕様書全体に `.*?` を当てると、
+	// 宣言が消えたときに後続スキーマの maxLength を拾って緑になる。
+	block := regexp.MustCompile(`(?ms)^    IdempotencyKey:\n(.*?)\n    \w+:`).
+		FindStringSubmatch(spec)
+	if block == nil {
+		t.Fatal("openapi.yaml から IdempotencyKey を読み取れなかった")
+	}
+	if got := intFrom(t, block[1], `maxLength: (\d+)`); got != MaxKeyLength {
 		t.Errorf("仕様書の maxLength = %d, Go 側 = %d", got, MaxKeyLength)
 	}
 }
