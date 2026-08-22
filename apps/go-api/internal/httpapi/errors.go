@@ -109,20 +109,35 @@ func respondError(c *gin.Context, err error) {
 	}
 }
 
+// specErrorPrefix は kin-openapi / gin-middleware が付ける前置きです。
+//
+// **照合はここを起点にします。** 部分一致で見てはいけません ——
+// メッセージにはクライアントが決めた値が
+// `value <生の値>` の形で埋め込まれるため、strings.Contains では
+// **要求側が判定を動かせます** (実測: `?size=openapi3filter.
+// SecurityRequirementsError` が 401、`?size=abc request body too large` が
+// 413 になっていた)。前置きは型名からライブラリが組み立てるので、
+// クライアントの値が**先頭に来ることはありません**。
+const specErrorPrefix = "error in openapi3filter."
+
 // securityFailureMarker は、検証ミドルウェアが security 要件の失敗を
-// 報告するときにメッセージへ含める文字列です。
+// 報告するときのメッセージの前置きです。
 //
 // gin-middleware は openapi3filter のエラーを型で渡さず、
 // 整形済みの文字列として渡してくるため、ここで文字列照合するしかありません。
 // ライブラリ側の書式が変われば追随が要ります
-// (server_test.go の TestAuth_MissingCookieIs401 が検出します)。
-const securityFailureMarker = "openapi3filter.SecurityRequirementsError"
+// (auth_test.go の TestAuth_MissingCookieIs401 が検出します)。
+const securityFailureMarker = specErrorPrefix + "SecurityRequirementsError:"
 
 // maxBytesErrorMarker は net/http が本文の上限超過で返す文言です。
 //
 // **型では受け取れません。** 検証ミドルウェアはエラーを整形済みの文字列で
 // 渡してくるため (securityFailureMarker と同じ事情)、ここで照合します。
 // net/http 側の文言が変われば追随が要ります —— bodylimit_test.go が検出します。
+//
+// **末尾で照合します。** 読み込みの失敗はライブラリのメッセージの
+// 一番外側に付くため必ず最後に来る一方、クライアントが決めた値は
+// 途中にしか現れません (実測した書式は spec_error_test.go に並べてあります)。
 const maxBytesErrorMarker = "request body too large"
 
 // respondSpecError は仕様書に基づく検証で弾かれた場合の応答です。
@@ -145,7 +160,8 @@ func respondSpecError(c *gin.Context, status int, message string) {
 	//
 	// Content-Length がある通常の要求は bodyLimit が読む前に 413 を返すので、
 	// ここに来るのは chunked (長さ未申告) の場合だけになる。
-	case strings.Contains(message, maxBytesErrorMarker):
+	case strings.HasPrefix(message, specErrorPrefix) &&
+		strings.HasSuffix(message, maxBytesErrorMarker):
 		c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge,
 			newErrorBody(oapigen.PAYLOADTOOLARGE, "リクエストが大きすぎます"))
 
@@ -160,7 +176,7 @@ func respondSpecError(c *gin.Context, status int, message string) {
 	// ADR 0013 は 401 と 403 を取り違えないことを求めており、
 	// フロントは 401 でログイン画面へ遷移する。
 	// 400 のままだとその分岐ができない。
-	case strings.Contains(message, securityFailureMarker):
+	case strings.HasPrefix(message, securityFailureMarker):
 		c.AbortWithStatusJSON(http.StatusUnauthorized,
 			newErrorBody(oapigen.UNAUTHENTICATED, "ログインが必要です"))
 
@@ -172,8 +188,27 @@ func respondSpecError(c *gin.Context, status int, message string) {
 		if status < http.StatusBadRequest {
 			status = http.StatusBadRequest
 		}
-		c.AbortWithStatusJSON(status, newErrorBody(oapigen.INVALIDARGUMENT, message))
+		c.AbortWithStatusJSON(status,
+			newErrorBody(oapigen.INVALIDARGUMENT, trimSpecErrorPrefix(message)))
 	}
+}
+
+// trimSpecErrorPrefix はライブラリの型名の前置きを落とします。
+//
+// 400 の本文はそのままクライアントへ返るため、
+// `error in openapi3filter.RequestError: ` が付いたままだと
+// **公開 API の文言が検証ライブラリの実装名に縛られます。**
+// 落としたあとに残るのは
+// `parameter "size" in query has an error: number must be at most 100` で、
+// 何を直せばよいかは変わりません。
+func trimSpecErrorPrefix(message string) string {
+	if !strings.HasPrefix(message, specErrorPrefix) {
+		return message
+	}
+	if _, rest, found := strings.Cut(message, ": "); found {
+		return rest
+	}
+	return message
 }
 
 // respondBadRequest はリクエストボディの解析失敗など、
