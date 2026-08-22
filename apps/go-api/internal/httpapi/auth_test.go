@@ -249,6 +249,19 @@ func flowCookies(state string) []*http.Cookie {
 	}
 }
 
+// flowCookiesWithout はフロー用 Cookie から 1 つだけ落としたものを返します。
+// **失効は 3 つ同時に起きる**のが実態ですが、どれが欠けても
+// 同じ扱いになることを 1 つずつ確かめるために分けています。
+func flowCookiesWithout(state, drop string) []*http.Cookie {
+	var kept []*http.Cookie
+	for _, c := range flowCookies(state) {
+		if c.Name != drop {
+			kept = append(kept, c)
+		}
+	}
+	return kept
+}
+
 // findCookie はレスポンスから名前で Cookie を探します。無ければ nil。
 func findCookie(rec *httptest.ResponseRecorder, name string) *http.Cookie {
 	var found *http.Cookie
@@ -528,18 +541,29 @@ func TestStartGoogleLogin_SetsFlowCookies(t *testing.T) {
 	}
 }
 
-// **state が一致しなければ 401。**
+// **state が一致しなければ、ログインを完了させない。**
 //
 // これが無いと、攻撃者が用意した認可コードを被害者のブラウザで交換させられる
 // (ログイン CSRF)。
+//
+// **応答は JSON ではなくフロントへのリダイレクト。** ここに来るのは Google
+// からのトップレベル遷移なので、4xx の JSON を返すとブラウザにそれが
+// 直接表示される (params.Error の分岐と同じ理由)。
 func TestGoogleLoginCallback_RejectsStateMismatch(t *testing.T) {
 	env := newAuthEnv(t, true)
 
 	rec := env.do(t, http.MethodGet, "/auth/google/callback?code=xyz&state=attacker",
 		flowCookies("victim")...,
 	)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 (body=%s)", rec.Code, rec.Body.String())
+	}
+	// **失効 (login_expired) と区別する。** ログイン CSRF の可能性がある側。
+	if loc := rec.Header().Get("Location"); loc != "http://localhost:3000?login_error=state_mismatch" {
+		t.Errorf("Location = %q, want state_mismatch", loc)
+	}
+	if c := findCookie(rec, sessionCookieName); c != nil && c.MaxAge > 0 {
+		t.Errorf("拒否したのにセッションが発行された: %+v", c)
 	}
 
 	// **攻撃を検知した経路でこそ、古い state を捨てたい。**
@@ -547,13 +571,53 @@ func TestGoogleLoginCallback_RejectsStateMismatch(t *testing.T) {
 	assertFlowCookiesCleared(t, rec)
 }
 
-// state の Cookie が無い場合も 401。
+// **state の Cookie が無い場合もリダイレクト。しかも識別子が違う。**
+//
+// 認可フローの Cookie は 10 分で切れる (authFlowCookieMaxAge)。
+// 同意画面を開いたまま放置して「許可」を押した利用者が、
+// **攻撃ではなくここへ来る。** 生の JSON を見せる相手ではない。
 func TestGoogleLoginCallback_RejectsMissingStateCookie(t *testing.T) {
 	env := newAuthEnv(t, true)
 
 	rec := env.do(t, http.MethodGet, "/auth/google/callback?code=xyz&state=whatever")
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "http://localhost:3000?login_error=login_expired" {
+		t.Errorf("Location = %q, want login_expired", loc)
+	}
+	if c := findCookie(rec, sessionCookieName); c != nil && c.MaxAge > 0 {
+		t.Errorf("拒否したのにセッションが発行された: %+v", c)
+	}
+}
+
+// **nonce / code_verifier の欠落もリダイレクト。**
+// state と同じ Cookie 群なので、失効するときは 3 つまとめて失効する。
+// state だけリダイレクトにしても、同じ利用者が次の行で JSON を見る。
+func TestGoogleLoginCallback_RejectsMissingFlowCookies(t *testing.T) {
+	tests := []struct {
+		name    string
+		cookies []*http.Cookie
+	}{
+		{name: "nonce が無い", cookies: flowCookiesWithout("s1", nonceCookieName)},
+		{name: "code_verifier が無い", cookies: flowCookiesWithout("s1", verifierCookieName)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newAuthEnv(t, true)
+
+			rec := env.do(t, http.MethodGet, "/auth/google/callback?code=xyz&state=s1", tt.cookies...)
+			if rec.Code != http.StatusFound {
+				t.Fatalf("status = %d, want 302 (body=%s)", rec.Code, rec.Body.String())
+			}
+			if loc := rec.Header().Get("Location"); loc != "http://localhost:3000?login_error=login_expired" {
+				t.Errorf("Location = %q, want login_expired", loc)
+			}
+			if c := findCookie(rec, sessionCookieName); c != nil && c.MaxAge > 0 {
+				t.Errorf("拒否したのにセッションが発行された: %+v", c)
+			}
+		})
 	}
 }
 
@@ -636,13 +700,16 @@ func TestGoogleLoginCallback_SanitizesErrorParam(t *testing.T) {
 	}
 }
 
-// code も error も無い場合は 401。仕様検証を緩めた分をここで受け止める。
+// code も error も無い場合もリダイレクト。仕様検証を緩めた分をここで受け止める。
 func TestGoogleLoginCallback_RejectsMissingCode(t *testing.T) {
 	env := newAuthEnv(t, true)
 
 	rec := env.do(t, http.MethodGet, "/auth/google/callback?state=s1", flowCookies("s1")...)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "http://localhost:3000?login_error=no_code" {
+		t.Errorf("Location = %q, want no_code", loc)
 	}
 	assertFlowCookiesCleared(t, rec)
 }

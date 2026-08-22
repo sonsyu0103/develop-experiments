@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -210,8 +211,25 @@ func (s *Server) GoogleLoginCallback(c *gin.Context, params oapigen.GoogleLoginC
 	// 認可コードを被害者のブラウザで交換させられる (ログイン CSRF)。
 	//
 	// 拒否された場合も Google は state を返すので、error の判定より先に置ける。
+	//
+	// **弾く場合もフロントへリダイレクトする。** ここに来るのは Google からの
+	// トップレベル遷移なので、4xx の JSON を返すとブラウザにそれが直接出る
+	// (params.Error の分岐が同じ理由でリダイレクトしている)。
+	// しかも**攻撃とは限らない** —— 認可フローの Cookie は 10 分で切れるため
+	// (authFlowCookieMaxAge)、同意画面を開いたまま放置して「許可」を押した
+	// 利用者が、ふつうに wantState == "" でここへ来る。
+	//
+	// **観測は落とさない。** ログイン CSRF の検知はここだけなので、
+	// リダイレクトに変えるぶんログへ残す。
 	if wantState == "" || wantState != params.State {
-		respondError(c, fmt.Errorf("state が一致しません: %w", apperr.ErrUnauthenticated))
+		reason := loginErrorStateMismatch
+		if wantState == "" {
+			reason = loginErrorExpired
+		}
+		slog.WarnContext(c.Request.Context(), "login_state_rejected",
+			slog.String("reason", reason),
+		)
+		c.Redirect(http.StatusFound, s.frontendURLWithError(reason))
 		return
 	}
 
@@ -222,19 +240,33 @@ func (s *Server) GoogleLoginCallback(c *gin.Context, params oapigen.GoogleLoginC
 		return
 	}
 
+	// **ここから下も JSON を返さない** (state の照合と同じ理由)。
+	// nonce と code_verifier は state と同じ Cookie 群なので、
+	// 失効するときは 3 つまとめて失効する。state だけリダイレクトにしても、
+	// 同じ利用者が次の行で JSON を見ることになる。
 	if params.Code == nil || *params.Code == "" {
-		respondError(c, fmt.Errorf("認可コードがありません: %w", apperr.ErrUnauthenticated))
+		c.Redirect(http.StatusFound, s.frontendURLWithError(loginErrorNoCode))
 		return
 	}
-	if nonce == "" {
-		respondError(c, fmt.Errorf("nonce がありません: %w", apperr.ErrUnauthenticated))
-		return
-	}
-	if verifier == "" {
-		respondError(c, fmt.Errorf("code_verifier がありません: %w", apperr.ErrUnauthenticated))
+	if nonce == "" || verifier == "" {
+		// **欠けたほうを reason に載せる。** 個別のフィールドを増やさないのは、
+		// Athena の DDL に無い列は静かに NULL になるため
+		// (infra/athena/table.sql の罠 2)。reason は防御層が
+		// 「なぜ弾いたか」に使っている既存の列で、csrf_rejected と揃う。
+		reason := "nonce_missing"
+		if nonce != "" {
+			reason = "verifier_missing"
+		}
+		slog.WarnContext(c.Request.Context(), "login_flow_cookie_missing",
+			slog.String("reason", reason),
+		)
+		c.Redirect(http.StatusFound, s.frontendURLWithError(loginErrorExpired))
 		return
 	}
 
+	// **ここだけは JSON のまま。** 退会済みの再ログインを 401 で返すことが
+	// 仕様書に書いてある (openapi.yaml の googleLoginCallback)。
+	// リダイレクトに寄せるなら仕様書を先に直す。
 	result, err := s.login.CompleteLogin(c.Request.Context(), *params.Code, verifier, nonce)
 	if err != nil {
 		respondError(c, err)
