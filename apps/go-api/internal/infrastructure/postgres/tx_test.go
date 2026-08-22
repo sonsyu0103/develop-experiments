@@ -447,22 +447,25 @@ func TestRunInTx_TranslatesCommitError(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		commitErr error
-		wantErrIs error
-		wantRetry bool
+		name         string
+		commitErr    error
+		wantErrIs    error
+		wantRetry    bool
+		wantSQLState string
 	}{
 		{
-			name:      "直列化失敗",
-			commitErr: &pgconn.PgError{Code: codeSerializationFailure},
-			wantErrIs: apperr.ErrConflict,
-			wantRetry: true,
+			name:         "直列化失敗",
+			commitErr:    &pgconn.PgError{Code: codeSerializationFailure},
+			wantErrIs:    apperr.ErrConflict,
+			wantRetry:    true,
+			wantSQLState: codeSerializationFailure,
 		},
 		{
-			name:      "デッドロック",
-			commitErr: &pgconn.PgError{Code: codeDeadlockDetected},
-			wantErrIs: apperr.ErrConflict,
-			wantRetry: true,
+			name:         "デッドロック",
+			commitErr:    &pgconn.PgError{Code: codeDeadlockDetected},
+			wantErrIs:    apperr.ErrConflict,
+			wantRetry:    true,
+			wantSQLState: codeDeadlockDetected,
 		},
 	}
 
@@ -480,6 +483,13 @@ func TestRunInTx_TranslatesCommitError(t *testing.T) {
 			}
 			if got := IsRetryable(err); got != tt.wantRetry {
 				t.Errorf("IsRetryable = %v, want %v", got, tt.wantRetry)
+			}
+			// **翻訳したあとも SQLSTATE が鎖に残っていること。**
+			// retrier がやり直すのはこの翻訳済みエラーなので、
+			// ここで PgError が落ちると logAttrs の sqlstate が空になる。
+			if got := sqlState(err); got != tt.wantSQLState {
+				t.Errorf("sqlState = %q, want %q (競合ログから sqlstate が消える)",
+					got, tt.wantSQLState)
 			}
 			if db.gotIso != pgx.Serializable {
 				t.Errorf("分離レベル = %q, want %q", db.gotIso, pgx.Serializable)
@@ -599,5 +609,37 @@ func TestRetryPolicyBackoff_GrowsWithAttempt(t *testing.T) {
 	if fifth <= first*4 {
 		t.Errorf("attempt=1 の最大 %v に対して attempt=5 の最大が %v しかない "+
 			"(指数で伸びていない)", first, fifth)
+	}
+}
+
+// **本番と同じ形のエラーで sqlstate が載ること。**
+//
+// tx モードの retrier が受け取るのは生の PgError ではなく、
+// insertWithSeq / runInTx が translateError に通した**あと**のエラーです。
+// TestRetrierDoLogLevels は生の PgError を注入するため、
+// 翻訳の途中で PgError が鎖から落ちても気づけません。
+// ここだけが production の経路をそのまま流します。
+func TestRetrierLogAttrsKeepsSQLStateAfterTranslate(t *testing.T) {
+	t.Parallel()
+
+	for _, code := range []string{codeSerializationFailure, codeDeadlockDetected} {
+		t.Run(code, func(t *testing.T) {
+			t.Parallel()
+
+			translated := translateError("テスト", &pgconn.PgError{Code: code})
+
+			r := retrier{policy: noDelay(1), retryable: retryEverything}
+			var got string
+			for _, attr := range r.logAttrs(translated) {
+				if attr.Key == "sqlstate" {
+					got = attr.Value.String()
+				}
+			}
+			if got != code {
+				t.Errorf("sqlstate = %q, want %q "+
+					"(ssi の serialization_retry_exhausted から sqlstate が消え、"+
+					"unique の 23505 と見分けられなくなる)", got, code)
+			}
+		})
 	}
 }

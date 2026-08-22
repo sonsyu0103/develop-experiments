@@ -101,7 +101,18 @@ func translateError(op string, err error) error {
 			)
 			return fmt.Errorf("入力値が制約を満たしていません: %w", apperr.ErrInvalidArgument)
 		case codeSerializationFailure, codeDeadlockDetected:
-			return fmt.Errorf("%s: 直列化に失敗しました (%s): %w", op, pgErr.Code, apperr.ErrConflict)
+			// **PgError を鎖から落とさない。** apperr.ErrConflict だけを包むと
+			// sqlState が空になり、retrier.logAttrs の sqlstate が消える。
+			//
+			// ssi と pessimistic は runInTx / insertWithSeq が翻訳した**あとの**
+			// エラーをリトライするため、落ちるのはこの経路だけ。
+			// unique は生の pgx エラーをやり直すので影響を受けず、
+			// **抜けが片側だけに出て気づきにくい。**
+			// 直列化失敗 (40001) と採番の衝突 (23505) を同じイベント名で出す以上、
+			// sqlstate が無いと ssi と unique のログを見分けられない
+			// (ADR 0019 決定 4)。
+			return fmt.Errorf("%s: 直列化に失敗しました (%s): %w",
+				op, pgErr.Code, errors.Join(err, apperr.ErrConflict))
 		case codeCharacterNotInRepertoire:
 			// **文言に op を含めないこと** (codeCheckViolation と同じ理由)。
 			// ErrInvalidArgument のメッセージはそのままクライアントへ返ります。
