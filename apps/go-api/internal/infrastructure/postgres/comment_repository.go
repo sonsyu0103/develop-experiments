@@ -441,8 +441,24 @@ func (r *CommentRepository) claimAndInsert(
 		// 自分が確保した行なので、必ず 1 行のはず。
 		// 0 行なら「キーは確保したが応答を記録していない」状態でコミットされ、
 		// 次の再送が永久に待つ側に倒れる。**コミットさせない。**
-		return fmt.Errorf("%s: 冪等キーの記録が %d 行に当たりました: %w",
-			op, affected, apperr.ErrConflict)
+		//
+		// **apperr.ErrConflict を返してはいけない** (replayRecorded と同じ理由)。
+		// CreateIdempotent の retryable は IsRetryable を通すため、
+		// **原理的に解消しない不変条件違反を 12 回やり直す**ことになる。
+		// 行を消したのは自分のトランザクションの外なので、
+		// やり直しても同じ結果にしかならない。
+		//
+		// **メッセージに op や行数を含めない。** 422 の本文はそのまま
+		// クライアントへ返る (respondError)。切り分けに要る情報はログへ。
+		slog.LogAttrs(ctx, slog.LevelError, "idempotency_complete_unexpected_rows",
+			slog.String("op", op),
+			slog.Int64("user_id", userID),
+			slog.String("endpoint", req.Endpoint),
+			slog.Int64("affected", affected),
+		)
+		return fmt.Errorf(
+			"冪等キーの記録が完了しませんでした。キーを作り直してください: %w",
+			apperr.ErrFailedPrecondition)
 	}
 
 	*row = inserted
