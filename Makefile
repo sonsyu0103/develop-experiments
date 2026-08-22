@@ -357,6 +357,16 @@ verify-log-events: ## ログの msg がイベント名になっているかを�
 	# (ADR 0010「実装して分かったこと 3」)。
 	.github/scripts/verify-log-events.py
 
+.PHONY: verify-constraint-checks
+verify-constraint-checks: ## DB の CHECK 制約に、守る検査が付いているかを検査する
+	# **Go のテストは、自分が存在しないことを検出できない。**
+	# 値の突き合わせは各ドメインのテストが持つが、その形では
+	# 「そもそも検査を書き忘れた制約」に誰も気づけない
+	# (実際に image で漏れた。ADR 0003 #8)。
+	#
+	# ここは値を見ない。制約と検査の対応だけを見る。DB は要らない。
+	.github/scripts/verify-constraint-checks.py
+
 PROBE_VIEWERS ?= 16
 
 .PHONY: viewcount-probe
@@ -536,7 +546,7 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 		fi
 
 .PHONY: check
-check: lint test cover verify-tidy verify-generated verify-log-events arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test cover verify-tidy verify-generated verify-log-events verify-constraint-checks arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
 check-all: check smoke logs-verify ## check に加えて実 DB / ログ基盤まで確認する

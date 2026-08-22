@@ -129,6 +129,15 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: .github/scripts/verify-log-events.py
 
+      # CHECK 制約と、それを守る検査の対応を見る。
+      #
+      # 値そのものは各ドメインの Go テストが突き合わせているが、
+      # **テストは自分の不在を検出できない。** 書き忘れた制約を
+      # 拾えるのはこちらだけになる (ADR 0003 #8)。
+      - name: Verify constraint checks
+        working-directory: ${{ github.workspace }}
+        run: .github/scripts/verify-constraint-checks.py
+
       - name: Run Vulnerability Check (govulncheck)
         # 脆弱性データベースは新しいほうが良いので、ここだけは latest を使う。
         # そのためキャッシュの対象にせず、毎回入れ直す。

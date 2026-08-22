@@ -2,6 +2,9 @@ package model
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -262,4 +265,128 @@ func TestUploadLimits(t *testing.T) {
 	if MaxUploadBytes >= MaxPixels {
 		t.Error("バイト数の上限が画素数の上限を上回っている (画素数の検査が無意味になる)")
 	}
+}
+
+// **画像の定義が 3 か所で一致していること。**
+//
+//	image.go の定数宣言 (ソースを走査する)
+//	000006 の CHECK 制約
+//	openapi.yaml の enum
+//
+// **上の TestFormat_ContentTypeAndExtension は、これを守っていなかった。**
+// 「DB の CHECK 制約 (images_content_type_valid) と揃っている必要がある」と
+// 書きながら、比較していたのはテスト内のリテラル同士でしかない。
+// 制約から image/webp を消してもあのテストは緑のままになる ——
+// role_test.go が「構造上落ちない」として一度直したのと同じ形が、
+// このパッケージに残っていた。
+//
+// **守るには変わる側から読むしかない。** ここでは 3 つの出所を解析して
+// 突き合わせる。ソースを読むテストは行儀が良くないが、この不一致は
+// 「保存できない値をアプリが作る」か「アプリが知らない値が DB に入る」形で
+// 本番に出る。検出できる場所が他に無い (ADR 0003 #8)。
+func TestImageDefinitions_AgreeAcrossSources(t *testing.T) {
+	t.Parallel()
+
+	migration := readRepoFile(t, "apps/go-api/db/migrations/000006_add_images.up.sql")
+	spec := readRepoFile(t, "api/openapi.yaml")
+	src := readRepoFile(t, "apps/go-api/internal/image/domain/model/image.go")
+
+	t.Run("kind", func(t *testing.T) {
+		t.Parallel()
+
+		declared := valuesFromSource(t, src, `(?m)^\s*(\w+)\s+Kind\s*=\s*"([^"]+)"`)
+		assertSameSet(t, "DB の CHECK 制約",
+			declared, valuesInList(t, migration, `CHECK \(kind IN \(([^)]+)\)\)`, `'([^']+)'`))
+		assertSameSet(t, "仕様書の enum",
+			declared, valuesInList(t, spec,
+				`(?ms)^    ImageKind:\n.*?\n      enum:\n((?:\s*- \w+\n)+)`, `- (\w+)`))
+	})
+
+	t.Run("status", func(t *testing.T) {
+		t.Parallel()
+
+		// **仕様書には無い。** status は API に出さないため
+		// (利用者から見えるのは「画像がある / 無い」だけになる)。
+		// 2 か所しか無いことを、無いまま突き合わせる。
+		declared := valuesFromSource(t, src, `(?m)^\s*(\w+)\s+Status\s*=\s*"([^"]+)"`)
+		assertSameSet(t, "DB の CHECK 制約",
+			declared, valuesInList(t, migration, `CHECK \(status IN \(([^)]+)\)\)`, `'([^']+)'`))
+	})
+
+	t.Run("content_type", func(t *testing.T) {
+		t.Parallel()
+
+		// **Format の定数ではなく ContentType() の出力を集める。**
+		// DB に入るのはこちらであり、定数値 ("jpeg") ではない。
+		produced := map[string]bool{}
+		for _, f := range []Format{FormatJPEG, FormatWebP} {
+			produced[f.ContentType()] = true
+		}
+		assertSameSet(t, "DB の CHECK 制約",
+			produced, valuesInList(t, migration,
+				`CHECK \(content_type IN \(([^)]+)\)\)`, `'([^']+)'`))
+	})
+}
+
+// valuesFromSource は「定数名 定数型 = "値"」の宣言を走査して値の集合を返します。
+//
+// **リテラルの一覧を書かない**のは、定数を足したときに気づくためです
+// (書き写す形にすると、増えた定数は永久に検査されません)。
+func valuesFromSource(t *testing.T, src, pattern string) map[string]bool {
+	t.Helper()
+
+	out := map[string]bool{}
+	for _, m := range regexp.MustCompile(pattern).FindAllStringSubmatch(src, -1) {
+		out[m[2]] = true
+	}
+	if len(out) == 0 {
+		t.Fatalf("%q に一致する宣言が 1 つも無い (書き方が変わった?)", pattern)
+	}
+	return out
+}
+
+// valuesInList は block で囲みを取り出し、その中から item を全部拾います。
+func valuesInList(t *testing.T, src, block, item string) map[string]bool {
+	t.Helper()
+
+	m := regexp.MustCompile(block).FindStringSubmatch(src)
+	if m == nil {
+		t.Fatalf("%q を読み取れなかった", block)
+	}
+	out := map[string]bool{}
+	for _, v := range regexp.MustCompile(item).FindAllStringSubmatch(m[1], -1) {
+		out[v[1]] = true
+	}
+	if len(out) == 0 {
+		t.Fatalf("%q の中身が空だった", block)
+	}
+	return out
+}
+
+func assertSameSet(t *testing.T, label string, want, got map[string]bool) {
+	t.Helper()
+
+	for v := range want {
+		if !got[v] {
+			t.Errorf("%s に %q が無い", label, v)
+		}
+	}
+	for v := range got {
+		if !want[v] {
+			t.Errorf("%s にだけ %q がある (定数の側が知らない値)", label, v)
+		}
+	}
+}
+
+// readRepoFile はリポジトリ直下からの相対パスでファイルを読みます。
+func readRepoFile(t *testing.T, rel string) string {
+	t.Helper()
+
+	// このファイルは apps/go-api/internal/image/domain/model にある。
+	root := filepath.Join("..", "..", "..", "..", "..", "..")
+	b, err := os.ReadFile(filepath.Join(root, rel))
+	if err != nil {
+		t.Fatalf("%s を読めない: %v", rel, err)
+	}
+	return string(b)
 }

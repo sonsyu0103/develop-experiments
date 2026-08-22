@@ -2,6 +2,10 @@ package model
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -131,4 +135,65 @@ func TestNewThread_AuthorID(t *testing.T) {
 	if anonymous.AuthorID != nil {
 		t.Errorf("AuthorID = %v, want nil (匿名)", *anonymous.AuthorID)
 	}
+}
+
+// **タイトルの上限が 3 か所で一致していること。**
+//
+//	この定数 / DB の CHECK 制約 (000001) / 仕様書の maxLength
+//
+// 揃っていないと「アプリが通した入力を DB が拒否して 500」または
+// 「仕様書より長い入力が通る」形で表に出ます。
+// contact の TestLengthLimits_AgreeAcrossSources と同じ考え方です
+// (ADR 0003 #8)。
+//
+// **検索語の上限も一緒に見ます。** SearchQueryMaxLength は
+// TitleMaxLength から導いているので、タイトルを変えると仕様書側の
+// SearchQuery も同時に変える必要があります。片方だけ直すと、
+// 「どのタイトルにも一致しない検索語」を受け付ける状態に戻ります。
+func TestTitleLengthLimit_AgreesAcrossSources(t *testing.T) {
+	t.Parallel()
+
+	migration := readRepoFile(t, "apps/go-api/db/migrations/000001_init_schema.up.sql")
+	spec := readRepoFile(t, "api/openapi.yaml")
+
+	if got := intFrom(t, migration,
+		`char_length\(title\)\s+BETWEEN 1 AND (\d+)`); got != TitleMaxLength {
+		t.Errorf("DB の CHECK 制約 = %d, Go 側 = %d", got, TitleMaxLength)
+	}
+	if got := intFrom(t, spec,
+		`(?ms)^    CreateThreadRequest:\n.*?^        title:\n.*?maxLength: (\d+)`,
+	); got != TitleMaxLength {
+		t.Errorf("仕様書の maxLength = %d, Go 側 = %d", got, TitleMaxLength)
+	}
+	if got := intFrom(t, spec,
+		`(?ms)^    SearchQuery:\n.*?maxLength: (\d+)`); got != SearchQueryMaxLength {
+		t.Errorf("仕様書の SearchQuery = %d, Go 側 = %d", got, SearchQueryMaxLength)
+	}
+}
+
+func intFrom(t *testing.T, src, pattern string) int {
+	t.Helper()
+
+	m := regexp.MustCompile(pattern).FindStringSubmatch(src)
+	if m == nil {
+		t.Fatalf("%q に一致しなかった", pattern)
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("%q を整数として読めない: %v", m[1], err)
+	}
+	return n
+}
+
+// readRepoFile はリポジトリ直下からの相対パスでファイルを読みます。
+func readRepoFile(t *testing.T, rel string) string {
+	t.Helper()
+
+	// このファイルは apps/go-api/internal/thread/domain/model にある。
+	root := filepath.Join("..", "..", "..", "..", "..", "..")
+	b, err := os.ReadFile(filepath.Join(root, rel))
+	if err != nil {
+		t.Fatalf("%s を読めない: %v", rel, err)
+	}
+	return string(b)
 }
