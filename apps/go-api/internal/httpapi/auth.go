@@ -211,6 +211,39 @@ func (s *Server) frontendURLWithError(reason string) string {
 	return u.String()
 }
 
+// ログイン失敗をフロントへ伝える識別子です。
+//
+// IdP が返す識別子 (access_denied など) と同じクエリに載せるため、
+// **loginErrorPattern に収まる書式で書きます** —— 外れると
+// frontendURLWithError が login_failed へ丸めるので、原因が消えます。
+const (
+	// loginErrorExpired は認可フローの Cookie が失効していた場合です。
+	// 10 分 (authFlowCookieMaxAge) を超えて同意画面を放置すると起きます。
+	loginErrorExpired = "login_expired"
+	// loginErrorStateMismatch は state が一致しなかった場合です。
+	// **ログイン CSRF の可能性がある**ため、失効とは区別します。
+	loginErrorStateMismatch = "state_mismatch"
+	// loginErrorNoCode は認可コードが付いていなかった場合です。
+	loginErrorNoCode = "no_code"
+	// loginErrorFailed は交換より後ろで失敗した場合です。
+	// **理由を細かく出しません。** IdP や DB の状態を利用者に伝える意味が
+	// 無く、切り分けに要る内容は login_complete_failed のログに出ます。
+	loginErrorFailed = "login_failed"
+)
+
+// ログに残す拒否の理由です (login_state_rejected / login_flow_cookie_missing)。
+//
+// **利用者向けの識別子とは分けます。** login_expired は「失効」に見えますが、
+// **ログイン CSRF の主要な形もそこに落ちる** (被害者は /auth/google を通って
+// いないので oauth_state を持たない)。利用者への案内は多数派に寄せつつ、
+// 検知の側では両方を数えられるようにしておきます。
+const (
+	loginRejectNoStateCookie = "state_cookie_missing"
+	loginRejectStateMismatch = "state_mismatch"
+	loginRejectNoNonce       = "nonce_missing"
+	loginRejectNoVerifier    = "verifier_missing"
+)
+
 // loginErrorPattern は OAuth 2.0 の error に許す書式です
 // (RFC 6749 4.1.2.1 は access_denied のような小文字の識別子を定めています)。
 var loginErrorPattern = regexp.MustCompile(`^[a-z_]{1,64}$`)

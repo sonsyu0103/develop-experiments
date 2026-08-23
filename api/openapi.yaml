@@ -91,6 +91,16 @@ paths:
         同意画面で拒否された場合、Google は code を付けずに
         error だけを返します。この経路もフロントエンドへリダイレクトし、
         API のエラー JSON をブラウザに直接見せません。
+
+        **認可フローの Cookie (state / nonce / code_verifier) の失効、
+        state の不一致、code の欠落も同じくリダイレクトします。**
+        ここに来るのは Google からのトップレベル遷移なので、
+        4xx の JSON を返すとブラウザにそれが直接表示されます。
+        フロントへは `login_error` で理由を伝えます
+        (`login_expired` / `state_mismatch` / `no_code`)。
+
+        401 が返るのは、認可コードの交換まで進んだあとの失敗
+        (退会済みの再ログインなど) だけです。
       parameters:
         - name: state
           in: query

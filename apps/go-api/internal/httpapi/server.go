@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -210,8 +212,35 @@ func (s *Server) GoogleLoginCallback(c *gin.Context, params oapigen.GoogleLoginC
 	// 認可コードを被害者のブラウザで交換させられる (ログイン CSRF)。
 	//
 	// 拒否された場合も Google は state を返すので、error の判定より先に置ける。
+	//
+	// **弾く場合もフロントへリダイレクトする。** ここに来るのは Google からの
+	// トップレベル遷移なので、4xx の JSON を返すとブラウザにそれが直接出る
+	// (params.Error の分岐が同じ理由でリダイレクトしている)。
+	// しかも**攻撃とは限らない** —— 認可フローの Cookie は 10 分で切れるため
+	// (authFlowCookieMaxAge)、同意画面を開いたまま放置して「許可」を押した
+	// 利用者が、ふつうに wantState == "" でここへ来る。
+	//
+	// **観測は落とさない。** ログイン CSRF の検知はここだけなので、
+	// リダイレクトに変えるぶんログへ残す。
+	//
+	// **ログイン CSRF の主要な形は wantState == "" のほうに落ちる。**
+	// 攻撃者の用意した callback URL を踏まされた被害者は /auth/google を
+	// 通っていないので、そもそも oauth_state を持たない。
+	// state_mismatch に入るのは「自分でログインを始めた最中に別の state を
+	// 差し込まれた」場合だけで、そちらのほうが稀になる。
+	//
+	// **つまり失効と攻撃は見分けられない。** 利用者向けの識別子
+	// (login_expired) は多数派の「放置して失効」に寄せ、
+	// **検知に使うときは 2 つの reason を合わせて見る。**
 	if wantState == "" || wantState != params.State {
-		respondError(c, fmt.Errorf("state が一致しません: %w", apperr.ErrUnauthenticated))
+		reason, clientError := loginRejectStateMismatch, loginErrorStateMismatch
+		if wantState == "" {
+			reason, clientError = loginRejectNoStateCookie, loginErrorExpired
+		}
+		slog.WarnContext(c.Request.Context(), "login_state_rejected",
+			slog.String("reason", reason),
+		)
+		c.Redirect(http.StatusFound, s.frontendURLWithError(clientError))
 		return
 	}
 
@@ -222,22 +251,50 @@ func (s *Server) GoogleLoginCallback(c *gin.Context, params oapigen.GoogleLoginC
 		return
 	}
 
+	// **ここから下も JSON を返さない** (state の照合と同じ理由)。
+	// nonce と code_verifier は state と同じ Cookie 群なので、
+	// 失効するときは 3 つまとめて失効する。state だけリダイレクトにしても、
+	// 同じ利用者が次の行で JSON を見ることになる。
 	if params.Code == nil || *params.Code == "" {
-		respondError(c, fmt.Errorf("認可コードがありません: %w", apperr.ErrUnauthenticated))
+		c.Redirect(http.StatusFound, s.frontendURLWithError(loginErrorNoCode))
 		return
 	}
-	if nonce == "" {
-		respondError(c, fmt.Errorf("nonce がありません: %w", apperr.ErrUnauthenticated))
-		return
-	}
-	if verifier == "" {
-		respondError(c, fmt.Errorf("code_verifier がありません: %w", apperr.ErrUnauthenticated))
+	if nonce == "" || verifier == "" {
+		// **欠けたほうを reason に載せる。** 個別のフィールドを増やさないのは、
+		// Athena の DDL に無い列は静かに NULL になるため
+		// (infra/athena/table.sql の罠 2)。reason は防御層が
+		// 「なぜ弾いたか」に使っている既存の列で、csrf_rejected と揃う。
+		reason := loginRejectNoNonce
+		if nonce != "" {
+			reason = loginRejectNoVerifier
+		}
+		slog.WarnContext(c.Request.Context(), "login_flow_cookie_missing",
+			slog.String("reason", reason),
+		)
+		c.Redirect(http.StatusFound, s.frontendURLWithError(loginErrorExpired))
 		return
 	}
 
 	result, err := s.login.CompleteLogin(c.Request.Context(), *params.Code, verifier, nonce)
 	if err != nil {
-		respondError(c, err)
+		// **401 だけ JSON のまま。** 退会済みの再ログインを 401 で返すことが
+		// 仕様書に書いてある (openapi.yaml の googleLoginCallback)。
+		// リダイレクトに寄せるなら仕様書を先に直す。
+		if errors.Is(err, apperr.ErrUnauthenticated) {
+			respondError(c, err)
+			return
+		}
+		// **それ以外は JSON を見せない。** ここに来るのは DB の瞬断
+		// (Upsert / セッションの作成) と IdP 側の障害 (Exchange の失敗) で、
+		// **同意画面を 10 分放置するより頻度が高い。**
+		// respondError に渡すと INTERNAL の JSON が
+		// ログインの結果としてブラウザに出る。
+		//
+		// **respondError を通さないぶん、ここでログを出す。**
+		slog.ErrorContext(c.Request.Context(), "login_complete_failed",
+			slog.String("error", err.Error()),
+		)
+		c.Redirect(http.StatusFound, s.frontendURLWithError(loginErrorFailed))
 		return
 	}
 

@@ -152,6 +152,25 @@ type authEnv struct {
 func newAuthEnv(t *testing.T, loginEnabled bool) *authEnv {
 	t.Helper()
 
+	return newAuthEnvWithFailures(t, loginEnabled, authFailures{})
+}
+
+// authFailures は CompleteLogin の途中で起こす失敗です。
+//
+// **どちらも 401 になるわけではない**ことが要点になります。
+// 交換の失敗はインタラクタが ErrUnauthenticated へ寄せる (認可コードの不正と
+// IdP 障害を区別できないため、interactor.go に理由がある) 一方、
+// Upsert の失敗はそのまま上がるので 500 相当になります。
+type authFailures struct {
+	// exchange は認可コードの交換 (IdP 側) を失敗させます。
+	exchange error
+	// upsert は利用者の保存 (DB 側) を失敗させます。
+	upsert error
+}
+
+func newAuthEnvWithFailures(t *testing.T, loginEnabled bool, fail authFailures) *authEnv {
+	t.Helper()
+
 	const token = usermodel.SessionToken("test-session-token")
 	publicID := uuid.MustParse("01920000-0000-7000-8000-000000000001")
 
@@ -171,11 +190,11 @@ func newAuthEnv(t *testing.T, loginEnabled bool) *authEnv {
 		user := usermodel.Reconstruct(1, publicID, "sub-1", "h@example.com", "ホシノ",
 			nil, usermodel.RoleUser, time.Unix(0, 0).UTC(), time.Unix(0, 0).UTC(), nil)
 		login = userusecase.NewLoginInteractor(
-			&fakeUserRepo{user: user},
+			&fakeUserRepo{user: user, err: fail.upsert},
 			sessions,
 			&fakeProvider{claims: &userusecase.IDTokenClaims{
 				Subject: "sub-1", Email: "h@example.com", EmailVerified: true, Name: "ホシノ",
-			}},
+			}, err: fail.exchange},
 			func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
 		)
 	}
@@ -247,6 +266,19 @@ func flowCookies(state string) []*http.Cookie {
 		{Name: nonceCookieName, Value: "n1"},
 		{Name: verifierCookieName, Value: "v1"},
 	}
+}
+
+// flowCookiesWithout はフロー用 Cookie から 1 つだけ落としたものを返します。
+// **失効は 3 つ同時に起きる**のが実態ですが、どれが欠けても
+// 同じ扱いになることを 1 つずつ確かめるために分けています。
+func flowCookiesWithout(state, drop string) []*http.Cookie {
+	var kept []*http.Cookie
+	for _, c := range flowCookies(state) {
+		if c.Name != drop {
+			kept = append(kept, c)
+		}
+	}
+	return kept
 }
 
 // findCookie はレスポンスから名前で Cookie を探します。無ければ nil。
@@ -528,18 +560,29 @@ func TestStartGoogleLogin_SetsFlowCookies(t *testing.T) {
 	}
 }
 
-// **state が一致しなければ 401。**
+// **state が一致しなければ、ログインを完了させない。**
 //
 // これが無いと、攻撃者が用意した認可コードを被害者のブラウザで交換させられる
 // (ログイン CSRF)。
+//
+// **応答は JSON ではなくフロントへのリダイレクト。** ここに来るのは Google
+// からのトップレベル遷移なので、4xx の JSON を返すとブラウザにそれが
+// 直接表示される (params.Error の分岐と同じ理由)。
 func TestGoogleLoginCallback_RejectsStateMismatch(t *testing.T) {
 	env := newAuthEnv(t, true)
 
 	rec := env.do(t, http.MethodGet, "/auth/google/callback?code=xyz&state=attacker",
 		flowCookies("victim")...,
 	)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 (body=%s)", rec.Code, rec.Body.String())
+	}
+	// **失効 (login_expired) と区別する。** ログイン CSRF の可能性がある側。
+	if loc := rec.Header().Get("Location"); loc != "http://localhost:3000?login_error=state_mismatch" {
+		t.Errorf("Location = %q, want state_mismatch", loc)
+	}
+	if c := findCookie(rec, sessionCookieName); c != nil && c.MaxAge > 0 {
+		t.Errorf("拒否したのにセッションが発行された: %+v", c)
 	}
 
 	// **攻撃を検知した経路でこそ、古い state を捨てたい。**
@@ -547,13 +590,111 @@ func TestGoogleLoginCallback_RejectsStateMismatch(t *testing.T) {
 	assertFlowCookiesCleared(t, rec)
 }
 
-// state の Cookie が無い場合も 401。
+// **state の Cookie が無い場合もリダイレクト。しかも識別子が違う。**
+//
+// 認可フローの Cookie は 10 分で切れる (authFlowCookieMaxAge)。
+// 同意画面を開いたまま放置して「許可」を押した利用者が、
+// **攻撃ではなくここへ来る。** 生の JSON を見せる相手ではない。
 func TestGoogleLoginCallback_RejectsMissingStateCookie(t *testing.T) {
 	env := newAuthEnv(t, true)
 
 	rec := env.do(t, http.MethodGet, "/auth/google/callback?code=xyz&state=whatever")
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "http://localhost:3000?login_error=login_expired" {
+		t.Errorf("Location = %q, want login_expired", loc)
+	}
+	if c := findCookie(rec, sessionCookieName); c != nil && c.MaxAge > 0 {
+		t.Errorf("拒否したのにセッションが発行された: %+v", c)
+	}
+}
+
+// **nonce / code_verifier の欠落もリダイレクト。**
+// state と同じ Cookie 群なので、失効するときは 3 つまとめて失効する。
+// state だけリダイレクトにしても、同じ利用者が次の行で JSON を見る。
+func TestGoogleLoginCallback_RejectsMissingFlowCookies(t *testing.T) {
+	tests := []struct {
+		name    string
+		cookies []*http.Cookie
+	}{
+		{name: "nonce が無い", cookies: flowCookiesWithout("s1", nonceCookieName)},
+		{name: "code_verifier が無い", cookies: flowCookiesWithout("s1", verifierCookieName)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newAuthEnv(t, true)
+
+			rec := env.do(t, http.MethodGet, "/auth/google/callback?code=xyz&state=s1", tt.cookies...)
+			if rec.Code != http.StatusFound {
+				t.Fatalf("status = %d, want 302 (body=%s)", rec.Code, rec.Body.String())
+			}
+			if loc := rec.Header().Get("Location"); loc != "http://localhost:3000?login_error=login_expired" {
+				t.Errorf("Location = %q, want login_expired", loc)
+			}
+			if c := findCookie(rec, sessionCookieName); c != nil && c.MaxAge > 0 {
+				t.Errorf("拒否したのにセッションが発行された: %+v", c)
+			}
+			// 兄弟の検査と粒度を揃える。**破棄はここでも効いている。**
+			assertFlowCookiesCleared(t, rec)
+		})
+	}
+}
+
+// **交換より後ろで失敗しても、生の JSON をブラウザに見せないこと。**
+//
+// ここに来るのは IdP の一時障害と DB の瞬断で、**同意画面を 10 分放置するより
+// 頻度が高い。** respondError に渡すと INTERNAL の JSON が
+// ログインの結果としてブラウザに出る。
+//
+// **401 だけは JSON のまま**にする —— 退会済みの再ログインを 401 で返すことが
+// 仕様書に書いてある。リダイレクトへ寄せるなら仕様書が先になる。
+func TestGoogleLoginCallback_CompleteLoginFailure(t *testing.T) {
+	tests := []struct {
+		name       string
+		fail       authFailures
+		wantStatus int
+		wantLoc    string
+	}{
+		{
+			// **respondError の default に落ちる経路。**
+			// 直す前はここが INTERNAL の JSON になっていた。
+			name:       "DB の失敗はリダイレクト",
+			fail:       authFailures{upsert: errors.New("接続が切れました")},
+			wantStatus: http.StatusFound,
+			wantLoc:    "http://localhost:3000?login_error=login_failed",
+		},
+		{
+			// **交換の失敗は 401 のまま。** インタラクタが認可コードの不正と
+			// IdP 障害を区別せず ErrUnauthenticated へ寄せており、
+			// 仕様書も 401 を宣言している (退会済みの再ログインも同じ経路)。
+			name:       "交換の失敗は 401 のまま (仕様書)",
+			fail:       authFailures{exchange: errors.New("IdP へ到達できません")},
+			wantStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newAuthEnvWithFailures(t, true, tt.fail)
+
+			rec := env.do(t, http.MethodGet, "/auth/google/callback?code=xyz&state=s1",
+				flowCookies("s1")...,
+			)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body=%s)", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if tt.wantLoc != "" {
+				if loc := rec.Header().Get("Location"); loc != tt.wantLoc {
+					t.Errorf("Location = %q, want %q", loc, tt.wantLoc)
+				}
+			}
+			if c := findCookie(rec, sessionCookieName); c != nil && c.MaxAge > 0 {
+				t.Errorf("失敗したのにセッションが発行された: %+v", c)
+			}
+			assertFlowCookiesCleared(t, rec)
+		})
 	}
 }
 
@@ -636,13 +777,16 @@ func TestGoogleLoginCallback_SanitizesErrorParam(t *testing.T) {
 	}
 }
 
-// code も error も無い場合は 401。仕様検証を緩めた分をここで受け止める。
+// code も error も無い場合もリダイレクト。仕様検証を緩めた分をここで受け止める。
 func TestGoogleLoginCallback_RejectsMissingCode(t *testing.T) {
 	env := newAuthEnv(t, true)
 
 	rec := env.do(t, http.MethodGet, "/auth/google/callback?state=s1", flowCookies("s1")...)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401 (body=%s)", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want 302 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if loc := rec.Header().Get("Location"); loc != "http://localhost:3000?login_error=no_code" {
+		t.Errorf("Location = %q, want no_code", loc)
 	}
 	assertFlowCookiesCleared(t, rec)
 }
