@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -59,16 +60,67 @@ func ParseKind(raw string) (model.Kind, error) {
 	return kind, nil
 }
 
+// decodeMemoryBudget はデコードに使ってよいヒープの上限です。
+//
+// **本当の予算 (ECS タスクのメモリ) はどこにも記録されていません。**
+// docs/infrastructure.md は Fargate としか書いておらず、サイズが無い。
+// ここは「1 GiB は積む」という仮置きで、**タスク定義が決まったら
+// この 1 か所を直す**ための定数になります (未決)。
+const decodeMemoryBudget int64 = 1 << 30 // 1 GiB
+
+// estimatedPeakBytesPerDecode は 1 本のデコードが確保するヒープの見積もりです。
+//
+// **コメントに散らしていた算術を、検査できる形にしたものです。**
+// 以前は「2500 万画素は RGBA で 1 枚 95 MB、4 本で 380 MB」と書いていたが、
+// **実測は 1 本 456 MB で、見積もりの約 4.8 倍**だった (下の内訳)。
+// 数字がコメントの中にあるうちは、ずれても誰も落とせません。
+//
+// 内訳 (maxPixels = 2500 万、長辺 1600 の場合):
+//
+//	デコード後の画素   200 MB  16bit PNG は image.NRGBA64 = **8 バイト/画素**
+//	                          (4 バイト/画素で見積もっていたのが誤り)
+//	縮小の一時バッファ 256 MB  x/image/draw の CatmullRom が
+//	                          make([][4]float64, dw*sh) を取る (scale.go)
+//	出力の RGBA         10 MB  1600x1600x4
+//	                   ------
+//	                   466 MB  実測 456 MB とほぼ一致
+//
+// **EXIF の向き直しはこの上限を超えません。** 直した後の実測は 382 MB で
+// (元画像 200 MB + RGBA 化 100 MB + 出力 100 MB)、縮小の 456 MB より小さい。
+// 直す前は 568 MB で**縮小より大きかった** —— 1 画素ごとに color.Color へ
+// 箱詰めしていたためで、そちらは orientation.go で潰した。
+//
+// 一時バッファの上限が dstLong * sqrt(maxPixels) * 32 になるのは、
+// 縦横比を保つため。横長なら dw = dstLong で sh <= sqrt(maxPixels)、
+// 縦長なら sh は伸びるが dw がその分縮むので、積は同じ上限に収まります。
+func estimatedPeakBytesPerDecode(maxPixels, dstLong int64) int64 {
+	const (
+		bytesPerPixelDecoded = 8  // image.NRGBA64
+		bytesPerScratchCell  = 32 // [4]float64
+		bytesPerPixelOutput  = 4  // image.RGBA
+	)
+	scratchCells := dstLong * int64(math.Sqrt(float64(maxPixels)))
+	return maxPixels*bytesPerPixelDecoded +
+		scratchCells*bytesPerScratchCell +
+		dstLong*dstLong*bytesPerPixelOutput
+}
+
 // defaultMaxConcurrentDecodes は同時にデコードする本数の上限です。
 //
 // **画素数の上限を下げるだけでは足りません** (ADR 0007 決定 2 の改訂)。
-// 2500 万画素は RGBA で 1 枚 95 MB を確保します。上限が無いと、
-// 同時アップロード数にそのまま比例してメモリを食い、OOM で落ちます。
+// 上限が無いと、同時アップロード数にそのまま比例してメモリを食い、OOM で落ちます。
 //
-// 4 本なら最悪でも約 380 MB。ADR 0007 の「引き受けるコスト」の
-// 1 つ目 (同時アップロード数に上限を設けないとメモリで落ちる) が、
-// 数字を入れると具体的な破綻シナリオになるため、ここで閉じます。
-const defaultMaxConcurrentDecodes = 4
+// **4 本では予算を超えていました。** 実測 (5000x5000 の 16bit PNG、
+// 入力 158 KB = バイト上限の 3%):
+//
+//	同時 1 本 ->  456 MB
+//	同時 2 本 ->  911 MB
+//	同時 4 本 -> 1821 MB   ← コメントは「約 380 MB」と書いていた
+//
+// 2 本にして decodeMemoryBudget (1 GiB) の内側へ入れます。
+// **この関係は interactor_test.go が検査します** —— 本数か画素数の上限を
+// 上げたときに、コメントではなくテストが落ちる形にしてあります。
+const defaultMaxConcurrentDecodes = 2
 
 // ImageInteractor は画像のアップロードを担当します。
 type ImageInteractor struct {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"image"
+	"image/draw"
 )
 
 // orientation は EXIF の Orientation タグ (0x0112) の値です。
@@ -45,6 +46,24 @@ func applyOrientation(src image.Image, o orientation) image.Image {
 	}
 
 	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+
+	// **1 画素ずつ At/Set で運ばない。**
+	//
+	// At が返すのは color.Color (インターフェース) なので、
+	// image.NRGBA64 のような 8 バイトの値は**1 画素ごとにヒープへ箱詰め**される。
+	// 2500 万画素なら 2500 万回の確保になり、実測でこの関数のピークが
+	// 568 MB まで膨らんでいた —— **縮小そのもの (456 MB) より大きい。**
+	// スマートフォンの写真は EXIF 付きなので、ここが既定の経路になる。
+	//
+	// draw.Draw で一度だけ RGBA に落とし、あとは Pix を直接動かす。
+	// 座標の対応 (下の switch) は変えていない。
+	srcRGBA, ok := src.(*image.RGBA)
+	if !ok {
+		srcRGBA = image.NewRGBA(image.Rect(0, 0, w, h))
+		draw.Draw(srcRGBA, srcRGBA.Bounds(), src, b.Min, draw.Src)
+	}
+	sMinX, sMinY := srcRGBA.Rect.Min.X, srcRGBA.Rect.Min.Y
+
 	for y := range h {
 		for x := range w {
 			// EXIF の 8 通り (TIFF 6.0 の Orientation)。
@@ -71,7 +90,9 @@ func applyOrientation(src image.Image, o orientation) image.Image {
 			default:
 				nx, ny = x, y
 			}
-			dst.Set(nx, ny, src.At(b.Min.X+x, b.Min.Y+y))
+			si := srcRGBA.PixOffset(sMinX+x, sMinY+y)
+			di := dst.PixOffset(nx, ny)
+			copy(dst.Pix[di:di+4], srcRGBA.Pix[si:si+4])
 		}
 	}
 	return dst
