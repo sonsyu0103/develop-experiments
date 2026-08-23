@@ -326,3 +326,61 @@ func TestScheduler_WaitRespectsDeadline(t *testing.T) {
 		t.Errorf("Wait = %v, want context.DeadlineExceeded", err)
 	}
 }
+
+// **停止したあとに、新しい 1 周を始めないこと** (レビュー指摘)。
+//
+// job.Run が Interval より長くかかると、戻ってきた時点で timer は発火済み。
+// 次の周回では ctx.Done() と timer.C の**両方が準備完了**なので、
+// select はランダムに選ぶ —— つまり停止のおよそ半分で、死んだ ctx のまま
+// もう 1 周始まる。DB 呼び出しは全部失敗し、**その無駄な 1 周ぶん
+// Wait がシャットダウンの猶予を食う** (猶予は srv.Shutdown と共有)。
+//
+// **回数で見ます。** 「止まったこと」だけでは、余分な 1 周を見逃します。
+func TestScheduler_DoesNotStartRoundAfterCancel(t *testing.T) {
+	t.Parallel()
+
+	// **1 回では見分けられません。** ctx.Done() と timer.C が同時に
+	// 準備完了のとき、select はランダムに選ぶので、検査を外した実装でも
+	// 半分は「1 回」で終わります。繰り返して、見逃す確率を 2^-12 まで下げます。
+	for range 12 {
+		assertNoRoundAfterCancel(t)
+	}
+}
+
+func assertNoRoundAfterCancel(t *testing.T) {
+	t.Helper()
+
+	const interval = 20 * time.Millisecond
+
+	var runs atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := New(Job{
+		Name:     "slow",
+		Interval: interval,
+		Run: func(context.Context) error {
+			if runs.Add(1) == 1 {
+				close(started)
+				// **Interval より長く居座る。** 戻る頃には timer が発火済み。
+				<-release
+			}
+			return nil
+		},
+	})
+	s.Start(ctx)
+
+	<-started
+	cancel()
+	// 打ち切りを見せてから Run を返す。
+	time.Sleep(2 * interval)
+	close(release)
+	if err := s.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait が失敗した: %v", err)
+	}
+
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("Run が %d 回走った, want 1 (停止後に新しい 1 周が始まっている)", got)
+	}
+}

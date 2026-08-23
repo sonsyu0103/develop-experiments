@@ -217,3 +217,19 @@ func readRepoFile(t *testing.T, rel string) string {
 	}
 	return string(b)
 }
+
+// **UTF-8 として妥当でないキーを、DB へ届かせないこと** (レビュー指摘)。
+//
+// net/http はヘッダ値の 0x80〜0xFF を通し、仕様書の IdempotencyKey に
+// pattern はありません。このまま TEXT へ入れると Postgres が
+// SQLSTATE 22021 で弾きます —— translateError が 400 に翻訳するので
+// 500 にはなりませんが、**DB まで往復してから同じ答えを返す**ことになります。
+// この型は「DB の CHECK 制約に到達させない」ための層です。
+func TestNew_RejectsInvalidUTF8(t *testing.T) {
+	t.Parallel()
+
+	_, err := New(string([]byte{0xff, 0xfe}), "POST /threads/1/comments", "body")
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
+	}
+}
