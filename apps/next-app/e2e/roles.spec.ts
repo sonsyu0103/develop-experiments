@@ -53,6 +53,28 @@ test('自分自身は送る前に止める', async ({ page }) => {
   expect(called).toBe(false);
 });
 
+// **大文字で貼られた UUID でも止めること** (レビュー指摘)。
+//
+// UUID は 16 進なので、コピー元によっては大文字で来ます。区別して比べると
+// isSelf が false のままになり、**「変更する」が押せてしまいます** ——
+// サーバは 403 で止めますが、この画面の役目 (送る前に気づかせる) が
+// casing だけで消えます。既存の検査は publicId をそのまま入れるので、
+// `.toLowerCase()` が有っても無くても通っていました。
+test('大文字で貼った自分の公開 ID も送る前に止める', async ({ page }) => {
+  let called = false;
+  await page.route('**/users/*/role', (route) => {
+    called = true;
+    return fail(route, 403, 'PERMISSION_DENIED');
+  });
+
+  await page.goto('/admin/roles');
+  await page.getByLabel('対象の公開 ID').fill(admin.publicId.toUpperCase());
+
+  await expect(page.getByText('自分のロールは変更できません')).toBeVisible();
+  await expect(page.getByRole('button', { name: '変更する' })).toBeDisabled();
+  expect(called).toBe(false);
+});
+
 test('422 は「最後の admin」だと伝える', async ({ page }) => {
   await page.route('**/users/*/role', (route) => fail(route, 422, 'FAILED_PRECONDITION'));
 
