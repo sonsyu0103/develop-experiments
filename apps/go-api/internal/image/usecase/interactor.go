@@ -60,13 +60,26 @@ func ParseKind(raw string) (model.Kind, error) {
 	return kind, nil
 }
 
+// assumedTaskMemory は 1 プロセスに割り当てられるメモリの仮置きです。
+//
+// **本当の値 (ECS タスクのメモリ) はどこにも記録されていません。**
+// docs/infrastructure.md は Fargate としか書いておらず、サイズが無い。
+// タスク定義が決まったらここを直します (未決)。
+const assumedTaskMemory int64 = 1 << 30 // 1 GiB
+
 // decodeMemoryBudget はデコードに使ってよいヒープの上限です。
 //
-// **本当の予算 (ECS タスクのメモリ) はどこにも記録されていません。**
-// docs/infrastructure.md は Fargate としか書いておらず、サイズが無い。
-// ここは「1 GiB は積む」という仮置きで、**タスク定義が決まったら
-// この 1 か所を直す**ための定数になります (未決)。
-const decodeMemoryBudget int64 = 1 << 30 // 1 GiB
+// **タスクのメモリを丸ごと使ってよいわけではありません。**
+// 同じプロセスに HTTP サーバ、pgx のプール、読み込み中の要求本文 (1 件 5 MiB)、
+// Go ランタイム自身が同居します。加えて **GOGC の既定は 100** ——
+// 生きているヒープの約 2 倍まで伸びてから回収するので、
+// ピークの見積もりぴったりに詰めると RSS はそれを超えます
+// (リポジトリに GOMEMLIMIT / GOGC の設定は無い。実測で確認)。
+//
+// **6 割に留めます。** 残り 4 割がランタイムと他の常駐ぶんになります。
+// 正確に詰めたいなら、タスク定義で GOMEMLIMIT を渡すのが本筋です
+// (Go は環境変数を直接読むので、コード側の変更は要りません)。
+const decodeMemoryBudget int64 = assumedTaskMemory * 6 / 10
 
 // estimatedPeakBytesPerDecode は 1 本のデコードが確保するヒープの見積もりです。
 //
@@ -117,10 +130,17 @@ func estimatedPeakBytesPerDecode(maxPixels, dstLong int64) int64 {
 //	同時 2 本 ->  911 MB
 //	同時 4 本 -> 1821 MB   ← コメントは「約 380 MB」と書いていた
 //
-// 2 本にして decodeMemoryBudget (1 GiB) の内側へ入れます。
-// **この関係は interactor_test.go が検査します** —— 本数か画素数の上限を
-// 上げたときに、コメントではなくテストが落ちる形にしてあります。
-const defaultMaxConcurrentDecodes = 2
+// **1 本にします。** decodeMemoryBudget (614 MB) に収まるのはここまで ——
+// 2 本だと 889 MB で、ランタイムと他の常駐ぶんを踏み潰します。
+//
+// **引き換えに、同時アップロードは待ち行列になります。** 待ちは要求の
+// context でしか打ち切られないので、詰まればクライアントの切断まで待ちます。
+// 最悪の 1 本が 0.3〜1 秒なので、この規模では受け入れる側に倒します。
+// 本数を戻したいなら MaxPixels を下げるのが先です (ADR 0007 決定 2 の再改訂、未決)。
+//
+// **この関係は interactor_test.go が検査します** —— 本数・画素数・長辺の
+// どれを上げても、コメントではなくテストが落ちる形にしてあります。
+const defaultMaxConcurrentDecodes = 1
 
 // ImageInteractor は画像のアップロードを担当します。
 type ImageInteractor struct {
@@ -174,7 +194,7 @@ func (i *ImageInteractor) Upload(
 	//
 	// 初版は defer で関数の出口まで持っていたため、DB への書き込みと
 	// ストレージへの PUT (ネットワーク往復) の間も枠を占有していた。
-	// S3 の応答が 5 秒に伸びると 4 本の枠が張り付き、
+	// S3 の応答が 5 秒に伸びると枠が張り付き、
 	// **以降のアップロードがストレージの遅さでまとめて失敗する**
 	// (待ち側には期限が無く、クライアントの切断でしか抜けない)。
 	// 枠が守りたいのはメモリであって、経路全体の同時実行数ではない。

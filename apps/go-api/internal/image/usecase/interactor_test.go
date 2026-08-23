@@ -433,14 +433,23 @@ func TestUpload_RespectsCanceledContext(t *testing.T) {
 func TestDecodeConcurrency_FitsMemoryBudget(t *testing.T) {
 	t.Parallel()
 
-	// 長辺がいちばん大きい用途で見る (コメント添付 = 1600)。
-	dstLong := int64(model.KindCommentAttachment.MaxDimension())
+	// **用途を全部見て、いちばん長辺の大きいものを取る。**
+	// コメント添付 (1600) を直接書いていたが、それだと
+	// **アバターの長辺を上げても検査が動かない** (レビュー指摘)。
+	// 見積もりは長辺に対して一時バッファが線形、出力が二乗で効く。
+	var dstLong int64
+	for _, k := range []model.Kind{
+		model.KindCommentAttachment, model.KindAvatar, model.KindThreadIcon,
+	} {
+		dstLong = max(dstLong, int64(k.MaxDimension()))
+	}
 	perDecode := estimatedPeakBytesPerDecode(model.MaxPixels, dstLong)
 	total := perDecode * defaultMaxConcurrentDecodes
 
-	t.Logf("1 本 %.0f MB x %d 本 = %.0f MB (予算 %.0f MB)",
-		float64(perDecode)/(1<<20), defaultMaxConcurrentDecodes,
-		float64(total)/(1<<20), float64(decodeMemoryBudget)/(1<<20))
+	t.Logf("長辺 %d / 1 本 %.0f MB x %d 本 = %.0f MB (予算 %.0f MB / 仮のタスク %.0f MB)",
+		dstLong, float64(perDecode)/(1<<20), defaultMaxConcurrentDecodes,
+		float64(total)/(1<<20), float64(decodeMemoryBudget)/(1<<20),
+		float64(assumedTaskMemory)/(1<<20))
 
 	if total > decodeMemoryBudget {
 		t.Errorf("同時 %d 本で %.0f MB になり、予算 %.0f MB を超える "+

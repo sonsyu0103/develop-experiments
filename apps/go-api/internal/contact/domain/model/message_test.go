@@ -244,13 +244,16 @@ func TestLengthLimits_AgreeAcrossSources(t *testing.T) {
 			if got := mustAtoi(t, bounds[2]); got != tc.declaredMax {
 				t.Errorf("DB の CHECK 制約の上限 (%s) = %d, Go 側 = %d", tc.field, got, tc.declaredMax)
 			}
-			// 仕様書側は「フィールド名の次に現れる minLength / maxLength」を読みます。
-			minPattern := `(?ms)^        ` + tc.field + `:\n.*?minLength: (\d+)`
-			if got := intFrom(t, block[1], minPattern); got != tc.declaredMin {
+			// **フィールドのブロックを先に切り出します。**
+			// `(?s)` の `.` は改行も越えるので、フィールド名から
+			// 直接 minLength を探すと**隣のフィールドの値を拾えます** ——
+			// subject の minLength を消しても body の 1 に一致して緑のまま通る。
+			// この PR が塞いだ `BETWEEN \d+ AND` と同じ形。
+			field := fieldBlock(t, block[1], tc.field)
+			if got := intFrom(t, field, `minLength: (\d+)`); got != tc.declaredMin {
 				t.Errorf("仕様書の minLength (%s) = %d, Go 側 = %d", tc.field, got, tc.declaredMin)
 			}
-			pattern := `(?ms)^        ` + tc.field + `:\n.*?maxLength: (\d+)`
-			if got := intFrom(t, block[1], pattern); got != tc.declaredMax {
+			if got := intFrom(t, field, `maxLength: (\d+)`); got != tc.declaredMax {
 				t.Errorf("仕様書の maxLength (%s) = %d, Go 側 = %d", tc.field, got, tc.declaredMax)
 			}
 		})
@@ -296,7 +299,22 @@ func validSubmission(mutate func(*Submission)) Submission {
 	return s
 }
 
-// intFrom は正規表現の 1 つ目のグループを整数として読みます。
+// fieldBlock は properties の中から 1 フィールドぶんだけを切り出します。
+//
+// **次のフィールド (同じ字下げのキー) の手前で止めます。**
+// ここを開けたまま `.*?` で値を探すと、宣言が消えたときに
+// 隣のフィールドの値を拾って**検査が緑のまま通ります**。
+func fieldBlock(t *testing.T, properties, field string) string {
+	t.Helper()
+
+	re := regexp.MustCompile(`(?ms)^        ` + field + `:\n(.*?)(?:^        \w+:|\z)`)
+	m := re.FindStringSubmatch(properties)
+	if m == nil {
+		t.Fatalf("仕様書から %s のブロックを切り出せなかった", field)
+	}
+	return m[1]
+}
+
 // mustAtoi は取り出した数字を整数にします。
 // intFrom と違って、正規表現の当て方は呼び出し側が決めます
 // (下限と上限を 1 回の照合で取りたいため)。
@@ -310,6 +328,7 @@ func mustAtoi(t *testing.T, raw string) int {
 	return n
 }
 
+// intFrom は正規表現の 1 つ目のグループを整数として読みます。
 func intFrom(t *testing.T, src, pattern string) int {
 	t.Helper()
 

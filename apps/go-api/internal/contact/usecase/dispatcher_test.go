@@ -312,9 +312,15 @@ func TestDispatch_NoAutoReplyWhenNotificationFails(t *testing.T) {
 // リースを超えると、**まだ処理していない行が他のレプリカから見え**、
 // 送信中の行を二重に送られます。
 //
-// 遅い送信器で 1 接続あたりリースの 1/4 を使わせると、控えのある行は
-// 1 件で半分 (通知 + 控え) を使うので、2 件目までで予算 (リースの 3/4) に
-// 届き、3 件目以降は次の周回に回ります。
+// **余白の大きさまで見分けられる粒度にします。** 1 件でリースの半分を使う
+// 設定だと、予算が 3/4 でも 1.0 (= 余白なし) でも「2 件で止まる」になり、
+// **余白を丸ごと削っても検査が緑のまま**でした (レビュー指摘)。
+// 1 接続あたり 1/10 にすると、
+//
+//	予算 3/4  -> 4 件で 0.8 リース。4 件目のあとで打ち切る
+//	予算 1.0  -> 5 件目まで回る (余白なし = 二重送信の窓)
+//
+// と分かれます。
 //
 // **控えを持つ行で検査します** (レビュー指摘)。ReplyTo を設定しない行だと
 // 送信は 1 接続ぶんで終わり、**leaseBudget が根拠にしている「1 件 = 最悪
@@ -331,11 +337,13 @@ func TestDispatch_StopsBeforeTheLeaseExpires(t *testing.T) {
 		m.ReplyTo = &verified
 		return m
 	}
-	repo := &fakeRepo{pending: []model.Message{
-		withReply(1), withReply(2), withReply(3), withReply(4),
-	}}
-	// 1 接続あたり。控えがあるので 1 件で 2 回待ちます。
-	sender := &fakeSender{delay: lease / 4}
+	pending := make([]model.Message, 0, 8)
+	for id := int64(1); id <= 8; id++ {
+		pending = append(pending, withReply(id))
+	}
+	repo := &fakeRepo{pending: pending}
+	// 1 接続あたり。控えがあるので 1 件で 2 回待ちます (= リースの 1/5)。
+	sender := &fakeSender{delay: lease / 10}
 
 	d := NewDispatcher(repo, sender)
 	d.lease = lease
@@ -345,17 +353,15 @@ func TestDispatch_StopsBeforeTheLeaseExpires(t *testing.T) {
 		t.Fatalf("Dispatch がエラーになった: %v", err)
 	}
 
-	// **件数まで見ます。** 「4 件未満」だけだと、控えの往復を数え落として
-	// 1 件あたりの費用を半分に見積もっていても (3 件処理) 通ってしまう。
-	// 1 件 = 通知 + 控えの 2 接続 = リースの半分なので、
-	// 予算 (3/4) の内側に収まるのは 2 件目まで。
+	// **件数まで見ます。** 「全件ではない」だけだと、控えの往復を数え落として
+	// いても、余白を削っていても通ってしまう。
 	if got.Total() == 0 {
 		t.Fatal("1 件も処理していない (予算が最初から尽きている)")
 	}
-	if got.Total() > 2 {
-		t.Errorf("%d 件処理した。1 件は最悪 2 接続ぶん (リースの半分) かかるので、"+
-			"予算の内側に入るのは 2 件までのはず ——"+
-			"控えの往復を費用に数えていない可能性がある", got.Total())
+	if got.Total() > 4 {
+		t.Errorf("%d 件処理した。1 件は 2 接続ぶん (リースの 1/5) かかるので、"+
+			"予算 3/4 の内側に入るのは 4 件まで —— "+
+			"余白が削れているか、控えの往復を費用に数えていない", got.Total())
 	}
 	// **残りは失われません。** 次の周回で拾い直されるので、
 	// 差し戻しも打ち切りも起きていないこと。
