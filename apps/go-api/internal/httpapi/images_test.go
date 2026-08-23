@@ -7,6 +7,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -140,7 +141,11 @@ func newImageEnv(t *testing.T) *imageEnv {
 			threadusecase.NewThreadInteractor(threads, nil),
 			commentusecase.NewCommentInteractor(comments, threads, imageInteractor),
 			&fakePinger{},
-			userusecase.NewSessionInteractor(sessions, nil),
+			// **本番と同じく画像の解決を渡す** (cmd/api/main.go の
+			// sessionImageResolver)。nil にすると SetAvatar が
+			// ErrUnavailable で短絡し、PUT /me/avatar の検査が
+			// 503 しか見られなくなる (レビュー指摘)。
+			userusecase.NewSessionInteractor(sessions, imageInteractor),
 			nil,
 			imageInteractor,
 			moderationusecase.NewInteractor(newFakeModerationRepo()),
@@ -485,4 +490,176 @@ func TestCreateComment_WithoutImageStillWorks(t *testing.T) {
 	if env.comments.created.ImageID != nil {
 		t.Error("画像を指定していないのに image_id が入っている")
 	}
+}
+
+// **URL のクエリ文字列で、本文の kind を上書きできないこと。**
+//
+// FormValue は r.Form を見る。ParseMultipartForm は先に ParseForm を呼んで
+// クエリ文字列を入れ、そこへ multipart の値を**後ろに足す**ので、
+// Get は先頭 = クエリの値を返していた。仕様検証は multipart 側を見て通すため、
+// **検証を抜けた値と、実際に使う値が食い違う**:
+//
+//	POST /images?kind=avatar  (本文は kind=comment_attachment) -> avatar で保存
+//	POST /images?kind=not_a_real_kind                          -> 400
+func TestUploadImage_QueryCannotOverrideKind(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "別の用途を指す", query: "?kind=avatar"},
+		{name: "存在しない用途を指す", query: "?kind=not_a_real_kind"},
+		{name: "空の指定", query: "?kind="},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := newImageEnv(t)
+
+			base := uploadRequest(t, "comment_attachment", testPNG(t, 64, 64), sessionCookie(env.token))
+			body, err := io.ReadAll(base.Body)
+			if err != nil {
+				t.Fatalf("本文を読めない: %v", err)
+			}
+			// **URL を組み立て直す。** httptest.NewRequest のあとで
+			// RawQuery を書き換えても RequestURI 側に載らず、届かない。
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost,
+				"/images"+tt.query, bytes.NewReader(body))
+			req.Header = base.Header.Clone()
+			for _, c := range base.Cookies() {
+				req.AddCookie(c)
+			}
+
+			rec := env.do(req)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201 (クエリで弾かれた) body=%s", rec.Code, rec.Body.String())
+			}
+			got := decodeJSON[oapigen.Image](t, rec)
+			stored := env.images.stored[got.Id]
+			if stored == nil {
+				t.Fatal("保存されていない")
+			}
+			if string(stored.Kind) != "comment_attachment" {
+				t.Errorf("保存された kind = %q, want comment_attachment (クエリが本文を上書きした)",
+					stored.Kind)
+			}
+		})
+	}
+}
+
+// **壊れた multipart は仕様検証が 400 で返すこと。**
+//
+// ハンドラの ParseMultipartForm はここまで来ない (検証ミドルウェアが
+// 本文を読み切って解析済みで、req.Body も差し替わっている)。
+// 到達しない枝に MaxBytesError の処理と**間違った上限値**が残っていたので、
+// 実際に返っている経路を検査で固定する。
+func TestUploadImage_MalformedMultipartIs400(t *testing.T) {
+	env := newImageEnv(t)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/images",
+		bytes.NewReader([]byte("これは multipart ではない")))
+	req.Header.Set("Origin", testOrigin)
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=xyz")
+	req.AddCookie(sessionCookie(env.token))
+
+	rec := env.do(req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if code := decodeError(t, rec).Error.Code; code != oapigen.INVALIDARGUMENT {
+		t.Errorf("code = %q, want INVALID_ARGUMENT", code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// アバターの設定 (PUT /me/avatar)
+// ---------------------------------------------------------------------------
+
+// **この経路には HTTP 層の検査が 1 本も無かった** (レビュー指摘)。
+//
+// フロントの e2e は `page.route('**/me/avatar', …)` で差し替えているので、
+// 要求は Go まで届かない。しかも newImageEnv は本番と違って画像の解決を
+// 渡していなかったため、仮に検査を足しても SetAvatar が
+// ErrUnavailable で短絡し、**503 しか見られなかった** (そちらも直した)。
+func TestSetMyAvatar(t *testing.T) {
+	setAvatar := func(t *testing.T, env *imageEnv, body string) *httptest.ResponseRecorder {
+		t.Helper()
+
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPut, "/me/avatar",
+			strings.NewReader(body))
+		req.Header.Set("Origin", testOrigin)
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(sessionCookie(env.token))
+		return env.do(req)
+	}
+
+	// 自分の avatar 画像を上げて、それを設定できること。
+	t.Run("設定できる", func(t *testing.T) {
+		env := newImageEnv(t)
+
+		rec := env.do(uploadRequest(t, "avatar", testPNG(t, 64, 64), sessionCookie(env.token)))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("アップロード status = %d (body=%s)", rec.Code, rec.Body.String())
+		}
+		uploaded := decodeJSON[oapigen.Image](t, rec)
+
+		rec = setAvatar(t, env, `{"imageId":"`+uploaded.Id.String()+`"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+		}
+		me := decodeJSON[oapigen.Me](t, rec)
+		if me.AvatarUrl == nil || *me.AvatarUrl == "" {
+			t.Fatal("avatarUrl が空 (設定が反映されていない)")
+		}
+		// **絶対 URL を返す** (ADR 0007 決定 5)。
+		if !strings.HasPrefix(*me.AvatarUrl, "https://") {
+			t.Errorf("avatarUrl = %q, want 絶対 URL", *me.AvatarUrl)
+		}
+	})
+
+	// **null は「解除」。** 省略と区別する必要はない (imageId は required)。
+	t.Run("null で解除できる", func(t *testing.T) {
+		env := newImageEnv(t)
+
+		rec := setAvatar(t, env, `{"imageId":null}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	// ゼロ値の UUID は「指定していない」と区別が付かないので弾く。
+	t.Run("ゼロ値の UUID は 400", func(t *testing.T) {
+		env := newImageEnv(t)
+
+		rec := setAvatar(t, env, `{"imageId":"00000000-0000-0000-0000-000000000000"}`)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	// **用途が違う画像は 404。** 添付用に上げた画像をアバターにはできない
+	// (EnsureOwned が kind まで見る)。
+	t.Run("用途が違う画像は 404", func(t *testing.T) {
+		env := newImageEnv(t)
+
+		rec := env.do(uploadRequest(t, "comment_attachment", testPNG(t, 64, 64), sessionCookie(env.token)))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("アップロード status = %d (body=%s)", rec.Code, rec.Body.String())
+		}
+		uploaded := decodeJSON[oapigen.Image](t, rec)
+
+		rec = setAvatar(t, env, `{"imageId":"`+uploaded.Id.String()+`"}`)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
+		}
+	})
+
+	// 存在しない画像も 404。
+	t.Run("知らない画像は 404", func(t *testing.T) {
+		env := newImageEnv(t)
+
+		rec := setAvatar(t, env, `{"imageId":"01920000-0000-7000-8000-0000000000ff"}`)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404 (body=%s)", rec.Code, rec.Body.String())
+		}
+	})
 }
