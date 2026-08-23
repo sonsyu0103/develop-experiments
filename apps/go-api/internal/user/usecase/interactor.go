@@ -216,7 +216,18 @@ func (i *LoginInteractor) promoteBootstrapAdmin(ctx context.Context, googleSub s
 		//
 		// sub 自体はログに出さない (個人を特定する識別子のため)。
 		// 長さだけ出せば、空白混入や切り詰めは判別できる。
-		slog.WarnContext(ctx, "bootstrap_admin_sub_mismatch",
+		//
+		// **WARN では出しません** (レビュー指摘)。
+		// BOOTSTRAP_ADMIN_GOOGLE_SUB は 1 回きりの設定ではなく常設なので、
+		// 管理者が 1 人決まったあとは**ほぼ全部のログインがここを通ります。**
+		// WARN のままだと、この行が作った地の底に「本当の打ち間違い」が
+		// 埋もれます —— **自分で作ったノイズで自分の信号を消す。**
+		// 保管の費用も無視できません (ADR 0010)。
+		//
+		// 打ち間違いを見つける口は残ります。DEBUG で拾えるほか、
+		// 「昇格したことがない = bootstrap_admin_promoted が 1 本も無い」
+		// を数えれば、常設のログ 1 本で判別できます。
+		slog.DebugContext(ctx, "bootstrap_admin_sub_mismatch",
 			slog.Int("configured_len", len(i.bootstrapAdminSub)),
 			slog.Int("received_len", len(googleSub)),
 		)

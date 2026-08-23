@@ -37,10 +37,35 @@ func TestNewUser(t *testing.T) {
 		{name: "google_sub が空", googleSub: "", email: "a@example.com", displayName: "ホシノ", wantErr: true},
 		{name: "google_sub が空白のみ", googleSub: "   ", email: "a@example.com", displayName: "ホシノ", wantErr: true},
 		{name: "メールが空", googleSub: "sub-1", email: "", displayName: "ホシノ", wantErr: true},
-		{name: "表示名が空", googleSub: "sub-1", email: "a@example.com", displayName: "", wantErr: true},
+		// **弾かずに直す。** ここに来るのは Google の claims で、
+		// 利用者がこのアプリから直せる値ではない。落とすと
+		// **その人は永久にログインできず、手の打ちようがない。**
 		{
-			name: "表示名が長すぎる", googleSub: "sub-1", email: "a@example.com",
-			displayName: strings.Repeat("あ", DisplayNameMaxLength+1), wantErr: true,
+			name: "表示名が空ならメールのローカル部で代用する", googleSub: "sub-1",
+			email: "hoshino@example.com", displayName: "", wantName: "hoshino",
+		},
+		{
+			name: "表示名が空白のみでも代用する", googleSub: "sub-1",
+			email: "hoshino@example.com", displayName: "   ", wantName: "hoshino",
+		},
+		{
+			name: "長すぎる表示名は切り詰める", googleSub: "sub-1", email: "a@example.com",
+			displayName: strings.Repeat("あ", DisplayNameMaxLength+1),
+			wantName:    strings.Repeat("あ", DisplayNameMaxLength),
+		},
+		{
+			// **バイトではなく文字で切る。** 途中で割ると不正な UTF-8 になり、
+			// DB の char_length と数え方もずれる。
+			name: "絵文字でも文字単位で切る", googleSub: "sub-1", email: "a@example.com",
+			displayName: strings.Repeat("🦊", DisplayNameMaxLength+5),
+			wantName:    strings.Repeat("🦊", DisplayNameMaxLength),
+		},
+
+		// ローカル部も取れないときだけ落とす (メールの検査が先に通っている以上、
+		// ここに来るのは `@example.com` のような壊れた値だけ)。
+		{
+			name: "表示名もローカル部も空", googleSub: "sub-1",
+			email: "@example.com", displayName: "", wantErr: true,
 		},
 	}
 

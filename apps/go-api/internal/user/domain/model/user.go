@@ -21,6 +21,31 @@ import (
 // (docs/adr/0016-schema-and-indexes.md)。
 const DisplayNameMaxLength = 100
 
+// normalizeDisplayName は Google の表示名を、保存できる形に整えます。
+//
+// **弾かずに直します。** 外部から来る値なので、利用者には直しようがありません。
+//
+//	空          -> メールアドレスのローカル部で代用する
+//	             (profile スコープが無いと name は空になりえます)
+//	長すぎる    -> DisplayNameMaxLength 文字で切る
+//	             (DB の CHECK は「暴走を止める上限」で、切るのはこちらの責任)
+//
+// 切るのは**文字単位**です。バイトで切ると UTF-8 の途中で割れます。
+func normalizeDisplayName(displayName, email string) string {
+	displayName = strings.TrimSpace(displayName)
+	if displayName == "" {
+		local, _, found := strings.Cut(strings.TrimSpace(email), "@")
+		if found {
+			displayName = strings.TrimSpace(local)
+		}
+	}
+
+	if utf8.RuneCountInString(displayName) > DisplayNameMaxLength {
+		displayName = string([]rune(displayName)[:DisplayNameMaxLength])
+	}
+	return displayName
+}
+
 // User は Google アカウントに紐づく利用者を表すエンティティです。
 //
 // ID は内部 ID で、API には出しません。外部に見せるのは PublicID だけです
@@ -102,16 +127,16 @@ func NewUser(googleSub, email, displayName string, avatarURL *string) (*User, er
 		return nil, fmt.Errorf("メールアドレスが空です: %w", apperr.ErrInvalidArgument)
 	}
 
-	displayName = strings.TrimSpace(displayName)
+	// **表示名で login を落とさない。** ここに来る値は Google が返す claims で、
+	// 利用者がこのアプリから直せるものではありません。長い・空を弾くと
+	// **その人は永久にログインできず、しかも直す手段がありません**
+	// (呼び出し側は ErrUnauthenticated ではないので login_failed になる)。
+	//
+	// この型のコメントも「切り詰めはアプリ側の責任」と書いていたのに、
+	// **実装は弾く側になっていました** (レビュー指摘)。
+	displayName = normalizeDisplayName(displayName, email)
 	if displayName == "" {
 		return nil, fmt.Errorf("表示名が空です: %w", apperr.ErrInvalidArgument)
-	}
-	// バイト数ではなく文字数で数える。DB 側の char_length() と揃えるため。
-	if n := utf8.RuneCountInString(displayName); n > DisplayNameMaxLength {
-		return nil, fmt.Errorf(
-			"表示名が長すぎます (%d 文字, 上限 %d 文字): %w",
-			n, DisplayNameMaxLength, apperr.ErrInvalidArgument,
-		)
 	}
 
 	publicID, err := uuid.NewV7()
