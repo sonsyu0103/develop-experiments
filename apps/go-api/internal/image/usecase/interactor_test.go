@@ -420,3 +420,60 @@ func TestUpload_RespectsCanceledContext(t *testing.T) {
 		t.Errorf("中断済みなのに %v が呼ばれた", rec.log)
 	}
 }
+
+// **同時デコードの本数 × 1 本の見積もりが、予算に収まること。**
+//
+// 直す前のコメントは「2500 万画素は 1 枚 95 MB、4 本で約 380 MB」だったが、
+// **実測は 1 本 456 MB / 4 本 1821 MB** で、約 4.8 倍ずれていた。
+// 16bit PNG が 8 バイト/画素でデコードされること、縮小の一時バッファ
+// (dw x sh x [4]float64) が入っていないことの 2 つを見落としていた。
+//
+// **算術をコメントに置いておくと、ずれても誰も落とせない。**
+// 本数・画素数・長辺のどれを上げてもここが落ちる。
+func TestDecodeConcurrency_FitsMemoryBudget(t *testing.T) {
+	t.Parallel()
+
+	// **用途を全部見て、いちばん長辺の大きいものを取る。**
+	// コメント添付 (1600) を直接書いていたが、それだと
+	// **アバターの長辺を上げても検査が動かない** (レビュー指摘)。
+	// 見積もりは長辺に対して一時バッファが線形、出力が二乗で効く。
+	var dstLong int64
+	for _, k := range []model.Kind{
+		model.KindCommentAttachment, model.KindAvatar, model.KindThreadIcon,
+	} {
+		dstLong = max(dstLong, int64(k.MaxDimension()))
+	}
+	perDecode := estimatedPeakBytesPerDecode(model.MaxPixels, dstLong)
+	total := perDecode * defaultMaxConcurrentDecodes
+
+	t.Logf("長辺 %d / 1 本 %.0f MB x %d 本 = %.0f MB (予算 %.0f MB / 仮のタスク %.0f MB)",
+		dstLong, float64(perDecode)/(1<<20), defaultMaxConcurrentDecodes,
+		float64(total)/(1<<20), float64(decodeMemoryBudget)/(1<<20),
+		float64(assumedTaskMemory)/(1<<20))
+
+	if total > decodeMemoryBudget {
+		t.Errorf("同時 %d 本で %.0f MB になり、予算 %.0f MB を超える "+
+			"(本数を減らすか、MaxPixels か長辺を下げる)",
+			defaultMaxConcurrentDecodes,
+			float64(total)/(1<<20), float64(decodeMemoryBudget)/(1<<20))
+	}
+}
+
+// **見積もりの式が実測から離れていないこと。**
+//
+// 実測はテストの中では取らない —— 456 MB を CI で確保するのは高いうえ、
+// -race だとさらに増える。代わりに**実測値をここに固定**して、
+// 式やライブラリが変わったときに「測り直せ」と言わせる。
+//
+//	実測 (5000x5000 の 16bit PNG、長辺 1600): 456 MB
+func TestEstimatedPeak_MatchesMeasurement(t *testing.T) {
+	t.Parallel()
+
+	const measuredMB = 456.0
+	got := float64(estimatedPeakBytesPerDecode(25_000_000, 1600)) / (1 << 20)
+
+	if diff := got - measuredMB; diff < -measuredMB*0.15 || diff > measuredMB*0.15 {
+		t.Errorf("見積もり %.0f MB は実測 %.0f MB から 15%% 以上ずれている "+
+			"(式かライブラリが変わった。測り直すこと)", got, measuredMB)
+	}
+}

@@ -171,6 +171,11 @@ func (f *fakeSender) Send(_ context.Context, n repository.Notification) error {
 }
 
 func (f *fakeSender) SendAutoReply(_ context.Context, r repository.AutoReply) error {
+	// **控えも 1 接続ぶん待たせます。** leaseBudget が余白を
+	// 「1 件 = 最悪 2 接続」で見積もっているので、ここが即返すと
+	// **その前提を検査できません** (リースの検査が 1 接続ぶんで通ってしまう)。
+	f.sleep()
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.autoReplyErr != nil {

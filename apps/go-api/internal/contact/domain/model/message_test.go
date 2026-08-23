@@ -211,28 +211,50 @@ func TestLengthLimits_AgreeAcrossSources(t *testing.T) {
 		t.Fatal("openapi.yaml から CreateContactRequest を読み取れなかった")
 	}
 
+	// **下限も見ます。** 以前は上限だけを拾い、email の行は
+	// `BETWEEN \d+ AND (\d+)` と書いて**下限を捨てていました**。
+	// DB だけ BETWEEN 6 AND 254 に変えても CI は緑のまま通り、
+	// Normalize が通した `a@b` を DB が拒否する ——
+	// **アプリが受理した入力で 500** になります。
+	// このファイルのコメントが「一番まずい壊れ方」として挙げている形そのものです。
 	cases := []struct {
-		field    string
-		declared int
-		// constraint は 000012 の CHECK 制約から上限を拾う正規表現です。
+		field string
+		// declaredMin / declaredMax は Go 側の定数です。
+		declaredMin int
+		declaredMax int
+		// constraint は 000012 の CHECK 制約から下限と上限を拾う正規表現です。
 		constraint string
 	}{
-		{"name", MaxNameLength, `char_length\(name\)\s+BETWEEN 1 AND (\d+)`},
-		{"email", MaxEmailLength, `char_length\(email\)\s+BETWEEN \d+ AND (\d+)`},
-		{"subject", MaxSubjectLength, `char_length\(subject\)\s+BETWEEN 1 AND (\d+)`},
-		{"body", MaxBodyLength, `char_length\(body\)\s+BETWEEN 1 AND (\d+)`},
+		{"name", 1, MaxNameLength, `char_length\(name\)\s+BETWEEN (\d+) AND (\d+)`},
+		{"email", MinEmailLength, MaxEmailLength, `char_length\(email\)\s+BETWEEN (\d+) AND (\d+)`},
+		{"subject", 1, MaxSubjectLength, `char_length\(subject\)\s+BETWEEN (\d+) AND (\d+)`},
+		{"body", 1, MaxBodyLength, `char_length\(body\)\s+BETWEEN (\d+) AND (\d+)`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.field, func(t *testing.T) {
 			t.Parallel()
 
-			if got := intFrom(t, migration, tc.constraint); got != tc.declared {
-				t.Errorf("DB の CHECK 制約 (%s) = %d, Go 側 = %d", tc.field, got, tc.declared)
+			bounds := regexp.MustCompile(tc.constraint).FindStringSubmatch(migration)
+			if bounds == nil {
+				t.Fatalf("000012 から %s の CHECK 制約を読み取れなかった", tc.field)
 			}
-			// 仕様書側は「フィールド名の次に現れる maxLength」を読みます。
-			pattern := `(?ms)^        ` + tc.field + `:\n.*?maxLength: (\d+)`
-			if got := intFrom(t, block[1], pattern); got != tc.declared {
-				t.Errorf("仕様書の maxLength (%s) = %d, Go 側 = %d", tc.field, got, tc.declared)
+			if got := mustAtoi(t, bounds[1]); got != tc.declaredMin {
+				t.Errorf("DB の CHECK 制約の下限 (%s) = %d, Go 側 = %d", tc.field, got, tc.declaredMin)
+			}
+			if got := mustAtoi(t, bounds[2]); got != tc.declaredMax {
+				t.Errorf("DB の CHECK 制約の上限 (%s) = %d, Go 側 = %d", tc.field, got, tc.declaredMax)
+			}
+			// **フィールドのブロックを先に切り出します。**
+			// `(?s)` の `.` は改行も越えるので、フィールド名から
+			// 直接 minLength を探すと**隣のフィールドの値を拾えます** ——
+			// subject の minLength を消しても body の 1 に一致して緑のまま通る。
+			// この PR が塞いだ `BETWEEN \d+ AND` と同じ形。
+			field := fieldBlock(t, block[1], tc.field)
+			if got := intFrom(t, field, `minLength: (\d+)`); got != tc.declaredMin {
+				t.Errorf("仕様書の minLength (%s) = %d, Go 側 = %d", tc.field, got, tc.declaredMin)
+			}
+			if got := intFrom(t, field, `maxLength: (\d+)`); got != tc.declaredMax {
+				t.Errorf("仕様書の maxLength (%s) = %d, Go 側 = %d", tc.field, got, tc.declaredMax)
 			}
 		})
 	}
@@ -275,6 +297,35 @@ func validSubmission(mutate func(*Submission)) Submission {
 		mutate(&s)
 	}
 	return s
+}
+
+// fieldBlock は properties の中から 1 フィールドぶんだけを切り出します。
+//
+// **次のフィールド (同じ字下げのキー) の手前で止めます。**
+// ここを開けたまま `.*?` で値を探すと、宣言が消えたときに
+// 隣のフィールドの値を拾って**検査が緑のまま通ります**。
+func fieldBlock(t *testing.T, properties, field string) string {
+	t.Helper()
+
+	re := regexp.MustCompile(`(?ms)^        ` + field + `:\n(.*?)(?:^        \w+:|\z)`)
+	m := re.FindStringSubmatch(properties)
+	if m == nil {
+		t.Fatalf("仕様書から %s のブロックを切り出せなかった", field)
+	}
+	return m[1]
+}
+
+// mustAtoi は取り出した数字を整数にします。
+// intFrom と違って、正規表現の当て方は呼び出し側が決めます
+// (下限と上限を 1 回の照合で取りたいため)。
+func mustAtoi(t *testing.T, raw string) int {
+	t.Helper()
+
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		t.Fatalf("%q を整数として読めない: %v", raw, err)
+	}
+	return n
 }
 
 // intFrom は正規表現の 1 つ目のグループを整数として読みます。
