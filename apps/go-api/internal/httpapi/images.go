@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,8 +17,12 @@ import (
 // multipartMemoryLimit はマルチパートの解析でメモリに置く上限です。
 //
 // これを超えた分は一時ファイルへ退避されます。**受け入れる上限とは別物**で、
-// サイズの拒否は下の maxUploadRequestBytes と、ドメイン側の
-// model.MaxUploadBytes が行います。
+// サイズの拒否は middleware.go の maxImageUploadBytes
+// (5 MiB + 64 KiB。multipart の包みぶんを足した要求全体の上限) と、
+// ドメイン側の model.MaxUploadBytes (5 MiB。画像そのもの) が行います。
+//
+// **maxUploadRequestBytes という名前は存在しません。** ここにそう書いてあった
+// —— 上限を追ってきた人が何も見つけられない状態だった (レビュー指摘)。
 const multipartMemoryLimit = 1 << 20 // 1 MiB
 
 // UploadImage は POST /images を処理します。
@@ -47,16 +50,21 @@ func (s *Server) UploadImage(c *gin.Context) {
 	// ここで http.MaxBytesReader を張っても手遅れです ——
 	// 仕様検証ミドルウェアが、この関数に入る前に本文を丸ごと読むため
 	// (初版はここに置いていて、実測で何の効果も無かった)。
+	//
+	// **ここでエラーになることは無い** (実測)。仕様検証ミドルウェアが
+	// 本文を読み切って multipart を解析済みで、しかも openapi3filter は
+	// req.Body を bytes.Reader に差し替える。2 回目の呼び出しは
+	// MultipartForm が埋まっているので即座に nil を返す。
+	//
+	//	壊れた multipart -> 400 "request body has an error: ... multipart: NextPart: EOF"
+	//	chunked の超過   -> 413 "リクエストが大きすぎます"
+	//
+	// どちらも respondSpecError が返す。**MaxBytesError の枝は消した** ——
+	// bodyLimit が張った MaxBytesReader はこの時点で差し替えられているので
+	// 発火しないうえ、文言が上限を imageusecase.MaxUploadBytes (5 MiB) と
+	// 取り違えていた (実際に効くのは maxImageUploadBytes = 5 MiB + 64 KiB)。
+	// **到達しない枝が、間違った数字を持っていた。**
 	if err := c.Request.ParseMultipartForm(multipartMemoryLimit); err != nil {
-		// MaxBytesReader の超過はここに現れる。413 として返す
-		// —— 400 だと「直せば通る」のか「大きすぎる」のかが伝わらない。
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			respondError(c, fmt.Errorf(
-				"画像が大きすぎます (上限は %d バイト): %w",
-				imageusecase.MaxUploadBytes, apperr.ErrPayloadTooLarge))
-			return
-		}
 		respondBadRequest(c, "multipart/form-data として解釈できません: "+err.Error())
 		return
 	}
@@ -86,7 +94,19 @@ func (s *Server) UploadImage(c *gin.Context) {
 	//  現在の回収バッチの対象外という別の問題は残ります —— 未決事項)。
 
 	// **用途の検証はユースケース層が行う。** HTTP 層はドメインの型を持たない。
-	dto, err := s.images.Upload(ctx, *ownerID, c.Request.FormValue("kind"), raw)
+	//
+	// **PostFormValue であること。** FormValue は r.Form を見るが、
+	// ParseMultipartForm は先に ParseForm を呼んでクエリ文字列を入れ、
+	// そこへ multipart の値を**後ろに足す**。Get は先頭を返すので、
+	// **URL に ?kind= を付けるだけで本文の kind を上書きできた** (実測):
+	//
+	//	POST /images?kind=avatar  (本文は kind=comment_attachment)
+	//	  -> avatar として保存される
+	//
+	// 仕様検証は multipart 側の値を見て通すので、検証を抜けた値と
+	// 実際に使う値が食い違う。PostFormValue は r.PostForm を見るため、
+	// クエリ文字列は入らない。
+	dto, err := s.images.Upload(ctx, *ownerID, c.Request.PostFormValue("kind"), raw)
 	if err != nil {
 		respondError(c, err)
 		return
