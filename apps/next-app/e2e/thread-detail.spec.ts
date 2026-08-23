@@ -258,6 +258,34 @@ test.describe('スレッド詳細', () => {
     await expect(page.getByRole('button', { name: '投稿する' })).toBeVisible();
   });
 
+  test('「もう一度確認する」で書きかけのコメントが消えない', async ({ page }) => {
+    // **フォームを 2 つ置くと、ここで消えます** (レビュー指摘)。
+    // 不明時と確定時で別の要素にすると、React の位置ベースの照合で
+    // 別物として作り直され、body の state が捨てられます ——
+    // 「もう一度確認する」はフォームのすぐ上にあるので、
+    // 長文を書いてから押した利用者がちょうどそれを踏みます。
+    let failMe = true;
+    await page.route('**/me', (route) =>
+      failMe ? fail(route, 500, 'INTERNAL', 'サーバ内部でエラー') : ok(route, plainUser),
+    );
+    await mockThreadOk(page);
+    await mockComments(page, (route) => ok(route, comments([])));
+
+    await page.goto(url);
+    await expect(page.getByText('ログイン状態を確認できませんでした。')).toBeVisible();
+
+    const draft = 'ここまで書いたところで確認を押した';
+    await page.getByLabel('コメント').fill(draft);
+
+    failMe = false;
+    await page.getByRole('button', { name: 'もう一度確認する' }).click();
+
+    // 状態は解決する (案内が消える)。
+    await expect(page.getByText('ログイン状態を確認できませんでした。')).toHaveCount(0);
+    // **本文は残る。**
+    await expect(page.getByLabel('コメント')).toHaveValue(draft);
+  });
+
   test('匿名で立てたスレッドには削除を出さない', async ({ page }) => {
     await mockMe(page, plainUser);
     // `author` が null = 匿名。**ログインしていても消せません**

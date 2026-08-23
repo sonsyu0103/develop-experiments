@@ -111,7 +111,11 @@ export function CommentForm({
       setPhase({ kind: 'editing' });
       onPosted(posted);
     } catch (e) {
-      setPhase({ kind: 'error', message: describePostError(e, signedIn) });
+      // **不明なときは匿名側 (安全側) の文言を出します** (レビュー指摘)。
+      // ログイン中だと決めつけると、409 で「二重には投稿されません」と
+      // 案内することになりますが、**冪等キーは未ログインでは無視される**ので
+      // (ADR 0015 決定 4)、その案内どおり押し直すと 2 件目ができます。
+      setPhase({ kind: 'error', message: describePostError(e, signedIn && !unknownIdentity) });
       // **422 のときだけキーを捨てます。** 前回と内容が食い違ったという
       // 申告なので、同じキーのままでは何度送っても 422 のままになります。
       if (e instanceof ApiError && e.code === 'FAILED_PRECONDITION') {
@@ -182,6 +186,9 @@ export function CommentForm({
         value={image}
         onChange={setImage}
         canUpload={signedIn && !unknownIdentity}
+        // 不明なときは「ログインが必要です」と断定しない
+        // (直上に「確認できませんでした」と出ている画面で矛盾する)。
+        uploadBlockedBy={unknownIdentity ? 'unknown' : 'anonymous'}
         disabled={sending}
       />
 

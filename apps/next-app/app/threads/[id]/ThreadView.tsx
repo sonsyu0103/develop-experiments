@@ -83,6 +83,15 @@ export function ThreadView({ threadId }: { threadId: number }) {
   const meResolved = meState.kind === 'ready' || meState.kind === 'anonymous';
   const meUnknown = meState.kind === 'error';
 
+  // **一度でも出したフォームは、二度と外しません。**
+  //
+  // reload は状態をいったん `loading` へ戻します。「決まるまで出さない」を
+  // そのまま当てると、**「もう一度確認する」を押した瞬間にフォームが外れ、
+  // 書きかけの本文が消えます** (検査で実測)。初回だけ待たせて、
+  // 以後は中身を差し替えるだけにします。
+  const formShown = useRef(false);
+  if (meResolved || meUnknown) formShown.current = true;
+
   const [threadState, setThreadState] = useState<ThreadState>({ kind: 'loading' });
   const [commentsState, setCommentsState] = useState<CommentsState>({ kind: 'loading' });
   const [comments, setComments] = useState<Comment[]>([]);
@@ -363,36 +372,48 @@ export function ThreadView({ threadId }: { threadId: number }) {
         書き始めた欄が消えるのは、操作を取り違えさせる形になります。
         コメントの読み取りは待たせないので、遅れるのはここだけです。
       */}
-      {meUnknown ? (
+      {meUnknown && (
         // **「確認しています」で固めない。** error は待っても変わりません。
         // 投稿そのものは Cookie があれば通るので、フォームは出したまま、
         // 匿名向けの案内 (名前欄・「あとから削除できません」) だけ伏せます。
-        <p className="notice" role="status">
-          ログイン状態を確認できませんでした。
-          <button type="button" className="link-button" onClick={reloadMe}>
+        <p className="alert alert--warn" role="status">
+          ログイン状態を確認できませんでした。{' '}
+          <button type="button" className="btn btn--quiet" onClick={reloadMe}>
             もう一度確認する
           </button>
         </p>
-      ) : !meResolved ? (
+      )}
+      {!formShown.current ? (
         <p className="muted" aria-live="polite">
           ログイン状態を確認しています...
         </p>
       ) : (
         <>
-          {!signedIn && (
+          {meResolved && !signedIn && (
             <p className="muted">
               ログインしなくても投稿できます。
               <a href={loginUrl()}>Google でログイン</a>
               すると、画像の添付と、自分の投稿の削除ができます。
             </p>
           )}
-          <CommentForm threadId={threadId} signedIn={signedIn} onPosted={onPosted} />
+          {/*
+            **フォームは 1 つだけ置きます** (レビュー指摘)。
+            不明時と確定時で別の要素にすると、React の位置ベースの照合で
+            **別物として作り直され、書きかけの本文が消えます** ——
+            「もう一度確認する」はこのすぐ上にあるので、長文を書いてから
+            押した利用者がちょうどそれを踏みます。
+            上のコメントが避けている事象そのものになります。
+          */}
+          <CommentForm
+            threadId={threadId}
+            signedIn={signedIn}
+            onPosted={onPosted}
+            // 再確認の最中 (loading) も「分からない」と同じ扱いにします ——
+            // 匿名向けの案内を一瞬出して引っ込めるより、伏せたままのほうが
+            // 入れ替わりが起きません。
+            unknownIdentity={!meResolved}
+          />
         </>
-      )}
-      {meUnknown && (
-        // 状態が分からないので **signedIn を渡しません** ——
-        // 名前欄も画像欄も出さず、本文だけで投稿できる形にします。
-        <CommentForm threadId={threadId} signedIn onPosted={onPosted} unknownIdentity />
       )}
 
       <div className="section-head">

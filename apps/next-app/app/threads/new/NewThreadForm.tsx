@@ -28,7 +28,7 @@ type Phase = { kind: 'editing' } | { kind: 'sending' } | { kind: 'error'; messag
 export function NewThreadForm() {
   const router = useRouter();
   const titleId = useId();
-  const { state: meState } = useMe();
+  const { state: meState, reload: reloadMe } = useMe();
   const signedIn = meState.kind === 'ready';
   // **決まるまでは「できない」と言い切らない** (レビュー指摘)。
   // GET /me の往復中は必ず signedIn === false なので、ログイン中の利用者にも
@@ -39,6 +39,11 @@ export function NewThreadForm() {
   // `error` も同じ扱いにします。401 以外を未ログイン扱いにしないのが
   // me.ts の設計なので (ADR 0013 決定 3)、error は「分からない」になります。
   const meResolved = meState.kind === 'ready' || meState.kind === 'anonymous';
+  // **`error` は「確認しています」で固めない** (レビュー指摘)。
+  // 待っても変わらないうえ、この画面にはログインの導線がここにしか無い ——
+  // meResolved で隠すと、/me が落ちている間**ログインできなくなる**
+  // (直す前は少なくともボタンは出ていたので、純粋な後退だった)。
+  const meUnknown = meState.kind === 'error';
 
   const [title, setTitle] = useState('');
   const [icon, setIcon] = useState<Image | null>(null);
@@ -96,8 +101,8 @@ export function NewThreadForm() {
         value={icon}
         onChange={setIcon}
         canUpload={signedIn}
-        // 決まるまでは案内を出さない (上の meResolved のコメント)。
-        uploadHintSuppressed={!meResolved}
+        // 決まるまでは「ログインが必要」と言い切らない (上のコメント)。
+        uploadBlockedBy={meUnknown ? 'unknown' : meResolved ? 'anonymous' : 'checking'}
         disabled={sending}
       />
 
@@ -110,12 +115,21 @@ export function NewThreadForm() {
         >
           {sending ? '作成しています...' : 'スレッドを立てる'}
         </button>
-        {meResolved && !signedIn && (
+        {(meResolved || meUnknown) && !signedIn && (
           <a href={loginUrl()} className="btn btn--quiet">
             Google でログインする
           </a>
         )}
       </div>
+
+      {meUnknown && (
+        <p className="alert alert--warn" role="status">
+          ログイン状態を確認できませんでした。{' '}
+          <button type="button" className="btn btn--quiet" onClick={reloadMe}>
+            もう一度確認する
+          </button>
+        </p>
+      )}
 
       {phase.kind === 'error' && (
         <p className="alert alert--error" role="alert">

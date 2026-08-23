@@ -50,14 +50,22 @@ type Props = {
    */
   canUpload: boolean;
   /**
-   * ログイン状態が**まだ決まっていない**ときに立てます。
+   * `canUpload` が false のときに出す理由です。
    *
-   * 「ログインが必要です」と言い切らず、確認中であることを出すためのものです。
+   * **「ログインが必要です」と言い切れるのは、決まったときだけ**になります。
    * 決まる前に言い切ると、ログイン中の利用者にも一瞬「使えません」と出て、
    * 応答が返った瞬間に入れ替わります (レビュー指摘)。
+   * 分からないまま固まる状態と、確認中とも区別します ——
+   * 前者は待っても変わらないので、そう書かないと待たせ続けることになります。
    */
-  uploadHintSuppressed?: boolean;
+  uploadBlockedBy?: 'anonymous' | 'checking' | 'unknown';
   disabled?: boolean;
+};
+
+const uploadBlockedText: Record<'anonymous' | 'checking' | 'unknown', string> = {
+  anonymous: '画像を使うにはログインが必要です。',
+  checking: 'ログイン状態を確認しています...',
+  unknown: 'ログイン状態が分からないため、画像は使えません。',
 };
 
 export function ImageField({
@@ -67,7 +75,7 @@ export function ImageField({
   value,
   onChange,
   canUpload,
-  uploadHintSuppressed = false,
+  uploadBlockedBy = 'anonymous',
   disabled,
 }: Props) {
   const inputId = useId();
@@ -118,9 +126,7 @@ export function ImageField({
       <div className="field">
         <span className="field__label">{label}</span>
         <p className="muted">
-          {uploadHintSuppressed
-            ? 'ログイン状態を確認しています...'
-            : '画像を使うにはログインが必要です。'}
+          {uploadBlockedText[uploadBlockedBy]}
         </p>
         {hint !== undefined && <span className="field__hint">{hint}</span>}
       </div>

@@ -96,7 +96,11 @@ async function getThreads(query: Query): Promise<FetchResult> {
   // keep-alive のプールへ戻りません (undici)。`?q=` に 201 文字を貼るだけで
   // 400 になる経路 —— つまり**利用者が URL に直接書ける経路**なので、
   // 繰り返されると Next から Go への接続が毎回使い捨てになります。
-  await res.body?.cancel();
+  // **失敗しても無視します。** 切断や途中終了でストリームが既にエラーだと
+  // cancel() は reject します。ここで素通しすると 400 のフォールバックへ
+  // 到達せず例外になり、**掲示板が丸ごと表示できなくなる** ——
+  // それを避けるためにこの関数があります (レビュー指摘)。
+  await res.body?.cancel().catch(() => {});
 
   if (res.status === 400 && (query.q !== '' || query.cursor !== '')) {
     // **並び順も一緒に落とす。** 原因が検索語とは限らない ——
@@ -107,7 +111,7 @@ async function getThreads(query: Query): Promise<FetchResult> {
     if (retry.ok) {
       return { list: (await retry.json()) as ThreadList, rejected: true, effective: fallback };
     }
-    await retry.body?.cancel();
+    await retry.body?.cancel().catch(() => {});
     throw new Error(`Failed to fetch threads: ${retry.status} ${retry.statusText}`);
   }
 
