@@ -17,8 +17,12 @@ import (
 // multipartMemoryLimit はマルチパートの解析でメモリに置く上限です。
 //
 // これを超えた分は一時ファイルへ退避されます。**受け入れる上限とは別物**で、
-// サイズの拒否は下の maxUploadRequestBytes と、ドメイン側の
-// model.MaxUploadBytes が行います。
+// サイズの拒否は middleware.go の maxImageUploadBytes
+// (5 MiB + 64 KiB。multipart の包みぶんを足した要求全体の上限) と、
+// ドメイン側の model.MaxUploadBytes (5 MiB。画像そのもの) が行います。
+//
+// **maxUploadRequestBytes という名前は存在しません。** ここにそう書いてあった
+// —— 上限を追ってきた人が何も見つけられない状態だった (レビュー指摘)。
 const multipartMemoryLimit = 1 << 20 // 1 MiB
 
 // UploadImage は POST /images を処理します。

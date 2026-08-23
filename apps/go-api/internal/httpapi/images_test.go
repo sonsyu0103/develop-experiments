@@ -524,10 +524,10 @@ func TestUploadImage_QueryCannotOverrideKind(t *testing.T) {
 			// RawQuery を書き換えても RequestURI 側に載らず、届かない。
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost,
 				"/images"+tt.query, bytes.NewReader(body))
+			// **Header.Clone() が Cookie ヘッダごと運ぶ。**
+			// ここで AddCookie を回すと同じ Cookie が 2 つ載り、
+			// 実在のクライアントが送らない形になる (レビュー指摘)。
 			req.Header = base.Header.Clone()
-			for _, c := range base.Cookies() {
-				req.AddCookie(c)
-			}
 
 			rec := env.do(req)
 			if rec.Code != http.StatusCreated {
@@ -565,8 +565,18 @@ func TestUploadImage_MalformedMultipartIs400(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
 	}
-	if code := decodeError(t, rec).Error.Code; code != oapigen.INVALIDARGUMENT {
-		t.Errorf("code = %q, want INVALID_ARGUMENT", code)
+	body := decodeError(t, rec).Error
+	if body.Code != oapigen.INVALIDARGUMENT {
+		t.Errorf("code = %q, want INVALID_ARGUMENT", body.Code)
+	}
+	// **文言まで見る。** ステータスとコードだけだと、ハンドラ側の
+	// respondBadRequest ("multipart/form-data として解釈できません") でも
+	// 同じ 400 + INVALID_ARGUMENT になり、**どちらの経路を通ったか区別できない。**
+	// 消した 413 の処理が必要になる形 (検証層より前で本文を読む配置に戻す、
+	// ExcludeRequestBody を立てる) へ変えても、この検査は緑のままになる。
+	if !strings.HasPrefix(body.Message, "request body has an error") {
+		t.Errorf("message = %q, want 仕様検証側の文言 (ハンドラ側の枝を通っている)",
+			body.Message)
 	}
 }
 
