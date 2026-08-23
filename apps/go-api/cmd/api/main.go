@@ -111,6 +111,20 @@ func run() error {
 		slog.Warn("trusted_proxies_unset")
 	}
 
+	// **許可オリジンが空になったことも知らせる。**
+	//
+	// 空にできる形にしたぶん (config.csvEnv)、打ち間違いでも空になる。
+	// フロントと API を別オリジンで動かす構成では、**CORS も csrfGuard も
+	// 全滅**して書き込みが 403 の山になる —— ADR 0013 の 5 が
+	// 「設定漏れが全書き込み停止に化けた」と記録しているのと同じ形。
+	// 同一オリジン構成なら csrfGuard が自分自身を許すので生き残る。
+	//
+	// 「静かに無効化された」状態には必ずログを立てる、の並びに揃える
+	// (login_disabled / trusted_proxies_unset / contact_mail_disabled)。
+	if len(cfg.AllowedOrigins) == 0 && !cfg.Debug {
+		slog.Warn("cors_allowed_origins_empty")
+	}
+
 	// 画像はストレージの設定が揃っているときだけ有効にする。
 	//
 	// 認証と同じ形 (ADR 0005 決定 4)。揃っていなくても API は起動し、

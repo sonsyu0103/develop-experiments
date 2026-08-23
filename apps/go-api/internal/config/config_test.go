@@ -510,3 +510,135 @@ func TestLoad_PoolOverride(t *testing.T) {
 		t.Errorf("MaxConns = %d, want 32 (DB_MAX_CONNS が効いていない)", cfg.MaxConns)
 	}
 }
+
+// 閲覧数の集計モード (docs/adr/0006-view-count-and-popularity.md)。
+//
+// **COMMENT_POST_MODE と同じ形なのに、検査が 1 本も無かった** (レビュー指摘)。
+// sync は Phase 4 の比較専用で、本番相当で選ぶと
+// **閲覧というまったく無関係な操作がコメント投稿の直列化失敗率を押し上げます。**
+// それを止めているのがこの検査になります。
+func TestLoad_ViewCountMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     string
+		devMode bool
+		want    ViewCountMode
+		wantErr bool
+	}{
+		{name: "未設定なら buffered", env: "", want: ViewCountModeBuffered},
+		{name: "buffered", env: "buffered", want: ViewCountModeBuffered},
+		{name: "大文字と空白を許す", env: "  BUFFERED ", want: ViewCountModeBuffered},
+
+		{name: "sync は開発モードでのみ選べる", env: "sync", devMode: true, want: ViewCountModeSync},
+		{name: "sync は本番相当だと起動しない", env: "sync", wantErr: true},
+
+		// **未知の値を既定へ落とさない** (COMMENT_POST_MODE と同じ理由)。
+		{name: "未知の値は起動時に落とす", env: "async", wantErr: true},
+		{name: "空白だけも落とす", env: "   ", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://app:password@localhost:5432/bbs")
+			t.Setenv("VIEW_COUNT_MODE", tt.env)
+			if tt.devMode {
+				t.Setenv("ENV", "development")
+			} else {
+				t.Setenv("ENV", "")
+			}
+
+			cfg, err := Load()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("VIEW_COUNT_MODE=%q で Load が成功した (mode=%q)", tt.env, cfg.ViewCount.Mode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load が失敗した: %v", err)
+			}
+			if cfg.ViewCount.Mode != tt.want {
+				t.Errorf("ViewCount.Mode = %q, want %q", cfg.ViewCount.Mode, tt.want)
+			}
+		})
+	}
+}
+
+// **数値の設定は、下限と上限の両方で落ちること。**
+//
+// 上限が無かったころは、秒数を time.Duration に掛ける側で int64 があふれた。
+// SHUTDOWN_TIMEOUT_SECONDS=10000000000 は下限 (0 以上) を通り、
+// `time.Duration(v) * time.Second` が**負に折り返して**
+// context.WithTimeout が最初から期限切れになる ——
+// **長い猶予を設定した運用者に、猶予ゼロが返る。**
+//
+// MAIL_SMTP_PORT=0 も同じ形。検証は通るのに Enabled() が false になり、
+// **メール経路だけが静かに止まる** (contact の行は溜まり続ける)。
+func TestLoad_NumericBounds(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		value   string
+		wantErr bool
+	}{
+		{name: "猶予の上限を超える", key: "SHUTDOWN_TIMEOUT_SECONDS", value: "10000000000", wantErr: true},
+		{name: "猶予の上限ちょうどは通る", key: "SHUTDOWN_TIMEOUT_SECONDS", value: "3600"},
+		{name: "SMTP ポートに 0 は使えない", key: "MAIL_SMTP_PORT", value: "0", wantErr: true},
+		{name: "SMTP ポートの範囲外", key: "MAIL_SMTP_PORT", value: "70000", wantErr: true},
+		{name: "SMTP ポートの上限ちょうどは通る", key: "MAIL_SMTP_PORT", value: "65535"},
+		{name: "フラッシュ間隔の上限を超える", key: "VIEW_COUNT_FLUSH_SECONDS", value: "100000", wantErr: true},
+		{name: "IP の保持日数の上限を超える", key: "CONTACT_IP_RETENTION_DAYS", value: "100000", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://app:password@localhost:5432/bbs")
+			t.Setenv(tt.key, tt.value)
+
+			_, err := Load()
+			if tt.wantErr && err == nil {
+				t.Fatalf("%s=%s で Load が成功した", tt.key, tt.value)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("%s=%s で Load が失敗した: %v", tt.key, tt.value, err)
+			}
+		})
+	}
+}
+
+// **ENV の前後の空白を落とすこと。**
+//
+// このファイルの他の値はすべて TrimSpace している (".env から貼り付けたときの
+// 末尾空白" が理由) のに、ENV だけ抜けていた。`ENV=development ` だと
+// debug=false になり、**SecureCookie が true になってブラウザが
+// http://localhost の Cookie を捨てる** —— サーバ側にはエラーが出ない。
+func TestLoad_EnvIsTrimmed(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://app:password@localhost:5432/bbs")
+	t.Setenv("ENV", "development ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load が失敗した: %v", err)
+	}
+	if !cfg.Debug {
+		t.Error("末尾の空白で開発モードにならなかった (SecureCookie が本番扱いになる)")
+	}
+}
+
+// **設定されているのに空、を既定へ戻さないこと。**
+//
+// `CORS_ALLOWED_ORIGINS=","` は「クロスオリジンを許さない」の自然な書き方。
+// 既定へ落とすと、**本番で開発用の localhost:3000 が復活する**うえ、
+// 設定した値が捨てられたことはどこにも出ない。
+func TestLoad_EmptyAllowedOriginsStayEmpty(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://app:password@localhost:5432/bbs")
+	t.Setenv("CORS_ALLOWED_ORIGINS", " , ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load が失敗した: %v", err)
+	}
+	if len(cfg.AllowedOrigins) != 0 {
+		t.Errorf("AllowedOrigins = %v, want 空 (既定が復活している)", cfg.AllowedOrigins)
+	}
+}

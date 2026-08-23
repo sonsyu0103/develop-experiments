@@ -160,6 +160,18 @@ func (s *Scheduler) run(ctx context.Context, job Job) {
 			slog.Int64("elapsed_ms", time.Since(start).Milliseconds()),
 		)
 
+		// **タイマーを張り直すのは Run のあと。**
+		//
+		// 前に置くと、Run が Interval より長引いたときに走行中へ発火し、
+		// 次の select で ctx.Done() と timer.C が**どちらも準備完了**になる。
+		// select はランダムに選ぶので、**停止のおよそ半分で、死んだ ctx の
+		// まま新しい 1 周が始まる** —— DB 呼び出しは全部失敗し、
+		// その無駄な 1 周ぶん Wait がシャットダウンの猶予を食う。
+		// (レビューは「実行前に ctx を見直していない」と指摘したが、実際は
+		//  この順序で防げている。順序が効いていることは変異で実測した ——
+		//  **Reset を Run の前へ「移動」すると検査は 5/5 で落ちる。**
+		//  「前へ足す」変異は末尾の Reset に打ち消されて通るだけなので、
+		//  そちらで確かめると「効かない検査」だと誤読する。)
 		timer.Reset(job.Interval)
 	}
 }

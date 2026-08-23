@@ -51,6 +51,18 @@ func New(key, endpoint string, fields ...string) (*Request, error) {
 	if key == "" {
 		return nil, fmt.Errorf("Idempotency-Key が空です: %w", apperr.ErrInvalidArgument)
 	}
+	// **UTF-8 として妥当なことも見ます。**
+	//
+	// net/http はヘッダ値の 0x80〜0xFF を通し、仕様書の IdempotencyKey には
+	// pattern がありません (oapi-codegen もヘッダの文字列制約は強制しない)。
+	// このまま TEXT へ入れると Postgres が SQLSTATE 22021 で弾きます ——
+	// translateError が 400 に翻訳するので 500 にはなりませんが、
+	// **DB まで往復してから同じ答えを返す**ことになります。
+	// ここは「DB の CHECK 制約に到達させない」ための層なので、手前で落とします。
+	if !utf8.ValidString(key) {
+		return nil, fmt.Errorf(
+			"Idempotency-Key に使えない文字が含まれています: %w", apperr.ErrInvalidArgument)
+	}
 	// 仕様書側でも maxLength を宣言していますが、
 	// ヘッダの検証が将来外れても DB の CHECK 制約に到達しないよう、ここでも見ます。
 	if n := utf8.RuneCountInString(key); n > MaxKeyLength {
