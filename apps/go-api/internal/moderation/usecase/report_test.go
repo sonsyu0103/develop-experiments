@@ -25,6 +25,11 @@ type fakeReports struct {
 	aliveTh  map[int64]bool
 	aliveCmt map[[2]int64]bool
 	listErr  error
+	// rows は List が返せる行数です (要求された件数で頭打ちになります)。
+	rows int
+	// gotSize は List に渡された Size です。
+	// **1 件多く取っているか**を外から確かめるために持ちます。
+	gotSize int32
 }
 
 func newFakeReports() *fakeReports {
@@ -40,9 +45,21 @@ func (f *fakeReports) Create(_ context.Context, r *model.Report) (*model.Report,
 }
 
 func (f *fakeReports) List(
-	context.Context, model.ReportStatus, pagination.Page,
+	_ context.Context, _ model.ReportStatus, page pagination.Page,
 ) ([]model.Report, error) {
-	return nil, f.listErr
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	// **並び順は真似しません** (上のコメントのとおり SQL の担当)。
+	// ここで再現するのは「要求された件数だけ返す」ことだけ ——
+	// 1 件多く取って「次がある」を判定する側の算術を検査するためです。
+	f.gotSize = page.Size
+	n := min(int(page.Size), f.rows)
+	out := make([]model.Report, 0, n)
+	for i := range n {
+		out = append(out, model.Report{ID: int64(i + 1), Status: model.ReportOpen})
+	}
+	return out, nil
 }
 
 func (f *fakeReports) Resolve(
@@ -243,5 +260,69 @@ func TestMaxNoteLength_AgreesAcrossSources(t *testing.T) {
 	}
 	if got, _ := strconv.Atoi(block[1]); got != maxNoteLength {
 		t.Errorf("仕様書の maxLength = %d, Go = %d", got, maxNoteLength)
+	}
+}
+
+// **切り詰めと次カーソルの算術** (レビュー指摘: ここに検査が 1 本も無かった)。
+//
+// フェイクの List が常に nil を返していたため、
+// 「1 件多く取る」も「余ったら切る」も一度も動いていませんでした。
+// 並び順は SQL の担当なので実 DB の検査に任せますが、
+// **件数の勘定はユースケース側の算術**なので、ここで固定します。
+func TestListQueue_TruncatesAndSetsCursor(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		size     int32
+		rows     int
+		wantLen  int
+		wantNext bool
+	}{
+		{name: "ちょうど埋まる (次は無い)", size: 3, rows: 3, wantLen: 3, wantNext: false},
+		{name: "余りがある (次がある)", size: 3, rows: 10, wantLen: 3, wantNext: true},
+		{name: "足りない", size: 3, rows: 1, wantLen: 1, wantNext: false},
+		{name: "1 件も無い", size: 3, rows: 0, wantLen: 0, wantNext: false},
+		// **Size が 0 以下でも panic しないこと。**
+		// pagination.NewPage が丸めるので HTTP からは来ないが、
+		// ユースケースを直接呼ぶ経路が増えると limit = 0 になり、
+		// reports[len(reports)-1] が空スライスへの添字になる。
+		{name: "Size が 0 なら既定値へ丸める", size: 0, rows: 200, wantLen: int(pagination.DefaultSize), wantNext: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			reports := newFakeReports()
+			reports.rows = tt.rows
+			interactor := NewReportInteractor(reports, reports)
+
+			got, err := interactor.ListQueue(t.Context(),
+				model.Actor{UserID: 1, CanModerate: true},
+				model.ReportOpen,
+				pagination.Page{Size: tt.size},
+			)
+			if err != nil {
+				t.Fatalf("ListQueue がエラーになった: %v", err)
+			}
+
+			if len(got.Reports) != tt.wantLen {
+				t.Errorf("件数 = %d, want %d", len(got.Reports), tt.wantLen)
+			}
+			if (got.NextCursor != nil) != tt.wantNext {
+				t.Errorf("NextCursor = %v, want ある: %v", got.NextCursor, tt.wantNext)
+			}
+			// **1 件多く取っていること。** ここが 1 のままだと
+			// 「次がある」の判定が常に偽になり、2 ページ目が出ない。
+			want := tt.size
+			if want < 1 {
+				want = pagination.DefaultSize
+			}
+			if reports.gotSize != want+1 {
+				t.Errorf("List に渡した Size = %d, want %d (1 件多く取っていない)",
+					reports.gotSize, want+1)
+			}
+		})
 	}
 }

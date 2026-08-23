@@ -75,6 +75,32 @@ func TestChangeRole_RejectsSelf(t *testing.T) {
 	}
 }
 
+// **操作者の ID を埋め忘れたら落ちること** (レビュー指摘)。
+//
+// ActorPublicID は Actor と別のフィールドなので、呼び出し側が忘れても
+// 型では気づけません。忘れると「対象は自分か」の比較が**常に偽**になり、
+// admin が 2 人以上いれば ensureAdminRemains も通るので、
+// **自分を降格できてしまいます** —— 決定 1 が禁じている状態そのもの。
+// 静かに素通りするより、ここで落とすほうが安全側になります。
+func TestChangeRole_RejectsZeroActorID(t *testing.T) {
+	t.Parallel()
+
+	cmd := changeCmd(admin())
+	cmd.ActorPublicID = uuid.Nil
+	// **対象は自分の公開 ID にする。** 埋め忘れを素通しすると、
+	// この組み合わせが「自分ではない」と判定されて通ってしまう。
+	cmd.TargetPublicID = actorPublic
+
+	repo := &fakeRepo{}
+	_, err := NewInteractor(repo).ChangeRole(context.Background(), cmd)
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Fatalf("err = %v, want ErrInvalidArgument", err)
+	}
+	if repo.changedTo != nil {
+		t.Error("操作者 ID が空のままロールが変わっている")
+	}
+}
+
 // **変更と記録が揃うこと** (決定 1 / 決定 3)。
 func TestChangeRole_ChangesAndRecords(t *testing.T) {
 	t.Parallel()
