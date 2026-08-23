@@ -148,6 +148,24 @@ test('スレッド ID の無いコメント通報を、読み込み中のまま�
 
   await expect(page.getByText('対象のスレッドが記録されていません')).toBeVisible();
   await expect(page.getByText('対象のスレッドを取得しています...')).toHaveCount(0);
+
+  // **削除も送らせないこと** (レビュー指摘)。
+  //
+  // この fixture は onDelete の早期 return を叩ける唯一の材料なのに、
+  // 表示しか見ていませんでした。分岐を消すと
+  // `{action:'delete_comment', targetId:'500'}` が **threadId 抜きで飛ぶ** ——
+  // このファイルが「絶対にやってはいけない」と書いている形です
+  // (パーティションを絞れず、何を消したかの記録も壊れる)。
+  let posted = false;
+  await page.route('**/moderation/actions', (route) => {
+    posted = true;
+    return ok(route, { id: 1, action: 'delete_comment', targetType: 'comment' });
+  });
+
+  await page.getByRole('button', { name: '対象を削除' }).click();
+
+  await expect(page.getByText('スレッド ID が無いため削除できません')).toBeVisible();
+  expect(posted).toBe(false);
 });
 
 test('対象スレッドが 404 なら「既に削除されています」と出す', async ({ page }) => {

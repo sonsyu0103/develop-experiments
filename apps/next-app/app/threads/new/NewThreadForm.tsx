@@ -29,6 +29,23 @@ export function NewThreadForm() {
   const router = useRouter();
   const titleId = useId();
   const { state: meState, reload: reloadMe } = useMe();
+
+  // **再確認の最中に、出していたものを引っ込めません** (レビュー指摘)。
+  //
+  // reload は同期で `loading` に戻すので、素直に書くと押した瞬間に
+  // **ログイン導線・警告・再確認ボタンが 3 つとも消えます** (実測)。
+  // この画面のログイン入口はここにしか無いので、応答が遅いほど
+  // 「押したら何も無くなった」状態が伸びます。
+  // ThreadView の formShown と同じ考え方で、直前に分かっていた状態を使います。
+  //
+  // **押した事実だけを持ちます。** レンダー中に ref を読む形は
+  // react-hooks/refs が、効果の中の同期 setState は
+  // react-hooks/set-state-in-effect が禁じています (両方で lint が落ちた)。
+  // 直前の状態を持ち回らなくても、「再確認を押したあとの loading」は
+  // イベントハンドラで立てた印だけで分かります。
+  const [recheckRequested, setRecheckRequested] = useState(false);
+  const rechecking = recheckRequested && meState.kind === 'loading';
+
   const signedIn = meState.kind === 'ready';
   // **決まるまでは「できない」と言い切らない** (レビュー指摘)。
   // GET /me の往復中は必ず signedIn === false なので、ログイン中の利用者にも
@@ -43,7 +60,9 @@ export function NewThreadForm() {
   // 待っても変わらないうえ、この画面にはログインの導線がここにしか無い ——
   // meResolved で隠すと、/me が落ちている間**ログインできなくなる**
   // (直す前は少なくともボタンは出ていたので、純粋な後退だった)。
-  const meUnknown = meState.kind === 'error';
+  // 再取得の最中も「分からない」のまま扱います —— 押した瞬間に
+  // ログイン導線や警告が消えないようにするため。
+  const meUnknown = meState.kind === 'error' || rechecking;
 
   const [title, setTitle] = useState('');
   const [icon, setIcon] = useState<Image | null>(null);
@@ -100,6 +119,8 @@ export function NewThreadForm() {
         hint="小さい正方形として保存されます。JPEG / PNG / WebP、5 MiB まで。"
         value={icon}
         onChange={setIcon}
+        // 再確認の最中も、直前にログイン中だったなら使えるままにします ——
+        // 1 秒の再取得のために書きかけの選択を落とす理由がありません。
         canUpload={signedIn}
         // 決まるまでは「ログインが必要」と言い切らない (上のコメント)。
         uploadBlockedBy={meUnknown ? 'unknown' : meResolved ? 'anonymous' : 'checking'}
@@ -125,7 +146,17 @@ export function NewThreadForm() {
       {meUnknown && (
         <p className="alert alert--warn" role="status">
           ログイン状態を確認できませんでした。{' '}
-          <button type="button" className="btn btn--quiet" onClick={reloadMe}>
+          <button
+            type="button"
+            className="btn btn--quiet"
+            // 再取得の最中は押せないようにします (二重に走らせない)。
+            // **消しはしません** —— 消すと「押したら無くなった」になります。
+            disabled={rechecking}
+            onClick={() => {
+              setRecheckRequested(true);
+              reloadMe();
+            }}
+          >
             もう一度確認する
           </button>
         </p>
