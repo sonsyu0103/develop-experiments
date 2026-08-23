@@ -49,10 +49,35 @@ type Props = {
    * 追跡不能な形で可能になるため。ADR 0007)。
    */
   canUpload: boolean;
+  /**
+   * `canUpload` が false のときに出す理由です。
+   *
+   * **「ログインが必要です」と言い切れるのは、決まったときだけ**になります。
+   * 決まる前に言い切ると、ログイン中の利用者にも一瞬「使えません」と出て、
+   * 応答が返った瞬間に入れ替わります (レビュー指摘)。
+   * 分からないまま固まる状態と、確認中とも区別します ——
+   * 前者は待っても変わらないので、そう書かないと待たせ続けることになります。
+   */
+  uploadBlockedBy?: 'anonymous' | 'checking' | 'unknown';
   disabled?: boolean;
 };
 
-export function ImageField({ kind, label, hint, value, onChange, canUpload, disabled }: Props) {
+const uploadBlockedText: Record<'anonymous' | 'checking' | 'unknown', string> = {
+  anonymous: '画像を使うにはログインが必要です。',
+  checking: 'ログイン状態を確認しています...',
+  unknown: 'ログイン状態が分からないため、画像は使えません。',
+};
+
+export function ImageField({
+  kind,
+  label,
+  hint,
+  value,
+  onChange,
+  canUpload,
+  uploadBlockedBy = 'anonymous',
+  disabled,
+}: Props) {
   const inputId = useId();
   const statusId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -100,7 +125,9 @@ export function ImageField({ kind, label, hint, value, onChange, canUpload, disa
     return (
       <div className="field">
         <span className="field__label">{label}</span>
-        <p className="muted">画像を使うにはログインが必要です。</p>
+        <p className="muted">
+          {uploadBlockedText[uploadBlockedBy]}
+        </p>
         {hint !== undefined && <span className="field__hint">{hint}</span>}
       </div>
     );

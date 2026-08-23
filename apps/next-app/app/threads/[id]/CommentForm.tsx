@@ -56,10 +56,20 @@ export function CommentForm({
   threadId,
   signedIn,
   onPosted,
+  unknownIdentity = false,
 }: {
   threadId: number;
   signedIn: boolean;
   onPosted: (comment: Comment) => void;
+  /**
+   * ログイン状態が**分からない**とき (GET /me が 401 以外で失敗) に立てます。
+   *
+   * 匿名向けの案内 (名前欄と「あとから削除できません」) を伏せるためのものです。
+   * ログイン中なのに名前欄を出すと、書いた名前はサーバが捨てて
+   * **実名の表示名で公開される** —— 利用者から見れば名前を無視された形になります。
+   * 画像の添付だけは、権限が分からないので出しません。
+   */
+  unknownIdentity?: boolean;
 }) {
   const bodyId = useId();
   const nameId = useId();
@@ -101,7 +111,11 @@ export function CommentForm({
       setPhase({ kind: 'editing' });
       onPosted(posted);
     } catch (e) {
-      setPhase({ kind: 'error', message: describePostError(e, signedIn) });
+      // **不明なときは匿名側 (安全側) の文言を出します** (レビュー指摘)。
+      // ログイン中だと決めつけると、409 で「二重には投稿されません」と
+      // 案内することになりますが、**冪等キーは未ログインでは無視される**ので
+      // (ADR 0015 決定 4)、その案内どおり押し直すと 2 件目ができます。
+      setPhase({ kind: 'error', message: describePostError(e, signedIn && !unknownIdentity) });
       // **422 のときだけキーを捨てます。** 前回と内容が食い違ったという
       // 申告なので、同じキーのままでは何度送っても 422 のままになります。
       if (e instanceof ApiError && e.code === 'FAILED_PRECONDITION') {
@@ -139,7 +153,7 @@ export function CommentForm({
         </span>
       </div>
 
-      {!signedIn && (
+      {!signedIn && !unknownIdentity && (
         <div className="field">
           <label className="field__label" htmlFor={nameId}>
             名前 (任意)
@@ -171,7 +185,10 @@ export function CommentForm({
         hint="JPEG / PNG / WebP、5 MiB まで。保存時に再エンコードされます (位置情報は残りません)。"
         value={image}
         onChange={setImage}
-        canUpload={signedIn}
+        canUpload={signedIn && !unknownIdentity}
+        // 不明なときは「ログインが必要です」と断定しない
+        // (直上に「確認できませんでした」と出ている画面で矛盾する)。
+        uploadBlockedBy={unknownIdentity ? 'unknown' : 'anonymous'}
         disabled={sending}
       />
 
@@ -184,7 +201,14 @@ export function CommentForm({
         >
           {sending ? '投稿しています...' : '投稿する'}
         </button>
-        {signedIn && <span className="muted">ログイン中の表示名で投稿されます。</span>}
+        {signedIn && !unknownIdentity && (
+          <span className="muted">ログイン中の表示名で投稿されます。</span>
+        )}
+        {unknownIdentity && (
+          <span className="muted">
+            ログイン中ならその表示名で、そうでなければ「名無しさん」で投稿されます。
+          </span>
+        )}
       </div>
 
       {phase.kind === 'error' && (

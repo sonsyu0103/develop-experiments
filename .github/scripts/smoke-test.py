@@ -1533,21 +1533,38 @@ if SQL_EXEC:
             #
             # 述語は db/query/images.sql の ListReclaimableImages の写し。
             # 本体を直したらここも直すこと。
+            #
+            # **「回収済み」も合格にする。** 回収バッチは API プロセスの中で
+            # 10 分間隔 + 初回ジッタで回っており (cmd/api/main.go の
+            # image_reclaim)、削除と この SELECT のあいだに走ると
+            # object_reclaimed_at が入って NOT_RECLAIMABLE になる。
+            # **回収されたこと自体が「対象に入った」証拠**なので、
+            # そちらも通す —— でないと確率で CI が赤くなる (実測: 233 件中
+            # この 1 件だけが落ち、直前の develop では通っていた)。
             out = scalar(f"""
-                SELECT CASE WHEN EXISTS (
-                    SELECT 1 FROM images
-                    WHERE id = '{image_id}'::uuid
-                      AND object_reclaimed_at IS NULL
-                      AND (attached_at IS NULL OR status = 'deleted')
-                      AND (status = 'deleted' OR (
-                        created_at < now() - interval '1 hour'
-                        AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
-                        AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id)
-                        AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.icon_image_id = images.id)))
-                ) THEN 'RECLAIMABLE' ELSE 'NOT_RECLAIMABLE' END;
+                SELECT CASE
+                    WHEN NOT EXISTS (SELECT 1 FROM images WHERE id = '{image_id}'::uuid)
+                        THEN 'MISSING'
+                    WHEN EXISTS (
+                        SELECT 1 FROM images
+                        WHERE id = '{image_id}'::uuid
+                          AND object_reclaimed_at IS NOT NULL
+                    ) THEN 'RECLAIMED'
+                    WHEN EXISTS (
+                        SELECT 1 FROM images
+                        WHERE id = '{image_id}'::uuid
+                          AND object_reclaimed_at IS NULL
+                          AND (attached_at IS NULL OR status = 'deleted')
+                          AND (status = 'deleted' OR (
+                            created_at < now() - interval '1 hour'
+                            AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.image_id = images.id)
+                            AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_image_id = images.id)
+                            AND NOT EXISTS (SELECT 1 FROM threads t WHERE t.icon_image_id = images.id)))
+                    ) THEN 'RECLAIMABLE' ELSE 'NOT_RECLAIMABLE' END;
             """)
             check("削除した画像が即座に回収対象になる (猶予を待たない)",
-                  "NOT_RECLAIMABLE" not in out and "RECLAIMABLE" in out,
+                  "NOT_RECLAIMABLE" not in out and "MISSING" not in out
+                  and ("RECLAIMABLE" in out or "RECLAIMED" in out),
                   f"got={out.strip()!r}")
 
             # **DB 行は残る** (ADR 0016 問題 3)。
