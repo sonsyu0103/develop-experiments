@@ -36,6 +36,11 @@ export function MyProfile() {
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // **ログアウトの失敗は別に持ちます** (レビュー指摘)。
+  // アバターと同じ state に入れると、**画面下の「プロフィール画像」カードの中**に
+  // ログアウトの失敗が出ます。ボタンの周りには成功も失敗も出ないので、
+  // 共有端末で「押したから切れた」と読まれる余地が残ります。
+  const [logoutError, setLogoutError] = useState<string | null>(null);
 
   /**
    * アバターを差し替えます。
@@ -67,7 +72,7 @@ export function MyProfile() {
 
   async function onLogout() {
     setSaving(true);
-    setError(null);
+    setLogoutError(null);
     try {
       await logout();
       // **控えを必ず捨てます。** Cookie は消えているのに画面だけ
@@ -78,7 +83,7 @@ export function MyProfile() {
       // Server Component 側の出力も引き直します。
       router.refresh();
     } catch (e) {
-      setError(describeWriteError(e));
+      setLogoutError(describeWriteError(e));
     } finally {
       setSaving(false);
     }
@@ -164,6 +169,11 @@ export function MyProfile() {
             ログアウト
           </button>
         </div>
+        {logoutError !== null && (
+          <p className="alert alert--error" role="alert">
+            {logoutError}
+          </p>
+        )}
         <p className="field__hint">
           セッションの実体はサーバ側にあるので、ログアウトは即座に効きます。
         </p>

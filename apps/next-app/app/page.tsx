@@ -90,6 +90,14 @@ async function getThreads(query: Query): Promise<FetchResult> {
     return { list: (await res.json()) as ThreadList, rejected: false, effective: query };
   }
 
+  // **失敗した応答の本文を捨てる** (レビュー指摘)。
+  //
+  // 読まずに放置した Response は、GC されるまでソケットを掴んだままになり、
+  // keep-alive のプールへ戻りません (undici)。`?q=` に 201 文字を貼るだけで
+  // 400 になる経路 —— つまり**利用者が URL に直接書ける経路**なので、
+  // 繰り返されると Next から Go への接続が毎回使い捨てになります。
+  await res.body?.cancel();
+
   if (res.status === 400 && (query.q !== '' || query.cursor !== '')) {
     // **並び順も一緒に落とす。** 原因が検索語とは限らない ——
     // 検索と人気順の同時指定も 400 になり、カーソルは並び順ごとに
@@ -99,6 +107,7 @@ async function getThreads(query: Query): Promise<FetchResult> {
     if (retry.ok) {
       return { list: (await retry.json()) as ThreadList, rejected: true, effective: fallback };
     }
+    await retry.body?.cancel();
     throw new Error(`Failed to fetch threads: ${retry.status} ${retry.statusText}`);
   }
 

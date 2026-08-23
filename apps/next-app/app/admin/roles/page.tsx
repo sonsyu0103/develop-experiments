@@ -30,7 +30,12 @@ function RoleForm({ me }: { me: Me }) {
 
   // **自分自身は対象にできません。** 手前で気づけるように、
   // 送る前に伝えます (サーバも 403 で弾きます)。
-  const isSelf = publicID.trim() === me.publicId;
+  //
+  // **大文字小文字を無視して比べます** (レビュー指摘)。UUID は 16 進なので
+  // 大文字で貼られる形があり、区別して比べると `isSelf` が false のまま
+  // 「変更する」が押せてしまいます —— サーバが 403 で止めるとはいえ、
+  // **この画面の役目 (送る前に気づかせる) が casing だけで消えます。**
+  const isSelf = publicID.trim().toLowerCase() === me.publicId.toLowerCase();
 
   async function onSubmit() {
     setBusy(true);

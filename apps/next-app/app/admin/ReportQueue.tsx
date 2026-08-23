@@ -324,7 +324,18 @@ export function ReportQueue() {
               {r.note !== null && <p className="body-text">補足: {r.note}</p>}
 
               <p className="muted">
-                {thread === undefined && '対象のスレッドを取得しています...'}
+                {/*
+                  **threadID が無い行を「取得しています」で固めない**
+                  (レビュー指摘)。hydrateThreads は undefined を除外するので、
+                  この行の `threads[...]` は永久に埋まりません ——
+                  onDelete 側 (「起こらないはずの状態です」) は同じ状態を
+                  検出して文言を出しているのに、表示側だけ抜けていました。
+                  123-127 行で `failed` を足して潰したのと同じ形になります。
+                */}
+                {threadID === undefined && '対象のスレッドが記録されていません'}
+                {threadID !== undefined &&
+                  thread === undefined &&
+                  '対象のスレッドを取得しています...'}
                 {thread === 'missing' && '対象のスレッドは既に削除されています'}
                 {thread === 'failed' && '対象のスレッドを取得できませんでした'}
                 {thread !== undefined && thread !== 'missing' && thread !== 'failed' && (
