@@ -466,13 +466,13 @@ func Load() (*Config, error) {
 	// 上限 4 では 8% 落ちたので、そこが下限の目安になる。
 	// 環境ごとに DB_MAX_CONNS で上書きすること
 	// (docs/adr/0009-scaling-strategy.md の「実測」3-2)。
-	maxConns, err := int32Env("DB_MAX_CONNS", 8, 1)
+	maxConns, err := int32Env("DB_MAX_CONNS", 8, 1, 1_000)
 	if err != nil {
 		return nil, err
 	}
 	// 下限の 0 は「アイドル接続を事前に張らない」という正当な設定
 	// (pgxpool の既定値でもある) なので許可する。
-	minConns, err := int32Env("DB_MIN_CONNS", 2, 0)
+	minConns, err := int32Env("DB_MIN_CONNS", 2, 0, 1_000)
 	if err != nil {
 		return nil, err
 	}
@@ -481,12 +481,19 @@ func Load() (*Config, error) {
 	}
 
 	// 0 は「猶予を設けず即座に終了する」という正当な設定なので許可する。
-	shutdownSec, err := intEnv("SHUTDOWN_TIMEOUT_SECONDS", 10, 0)
+	shutdownSec, err := intEnv("SHUTDOWN_TIMEOUT_SECONDS", 10, 0, 3_600)
 	if err != nil {
 		return nil, err
 	}
 
-	debug := strings.EqualFold(os.Getenv("ENV"), "development")
+	// **TrimSpace する。** このファイルの他の値はすべて空白を落としている
+	// (".env から貼り付けたときの末尾空白" が理由)。ここだけ抜けていた。
+	// `ENV=development ` だと debug=false になり、SecureCookie が true になって
+	// **ブラウザが http://localhost の Cookie を捨てる** ——
+	// サーバ側にはエラーが 1 行も出ないまま、ログインだけが失敗する。
+	// おまけに COMMENT_POST_MODE=naive は
+	// 「ENV=development でのみ選べます」で弾かれ、設定した本人には矛盾して見える。
+	debug := strings.EqualFold(strings.TrimSpace(os.Getenv("ENV")), "development")
 
 	commentPostMode, err := parseCommentPostMode(os.Getenv("COMMENT_POST_MODE"), debug)
 	if err != nil {
@@ -501,13 +508,13 @@ func Load() (*Config, error) {
 	// 既定は 5 秒 (ADR 0006 の「一定間隔 (既定 5 秒)」)。
 	// **0 を許さない。** 0 だとスケジューラが既定値 (10 分) へ丸めるので、
 	// 「即時に反映されるつもりで 0 にしたら、いちばん遅くなった」が起きる。
-	flushSec, err := intEnv("VIEW_COUNT_FLUSH_SECONDS", 5, 1)
+	flushSec, err := intEnv("VIEW_COUNT_FLUSH_SECONDS", 5, 1, 3_600)
 	if err != nil {
 		return nil, err
 	}
 	// 既定は 10 分。0 を許すと抑制が無効になるが、それは Phase 4 の
 	// 比較で使う設定なので、下限を 0 にして明示的に選べるようにする。
-	dedupeSec, err := intEnv("VIEW_COUNT_DEDUPE_SECONDS", 600, 0)
+	dedupeSec, err := intEnv("VIEW_COUNT_DEDUPE_SECONDS", 600, 0, 86_400)
 	if err != nil {
 		return nil, err
 	}
@@ -582,11 +589,11 @@ func loadContact() (ContactConfig, error) {
 	//   窓 0 秒   → 数える対象が常に空になり、実質無制限
 	//   上限 0 件 → 誰も送れない
 	// 無効化に見える設定を「うっかり」で作れないようにします。
-	rateWindowSec, err := intEnv("CONTACT_RATE_LIMIT_WINDOW_SECONDS", 3600, 1)
+	rateWindowSec, err := intEnv("CONTACT_RATE_LIMIT_WINDOW_SECONDS", 3600, 1, 86_400)
 	if err != nil {
 		return ContactConfig{}, err
 	}
-	rateMax, err := intEnv("CONTACT_RATE_LIMIT_MAX", 5, 1)
+	rateMax, err := intEnv("CONTACT_RATE_LIMIT_MAX", 5, 1, 1_000_000)
 	if err != nil {
 		return ContactConfig{}, err
 	}
@@ -595,7 +602,7 @@ func loadContact() (ContactConfig, error) {
 	// **0 を許しません。** 0 だとスケジューラが既定値 (10 分) へ丸めるので、
 	// 「速くするつもりで 0 にしたら、いちばん遅くなった」が起きます
 	// (VIEW_COUNT_FLUSH_SECONDS と同じ理由)。
-	dispatchSec, err := intEnv("CONTACT_DISPATCH_INTERVAL_SECONDS", 60, 1)
+	dispatchSec, err := intEnv("CONTACT_DISPATCH_INTERVAL_SECONDS", 60, 1, 86_400)
 	if err != nil {
 		return ContactConfig{}, err
 	}
@@ -604,16 +611,16 @@ func loadContact() (ContactConfig, error) {
 	// **0 を許します** —— 「受け付けた直後の周回で消す」は、
 	// レート制限の窓より短くなるだけで、設定として不正ではありません。
 	// その場合レート制限が効かなくなることは運用の判断になります。
-	ipRetentionDays, err := intEnv("CONTACT_IP_RETENTION_DAYS", 400, 0)
+	ipRetentionDays, err := intEnv("CONTACT_IP_RETENTION_DAYS", 400, 0, 3_650)
 	if err != nil {
 		return ContactConfig{}, err
 	}
 
-	smtpPort, err := intEnv("MAIL_SMTP_PORT", 1025, 0)
+	smtpPort, err := intEnv("MAIL_SMTP_PORT", 1025, 1, 65_535)
 	if err != nil {
 		return ContactConfig{}, err
 	}
-	mailTimeoutSec, err := intEnv("MAIL_TIMEOUT_SECONDS", 10, 1)
+	mailTimeoutSec, err := intEnv("MAIL_TIMEOUT_SECONDS", 10, 1, 300)
 	if err != nil {
 		return ContactConfig{}, err
 	}
@@ -675,9 +682,13 @@ func csvEnv(key string, fallback []string) []string {
 			out = append(out, p)
 		}
 	}
-	if len(out) == 0 {
-		return fallback
-	}
+	// **設定されているのに空、を既定へ戻さない** (レビュー指摘)。
+	//
+	// `CORS_ALLOWED_ORIGINS=","` や `" "` は「クロスオリジンを許さない」の
+	// 自然な書き方だが、既定へ落とすと**本番で開発用の localhost:3000 が
+	// 復活する。** しかも設定した値が捨てられたことはどこにも出ない。
+	// 空を空として扱えば、その意図を書けるようになる
+	// (csrfGuard は自分自身のオリジンを常に許すので、同一オリジンは通る)。
 	return out
 }
 
@@ -688,16 +699,16 @@ func stringEnv(key, fallback string) string {
 	return fallback
 }
 
-func intEnv(key string, fallback, minimum int) (int, error) {
-	v, err := parseIntEnv(key, int64(fallback), int64(minimum), 64)
+func intEnv(key string, fallback, minimum, maximum int) (int, error) {
+	v, err := parseIntEnv(key, int64(fallback), int64(minimum), int64(maximum), 64)
 	return int(v), err
 }
 
 // int32Env は int32 に収まることを保証して読み取ります。
 // pgxpool の設定値が int32 なので、ここで範囲を確定させておくと
 // 呼び出し側で範囲外を気にする必要がなくなります。
-func int32Env(key string, fallback, minimum int32) (int32, error) {
-	v, err := parseIntEnv(key, int64(fallback), int64(minimum), 32)
+func int32Env(key string, fallback, minimum, maximum int32) (int32, error) {
+	v, err := parseIntEnv(key, int64(fallback), int64(minimum), int64(maximum), 32)
 	if err != nil {
 		return 0, err
 	}
@@ -709,9 +720,16 @@ func int32Env(key string, fallback, minimum int32) (int32, error) {
 	return int32(v), nil
 }
 
-// parseIntEnv は環境変数を整数として読み取り、minimum 以上であることを確認します。
-// bitSize は strconv.ParseInt に渡す値で、これにより桁あふれを防ぎます。
-func parseIntEnv(key string, fallback, minimum int64, bitSize int) (int64, error) {
+// parseIntEnv は環境変数を整数として読み取り、minimum 以上 maximum 以下で
+// あることを確認します。bitSize は strconv.ParseInt に渡す値です。
+//
+// **上限が要ります。** 下限しか見ていなかったときは、秒数を
+// time.Duration に掛ける呼び出し側で int64 があふれました。
+// SHUTDOWN_TIMEOUT_SECONDS=10000000000 は下限を通り、
+// `time.Duration(v) * time.Second` が**負に折り返し**、
+// context.WithTimeout が最初から期限切れになる ——
+// 長い猶予を設定した運用者に、**猶予ゼロ**が返る (レビュー指摘)。
+func parseIntEnv(key string, fallback, minimum, maximum int64, bitSize int) (int64, error) {
 	raw := os.Getenv(key)
 	if raw == "" {
 		return fallback, nil
@@ -722,6 +740,9 @@ func parseIntEnv(key string, fallback, minimum int64, bitSize int) (int64, error
 	}
 	if v < minimum {
 		return 0, fmt.Errorf("config: %s は %d 以上である必要があります (got %d)", key, minimum, v)
+	}
+	if v > maximum {
+		return 0, fmt.Errorf("config: %s は %d 以下である必要があります (got %d)", key, maximum, v)
 	}
 	return v, nil
 }
