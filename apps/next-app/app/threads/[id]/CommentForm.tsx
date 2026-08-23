@@ -56,10 +56,20 @@ export function CommentForm({
   threadId,
   signedIn,
   onPosted,
+  unknownIdentity = false,
 }: {
   threadId: number;
   signedIn: boolean;
   onPosted: (comment: Comment) => void;
+  /**
+   * ログイン状態が**分からない**とき (GET /me が 401 以外で失敗) に立てます。
+   *
+   * 匿名向けの案内 (名前欄と「あとから削除できません」) を伏せるためのものです。
+   * ログイン中なのに名前欄を出すと、書いた名前はサーバが捨てて
+   * **実名の表示名で公開される** —— 利用者から見れば名前を無視された形になります。
+   * 画像の添付だけは、権限が分からないので出しません。
+   */
+  unknownIdentity?: boolean;
 }) {
   const bodyId = useId();
   const nameId = useId();
@@ -139,7 +149,7 @@ export function CommentForm({
         </span>
       </div>
 
-      {!signedIn && (
+      {!signedIn && !unknownIdentity && (
         <div className="field">
           <label className="field__label" htmlFor={nameId}>
             名前 (任意)
@@ -171,7 +181,7 @@ export function CommentForm({
         hint="JPEG / PNG / WebP、5 MiB まで。保存時に再エンコードされます (位置情報は残りません)。"
         value={image}
         onChange={setImage}
-        canUpload={signedIn}
+        canUpload={signedIn && !unknownIdentity}
         disabled={sending}
       />
 
@@ -184,7 +194,14 @@ export function CommentForm({
         >
           {sending ? '投稿しています...' : '投稿する'}
         </button>
-        {signedIn && <span className="muted">ログイン中の表示名で投稿されます。</span>}
+        {signedIn && !unknownIdentity && (
+          <span className="muted">ログイン中の表示名で投稿されます。</span>
+        )}
+        {unknownIdentity && (
+          <span className="muted">
+            ログイン中ならその表示名で、そうでなければ「名無しさん」で投稿されます。
+          </span>
+        )}
       </div>
 
       {phase.kind === 'error' && (

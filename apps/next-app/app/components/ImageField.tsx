@@ -49,10 +49,27 @@ type Props = {
    * 追跡不能な形で可能になるため。ADR 0007)。
    */
   canUpload: boolean;
+  /**
+   * ログイン状態が**まだ決まっていない**ときに立てます。
+   *
+   * 「ログインが必要です」と言い切らず、確認中であることを出すためのものです。
+   * 決まる前に言い切ると、ログイン中の利用者にも一瞬「使えません」と出て、
+   * 応答が返った瞬間に入れ替わります (レビュー指摘)。
+   */
+  uploadHintSuppressed?: boolean;
   disabled?: boolean;
 };
 
-export function ImageField({ kind, label, hint, value, onChange, canUpload, disabled }: Props) {
+export function ImageField({
+  kind,
+  label,
+  hint,
+  value,
+  onChange,
+  canUpload,
+  uploadHintSuppressed = false,
+  disabled,
+}: Props) {
   const inputId = useId();
   const statusId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -100,7 +117,11 @@ export function ImageField({ kind, label, hint, value, onChange, canUpload, disa
     return (
       <div className="field">
         <span className="field__label">{label}</span>
-        <p className="muted">画像を使うにはログインが必要です。</p>
+        <p className="muted">
+          {uploadHintSuppressed
+            ? 'ログイン状態を確認しています...'
+            : '画像を使うにはログインが必要です。'}
+        </p>
         {hint !== undefined && <span className="field__hint">{hint}</span>}
       </div>
     );

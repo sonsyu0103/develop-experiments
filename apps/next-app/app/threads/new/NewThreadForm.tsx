@@ -30,6 +30,15 @@ export function NewThreadForm() {
   const titleId = useId();
   const { state: meState } = useMe();
   const signedIn = meState.kind === 'ready';
+  // **決まるまでは「できない」と言い切らない** (レビュー指摘)。
+  // GET /me の往復中は必ず signedIn === false なので、ログイン中の利用者にも
+  // 「画像を使うにはログインが必要です」とログインボタンが出て、
+  // 応答が返った瞬間に入れ替わります —— ThreadView が避けている
+  // 「押そうとした先が変わる」挙動が、この画面には残っていました。
+  //
+  // `error` も同じ扱いにします。401 以外を未ログイン扱いにしないのが
+  // me.ts の設計なので (ADR 0013 決定 3)、error は「分からない」になります。
+  const meResolved = meState.kind === 'ready' || meState.kind === 'anonymous';
 
   const [title, setTitle] = useState('');
   const [icon, setIcon] = useState<Image | null>(null);
@@ -87,6 +96,8 @@ export function NewThreadForm() {
         value={icon}
         onChange={setIcon}
         canUpload={signedIn}
+        // 決まるまでは案内を出さない (上の meResolved のコメント)。
+        uploadHintSuppressed={!meResolved}
         disabled={sending}
       />
 
@@ -99,7 +110,7 @@ export function NewThreadForm() {
         >
           {sending ? '作成しています...' : 'スレッドを立てる'}
         </button>
-        {!signedIn && (
+        {meResolved && !signedIn && (
           <a href={loginUrl()} className="btn btn--quiet">
             Google でログインする
           </a>

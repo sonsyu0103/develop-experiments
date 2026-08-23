@@ -221,6 +221,43 @@ test.describe('スレッド詳細', () => {
     await expect(page.getByRole('button', { name: '削除' })).toBeVisible();
   });
 
+  test('ログイン状態が分からないとき、匿名の画面を出さない', async ({ page }) => {
+    // **401 ではなく 500。** me.ts は 401 だけを「未ログイン」に翻訳し、
+    // それ以外は `error` = 「分からない」として持ちます (ADR 0013 決定 3)。
+    //
+    // ここを「解決済み＝未ログイン」に数えると、**ログイン中の利用者に
+    // 匿名用の画面が出ます** ——
+    //
+    //   - 名前欄に書いて投稿しても、Cookie が生きているのでサーバは
+    //     authorName を捨て、実名の表示名とアバターで公開される
+    //   - 自分の投稿に「削除」ではなく「通報する」が出て、実際に成立する
+    await page.route('**/me', (route) => fail(route, 500, 'INTERNAL', 'サーバ内部でエラー'));
+    await mockThreadOk(page);
+    await mockComments(page, (route) =>
+      ok(route, comments([byUser(plainUser, { id: 1, seq: 1, body: '本人の書き込み' })])),
+    );
+
+    await page.goto(url);
+    await expect(page.getByText('本人の書き込み')).toBeVisible();
+
+    // **匿名向けの案内を出さない。**
+    await expect(page.getByLabel('名前 (任意)')).toHaveCount(0);
+    await expect(page.getByText('ログインしなくても投稿できます。')).toHaveCount(0);
+
+    // **投稿ごとの操作も出さない** (自分のものか判定できないため)。
+    await expect(page.getByRole('button', { name: '通報する' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: '削除' })).toHaveCount(0);
+
+    // **「確認しています...」で固めない。** 待っても変わらないので、
+    // 分からないことと、やり直せることを出す。
+    await expect(page.getByText('ログイン状態を確認できませんでした。')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'もう一度確認する' })).toBeVisible();
+
+    // **投稿そのものは塞がない。** Cookie があれば通るので、
+    // /me の一時的な失敗で投稿できなくなるほうが害が大きい。
+    await expect(page.getByRole('button', { name: '投稿する' })).toBeVisible();
+  });
+
   test('匿名で立てたスレッドには削除を出さない', async ({ page }) => {
     await mockMe(page, plainUser);
     // `author` が null = 匿名。**ログインしていても消せません**

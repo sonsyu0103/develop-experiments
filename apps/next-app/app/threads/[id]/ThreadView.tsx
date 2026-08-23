@@ -64,13 +64,24 @@ function isMine(author: Author, me: Me | null): boolean {
 
 export function ThreadView({ threadId }: { threadId: number }) {
   const router = useRouter();
-  const { state: meState } = useMe();
+  const { state: meState, reload: reloadMe } = useMe();
   const me = meState.kind === 'ready' ? meState.me : null;
   const signedIn = me !== null;
   // **ログイン状態が決まるまで、投稿ごとの操作を出しません** (レビュー指摘)。
   // 決まる前は `me` が null なので、自分の投稿にも「通報する」が出て、
   // 一拍あとに「削除」へ化けます —— 押そうとした先が変わるのは事故のもとになります。
-  const meResolved = meState.kind !== 'loading';
+  //
+  // **`error` を「決まった」に数えてはいけません** (2 巡目のレビュー指摘)。
+  // me.ts は 401 以外を未ログイン扱いにしない設計で (ADR 0013 決定 3)、
+  // `error` は「分からない」を意味します。ここで解決済みに数えると、
+  // **ログイン中の利用者に匿名用の画面が出ます** ——
+  //
+  //   - 名前欄に書いて投稿しても、Cookie が生きているのでサーバは
+  //     authorName を捨て、**実名の表示名とアバターで公開される**
+  //   - 自分の投稿に「削除」ではなく「通報する」が出て、実際に成立する
+  //     (通報を open へ戻す経路は無い)
+  const meResolved = meState.kind === 'ready' || meState.kind === 'anonymous';
+  const meUnknown = meState.kind === 'error';
 
   const [threadState, setThreadState] = useState<ThreadState>({ kind: 'loading' });
   const [commentsState, setCommentsState] = useState<CommentsState>({ kind: 'loading' });
@@ -352,7 +363,17 @@ export function ThreadView({ threadId }: { threadId: number }) {
         書き始めた欄が消えるのは、操作を取り違えさせる形になります。
         コメントの読み取りは待たせないので、遅れるのはここだけです。
       */}
-      {!meResolved ? (
+      {meUnknown ? (
+        // **「確認しています」で固めない。** error は待っても変わりません。
+        // 投稿そのものは Cookie があれば通るので、フォームは出したまま、
+        // 匿名向けの案内 (名前欄・「あとから削除できません」) だけ伏せます。
+        <p className="notice" role="status">
+          ログイン状態を確認できませんでした。
+          <button type="button" className="link-button" onClick={reloadMe}>
+            もう一度確認する
+          </button>
+        </p>
+      ) : !meResolved ? (
         <p className="muted" aria-live="polite">
           ログイン状態を確認しています...
         </p>
@@ -367,6 +388,11 @@ export function ThreadView({ threadId }: { threadId: number }) {
           )}
           <CommentForm threadId={threadId} signedIn={signedIn} onPosted={onPosted} />
         </>
+      )}
+      {meUnknown && (
+        // 状態が分からないので **signedIn を渡しません** ——
+        // 名前欄も画像欄も出さず、本文だけで投稿できる形にします。
+        <CommentForm threadId={threadId} signedIn onPosted={onPosted} unknownIdentity />
       )}
 
       <div className="section-head">
