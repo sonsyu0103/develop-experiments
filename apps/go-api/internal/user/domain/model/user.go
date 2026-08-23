@@ -2,6 +2,8 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -25,25 +27,75 @@ const DisplayNameMaxLength = 100
 //
 // **弾かずに直します。** 外部から来る値なので、利用者には直しようがありません。
 //
-//	空          -> メールアドレスのローカル部で代用する
+//	空          -> google_sub から導いた代替名を使う
 //	             (profile スコープが無いと name は空になりえます)
 //	長すぎる    -> DisplayNameMaxLength 文字で切る
 //	             (DB の CHECK は「暴走を止める上限」で、切るのはこちらの責任)
 //
-// 切るのは**文字単位**です。バイトで切ると UTF-8 の途中で割れます。
-func normalizeDisplayName(displayName, email string) string {
+// **メールアドレスは使いません。** DisplayName は Author に載って
+// 未ログインの一覧にも出ます。仕様書は Me.email について
+// 「本人にだけ返します。投稿一覧には含まれません」と約束しており、
+// ローカル部だけでも個人を指す文字列がそこへ混ざります
+// (初版はローカル部で代用していました。レビュー指摘)。
+func normalizeDisplayName(displayName, googleSub string) string {
 	displayName = strings.TrimSpace(displayName)
 	if displayName == "" {
-		local, _, found := strings.Cut(strings.TrimSpace(email), "@")
-		if found {
-			displayName = strings.TrimSpace(local)
-		}
+		displayName = fallbackDisplayName(googleSub)
 	}
 
 	if utf8.RuneCountInString(displayName) > DisplayNameMaxLength {
-		displayName = string([]rune(displayName)[:DisplayNameMaxLength])
+		displayName = trimDanglingSequence([]rune(displayName)[:DisplayNameMaxLength])
 	}
 	return displayName
+}
+
+// fallbackDisplayName は表示名が取れないときの代替です。
+//
+// **google_sub のハッシュから作ります。** 満たしたい性質が 3 つあります。
+//
+//	一意である      同じ名前が並ばない
+//	毎回同じである  Upsert が display_name を上書きするので、ログインの
+//	                たびに変わると表示名が揺れます。**public_id は使えません**
+//	                —— NewUser は毎回新しい値を採番するため
+//	復元できない    google_sub をそのまま出すと外部の識別子が公開されます
+func fallbackDisplayName(googleSub string) string {
+	sum := sha256.Sum256([]byte(googleSub))
+	return "利用者-" + hex.EncodeToString(sum[:4])
+}
+
+// trimDanglingSequence は、切った末尾に残った「途中」の記号を落とします。
+//
+// **文字 (rune) 単位で切っても、絵文字は割れます。** 家族の絵文字は
+// ZWJ (U+200D) で複数の絵文字をつないだ列で、旗は地域指示符号の 2 個組です。
+// 境界で切ると、末尾に**行き場のない ZWJ** や地域指示符号が 1 個だけ残り、
+// 豆腐 (□) として表示されます。
+//
+// 書記素クラスタまで正確に扱うには外部ライブラリが要るので、
+// **末尾の破片を落とすところまで**にしています。
+func trimDanglingSequence(rs []rune) string {
+	for len(rs) > 0 {
+		last := rs[len(rs)-1]
+		switch {
+		case last == '\u200d': // ZWJ。次の絵文字が来るはずだった
+		case last == '\ufe0f' || last == '\ufe0e': // 異体字セレクタ
+		case isRegionalIndicator(last) && countTrailingRegionalIndicators(rs)%2 == 1:
+		default:
+			return string(rs)
+		}
+		rs = rs[:len(rs)-1]
+	}
+	return ""
+}
+
+// isRegionalIndicator は旗を作る地域指示符号かを返します (2 個で 1 つの旗)。
+func isRegionalIndicator(r rune) bool { return r >= 0x1F1E6 && r <= 0x1F1FF }
+
+func countTrailingRegionalIndicators(rs []rune) int {
+	n := 0
+	for i := len(rs) - 1; i >= 0 && isRegionalIndicator(rs[i]); i-- {
+		n++
+	}
+	return n
 }
 
 // User は Google アカウントに紐づく利用者を表すエンティティです。
@@ -134,7 +186,7 @@ func NewUser(googleSub, email, displayName string, avatarURL *string) (*User, er
 	//
 	// この型のコメントも「切り詰めはアプリ側の責任」と書いていたのに、
 	// **実装は弾く側になっていました** (レビュー指摘)。
-	displayName = normalizeDisplayName(displayName, email)
+	displayName = normalizeDisplayName(displayName, googleSub)
 	if displayName == "" {
 		return nil, fmt.Errorf("表示名が空です: %w", apperr.ErrInvalidArgument)
 	}

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"develop-experiments/apps/go-api/internal/apperr"
 )
@@ -40,13 +41,22 @@ func TestNewUser(t *testing.T) {
 		// **弾かずに直す。** ここに来るのは Google の claims で、
 		// 利用者がこのアプリから直せる値ではない。落とすと
 		// **その人は永久にログインできず、手の打ちようがない。**
+		// **メールアドレスは使わない。** DisplayName は Author に載って
+		// 未ログインの一覧にも出る。仕様書は email を「本人にだけ返します。
+		// 投稿一覧には含まれません」と約束しており、ローカル部だけでも
+		// 個人を指す文字列がそこへ混ざる。
 		{
-			name: "表示名が空ならメールのローカル部で代用する", googleSub: "sub-1",
-			email: "hoshino@example.com", displayName: "", wantName: "hoshino",
+			// **期待値をリテラルで書く。** fallbackDisplayName を呼んで
+			// 比べると実装どうしの比較になり、中身を "利用者" 固定に
+			// 変えても緑のまま通る (変異で実測)。
+			name: "表示名が空なら google_sub から作る", googleSub: "sub-1",
+			email: "hoshino@example.com", displayName: "",
+			wantName: "利用者-0a80627d",
 		},
 		{
-			name: "表示名が空白のみでも代用する", googleSub: "sub-1",
-			email: "hoshino@example.com", displayName: "   ", wantName: "hoshino",
+			name: "表示名が空白のみでも同じ", googleSub: "sub-1",
+			email: "hoshino@example.com", displayName: "   ",
+			wantName: "利用者-0a80627d",
 		},
 		{
 			name: "長すぎる表示名は切り詰める", googleSub: "sub-1", email: "a@example.com",
@@ -61,11 +71,22 @@ func TestNewUser(t *testing.T) {
 			wantName:    strings.Repeat("🦊", DisplayNameMaxLength),
 		},
 
-		// ローカル部も取れないときだけ落とす (メールの検査が先に通っている以上、
-		// ここに来るのは `@example.com` のような壊れた値だけ)。
 		{
-			name: "表示名もローカル部も空", googleSub: "sub-1",
-			email: "@example.com", displayName: "", wantErr: true,
+			// **UTF-8 の途中で割らないだけでは足りない。** 家族の絵文字は
+			// ZWJ (U+200D) つなぎなので、境界で切ると行き場のない ZWJ が
+			// 末尾に残り、豆腐 (□) になる。**🦊 のような 1 コードポイントの
+			// 絵文字では、この形を踏めない** (初版の検査がそうだった)。
+			name: "ZWJ の途中で切れたら破片を落とす", googleSub: "sub-1",
+			email: "a@example.com",
+			displayName: strings.Repeat("あ", DisplayNameMaxLength-1) +
+				"\U0001F468\u200D\U0001F469\u200D\U0001F467",
+			wantName: strings.Repeat("あ", DisplayNameMaxLength-1) + "\U0001F468",
+		},
+		{
+			// 旗は地域指示符号の 2 個組。片方だけ残さない。
+			name: "旗が半分だけ残らない", googleSub: "sub-1", email: "a@example.com",
+			displayName: strings.Repeat("あ", DisplayNameMaxLength-1) + "\U0001F1EF\U0001F1F5",
+			wantName:    strings.Repeat("あ", DisplayNameMaxLength-1),
 		},
 	}
 
@@ -176,5 +197,41 @@ func TestDisplayNameMaxLength_AgreesWithConstraint(t *testing.T) {
 	}
 	if got != DisplayNameMaxLength {
 		t.Errorf("DB の CHECK 制約 = %d, Go 側 = %d", got, DisplayNameMaxLength)
+	}
+}
+
+// **代替名が満たすべき 3 つの性質。**
+//
+// 表示名が取れないときの代わりなので、次を同時に満たす必要があります。
+//
+//	一意である      同じ名前が並ばない
+//	毎回同じである  Upsert が display_name を上書きするので、揺れると
+//	                ログインのたびに表示名が変わる
+//	復元できない    google_sub をそのまま出すと外部の識別子が公開される
+//
+// **メールアドレスを混ぜないこと**も見ます。DisplayName は Author に載って
+// 未ログインの一覧にも出るため、初版のようにローカル部を使うと
+// 「email は本人にだけ返す」という仕様書の約束を破ります。
+func TestFallbackDisplayName(t *testing.T) {
+	t.Parallel()
+
+	const (
+		subA = "google-sub-aaa"
+		subB = "google-sub-bbb"
+	)
+
+	a1, a2, b := fallbackDisplayName(subA), fallbackDisplayName(subA), fallbackDisplayName(subB)
+
+	if a1 != a2 {
+		t.Errorf("同じ sub で違う名前になった: %q と %q (ログインのたびに変わる)", a1, a2)
+	}
+	if a1 == b {
+		t.Errorf("違う sub で同じ名前になった: %q (全員が同じ表示名で並ぶ)", a1)
+	}
+	if strings.Contains(a1, subA) {
+		t.Errorf("代替名に google_sub がそのまま入っている: %q", a1)
+	}
+	if n := utf8.RuneCountInString(a1); n > DisplayNameMaxLength {
+		t.Errorf("代替名が上限を超えている: %d 文字", n)
 	}
 }

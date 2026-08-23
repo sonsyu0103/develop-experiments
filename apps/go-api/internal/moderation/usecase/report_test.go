@@ -283,10 +283,12 @@ func TestListQueue_TruncatesAndSetsCursor(t *testing.T) {
 		{name: "余りがある (次がある)", size: 3, rows: 10, wantLen: 3, wantNext: true},
 		{name: "足りない", size: 3, rows: 1, wantLen: 1, wantNext: false},
 		{name: "1 件も無い", size: 3, rows: 0, wantLen: 0, wantNext: false},
-		// **Size が 0 以下でも panic しないこと。**
-		// pagination.NewPage が丸めるので HTTP からは来ないが、
-		// ユースケースを直接呼ぶ経路が増えると limit = 0 になり、
-		// reports[len(reports)-1] が空スライスへの添字になる。
+		// **Size が 0 でも既定値へ丸めること。**
+		//
+		// 丸めをやめても panic はしません (レビュー指摘) ——
+		// limit が 0 になっても `limit > 0 &&` が先に短絡するためで、
+		// 空スライスへの添字には到達しない。**丸めが守っているのは
+		// 「1 件も返らない」ほう**で、キューが常に空に見える形になります。
 		{name: "Size が 0 なら既定値へ丸める", size: 0, rows: 200, wantLen: int(pagination.DefaultSize), wantNext: true},
 	}
 
