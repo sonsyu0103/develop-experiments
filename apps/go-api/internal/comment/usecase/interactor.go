@@ -136,6 +136,32 @@ func NewCommentInteractor(
 	return &CommentInteractor{repo: repo, threads: threads, images: images}
 }
 
+// commentCursorSort はコメント一覧が発行するカーソルの並び順識別子です。
+//
+// コメントは並び順を選べないので**既定のまま = 空文字**になります
+// (ADR 0018「並び順を足すときの規則」)。コメントに並び順を足すときは、
+// ここに識別子を与えて発行側 (NewCursor(...).WithSort) と揃えます。
+const commentCursorSort = ""
+
+// ensureOwnCursor は、別の並び順で発行されたカーソルを弾きます。
+//
+// **これが無いと、黙って誤ったページが返ります。** スレッド一覧の
+// 人気順が発行したトークンは {"v":1,"s":"popular","id":42,"vc":100} で、
+// 復号そのものは通ります。コメント一覧は view_count 成分を読まないので、
+// **vc が捨てられて id < 42 だけが効いたページ**が 200 で返ります。
+// ADR 0018 が名指しで挙げている失敗の形で、スレッド側には既に同じ検査が
+// 2 か所ありました (こちらだけ抜けていた。レビュー指摘)。
+//
+// **先頭ページは検査しません。** カーソルが無いので発行元もありません。
+func ensureOwnCursor(page pagination.Page) error {
+	if page.Cursor != nil && page.CursorSort() != commentCursorSort {
+		return fmt.Errorf(
+			"cursor は別の並び順で発行されたものです。先頭ページから取得し直してください: %w",
+			apperr.ErrInvalidArgument)
+	}
+	return nil
+}
+
 // FetchComments は 1 スレッドのコメントを新しい順に取得します。
 // スレッドが存在しない、または論理削除済みの場合は apperr.ErrNotFound を返します。
 //
@@ -152,6 +178,10 @@ func NewCommentInteractor(
 func (i *CommentInteractor) FetchComments(
 	ctx context.Context, threadID int64, page pagination.Page,
 ) (CommentListResult, error) {
+	if err := ensureOwnCursor(page); err != nil {
+		return CommentListResult{}, err
+	}
+
 	ok, err := i.threads.Exists(ctx, threadID)
 	if err != nil {
 		return CommentListResult{}, err
@@ -197,6 +227,10 @@ func (i *CommentInteractor) FetchComments(
 func (i *CommentInteractor) FetchMyComments(
 	ctx context.Context, authorID int64, page pagination.Page,
 ) (MyCommentListResult, error) {
+	if err := ensureOwnCursor(page); err != nil {
+		return MyCommentListResult{}, err
+	}
+
 	comments, err := i.repo.ListByAuthor(ctx, authorID, page)
 	if err != nil {
 		return MyCommentListResult{}, err

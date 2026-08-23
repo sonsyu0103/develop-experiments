@@ -917,3 +917,75 @@ func TestFetchMyComments_PropagatesRepositoryError(t *testing.T) {
 		t.Errorf("err = %v, want %v", err, sentinel)
 	}
 }
+
+// **別の並び順で発行されたカーソルを弾くこと** (レビュー指摘)。
+//
+// 利用者は `GET /threads?sort=popular` が返したトークンを、そのまま
+// コメント一覧の `?cursor=` に貼れます。検査しないと view_count 成分が
+// 黙って捨てられ、`id < cursorID` だけが効いた「要求していない位置のページ」が
+// **400 も出さずに 200 で**返ります。ADR 0018 が名指しで挙げている形で、
+// スレッド側には同じ検査が 2 か所ありました —— こちらだけ抜けていた。
+func TestFetchComments_RejectsForeignSortCursor(t *testing.T) {
+	t.Parallel()
+
+	// 人気順が発行する形のトークン (並び順の印と view_count を含む)。
+	token, err := pagination.NewCursor(42).WithSort("popular").WithViewCount(100).Encode()
+	if err != nil {
+		t.Fatalf("カーソルの符号化が失敗した: %v", err)
+	}
+	page, err := pagination.NewPage(&token, 10)
+	if err != nil {
+		t.Fatalf("pagination.NewPage が失敗した: %v", err)
+	}
+
+	t.Run("スレッドのコメント一覧", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newFakeCommentRepo(3)
+		checker := &fakeThreadChecker{exists: true}
+		uc := NewCommentInteractor(repo, checker, nil)
+
+		_, err := uc.FetchComments(context.Background(), 1, page)
+		if !errors.Is(err, apperr.ErrInvalidArgument) {
+			t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
+		}
+		// **弾いたなら DB を引かない。** 検査が後ろにあると、
+		// 誤ったページを組み立てる仕事だけ先にやることになる。
+		if checker.calls != 0 {
+			t.Errorf("スレッドの存在確認が %d 回呼ばれた, want 0", checker.calls)
+		}
+		if repo.gotPage.Cursor != nil {
+			t.Error("リポジトリまで到達している")
+		}
+	})
+
+	t.Run("自分のコメント一覧", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newFakeCommentRepo(0)
+		repo.myComments = newMyComments(2)
+		uc := NewCommentInteractor(repo, &fakeThreadChecker{exists: true}, nil)
+
+		_, err := uc.FetchMyComments(context.Background(), 1, page)
+		if !errors.Is(err, apperr.ErrInvalidArgument) {
+			t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
+		}
+		if repo.gotPage.Cursor != nil {
+			t.Error("リポジトリまで到達している")
+		}
+	})
+
+	// **既定の並び順で発行されたカーソルは通ること。**
+	// ここを一緒に見ないと「常に 400」でも上の 2 つは緑になる。
+	t.Run("自前のカーソルは通る", func(t *testing.T) {
+		t.Parallel()
+
+		repo := newFakeCommentRepo(3)
+		uc := newInteractor(repo)
+
+		id := int64(2)
+		if _, err := uc.FetchComments(context.Background(), 1, mustPage(t, &id, 10)); err != nil {
+			t.Fatalf("自前のカーソルが弾かれた: %v", err)
+		}
+	})
+}
