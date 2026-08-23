@@ -671,6 +671,16 @@ func boolEnv(key string) bool {
 // csvEnv はカンマ区切りの環境変数を文字列スライスとして読み取ります。
 func csvEnv(key string, fallback []string) []string {
 	raw := os.Getenv(key)
+	// **空文字は「未設定」として扱います。**
+	//
+	// compose がこのリポジトリで使う `${VAR:-}` は、変数が無いときに
+	// **空文字を渡します。** つまりプロセスから見ると「設定していない」と
+	// 「空にした」が区別できません。ここを空リスト扱いにすると、
+	// 変数を書いていない開発環境で既定の localhost:3000 が消え、
+	// フロント (別オリジン) からの書き込みが全部 403 になります。
+	//
+	// **空にする意図は `,` や空白で書けます** (下で空要素を落とすため、
+	// 結果は空リストになる)。区別が要るのはそちらの側。
 	if raw == "" {
 		return fallback
 	}
@@ -693,7 +703,7 @@ func csvEnv(key string, fallback []string) []string {
 }
 
 func stringEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
 	}
 	return fallback
@@ -730,7 +740,12 @@ func int32Env(key string, fallback, minimum, maximum int32) (int32, error) {
 // context.WithTimeout が最初から期限切れになる ——
 // 長い猶予を設定した運用者に、**猶予ゼロ**が返る (レビュー指摘)。
 func parseIntEnv(key string, fallback, minimum, maximum int64, bitSize int) (int64, error) {
-	raw := os.Getenv(key)
+	// **ここでも空白を落とします。** ENV を直したときのコメントで
+	// 「他の値はすべて落としている」と書いたが、実際には数値系と
+	// stringEnv が落としていなかった (レビュー指摘)。
+	// `SHUTDOWN_TIMEOUT_SECONDS=10 ` は起動時に落ちるので静かな失敗では
+	// ないが、**根拠にした不変条件が実在しない**のは直す。
+	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
 		return fallback, nil
 	}
