@@ -130,6 +130,44 @@ test('対象スレッドの取得が 500 なら、読み込み中のままにし
   await expect(page.getByText('対象のスレッドを取得しています...')).toHaveCount(0);
 });
 
+// **スレッド ID を持たないコメント通報も、読み込み中で固定しない** (レビュー指摘)。
+//
+// hydrateThreads は threadId が無い行を除外するので、その行の取得は
+// **永久に始まりません。** 指摘 ③ と同じ「読み込み中に見え続ける」形が、
+// この経路にだけ残っていました (onDelete 側は検出していたのに表示側だけ抜け)。
+//
+// reports.target_thread_id はコメントの通報に必須 (CHECK 制約) なので
+// 本来は起こらない状態ですが、**起こらないはずの状態こそ画面に出す**
+// —— 出さないと、壊れていることが「まだ読み込み中」に見えます。
+test('スレッド ID の無いコメント通報を、読み込み中のままにしない', async ({ page }) => {
+  await page.route('**/moderation/reports*', (route) =>
+    ok(route, list([report({ id: 1, targetType: 'comment', targetId: 500 })])),
+  );
+
+  await page.goto('/admin');
+
+  await expect(page.getByText('対象のスレッドが記録されていません')).toBeVisible();
+  await expect(page.getByText('対象のスレッドを取得しています...')).toHaveCount(0);
+
+  // **削除も送らせないこと** (レビュー指摘)。
+  //
+  // この fixture は onDelete の早期 return を叩ける唯一の材料なのに、
+  // 表示しか見ていませんでした。分岐を消すと
+  // `{action:'delete_comment', targetId:'500'}` が **threadId 抜きで飛ぶ** ——
+  // このファイルが「絶対にやってはいけない」と書いている形です
+  // (パーティションを絞れず、何を消したかの記録も壊れる)。
+  let posted = false;
+  await page.route('**/moderation/actions', (route) => {
+    posted = true;
+    return ok(route, { id: 1, action: 'delete_comment', targetType: 'comment' });
+  });
+
+  await page.getByRole('button', { name: '対象を削除' }).click();
+
+  await expect(page.getByText('スレッド ID が無いため削除できません')).toBeVisible();
+  expect(posted).toBe(false);
+});
+
 test('対象スレッドが 404 なら「既に削除されています」と出す', async ({ page }) => {
   await page.route('**/moderation/reports*', (route) =>
     ok(route, list([report({ id: 1, targetId: 100 })])),

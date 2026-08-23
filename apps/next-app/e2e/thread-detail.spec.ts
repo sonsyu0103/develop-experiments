@@ -240,6 +240,12 @@ test.describe('スレッド詳細', () => {
     await page.goto(url);
     await expect(page.getByText('本人の書き込み')).toBeVisible();
 
+    // **先に「確定した」印を待ちます** (レビュー指摘)。
+    // 否定の assert は、要素が「まだ出ていない」だけでも通ります ——
+    // /me の 500 が届く前に走ると全部空振りで緑になり、
+    // 「警告は出るが名前欄も一緒に出る」形の後退を見逃します。
+    await expect(page.getByText('ログイン状態を確認できませんでした。')).toBeVisible();
+
     // **匿名向けの案内を出さない。**
     await expect(page.getByLabel('名前 (任意)')).toHaveCount(0);
     await expect(page.getByText('ログインしなくても投稿できます。')).toHaveCount(0);
@@ -249,8 +255,7 @@ test.describe('スレッド詳細', () => {
     await expect(page.getByRole('button', { name: '削除' })).toHaveCount(0);
 
     // **「確認しています...」で固めない。** 待っても変わらないので、
-    // 分からないことと、やり直せることを出す。
-    await expect(page.getByText('ログイン状態を確認できませんでした。')).toBeVisible();
+    // やり直せることを出す。
     await expect(page.getByRole('button', { name: 'もう一度確認する' })).toBeVisible();
 
     // **投稿そのものは塞がない。** Cookie があれば通るので、
@@ -280,7 +285,13 @@ test.describe('スレッド詳細', () => {
     failMe = false;
     await page.getByRole('button', { name: 'もう一度確認する' }).click();
 
-    // 状態は解決する (案内が消える)。
+    // **`ready` になったことを先に待ちます** (レビュー指摘)。
+    //
+    // reload は同期で `loading` に戻すので、クリック直後は警告が消えます ——
+    // そこで値を見ると、**再取得が起きなくても緑になります**
+    // (実測: invalidateMe を外す変異が通り抜けた)。
+    // ログイン中にしか出ない文言を目印にして、確定を観測してから確かめます。
+    await expect(page.getByText('ログイン中の表示名で投稿されます。')).toBeVisible();
     await expect(page.getByText('ログイン状態を確認できませんでした。')).toHaveCount(0);
     // **本文は残る。**
     await expect(page.getByLabel('コメント')).toHaveValue(draft);
