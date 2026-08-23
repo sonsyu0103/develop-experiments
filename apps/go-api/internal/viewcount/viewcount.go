@@ -112,6 +112,8 @@ type visitorGate struct {
 	// evictScans は全件走査した回数です。**掃除の頻度そのもの**を
 	// 検査から見るために持ちます (消えた件数では見分けられないため)。
 	evictScans int
+	// saturatedOnce は上限到達の警告を 1 回だけ出すためのものです。
+	saturatedOnce sync.Once
 }
 
 func newVisitorGate(window time.Duration, max int, now func() time.Time) *visitorGate {
@@ -152,7 +154,23 @@ func (g *visitorGate) allow(threadID int64, visitor string) bool {
 	// 上限到達後に「一度覚えた人だけ永久に抑制される」ことになる。
 	if _, known := g.seen[key]; known || len(g.seen) < g.max {
 		g.seen[key] = now
+		return true
 	}
+
+	// **上限に達したことを 1 回だけ知らせる。**
+	//
+	// ここから先は抑制が効かないので、閲覧数はリロードで積めます。
+	// 黙ってその状態になるのが一番困る —— 数字がおかしいと気づいたときに、
+	// 上限のせいだと結び付ける手がかりがどこにも無い。
+	//
+	// **毎回は出しません。** 上限に達している間は全部の閲覧がここを通るので、
+	// 1 リクエスト 1 行になります (bootstrap_admin_sub_mismatch と同じ判断)。
+	g.saturatedOnce.Do(func() {
+		// **既存の limit 列を使います。** 「効かなくなった上限」という
+		// 意味は contact のレート制限と同じで、列を増やす理由がない
+		// (Athena の DDL に無い列は静かに NULL になる)。型も Int64 で揃える。
+		slog.Warn("view_count_gate_saturated", slog.Int64("limit", int64(g.max)))
+	})
 	return true
 }
 
@@ -206,6 +224,14 @@ func (g *visitorGate) evictExpired() {
 	// もう 1 つ副作用があった。ここで lastEvict を毎回更新するため、
 	// allow 側の「窓が 1 周したら自分で掃除する」枝が **Buffer 経路では
 	// 一度も発火しない**状態になっていた (前のレビューで足した仕組み)。
+	//
+	// **引き換えに、記録の滞留は最長で窓の 2 倍になります** (レビュー指摘)。
+	// 掃除の直後に作られた記録は、次の掃除まで生き残るためです
+	// (直す前は Flush が 5 秒ごとに掃除していたので「窓 + 5 秒」だった)。
+	// つまり max (DefaultMaxVisitors) に届いて**抑制が静かに無効になる**
+	// 閾値が、およそ半分の密度で来ます —— 10 分で 10 万一意ではなく、
+	// 20 分で 10 万一意。走査の費用と引き換えに受け入れる側に倒しました。
+	// 抑制が無効になったこと自体は view_count_gate_saturated が知らせます。
 	now := g.now()
 	if now.Sub(g.lastEvict) < g.window {
 		return

@@ -1,8 +1,12 @@
 package viewcount
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -648,17 +652,56 @@ func TestFlush_EvictsOnlyOncePerWindow(t *testing.T) {
 		t.Errorf("窓の内側で %d 回走査した, want 0 (既定なら 5 秒ごとに走ることになる)", got)
 	}
 
-	// 窓を越えたら 1 回だけ走り、期限切れが消える。
+	// **窓を越えたら Flush だけで掃除が走ること。**
+	//
+	// ここで Record を先に呼んではいけません (レビュー指摘)。
+	// allow 側にも「窓が 1 周したら掃除する」枝があるので、
+	// **走査を進めているのが Flush なのか Record なのか区別できなくなります。**
+	// 実際、初版は Record を先に置いていたため、evictExpired を丸ごと
+	// no-op にしても全テストが通りました ——
+	// 「閲覧が止まっている間に記録を抱えたままにしない」という
+	// Flush 側の掃除の目的が、まったく守られていなかった。
 	c.advance(10 * time.Minute)
-	b.Record(t.Context(), 3, "u:7")
 	if _, err := b.Flush(t.Context(), sink); err != nil {
 		t.Fatalf("Flush が失敗した: %v", err)
 	}
 	if got := b.gate.scans() - before; got != 1 {
-		t.Errorf("窓を越えたあとの走査が %d 回, want 1", got)
+		t.Errorf("窓を越えたあとの走査が %d 回, want 1 (Flush が掃除していない)", got)
 	}
-	// 古い 1 件は消え、いま入れた 1 件だけが残る。
-	if got := b.gate.size(); got != 1 {
-		t.Errorf("窓を越えても掃除されない: seen = %d 件, want 1", got)
+	if got := b.gate.size(); got != 0 {
+		t.Errorf("窓を越えても掃除されない: seen = %d 件, want 0", got)
+	}
+}
+
+// **上限に達したことを 1 回だけ知らせること。**
+//
+// 上限を超えると抑制が効かなくなり、閲覧数はリロードで積めます
+// (DefaultMaxVisitors の説明にある、意図した振る舞い)。
+// **黙ってその状態になるのが困る** —— 数字がおかしいと気づいたときに、
+// 上限のせいだと結び付ける手がかりがどこにも無い。
+//
+// 毎回出すと、上限に達している間は 1 リクエスト 1 行になるので 1 回だけ。
+// **並列にしない** —— 既定のロガーを差し替えるため。
+func TestGateSaturation_WarnsOnce(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	c := &clock{now: time.Unix(1_700_000_000, 0)}
+	b := New(WithClock(c.Now), WithMaxVisitors(2), WithDedupeWindow(10*time.Minute))
+
+	// 上限まで埋めてから、さらに通す。
+	for i := range 5 {
+		b.Record(t.Context(), 1, "u:"+strconv.Itoa(i))
+	}
+
+	got := strings.Count(buf.String(), "view_count_gate_saturated")
+	if got != 1 {
+		t.Errorf("view_count_gate_saturated が %d 行, want 1 (出ない = 抑制が消えたことに気づけない)", got)
+	}
+	// 上限を超えても閲覧そのものは数える (抑制をやめるだけ)。
+	if !b.Record(t.Context(), 1, "u:99") {
+		t.Error("上限を超えたら数えられなくなっている")
 	}
 }
