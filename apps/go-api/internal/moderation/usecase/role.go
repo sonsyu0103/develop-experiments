@@ -62,6 +62,15 @@ func (i *Interactor) ChangeRole(
 	//    互いを同時に降格させると両方が「対象は自分ではない」を通り、
 	//    更新する行も別なのでロックも衝突せず、**両方コミットして
 	//    admin が 0 人になります。** 残りは 4 で塞ぎます。
+	//
+	//    **ゼロ値も弾きます** (レビュー指摘)。ActorPublicID は Actor と
+	//    別のフィールドなので、呼び出し側が埋め忘れても型では気づけません。
+	//    忘れると比較が**常に偽**になり、admin が 2 人以上いれば
+	//    ensureAdminRemains も通って、**自分を降格できてしまいます。**
+	//    静かに素通りするより、ここで落とすほうが安全側になります。
+	if cmd.ActorPublicID == uuid.Nil {
+		return nil, fmt.Errorf("操作者の ID が不正です: %w", apperr.ErrInvalidArgument)
+	}
 	if cmd.TargetPublicID == cmd.ActorPublicID {
 		return nil, fmt.Errorf("自分のロールは変更できません: %w", apperr.ErrPermissionDenied)
 	}
