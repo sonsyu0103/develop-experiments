@@ -96,6 +96,21 @@ func run() error {
 		slog.Warn("login_disabled")
 	}
 
+	// **プロキシを信じない既定は、逆側にも壊れ方がある。**
+	//
+	// TRUSTED_PROXIES が空のとき ClientIP は接続元アドレスを返す。
+	// 偽装を受け入れないための既定だが (config.TrustedProxies)、
+	// ALB や CloudFront の背後では**全員が同じ「プロキシの IP」になる**。
+	// 問い合わせのレート制限は既定で 5 件/時なので、
+	// **誰か 5 人が送った時点で、その 1 時間は全員が 429** になる。
+	//
+	// 弾いた事実は contact_rate_limited に client_ip 付きで残る (同じ IP が
+	// 並ぶので後からは分かる) が、**起動時には何も出ていなかった。**
+	// 開発環境では素の接続元で正しいので、そこでは出さない。
+	if len(cfg.TrustedProxies) == 0 && !cfg.Debug {
+		slog.Warn("trusted_proxies_unset")
+	}
+
 	// 画像はストレージの設定が揃っているときだけ有効にする。
 	//
 	// 認証と同じ形 (ADR 0005 決定 4)。揃っていなくても API は起動し、

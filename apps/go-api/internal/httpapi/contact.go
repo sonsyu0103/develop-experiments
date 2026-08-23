@@ -62,6 +62,15 @@ func (s *Server) CreateContact(c *gin.Context) {
 // 見ます。**偽装されうる値です。** 偽装されればレート制限を回避できますが、
 // それは「IP でレート制限する」ことに元々ある限界で、
 // 突破されたら WAF 側のルールへ移します (ADR 0008 決定 4)。
+//
+// **逆側の壊れ方のほうが痛い。** TRUSTED_PROXIES が空のまま
+// ALB や CloudFront の背後に置くと、ClientIP は全員について
+// **プロキシのアドレス 1 つ**を返す。レート制限は既定で 5 件/時なので、
+// **誰か 5 人が送った時点で、その 1 時間は全員が 429** になる
+// —— 「精度が落ちる」ではなく、機能が別物に化ける。
+// 起動時に trusted_proxies_unset を出しているのはこのため
+// (cmd/api/main.go)。弾いた側は contact_rate_limited の client_ip が
+// 全部同じ値で並ぶので、そこからも分かる。
 func clientIP(c *gin.Context) netip.Addr {
 	// **ParseAddr です。** ClientIP はポートを含まない文字列を返すので、
 	// ここで SplitHostPort は要りません。
