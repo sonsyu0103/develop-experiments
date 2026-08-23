@@ -478,6 +478,17 @@ func TestSyncCounter_SurvivesSinkFailure(t *testing.T) {
 	if c.Record(t.Context(), 7, "a") {
 		t.Error("失敗したのに数えたことになっている")
 	}
+
+	// **抑制の記録を残さないこと** (レビュー指摘)。
+	//
+	// allow は「数えた」と印を付けてから反映へ進みます。失敗しても
+	// 印が残ると、**窓 (10 分) が明けるまで再試行できません** ——
+	// DB が復旧しても、その訪問者のその閲覧は二度と数えられない。
+	// 戻り値だけを見ていた頃は、この穴が検査に掛かりませんでした。
+	sink.err = nil
+	if !c.Record(t.Context(), 7, "a") {
+		t.Error("復旧後も抑制されたままになっている (失敗した閲覧が永久に失われる)")
+	}
 }
 
 // 不正なスレッド ID では UPDATE を打たないこと。
@@ -596,5 +607,58 @@ func TestRecord_EvictsExpiredVisitorsWithoutFlush(t *testing.T) {
 
 	if b.Record(t.Context(), 2, "c") {
 		t.Error("Flush 無しでは掃除されていない")
+	}
+}
+
+// **Flush の掃除が、窓ごとにしか走らないこと** (レビュー指摘)。
+//
+// 掃除は全件走査で、Record が握るのと同じロックを止めます。
+// evictExpiredLocked のコメントは「掃除は窓ごとにしか走らない」を根拠に
+// 全件走査を選んでいるのに、Flush は無条件に呼んでいました ——
+// 既定はフラッシュ 5 秒 / 窓 600 秒なので、**想定の 120 倍**の頻度。
+//
+// 副作用がもう 1 つあります。掃除のたびに lastEvict が進むため、
+// allow 側の「窓が 1 周したら自分で掃除する」枝が
+// **Buffer 経路では一度も発火しません。**
+func TestFlush_EvictsOnlyOncePerWindow(t *testing.T) {
+	t.Parallel()
+
+	c := &clock{now: time.Unix(1_700_000_000, 0)}
+	b := newTestBuffer(c, WithDedupeWindow(10*time.Minute))
+	sink := &fakeSink{}
+
+	// 期限切れにする記録を作る。
+	b.Record(t.Context(), 1, "u:42")
+	if _, err := b.Flush(t.Context(), sink); err != nil {
+		t.Fatalf("Flush が失敗した: %v", err)
+	}
+
+	before := b.gate.scans()
+
+	// **窓の内側では、何回フラッシュしても走査しない。**
+	// 「消えた件数」では見分けられません —— 窓の内側には期限切れが
+	// 無いので、無条件に走らせても結果は同じに見えます。
+	for range 5 {
+		c.advance(5 * time.Second)
+		if _, err := b.Flush(t.Context(), sink); err != nil {
+			t.Fatalf("Flush が失敗した: %v", err)
+		}
+	}
+	if got := b.gate.scans() - before; got != 0 {
+		t.Errorf("窓の内側で %d 回走査した, want 0 (既定なら 5 秒ごとに走ることになる)", got)
+	}
+
+	// 窓を越えたら 1 回だけ走り、期限切れが消える。
+	c.advance(10 * time.Minute)
+	b.Record(t.Context(), 3, "u:7")
+	if _, err := b.Flush(t.Context(), sink); err != nil {
+		t.Fatalf("Flush が失敗した: %v", err)
+	}
+	if got := b.gate.scans() - before; got != 1 {
+		t.Errorf("窓を越えたあとの走査が %d 回, want 1", got)
+	}
+	// 古い 1 件は消え、いま入れた 1 件だけが残る。
+	if got := b.gate.size(); got != 1 {
+		t.Errorf("窓を越えても掃除されない: seen = %d 件, want 1", got)
 	}
 }
