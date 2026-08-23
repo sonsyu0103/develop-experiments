@@ -1,8 +1,12 @@
 package viewcount
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -478,6 +482,17 @@ func TestSyncCounter_SurvivesSinkFailure(t *testing.T) {
 	if c.Record(t.Context(), 7, "a") {
 		t.Error("失敗したのに数えたことになっている")
 	}
+
+	// **抑制の記録を残さないこと** (レビュー指摘)。
+	//
+	// allow は「数えた」と印を付けてから反映へ進みます。失敗しても
+	// 印が残ると、**窓 (10 分) が明けるまで再試行できません** ——
+	// DB が復旧しても、その訪問者のその閲覧は二度と数えられない。
+	// 戻り値だけを見ていた頃は、この穴が検査に掛かりませんでした。
+	sink.err = nil
+	if !c.Record(t.Context(), 7, "a") {
+		t.Error("復旧後も抑制されたままになっている (失敗した閲覧が永久に失われる)")
+	}
 }
 
 // 不正なスレッド ID では UPDATE を打たないこと。
@@ -596,5 +611,97 @@ func TestRecord_EvictsExpiredVisitorsWithoutFlush(t *testing.T) {
 
 	if b.Record(t.Context(), 2, "c") {
 		t.Error("Flush 無しでは掃除されていない")
+	}
+}
+
+// **Flush の掃除が、窓ごとにしか走らないこと** (レビュー指摘)。
+//
+// 掃除は全件走査で、Record が握るのと同じロックを止めます。
+// evictExpiredLocked のコメントは「掃除は窓ごとにしか走らない」を根拠に
+// 全件走査を選んでいるのに、Flush は無条件に呼んでいました ——
+// 既定はフラッシュ 5 秒 / 窓 600 秒なので、**想定の 120 倍**の頻度。
+//
+// 副作用がもう 1 つあります。掃除のたびに lastEvict が進むため、
+// allow 側の「窓が 1 周したら自分で掃除する」枝が
+// **Buffer 経路では一度も発火しません。**
+func TestFlush_EvictsOnlyOncePerWindow(t *testing.T) {
+	t.Parallel()
+
+	c := &clock{now: time.Unix(1_700_000_000, 0)}
+	b := newTestBuffer(c, WithDedupeWindow(10*time.Minute))
+	sink := &fakeSink{}
+
+	// 期限切れにする記録を作る。
+	b.Record(t.Context(), 1, "u:42")
+	if _, err := b.Flush(t.Context(), sink); err != nil {
+		t.Fatalf("Flush が失敗した: %v", err)
+	}
+
+	before := b.gate.scans()
+
+	// **窓の内側では、何回フラッシュしても走査しない。**
+	// 「消えた件数」では見分けられません —— 窓の内側には期限切れが
+	// 無いので、無条件に走らせても結果は同じに見えます。
+	for range 5 {
+		c.advance(5 * time.Second)
+		if _, err := b.Flush(t.Context(), sink); err != nil {
+			t.Fatalf("Flush が失敗した: %v", err)
+		}
+	}
+	if got := b.gate.scans() - before; got != 0 {
+		t.Errorf("窓の内側で %d 回走査した, want 0 (既定なら 5 秒ごとに走ることになる)", got)
+	}
+
+	// **窓を越えたら Flush だけで掃除が走ること。**
+	//
+	// ここで Record を先に呼んではいけません (レビュー指摘)。
+	// allow 側にも「窓が 1 周したら掃除する」枝があるので、
+	// **走査を進めているのが Flush なのか Record なのか区別できなくなります。**
+	// 実際、初版は Record を先に置いていたため、evictExpired を丸ごと
+	// no-op にしても全テストが通りました ——
+	// 「閲覧が止まっている間に記録を抱えたままにしない」という
+	// Flush 側の掃除の目的が、まったく守られていなかった。
+	c.advance(10 * time.Minute)
+	if _, err := b.Flush(t.Context(), sink); err != nil {
+		t.Fatalf("Flush が失敗した: %v", err)
+	}
+	if got := b.gate.scans() - before; got != 1 {
+		t.Errorf("窓を越えたあとの走査が %d 回, want 1 (Flush が掃除していない)", got)
+	}
+	if got := b.gate.size(); got != 0 {
+		t.Errorf("窓を越えても掃除されない: seen = %d 件, want 0", got)
+	}
+}
+
+// **上限に達したことを 1 回だけ知らせること。**
+//
+// 上限を超えると抑制が効かなくなり、閲覧数はリロードで積めます
+// (DefaultMaxVisitors の説明にある、意図した振る舞い)。
+// **黙ってその状態になるのが困る** —— 数字がおかしいと気づいたときに、
+// 上限のせいだと結び付ける手がかりがどこにも無い。
+//
+// 毎回出すと、上限に達している間は 1 リクエスト 1 行になるので 1 回だけ。
+// **並列にしない** —— 既定のロガーを差し替えるため。
+func TestGateSaturation_WarnsOnce(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	c := &clock{now: time.Unix(1_700_000_000, 0)}
+	b := New(WithClock(c.Now), WithMaxVisitors(2), WithDedupeWindow(10*time.Minute))
+
+	// 上限まで埋めてから、さらに通す。
+	for i := range 5 {
+		b.Record(t.Context(), 1, "u:"+strconv.Itoa(i))
+	}
+
+	got := strings.Count(buf.String(), "view_count_gate_saturated")
+	if got != 1 {
+		t.Errorf("view_count_gate_saturated が %d 行, want 1 (出ない = 抑制が消えたことに気づけない)", got)
+	}
+	// 上限を超えても閲覧そのものは数える (抑制をやめるだけ)。
+	if !b.Record(t.Context(), 1, "u:99") {
+		t.Error("上限を超えたら数えられなくなっている")
 	}
 }

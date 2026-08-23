@@ -328,3 +328,34 @@ func TestListQueue_TruncatesAndSetsCursor(t *testing.T) {
 		})
 	}
 }
+
+// **別の並び順で発行されたカーソルを弾くこと** (レビュー指摘)。
+//
+// モデレーターが `GET /threads?sort=popular` のトークンを
+// 通報キューの `?cursor=` に貼ると、view_count 成分が黙って捨てられ、
+// **id > cursor だけが効いたページ**が 400 も出さずに返ります。
+// コメント一覧と同じ形の漏れが、権限のある経路に残っていました。
+func TestListQueue_RejectsForeignSortCursor(t *testing.T) {
+	t.Parallel()
+
+	token, err := pagination.NewCursor(42).WithSort("popular").WithViewCount(100).Encode()
+	if err != nil {
+		t.Fatalf("カーソルの符号化が失敗した: %v", err)
+	}
+	page, err := pagination.NewPage(&token, 10)
+	if err != nil {
+		t.Fatalf("pagination.NewPage が失敗した: %v", err)
+	}
+
+	reports := newFakeReports()
+	reports.rows = 10
+	_, err = NewReportInteractor(reports, reports).ListQueue(t.Context(),
+		model.Actor{UserID: 1, CanModerate: true}, model.ReportOpen, page)
+	if !errors.Is(err, apperr.ErrInvalidArgument) {
+		t.Fatalf("err = %v, want apperr.ErrInvalidArgument", err)
+	}
+	// 弾いたなら DB を引かない。
+	if reports.gotSize != 0 {
+		t.Errorf("List が呼ばれている (Size = %d)", reports.gotSize)
+	}
+}

@@ -159,6 +159,10 @@ type ReportListResult struct {
 	NextCursor *string
 }
 
+// queueCursorSort は通報キューが発行するカーソルの並び順識別子です。
+// 並び順を選べないので既定のまま (空文字) になります。
+const queueCursorSort = ""
+
 // ListQueue は通報キューを返します。
 //
 // **moderator 以上だけが読めます** (ADR 0011 決定 1)。
@@ -169,6 +173,19 @@ func (i *ReportInteractor) ListQueue(
 	if !actor.CanModerate {
 		return ReportListResult{},
 			fmt.Errorf("通報キューを読む権限がありません: %w", apperr.ErrPermissionDenied)
+	}
+
+	// **別の並び順で発行されたカーソルを弾く** (ADR 0018「並び順を足すときの規則」)。
+	//
+	// 通報キューは並び順を選べないので、識別子は既定のまま (空文字)。
+	// これが無いと、モデレーターが `GET /threads?sort=popular` の
+	// トークンを貼ったとき、**vc が黙って捨てられて id > cursor だけが
+	// 効いたページ**が 400 も出さずに返ります。
+	// コメント一覧と同じ形の漏れでした (レビュー指摘)。
+	if page.Cursor != nil && page.CursorSort() != queueCursorSort {
+		return ReportListResult{}, fmt.Errorf(
+			"cursor は別の並び順で発行されたものです。先頭ページから取得し直してください: %w",
+			apperr.ErrInvalidArgument)
 	}
 
 	// **1 件多く取って「次がある」を判定する。** 件数を数える問い合わせを

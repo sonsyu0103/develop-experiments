@@ -109,6 +109,11 @@ type visitorGate struct {
 	// **抑制が静かに無効になった状態で測定が続く** ——
 	// Phase 4 で「抑制あり」の条件を作ったつもりが「抑制なし」になります。
 	lastEvict time.Time
+	// evictScans は全件走査した回数です。**掃除の頻度そのもの**を
+	// 検査から見るために持ちます (消えた件数では見分けられないため)。
+	evictScans int
+	// saturatedOnce は上限到達の警告を 1 回だけ出すためのものです。
+	saturatedOnce sync.Once
 }
 
 func newVisitorGate(window time.Duration, max int, now func() time.Time) *visitorGate {
@@ -149,8 +154,55 @@ func (g *visitorGate) allow(threadID int64, visitor string) bool {
 	// 上限到達後に「一度覚えた人だけ永久に抑制される」ことになる。
 	if _, known := g.seen[key]; known || len(g.seen) < g.max {
 		g.seen[key] = now
+		return true
 	}
+
+	// **上限に達したことを 1 回だけ知らせる。**
+	//
+	// ここから先は抑制が効かないので、閲覧数はリロードで積めます。
+	// 黙ってその状態になるのが一番困る —— 数字がおかしいと気づいたときに、
+	// 上限のせいだと結び付ける手がかりがどこにも無い。
+	//
+	// **毎回は出しません。** 上限に達している間は全部の閲覧がここを通るので、
+	// 1 リクエスト 1 行になります (bootstrap_admin_sub_mismatch と同じ判断)。
+	g.saturatedOnce.Do(func() {
+		// **既存の limit 列を使います。** 「効かなくなった上限」という
+		// 意味は contact のレート制限と同じで、列を増やす理由がない
+		// (Athena の DDL に無い列は静かに NULL になる)。型も Int64 で揃える。
+		slog.Warn("view_count_gate_saturated", slog.Int64("limit", int64(g.max)))
+	})
 	return true
+}
+
+// size は覚えている訪問者の数を返します (検査用)。
+func (g *visitorGate) size() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.seen)
+}
+
+// scans は全件走査した回数を返します (検査用)。
+//
+// **「何件消えたか」では掃除の頻度を見分けられません。** 窓の内側では
+// 走査しても消える行が無いので、無条件に走らせても結果は同じに見えます。
+// 見たいのは費用のほうなので、走った回数そのものを数えます。
+func (g *visitorGate) scans() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.evictScans
+}
+
+// forget は抑制の記録を取り消します。
+//
+// **allow は「数えた」と印を付けます。** その後の反映が失敗したときに
+// 印を残すと、窓が明けるまでその訪問者の閲覧は再試行できません。
+func (g *visitorGate) forget(threadID int64, visitor string) {
+	if visitor == "" {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	delete(g.seen, visitKey{visitor: hashVisitor(visitor), threadID: threadID})
 }
 
 // evictExpired は期限切れの記録を捨てます。
@@ -161,7 +213,30 @@ func (g *visitorGate) allow(threadID int64, visitor string) bool {
 func (g *visitorGate) evictExpired() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.evictExpiredLocked(g.now())
+
+	// **窓が 1 周していなければ何もしない。**
+	//
+	// 以前は無条件に走査していた。呼び出し元の Flush は既定 5 秒間隔
+	// (VIEW_COUNT_FLUSH_SECONDS) で、窓は 600 秒 (VIEW_COUNT_DEDUPE_SECONDS)。
+	// **evictExpiredLocked が想定する頻度の 120 倍**で全件走査が走り、
+	// しかも Record が握るのと同じ g.mu を毎回止めていた。
+	//
+	// もう 1 つ副作用があった。ここで lastEvict を毎回更新するため、
+	// allow 側の「窓が 1 周したら自分で掃除する」枝が **Buffer 経路では
+	// 一度も発火しない**状態になっていた (前のレビューで足した仕組み)。
+	//
+	// **引き換えに、記録の滞留は最長で窓の 2 倍になります** (レビュー指摘)。
+	// 掃除の直後に作られた記録は、次の掃除まで生き残るためです
+	// (直す前は Flush が 5 秒ごとに掃除していたので「窓 + 5 秒」だった)。
+	// つまり max (DefaultMaxVisitors) に届いて**抑制が静かに無効になる**
+	// 閾値が、およそ半分の密度で来ます —— 10 分で 10 万一意ではなく、
+	// 20 分で 10 万一意。走査の費用と引き換えに受け入れる側に倒しました。
+	// 抑制が無効になったこと自体は view_count_gate_saturated が知らせます。
+	now := g.now()
+	if now.Sub(g.lastEvict) < g.window {
+		return
+	}
+	g.evictExpiredLocked(now)
 }
 
 // evictExpiredLocked は呼び出し側がロックを保持している前提で掃除します。
@@ -172,6 +247,7 @@ func (g *visitorGate) evictExpired() {
 // 掃除は窓ごとにしか走らないためです。
 func (g *visitorGate) evictExpiredLocked(now time.Time) {
 	g.lastEvict = now
+	g.evictScans++
 	for key, last := range g.seen {
 		if now.Sub(last) >= g.window {
 			delete(g.seen, key)
@@ -294,6 +370,14 @@ func (c *SyncCounter) Record(ctx context.Context, threadID int64, visitor string
 		return false
 	}
 	if _, err := c.sink.IncrementViewCounts(ctx, []int64{threadID}, []int64{1}); err != nil {
+		// **抑制の記録を取り消す。** allow は「数えた」と印を付けてから
+		// ここへ来るので、取り消さないと**窓が明けるまで再試行できません**
+		// —— DB が復旧しても、その訪問者のその閲覧は二度と数えられない。
+		//
+		// Buffer 側は増分を戻して次のフラッシュで再試行する。
+		// **同じ性質をこちらにも持たせます** (ADR 0006 の比較が
+		// 「DB が苦しいとき」の UPDATE 量を過小に見せないため)。
+		c.gate.forget(threadID, visitor)
 		slog.WarnContext(ctx, "view_count_sync_failed",
 			slog.Int64("thread_id", threadID),
 			slog.String("error", err.Error()),
