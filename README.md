@@ -98,7 +98,7 @@ make checker-probe     # 静的検査そのものが「落とすべきものを�
 make cover             # 手書きロジックのカバレッジを測り、下限を割ったら落とす
 make cover-html        # どこが通っていないかをブラウザで見る
 make check             # 静的検査 + ユニットテスト + カバレッジ + 生成物のドリフト検出 (DB 不要)
-make test-live         # 実 DB / MinIO に対する検査だけを走らせる (make up が要る)
+make test-live         # 実 DB / MinIO に対する検査だけを走らせる (環境も立てる)
 make smoke             # 実 DB を立てて API を起動し、HTTP 越しに疎通を検証
 make logs-verify       # ログ基盤が本番と同じ形で動いているかを実測
 make check-all         # check + smoke + test-live + logs-verify

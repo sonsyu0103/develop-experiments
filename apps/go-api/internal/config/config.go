@@ -286,11 +286,18 @@ const (
 	// CommentPostModeUnique は 1 文で採番し、一意制約違反をリトライします。
 	// **既定値。** 実測で最も速く、往復も 1 回で済みます。
 	CommentPostModeUnique CommentPostMode = "unique"
-	// CommentPostModeNaive は防御なしの実装です。**投稿が 500 で失われます。**
+	// CommentPostModeNaive は防御なしの実装です。**並行投稿が失われます。**
 	//
 	// **重複はしません。** UNIQUE (thread_id, seq) が 2 件目を拒否するため、
 	// 起きるのは重複ではなく失敗です (23505 がリトライされずに上がる。
 	// 32 並列で 32 件中 18 件。docs/adr/0019-comment-concurrency.md の実測)。
+	//
+	// **落ち方は経路で変わります。** Idempotency-Key の無い通常の投稿は
+	// 23505 が翻訳されずに上がって 500。**キーがあると 409 になります** ——
+	// CreateIdempotent が採番衝突を apperr.ErrConflict に包み直すためです
+	// (「キーを付けた途端に 409 が 500 に変わる」のを避ける意図的な処理)。
+	// concurrency-probe を冪等キー付きで回すと 409 が並ぶので、
+	// **500 が出ないことを「naive が直っている」と読まないこと。**
 	// **データを守っているのはアプリの並行制御ではなく DB の制約**であり、
 	// 並行制御が担っているのは「制約に弾かれないようにする」ことです。
 	//
