@@ -286,7 +286,13 @@ const (
 	// CommentPostModeUnique は 1 文で採番し、一意制約違反をリトライします。
 	// **既定値。** 実測で最も速く、往復も 1 回で済みます。
 	CommentPostModeUnique CommentPostMode = "unique"
-	// CommentPostModeNaive は防御なしの実装です。**レス番号が重複します。**
+	// CommentPostModeNaive は防御なしの実装です。**投稿が 500 で失われます。**
+	//
+	// **重複はしません。** UNIQUE (thread_id, seq) が 2 件目を拒否するため、
+	// 起きるのは重複ではなく失敗です (23505 がリトライされずに上がる。
+	// 32 並列で 32 件中 18 件。docs/adr/0019-comment-concurrency.md の実測)。
+	// **データを守っているのはアプリの並行制御ではなく DB の制約**であり、
+	// 並行制御が担っているのは「制約に弾かれないようにする」ことです。
 	//
 	// 「SSI を入れたら正しくなった」は、入れる前が本当に壊れていたことを
 	// 示さない限り主張になりません。それを実測するためだけに存在します。
@@ -321,7 +327,8 @@ func parseCommentPostMode(raw string, debug bool) (CommentPostMode, error) {
 	if !allowedInProduction && !debug {
 		// 既定を安全側に倒す方針は AuthConfig.SecureCookie と同じです。
 		return "", fmt.Errorf(
-			"config: COMMENT_POST_MODE=%s は ENV=development でのみ選べます (レス番号が重複します)", mode)
+			"config: COMMENT_POST_MODE=%s は ENV=development でのみ選べます "+
+				"(並行投稿が一意制約に弾かれ、投稿が失われます)", mode)
 	}
 	return mode, nil
 }

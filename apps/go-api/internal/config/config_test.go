@@ -153,7 +153,7 @@ func TestLoad_CommentPostMode(t *testing.T) {
 		{name: "unique", env: "unique", want: CommentPostModeUnique},
 		{name: "大文字と空白を許す", env: "  SSI ", want: CommentPostModeSSI},
 
-		// naive はレス番号が重複する。本番相当の設定では選ばせない。
+		// naive は並行投稿が一意制約に弾かれて失われる。本番相当の設定では選ばせない。
 		{name: "naive は開発モードでのみ選べる", env: "naive", devMode: true, want: CommentPostModeNaive},
 		{name: "naive は本番相当だと起動しない", env: "naive", wantErr: true},
 

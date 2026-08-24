@@ -104,6 +104,12 @@ make logs-verify       # ログ基盤が本番と同じ形で動いているか�
 make check-all         # check + smoke + test-live + logs-verify
 ```
 
+**`make smoke` と `make check-all` は、手元の DB のスレッドとコメントを消す。**
+smoke が `make seed` を呼び、`seed.sql` の先頭が
+`TRUNCATE TABLE comments, threads RESTART IDENTITY CASCADE` になっているため
+(毎回同じ状態から検証するのが狙い)。ベンチ用データセットを入れていた場合は
+`make bench-dataset` で入れ直す。`make test-live` 単体なら消えない。
+
 **`docker compose logs go-api` は空になる。** ログは fluent-bit へ
 転送されるため (下の「ログ基盤」節)。`make logs` なら両方まとめて見える。
 
