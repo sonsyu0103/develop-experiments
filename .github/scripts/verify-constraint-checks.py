@@ -310,17 +310,38 @@ ALTER_ADD_CHECK = re.compile(
 def apply_unsafe() -> list[tuple[str, str, str]]:
     """適用時に落ちうる CHECK 制約を (マイグレーション, 制約名, 理由) で返します。
 
-    判定は狭く取ります —— **同じファイルで足した列**を参照していて、
-    その列に DEFAULT が無く、制約より前にその表への UPDATE も無い場合だけ。
+    **CHECK 制約は NULL では違反しません。** 評価が NULL になるだけで、
+    FALSE ではないため通ります。実測 (PostgreSQL 16):
 
-    広く「ALTER TABLE ADD CONSTRAINT はすべて危ない」とすると、
-    000013 のような**制約を緩める**変更まで鳴り、
-    無視される検査になります。狭く取るぶん見逃す形はあります:
+        col が NULL の行に対して
+          CHECK (length(col) >= 1)                     -> 通る
+          CHECK (col IS NULL OR a <> 0)                -> 通る
+          CHECK (col IN ('x','y'))                     -> 通る
+          CHECK ((a=1 AND col IS NOT NULL) OR ...)     -> **落ちる**
 
+    つまり、足したばかりの全 NULL の列が制約を壊すのは
+    **その列に IS NOT NULL を要求する枝がある場合だけ**になります。
+    そこで条件を全部満たすものに絞ります:
+
+      1. ALTER TABLE ... ADD CONSTRAINT ... CHECK (既存行の検証が走る)
+      2. 同じ版で足した列を参照している
+      3. その列に DEFAULT が無い
+      4. 制約の本文が `<列> IS NOT NULL` を要求している
+      5. 制約より前に、その表への UPDATE (埋め戻し) が無い
+
+    **4 を入れないと 000003 / 000004 / 000007 まで鳴ります** ——
+    どれも安全なのに。鳴りすぎる検査は読まれなくなるので、精度を取ります。
+    広く「ALTER TABLE ADD CONSTRAINT はすべて危ない」とするのも同じ理由で
+    採りません (000013 のような**制約を緩める**変更まで鳴る)。
+
+    見逃す形は残ります:
+
+      - `CHECK (coalesce(col,'') <> '')` のように、NULL で FALSE になるが
+        IS NOT NULL とは書かない形
       - 既存の列に、既存データが違反する制約を足す場合
       - 埋め戻しの UPDATE が実は対象を埋めていない場合
 
-    どちらも「書いた人が既存データを考えた」形跡はあるので、
+    どれも「書いた人が既存データを考えた」形跡はあります。
     考えた形跡が無いもの (足した直後に NOT NULL を要求する) に絞ります。
     """
     found: list[tuple[str, str, str]] = []
@@ -345,10 +366,15 @@ def apply_unsafe() -> list[tuple[str, str, str]]:
             for col, has_default in added.items():
                 if has_default:
                     continue
-                if re.search(rf"\b{re.escape(col)}\b", inner):
+                # **IS NOT NULL を要求している枝があるか。**
+                # 無ければ、全 NULL の列でも制約は通る (docstring の実測)。
+                if re.search(
+                    rf"\b{re.escape(col)}\b\s+IS\s+NOT\s+NULL", inner, re.I
+                ):
                     found.append((
                         path.name, name,
-                        f"同じ版で足した {col} に DEFAULT も埋め戻しも無い",
+                        f"同じ版で足した {col} に DEFAULT も埋め戻しも無いまま "
+                        f"IS NOT NULL を要求している",
                     ))
                     break
     return found

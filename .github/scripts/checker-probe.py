@@ -169,11 +169,17 @@ PROBES = [
           "CREATE INDEX contact_ip_scrub_idx",
           "もう存在しない CHECK 制約が対応表に",
           "DROP COLUMN で消える CHECK を追えているか"),
-    Probe("P", CONSTRAINTS, ROLE_MIGRATION_FILE,
-          "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user';",
-          "ALTER TABLE users ADD COLUMN role TEXT;",
+    # **免除を外して、実物 (000009) が鳴ることを見る。**
+    #
+    # 合成の変異では測れなかった。CHECK 制約は NULL では違反しない
+    # (評価が NULL になるだけで FALSE ではない) ので、
+    # 「DEFAULT を消す」程度の変異では**そもそも落ちるべきではない**。
+    # 実際に落ちる形は 000009 が持っているので、それを使う。
+    Probe("P", CONSTRAINTS, CHECKER,
+          'APPLY_UNSAFE_EXEMPT: dict[str, str] = {\n    "reports_thread_id_matches_target": (\n        "000009 で追加済み。ADD COLUMN target_thread_id の直後に "\n        "「comment の通報なら NOT NULL」を要求しており、000008 の時点で "\n        "コメントの通報が 1 行でもある環境では ALTER が落ちる (実測)。"\n        "000009 自体が『既に develop に入っており適用済みの環境がありうる』"\n        "と書いていながら、スキーマの状態だけ見てデータを見ていなかった。"\n        "**マイグレーションは前へ直す方式なので、いま書き換えても "\n        "適用済みの環境は救えない。** 同じ形を二度と入れないための記録として残す。"\n    ),\n}\n',
+          "APPLY_UNSAFE_EXEMPT: dict[str, str] = {}\n",
           "適用時に落ちうる CHECK 制約が",
-          "足したばかりの列に DEFAULT も埋め戻しも無いまま CHECK を張る"),
+          "免除を外すと、適用時に落ちうる制約 (000009) を検出するか"),
     Probe("O", CONSTRAINTS, ROLE_TEST,
           '\tassertSameSet(t, "DB の CHECK 制約", registered, valuesFromMigration(t))',
           '\t// assertSameSet(t, "DB の CHECK 制約", registered, valuesFromMigration(t))',
