@@ -73,6 +73,7 @@ ROLE_MIGRATION = "apps/go-api/db/migrations/000003_add_user_role.up.sql"
 DUCKDB_VERIFY = "infra/duckdb/verify.py"
 CHECKER = f".github/scripts/{CONSTRAINTS}"
 CONTACT_MIGRATION = "apps/go-api/db/migrations/000012_add_contact_messages.up.sql"
+ROLE_MIGRATION_FILE = "apps/go-api/db/migrations/000003_add_user_role.up.sql"
 
 # 共通で差し替えるログ行。**起動時に必ず 1 回出る行**なので、
 # 消えたときは置換が 0 件になり、このスクリプトが先に気づく。
@@ -168,6 +169,11 @@ PROBES = [
           "CREATE INDEX contact_ip_scrub_idx",
           "もう存在しない CHECK 制約が対応表に",
           "DROP COLUMN で消える CHECK を追えているか"),
+    Probe("P", CONSTRAINTS, ROLE_MIGRATION_FILE,
+          "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user';",
+          "ALTER TABLE users ADD COLUMN role TEXT;",
+          "適用時に落ちうる CHECK 制約が",
+          "足したばかりの列に DEFAULT も埋め戻しも無いまま CHECK を張る"),
     Probe("O", CONSTRAINTS, ROLE_TEST,
           '\tassertSameSet(t, "DB の CHECK 制約", registered, valuesFromMigration(t))',
           '\t// assertSameSet(t, "DB の CHECK 制約", registered, valuesFromMigration(t))',

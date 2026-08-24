@@ -360,7 +360,30 @@ type Querier interface {
 	// 一度に消す件数を制限しているのは sessions と同じ理由。
 	// 呼び出し側は「0 行になるまで繰り返す」形で使う。
 	//
-	// idempotency_keys (created_at) の索引で引く。
+	// idempotency_keys_created_idx (created_at) で引く。
+	//
+	// 【ctid で消す理由】
+	// DeleteExpiredSessions と同じ形に揃えてある (実測の表はそちらにある)。
+	//
+	// **ただし、こちらは sessions ほど悪くなかった。**
+	// 200,000 行 / バッチ 1000 での実測:
+	//
+	//   書き方                              プラン                        Buffers  実行
+	//   (user_id, key) IN (SELECT ... LIMIT) Nested Loop + pkey 索引引き      4036  1.7ms
+	//   ctid = ANY(ARRAY(SELECT ctid ...))   Tid Scan                        2020  0.7ms
+	//
+	// 行値の IN でも**主キー索引が効いていた** —— sessions の id IN が
+	// 全表走査に落ちたのとは違う。レビューは「行値なので外側に使える索引が無く、
+	// 全表走査が確定する」と書いていたが、**実測ではそうならなかった。**
+	//
+	// それでも揃える理由は 2 つ:
+	//   - ctid のほうが 2 倍速く、バッファも半分になる (上の表)
+	//   - **プランの選択に依存しない。** 上のプランは統計次第で
+	//     sessions と同じ全表走査に落ちうる。ARRAY(...) は InitPlan として
+	//     1 回だけ評価され、走査量がバッチサイズだけで決まる
+	//
+	// 引き受けるものは DeleteExpiredSessions に書いたとおり
+	// (UPDATE と競合した行が 1 周ぶん残る。drain が次で拾う)。
 	DeleteExpiredIdempotencyKeys(ctx context.Context, arg DeleteExpiredIdempotencyKeysParams) (int64, error)
 	// 期限切れの削除。定期処理から呼ぶ (ADR 0003 未決 #9: どのプロセスで動かすかは未決)。
 	//
@@ -368,7 +391,42 @@ type Querier interface {
 	// 1 トランザクションを短く保つため。長時間のロックと WAL の急増を避ける。
 	// 呼び出し側は「0 行になるまで繰り返す」形で使う。
 	//
-	// sessions (expires_at) の索引で引く。
+	// sessions_expires_at_idx (expires_at) で引く。
+	//
+	// 【ctid で消す理由 —— 素直な書き方はどれも全表を走査する】
+	//
+	// 初版は `WHERE id IN (SELECT ... LIMIT $1)` だった。**件数の上限は
+	// 効いていた**が (実測)、外側が絞り込みの無い全表走査になる。
+	// cmd/api/main.go の drain は 1 周 1000 行を最大 100 周するので、
+	// **毎時 100 回の全表走査**になる (レビュー指摘)。
+	//
+	// 200,000 行 / バッチ 1000 で 4 通り測った (EXPLAIN ANALYZE, BUFFERS):
+	//
+	//   書き方                              プラン                    Buffers  実行
+	//   IN (SELECT ... LIMIT n)             Hash Semi Join + Seq Scan    4256  27.1ms
+	//   WITH ... DELETE ... USING           Hash Join + Seq Scan         4268  26.0ms
+	//   id   = ANY(ARRAY(SELECT ...))       Bitmap Heap Scan (pkey)      3619   3.1ms
+	//   ctid = ANY(ARRAY(SELECT ctid ...))  Tid Scan                     2052   0.7ms
+	//
+	// **CTE + USING では直らない。** ScrubContactClientIPs と同じ形にしても、
+	// プランナは結局 sessions 全体を走査して 1000 行のハッシュに突き合わせる ——
+	// 「消す 1000 行を選ぶために 200,000 行を読む」構造が変わらない。
+	// 実測でも 27.1ms → 26.0ms で、誤差の範囲だった。
+	//
+	// ARRAY(SELECT ...) は InitPlan として**1 回だけ**評価される。そのため
+	//   - LIMIT が半結合の再評価で無効化されない
+	//     (contact.sql が踏んだ罠が、原理的に起きない形になる)
+	//   - 外側が Tid Scan になり、走査量が**バッチサイズだけ**で決まる
+	//
+	// 【ctid を使うことで引き受けるもの】
+	// ctid は物理位置なので、InitPlan の評価後にその行が UPDATE されると
+	// 位置が変わり、**その行は消えずに残る。** 一掃処理としては無害で、
+	// drain が次の周回で拾い直す (0 行になるまで回す形なので終端も変わらない)。
+	// **消しすぎる方向には倒れない** —— 同一スナップショット内で
+	// ctid が別の行を指すことは無い。
+	//
+	// **ORDER BY は古いものから消すため。** sessions_expires_at_idx の
+	// 並びと同じなので追加のコストは無い。
 	DeleteExpiredSessions(ctx context.Context, maxRows int32) (int64, error)
 	// DB 行ごと消す。
 	//

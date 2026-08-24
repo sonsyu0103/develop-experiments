@@ -109,6 +109,51 @@ func TestModerationRepository_MarkImageDeleted_MakesReclaimable_Live(t *testing.
 	}
 }
 
+// **まだアップロード中の画像も削除できること。**
+//
+// db/query/images.sql の MarkImageDeleted は 'pending' も対象にすると
+// 明記し、そのうえで「消すと回収の猶予が外れる」競合まで分析して残すと
+// 決めている。ところが 000006 の CHECK 制約が
+//
+//	(status = 'pending'  AND committed_at IS NULL) OR
+//	(status <> 'pending' AND committed_at IS NOT NULL)
+//
+// だったため、**'pending' を 'deleted' にするとどちらの枝も満たさず
+// 23514 で落ちていた** (レビュー指摘)。translateError は 500 を返すので、
+// モデレーターには「サーバエラー」としか見えない。
+//
+// **既存の検査はすべて StatusCommitted で作っていたので、
+// この経路は CI で 1 度も通っていなかった。** 000013 で制約を直し、
+// ここで経路を押さえる。
+func TestModerationRepository_MarkImageDeleted_AcceptsPending_Live(t *testing.T) {
+	pool := liveDB(t)
+	const ownerID = int64(900403)
+	seedOwner(t, pool, ownerID)
+
+	repo := NewModerationRepository(pool)
+
+	id := insertImage(t, pool, ownerID, imagemodel.StatusPending, 2*time.Hour)
+	if err := repo.MarkImageDeleted(t.Context(), id); err != nil {
+		t.Fatalf("pending の画像を削除できなかった: %v", err)
+	}
+
+	var status string
+	var committedAt *time.Time
+	if err := pool.QueryRow(t.Context(),
+		`SELECT status, committed_at FROM images WHERE id = $1`, id,
+	).Scan(&status, &committedAt); err != nil {
+		t.Fatalf("状態を読めなかった: %v", err)
+	}
+	if status != string(imagemodel.StatusDeleted) {
+		t.Errorf("status = %q, want deleted", status)
+	}
+	// **committed_at は埋めない。** 「アップロードが完了した時刻」なので、
+	// 完了していない画像に入れるのは嘘になる (000013 の判断)。
+	if committedAt != nil {
+		t.Errorf("committed_at = %v, want nil (完了していないので入れてはいけない)", *committedAt)
+	}
+}
+
 // **削除した画像には猶予を与えないこと** (Phase 10 後半で直した)。
 //
 // 初版は 3 種類すべてに created_at の足切りをかけていたため、

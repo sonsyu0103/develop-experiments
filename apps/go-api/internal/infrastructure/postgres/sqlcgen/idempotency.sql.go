@@ -106,11 +106,12 @@ func (q *Queries) CompleteIdempotencyKey(ctx context.Context, arg CompleteIdempo
 
 const deleteExpiredIdempotencyKeys = `-- name: DeleteExpiredIdempotencyKeys :execrows
 DELETE FROM idempotency_keys
-WHERE (user_id, key) IN (
-    SELECT user_id, key FROM idempotency_keys
+WHERE ctid = ANY(ARRAY(
+    SELECT ctid FROM idempotency_keys
     WHERE created_at <= now() - $1::interval
+    ORDER BY created_at
     LIMIT $2
-)
+))
 `
 
 type DeleteExpiredIdempotencyKeysParams struct {
@@ -127,7 +128,30 @@ type DeleteExpiredIdempotencyKeysParams struct {
 // 一度に消す件数を制限しているのは sessions と同じ理由。
 // 呼び出し側は「0 行になるまで繰り返す」形で使う。
 //
-// idempotency_keys (created_at) の索引で引く。
+// idempotency_keys_created_idx (created_at) で引く。
+//
+// 【ctid で消す理由】
+// DeleteExpiredSessions と同じ形に揃えてある (実測の表はそちらにある)。
+//
+// **ただし、こちらは sessions ほど悪くなかった。**
+// 200,000 行 / バッチ 1000 での実測:
+//
+//	書き方                              プラン                        Buffers  実行
+//	(user_id, key) IN (SELECT ... LIMIT) Nested Loop + pkey 索引引き      4036  1.7ms
+//	ctid = ANY(ARRAY(SELECT ctid ...))   Tid Scan                        2020  0.7ms
+//
+// 行値の IN でも**主キー索引が効いていた** —— sessions の id IN が
+// 全表走査に落ちたのとは違う。レビューは「行値なので外側に使える索引が無く、
+// 全表走査が確定する」と書いていたが、**実測ではそうならなかった。**
+//
+// それでも揃える理由は 2 つ:
+//   - ctid のほうが 2 倍速く、バッファも半分になる (上の表)
+//   - **プランの選択に依存しない。** 上のプランは統計次第で
+//     sessions と同じ全表走査に落ちうる。ARRAY(...) は InitPlan として
+//     1 回だけ評価され、走査量がバッチサイズだけで決まる
+//
+// 引き受けるものは DeleteExpiredSessions に書いたとおり
+// (UPDATE と競合した行が 1 周ぶん残る。drain が次で拾う)。
 func (q *Queries) DeleteExpiredIdempotencyKeys(ctx context.Context, arg DeleteExpiredIdempotencyKeysParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteExpiredIdempotencyKeys, arg.Retention, arg.MaxRows)
 	if err != nil {
