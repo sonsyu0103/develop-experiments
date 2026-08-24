@@ -192,6 +192,26 @@ GUARDED: dict[str, tuple[str, str]] = {
 # ここに足すときは、なぜ検査できないのかを書く。
 EXEMPT: dict[str, str] = {}
 
+# 【適用時に落ちうる CHECK 制約】
+#
+# ALTER TABLE ... ADD CONSTRAINT ... CHECK は**既存の全行を検証する。**
+# 同じマイグレーションで足したばかりの列を参照していて、その列に
+# DEFAULT も埋め戻しも無いなら、**既存行は NULL のまま検証に入る。**
+# 1 行でも違反すれば ALTER が落ち、golang-migrate は dirty で止まる。
+#
+# 既に適用済みで、もう直せないもの。**理由つきでここに載せる。**
+APPLY_UNSAFE_EXEMPT: dict[str, str] = {
+    "reports_thread_id_matches_target": (
+        "000009 で追加済み。ADD COLUMN target_thread_id の直後に "
+        "「comment の通報なら NOT NULL」を要求しており、000008 の時点で "
+        "コメントの通報が 1 行でもある環境では ALTER が落ちる (実測)。"
+        "000009 自体が『既に develop に入っており適用済みの環境がありうる』"
+        "と書いていながら、スキーマの状態だけ見てデータを見ていなかった。"
+        "**マイグレーションは前へ直す方式なので、いま書き換えても "
+        "適用済みの環境は救えない。** 同じ形を二度と入れないための記録として残す。"
+    ),
+}
+
 
 # 制約の生き死にに関わる文。**出現順に畳み込む**ので 1 本の正規表現にする。
 #
@@ -268,6 +288,98 @@ def alive_constraints() -> dict[str, tuple[str, str]]:
     return alive
 
 
+# 同じファイル内で足された列。DEFAULT の有無まで見る。
+ADD_COLUMN = re.compile(
+    r'ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?"?(\w+)"?([^,;]*)', re.I)
+
+# 埋め戻し。UPDATE が 1 つでもあれば「埋めている」とみなす。
+#
+# **中身までは見ない。** 見ようとすると SQL を解釈することになり、
+# 書き方を変えた瞬間に静かに検出から外れる ——
+# このスクリプトが避けたい失敗そのものになる。
+# 埋め戻しの正しさは、落ちたときに人が読む。
+BACKFILL = re.compile(r'^\s*UPDATE\s+"?(\w+)"?', re.I | re.M)
+
+# ALTER TABLE で足す CHECK 制約 (CREATE TABLE の中のものは対象外 ——
+# 新しい表には検証すべき既存行が無い)。
+ALTER_ADD_CHECK = re.compile(
+    r'ALTER\s+TABLE\s+(?:ONLY\s+)?"?(\w+)"?\s+ADD\s+CONSTRAINT\s+"?(\w+)"?\s+CHECK\s*\(',
+    re.I | re.S)
+
+
+def apply_unsafe() -> list[tuple[str, str, str]]:
+    """適用時に落ちうる CHECK 制約を (マイグレーション, 制約名, 理由) で返します。
+
+    **CHECK 制約は NULL では違反しません。** 評価が NULL になるだけで、
+    FALSE ではないため通ります。実測 (PostgreSQL 16):
+
+        col が NULL の行に対して
+          CHECK (length(col) >= 1)                     -> 通る
+          CHECK (col IS NULL OR a <> 0)                -> 通る
+          CHECK (col IN ('x','y'))                     -> 通る
+          CHECK ((a=1 AND col IS NOT NULL) OR ...)     -> **落ちる**
+
+    つまり、足したばかりの全 NULL の列が制約を壊すのは
+    **その列に IS NOT NULL を要求する枝がある場合だけ**になります。
+    そこで条件を全部満たすものに絞ります:
+
+      1. ALTER TABLE ... ADD CONSTRAINT ... CHECK (既存行の検証が走る)
+      2. 同じ版で足した列を参照している
+      3. その列に DEFAULT が無い
+      4. 制約の本文が `<列> IS NOT NULL` を要求している
+      5. 制約より前に、その表への UPDATE (埋め戻し) が無い
+
+    **4 を入れないと 000003 / 000004 / 000007 まで鳴ります** ——
+    どれも安全なのに。鳴りすぎる検査は読まれなくなるので、精度を取ります。
+    広く「ALTER TABLE ADD CONSTRAINT はすべて危ない」とするのも同じ理由で
+    採りません (000013 のような**制約を緩める**変更まで鳴る)。
+
+    見逃す形は残ります:
+
+      - `CHECK (coalesce(col,'') <> '')` のように、NULL で FALSE になるが
+        IS NOT NULL とは書かない形
+      - 既存の列に、既存データが違反する制約を足す場合
+      - 埋め戻しの UPDATE が実は対象を埋めていない場合
+
+    どれも「書いた人が既存データを考えた」形跡はあります。
+    考えた形跡が無いもの (足した直後に NOT NULL を要求する) に絞ります。
+    """
+    found: list[tuple[str, str, str]] = []
+    for path in sorted(MIGRATIONS.glob("*.up.sql")):
+        body = _sql_body(path)
+        added = {
+            name: ("DEFAULT" in rest.upper())
+            for name, rest in ADD_COLUMN.findall(body)
+        }
+        if not added:
+            continue
+        for m in ALTER_ADD_CHECK.finditer(body):
+            table, name = m.group(1), m.group(2)
+            inner = _paren_body(body, m.end() - 1)
+            # 制約より前に、その表を埋め戻しているか。
+            backfilled = any(
+                t.lower() == table.lower() and pos < m.start()
+                for t, pos in ((mm.group(1), mm.start()) for mm in BACKFILL.finditer(body))
+            )
+            if backfilled:
+                continue
+            for col, has_default in added.items():
+                if has_default:
+                    continue
+                # **IS NOT NULL を要求している枝があるか。**
+                # 無ければ、全 NULL の列でも制約は通る (docstring の実測)。
+                if re.search(
+                    rf"\b{re.escape(col)}\b\s+IS\s+NOT\s+NULL", inner, re.I
+                ):
+                    found.append((
+                        path.name, name,
+                        f"同じ版で足した {col} に DEFAULT も埋め戻しも無いまま "
+                        f"IS NOT NULL を要求している",
+                    ))
+                    break
+    return found
+
+
 def _sql_body(path: pathlib.Path) -> str:
     """コメント行を落とした SQL を返します。
 
@@ -326,7 +438,17 @@ def constraints() -> list[tuple[str, str, str]]:
                 # **前へ直す方式では、消した制約もここに残り続ける。**
                 continue
             found.append((path.name, name, " / ".join(kinds)))
-    return found
+
+    # **同じ名前は最後の定義だけ残す。** 前へ直す方式では、制約は
+    # 後の版で DROP されて張り替えられる (000006 -> 000013)。
+    # 全部残すと件数が水増しされ、しかも報告が**古いほうのファイル**を
+    # 指す —— 「死んだ定義を見に行かせる」ことになる。
+    latest: dict[str, tuple[str, str, str]] = {}
+    unnamed = [row for row in found if row[1] == "(無名)"]
+    for row in found:
+        if row[1] != "(無名)":
+            latest[row[1]] = row
+    return unnamed + list(latest.values())
 
 
 def func_body(src: str, name: str) -> str | None:
@@ -462,6 +584,41 @@ def main() -> int:
         print()
     else:
         print("OK  対応表に、もう無い制約は残っていません")
+
+    # **適用したときに落ちないか。**
+    unsafe = apply_unsafe()
+    unexpected = [row for row in unsafe if row[1] not in APPLY_UNSAFE_EXEMPT]
+    if unexpected:
+        failed = True
+        print(f"NG  適用時に落ちうる CHECK 制約が {len(unexpected)} 件あります")
+        print("    ADD CONSTRAINT ... CHECK は既存の全行を検証します。")
+        print("    1 行でも違反すると ALTER が落ち、golang-migrate は dirty で止まります")
+        print()
+        for place, name, why in unexpected:
+            print(f"  {name}  ({place})")
+            print(f"    {why}")
+        print()
+        print("列に DEFAULT を付けるか、制約より前に UPDATE で埋め戻すか、")
+        print("NOT VALID で足して後の版で VALIDATE CONSTRAINT してください。")
+        print("既に適用済みで直せない場合は APPLY_UNSAFE_EXEMPT に理由つきで入れます。")
+        print()
+    else:
+        print("OK  適用時に落ちうる CHECK 制約はありません"
+              + (f" (既知の {len(APPLY_UNSAFE_EXEMPT)} 件を除く)"
+                 if APPLY_UNSAFE_EXEMPT else ""))
+
+    # 免除に載せたまま直った / 消えたものが残っていないか。
+    stale_exempt = sorted(set(APPLY_UNSAFE_EXEMPT) - {row[1] for row in unsafe})
+    if stale_exempt:
+        failed = True
+        print(f"NG  APPLY_UNSAFE_EXEMPT に、もう当てはまらない制約が "
+              f"{len(stale_exempt)} 件あります")
+        print()
+        for name in stale_exempt:
+            print(f"  {name}")
+        print()
+        print("直った (あるいは消えた) なら、免除も消してください。")
+        print()
 
     # **対応表が嘘になっていないか。** ここが本体になる ——
     # 表だけならテストを消しても残る。

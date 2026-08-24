@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -414,25 +415,87 @@ func readRepoFile(t *testing.T, rel string) string {
 func TestConditionalConstraints_UseKnownValues(t *testing.T) {
 	t.Parallel()
 
-	migration := readRepoFile(t, "apps/go-api/db/migrations/000006_add_images.up.sql")
-	attached := readRepoFile(t, "apps/go-api/db/migrations/000007_add_image_attached_at.up.sql")
 	src := readRepoFile(t, "apps/go-api/internal/image/domain/model/image.go")
 	known := valuesFromSource(t, src, `(?m)^\s*(\w+)\s+Status\s*=\s*"([^"]+)"`)
 
-	for _, tc := range []struct{ name, sql string }{
-		{"images_committed_at_matches_status", migration},
-		{"images_attached_at_requires_commit", attached},
+	for _, name := range []string{
+		"images_committed_at_matches_status",
+		"images_attached_at_requires_commit",
 	} {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			for _, v := range literalsIn(t, tc.sql, tc.name) {
+			for _, v := range literalsIn(t, latestConstraintSQL(t, name), name) {
 				if !known[v] {
-					t.Errorf("%s が知らない値 %q を使っている", tc.name, v)
+					t.Errorf("%s が知らない値 %q を使っている", name, v)
 				}
 			}
 		})
 	}
+}
+
+// latestConstraintSQL は、その制約を**最後に定義しているマイグレーション**を返します。
+//
+// **ファイル名を直書きしない。** マイグレーションは前へ直す方式なので、
+// 制約は後の版で DROP されて別の定義に置き換わる ——
+// 実際 images_committed_at_matches_status は 000006 で作られ、
+// 000013 で張り替えられている ('pending' の画像を削除できるようにするため)。
+//
+// 直書きしていると、**死んだ定義を検査し続けて緑のまま**になる。
+// 生きている定義のほうは誰も見ていない、という形になります。
+func latestConstraintSQL(t *testing.T, constraint string) string {
+	t.Helper()
+
+	root := filepath.Join("..", "..", "..", "..", "..", "..")
+	// **"db/migrations/" を文字列として残す。**
+	// .github/scripts/verify-constraint-checks.py が「この検査は本当に
+	// マイグレーションを読んでいるか」をこの部分文字列で見ている。
+	// 分割して組み立てると、読んでいるのに「読んでいない」と鳴る。
+	dir := filepath.Join(root, "apps/go-api/db/migrations/")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("マイグレーションを読めない: %v", err)
+	}
+
+	head := regexp.MustCompile(`CONSTRAINT\s+` + constraint + `\s+CHECK\s*\(`)
+	latest := ""
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".up.sql") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("%s を読めない: %v", name, err)
+		}
+		// **コメントを落としてから探す。** マイグレーションの説明文には
+		// 旧定義をそのまま貼ることがある (000013 がそう)。落とさないと
+		// **コメント内の死んだ定義を検査してしまう。**
+		body := stripSQLComments(string(b))
+		if head.MatchString(body) {
+			latest = body
+		}
+	}
+	if latest == "" {
+		t.Fatalf("%s を定義しているマイグレーションが無い", constraint)
+	}
+	return latest
+}
+
+// stripSQLComments は行コメント (--) を落とします。
+func stripSQLComments(sql string) string {
+	lines := strings.Split(sql, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if i := strings.Index(line, "--"); i >= 0 {
+			line = line[:i]
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
 }
 
 // literalsIn は名前つき CHECK 制約の本文から、引用符つきの値を全部拾います。

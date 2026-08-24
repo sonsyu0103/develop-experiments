@@ -34,8 +34,17 @@ WHERE t.title <> 'コメントが 0 件のスレッド';
 -- ここで消える 1 件はスレッド 1 の 1 番なので、
 -- スレッド 1 は「2, 3, 4 番があって 1 番が欠番」という状態になる。
 -- 欠番がそのまま残ることをスモークテストが検査している。
+-- **min(id) では狙った行にならないことがある。**
+-- 上の INSERT ... SELECT に ORDER BY が無いので、
+-- どの行に小さい ID が付くかは結合順 (= プラン) 次第になる。
+-- 「スレッド 1 の 1 番」を消したいなら、そう書く。
 UPDATE comments
 SET deleted_at = now()
-WHERE id = (SELECT min(id) FROM comments);
+WHERE id = (
+    SELECT c.id FROM comments c
+    JOIN threads t ON t.id = c.thread_id
+    ORDER BY t.id, c.seq
+    LIMIT 1
+);
 
 COMMIT;

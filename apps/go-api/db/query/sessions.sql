@@ -78,10 +78,46 @@ DELETE FROM sessions WHERE user_id = sqlc.arg('user_id');
 -- 1 トランザクションを短く保つため。長時間のロックと WAL の急増を避ける。
 -- 呼び出し側は「0 行になるまで繰り返す」形で使う。
 --
--- sessions (expires_at) の索引で引く。
+-- sessions_expires_at_idx (expires_at) で引く。
+--
+-- 【ctid で消す理由 —— 素直な書き方はどれも全表を走査する】
+--
+-- 初版は `WHERE id IN (SELECT ... LIMIT $1)` だった。**件数の上限は
+-- 効いていた**が (実測)、外側が絞り込みの無い全表走査になる。
+-- cmd/api/main.go の drain は 1 周 1000 行を最大 100 周するので、
+-- **毎時 100 回の全表走査**になる (レビュー指摘)。
+--
+-- 200,000 行 / バッチ 1000 で 4 通り測った (EXPLAIN ANALYZE, BUFFERS):
+--
+--   書き方                              プラン                    Buffers  実行
+--   IN (SELECT ... LIMIT n)             Hash Semi Join + Seq Scan    4256  27.1ms
+--   WITH ... DELETE ... USING           Hash Join + Seq Scan         4268  26.0ms
+--   id   = ANY(ARRAY(SELECT ...))       Bitmap Heap Scan (pkey)      3619   3.1ms
+--   ctid = ANY(ARRAY(SELECT ctid ...))  Tid Scan                     2052   0.7ms
+--
+-- **CTE + USING では直らない。** ScrubContactClientIPs と同じ形にしても、
+-- プランナは結局 sessions 全体を走査して 1000 行のハッシュに突き合わせる ——
+-- 「消す 1000 行を選ぶために 200,000 行を読む」構造が変わらない。
+-- 実測でも 27.1ms → 26.0ms で、誤差の範囲だった。
+--
+-- ARRAY(SELECT ...) は InitPlan として**1 回だけ**評価される。そのため
+--   - LIMIT が半結合の再評価で無効化されない
+--     (contact.sql が踏んだ罠が、原理的に起きない形になる)
+--   - 外側が Tid Scan になり、走査量が**バッチサイズだけ**で決まる
+--
+-- 【ctid を使うことで引き受けるもの】
+-- ctid は物理位置なので、InitPlan の評価後にその行が UPDATE されると
+-- 位置が変わり、**その行は消えずに残る。** 一掃処理としては無害で、
+-- drain が次の周回で拾い直す (0 行になるまで回す形なので終端も変わらない)。
+-- **消しすぎる方向には倒れない** —— 同一スナップショット内で
+-- ctid が別の行を指すことは無い。
+--
+-- **ORDER BY は古いものから消すため。** sessions_expires_at_idx の
+-- 並びと同じなので追加のコストは無い。
 DELETE FROM sessions
-WHERE id IN (
-    SELECT id FROM sessions
+WHERE ctid = ANY(ARRAY(
+    SELECT ctid FROM sessions
     WHERE expires_at <= now()
+    ORDER BY expires_at
     LIMIT sqlc.arg('max_rows')
-);
+));
