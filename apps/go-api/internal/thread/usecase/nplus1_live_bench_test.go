@@ -204,10 +204,24 @@ func BenchmarkThreadList_NPlusOne(b *testing.B) {
 // その数字は「N+1 のほうが速い」ではなく「仕事をしていない」を意味します
 // (ADR 0014「測定の前提が 1 つ崩れている」がまさにこれでした)。
 //
-// go test の通常経路にも載りますが、DATABASE_TEST_URL が無ければスキップします。
-func TestNPlusOneMatchesSingleQuery(t *testing.T) {
+// **名前を _Live で終わらせています。** CI の実 DB 検査は
+// `-run '_Live$'` で拾うので、この規約から外れると**どこでも走らなく**なります。
+// 実際、以前は TestNPlusOneMatchesSingleQuery という名前で、
+// CI では 1 度も実行されていませんでした (対象パッケージからも外れていた)。
+//
+// **どんなデータが入っていても動きます。** 以前は閲覧数の検査が
+// 「ベンチ用データセットが入っていること」に依存しており、
+// 開発用シード (make seed) を流したあとだと落ちていました ——
+// **前提を検査せずに前提としていた**ためで、実際に踏みました。
+// いまは前提を自分で用意します (ensureSomeViewCount)。
+func TestNPlusOneMatchesSingleQuery_Live(t *testing.T) {
 	dsn := os.Getenv("DATABASE_TEST_URL")
 	if dsn == "" {
+		if requireLiveDB() {
+			t.Fatal("DATABASE_TEST_URL が未設定です。" +
+				"CI では実 DB に対する検証を省略できません " +
+				"(意図的に飛ばすなら DB_TEST_REQUIRE=0)")
+		}
 		t.Skip("DATABASE_TEST_URL が未設定のためスキップ (実 DB が必要)")
 	}
 
@@ -217,11 +231,16 @@ func TestNPlusOneMatchesSingleQuery(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 
+	// **閲覧数の検査の前提を、ここで用意する。**
+	// 「0 以外が 1 件でもあること」に依存するので、
+	// 入っているデータ次第で成否が変わってはいけない。
+	ensureSomeViewCount(t, pool, comparePageSize)
+
 	repo := postgres.NewThreadRepository(pool)
 	single := NewThreadInteractor(repo, nil)
 	nplus1 := NewNPlusOneInteractor(repo, 8)
 
-	page, err := pagination.NewPage(nil, 50)
+	page, err := pagination.NewPage(nil, comparePageSize)
 	if err != nil {
 		t.Fatalf("ページの組み立てに失敗した: %v", err)
 	}
@@ -271,7 +290,119 @@ func TestNPlusOneMatchesSingleQuery(t *testing.T) {
 	if !slices.ContainsFunc(gotResult.Threads, func(d ThreadDTO) bool {
 		return d.ViewCount > 0
 	}) {
-		t.Error("N+1 側の閲覧数が全件 0。view_count を引いていない可能性がある " +
-			"(make bench-dataset を流したか確認すること)")
+		t.Error("N+1 側の閲覧数が全件 0。view_count を引いていない")
 	}
+}
+
+// comparePageSize は比較に使うページの件数です。
+//
+// **ensureSomeViewCount と assert が同じ範囲を見るために 1 箇所に置きます。**
+// ずれると「前提を用意した範囲」と「検査が見る範囲」が食い違います。
+const comparePageSize int32 = 50
+
+// seedThreadForCompare は比較用のスレッドを 1 件作り、後で消します。
+func seedThreadForCompare(t *testing.T, pool *pgxpool.Pool) int64 {
+	t.Helper()
+
+	var id int64
+	err := pool.QueryRow(t.Context(),
+		`INSERT INTO threads (title) VALUES ($1) RETURNING id`,
+		"N+1 比較のための下ごしらえ",
+	).Scan(&id)
+	if err != nil {
+		t.Fatalf("スレッドを作れなかった: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx := context.Background()
+		if _, err := pool.Exec(ctx, `DELETE FROM threads WHERE id = $1`, id); err != nil {
+			t.Logf("下ごしらえのスレッドを消せなかった (id=%d): %v", id, err)
+		}
+	})
+	return id
+}
+
+// requireLiveDB は実 DB への検証を必須とするかを返します。
+//
+// **postgres パッケージの同名関数と揃えてあります。** 片方だけ規約が
+// 変わると、「CI では飛ばせない」という取り決めがパッケージごとに割れます。
+func requireLiveDB() bool {
+	raw := strings.TrimSpace(os.Getenv("DB_TEST_REQUIRE"))
+	return raw != "" && raw != "0" && !strings.EqualFold(raw, "false")
+}
+
+// ensureSomeViewCount は「閲覧数が 0 でないスレッドが少なくとも 1 件ある」
+// 状態を作り、測り終わったら元に戻します。
+//
+// **前提を検査ではなく用意で満たします。**
+//
+// 以前はここが「ベンチ用データセットには歪んだ分布が入っているはず」
+// という暗黙の前提になっており、開発用シードを流したあとだと落ちていました。
+// 落ちる理由も「view_count を引いていない可能性がある」という**誤った説明**で、
+// 実際の原因 (データが違う) には辿り着けませんでした。
+//
+// 検査したいのは「N+1 側が view_count を引いているか」だけなので、
+// **1 件だけ 0 でない行があれば足ります。** データセットに依存する理由が無い。
+func ensureSomeViewCount(t *testing.T, pool *pgxpool.Pool, pageSize int32) {
+	t.Helper()
+
+	// **1 ページ目だけを見る。** 検査が見るのもそこだけなので、
+	// テーブル全体で max を取ると範囲がずれる ——
+	// 「どこかに 0 でない行はあるが、id 降順の上位 N 件は全部 0」という
+	// 状態で用意をスキップし、検査だけが落ちる (レビュー指摘)。
+	// しかもそのとき出るのは「view_count を引いていない」という、
+	// **この関数が消したかったはずの誤った説明**になる。
+	const firstPage = `SELECT id, view_count FROM threads
+	                   WHERE deleted_at IS NULL ORDER BY id DESC LIMIT $1`
+
+	rows, err := pool.Query(t.Context(), firstPage, pageSize)
+	if err != nil {
+		t.Fatalf("閲覧数を読めなかった: %v", err)
+	}
+	var (
+		topID   int64
+		found   bool
+		hasView bool
+	)
+	for rows.Next() {
+		var id, count int64
+		if err := rows.Scan(&id, &count); err != nil {
+			rows.Close()
+			t.Fatalf("閲覧数を読めなかった: %v", err)
+		}
+		if !found {
+			topID, found = id, true
+		}
+		if count > 0 {
+			hasView = true
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("閲覧数を読めなかった: %v", err)
+	}
+	if hasView {
+		return
+	}
+
+	if !found {
+		// **行が 1 つも無いなら作る。** make up はマイグレーションまでで
+		// シードを流さないので、ボリュームを作り直した直後はこの状態になる
+		// (レビュー指摘)。ここで落とすと、検査したいこととは無関係な理由で
+		// make test-live が止まる。
+		topID = seedThreadForCompare(t, pool)
+	}
+	id := topID
+
+	if _, err := pool.Exec(t.Context(),
+		`UPDATE threads SET view_count = 1 WHERE id = $1`, id); err != nil {
+		t.Fatalf("閲覧数を用意できなかった: %v", err)
+	}
+	t.Cleanup(func() {
+		// **戻す。** 人気順の検査や測定が、この 1 件で歪まないように。
+		ctx := context.Background()
+		if _, err := pool.Exec(ctx,
+			`UPDATE threads SET view_count = 0 WHERE id = $1`, id); err != nil {
+			t.Logf("閲覧数を戻せなかった (id=%d): %v", id, err)
+		}
+	})
 }

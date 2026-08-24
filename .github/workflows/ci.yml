@@ -552,12 +552,28 @@ jobs:
       #
       # **この 2 つは対で置く。** URL だけ消えると REQUIRE が残って
       # t.Fatal になり、静かなスキップにはならない (objectstorage と同じ形)。
-      - name: Verify the image repository against the real database
+      #
+      # **対象パッケージを列挙している。** ここから漏れた検査は、
+      # 名前が _Live で終わっていても**どこでも走らない** ——
+      # 実際 thread/usecase の N+1 比較が長らくその状態だった
+      # (make check では手元に DB があるときだけ走り、CI では 1 度も走らなかった)。
+      - name: Verify the repositories against the real database
         working-directory: ./apps/go-api
         env:
           DB_TEST_REQUIRE: "1"
           DATABASE_TEST_URL: postgres://app:password@localhost:5432/bbs?sslmode=disable
-        run: go test -v -run '_Live$' ./internal/infrastructure/postgres/
+        # **-p 1 でパッケージを並列に走らせない。**
+        #
+        # go test は既定で GOMAXPROCS 個のテストバイナリを同時に走らせる。
+        # postgres 側の live 検査は同じ DB にスレッドを**コミットして**作り、
+        # Cleanup で消す。一方 thread/usecase の N+1 比較は 2 つの実装を
+        # **別々の瞬間に**投げて件数と ID 列の完全一致を求めるので、
+        # その間に挿入や削除が挟まると落ちる。
+        # 既定の並びは id の降順なので、**挿入も削除も必ず 1 ページ目の先頭に効く。**
+        run: |
+          go test -v -p 1 -run '_Live$' \
+            ./internal/infrastructure/postgres/ \
+            ./internal/thread/usecase/
 
       - name: Run smoke test against the real database
         env:

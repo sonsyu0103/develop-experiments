@@ -206,8 +206,60 @@ generate: sqlc openapi ## 生成物をすべて作り直す
 # ---------------------------------------------------------------------------
 
 .PHONY: test
-test: ## Go のテストを実行する (race detector + カバレッジ)
-	cd $(GO_API_DIR) && go test -race -cover ./...
+test: ## Go のテストを実行する (race detector + カバレッジ。実 DB / S3 は使わない)
+	# **実 DB と S3 を使う検査は、ここでは走らせない。**
+	#
+	# 環境変数を明示的に空にする。**残しておくと、手元に DB があるかどうかで
+	# make check の結果が変わる** —— 実際、開発用シードを流したあとだと
+	# 落ちる状態になっていた (ベンチ用データセットを前提にした検査があった)。
+	# CI の Go Checks には DB が無いので、そちらでは元から走っていない。
+	# **手元と CI で同じものを検査する**ほうを取る。
+	#
+	# 実 DB を使う検査は make test-live (と CI の Migration Check) が持つ。
+	cd $(GO_API_DIR) && DATABASE_TEST_URL= S3_TEST_ENDPOINT= \
+		DB_TEST_REQUIRE= S3_TEST_REQUIRE= \
+		go test -race -cover ./...
+
+# 実 DB / MinIO に対する検査。**環境が要るので check には入れない。**
+LIVE_DATABASE_URL ?= postgres://app:password@localhost:5432/bbs?sslmode=disable
+LIVE_S3_ENDPOINT  ?= http://localhost:9000
+
+.PHONY: test-live
+test-live: up ## 実 DB / MinIO に対する検査だけを走らせる (環境も立てる)
+	# **CI の Migration Check と同じものを手元で回す。**
+	#
+	# 名前の規約は _Live で終わること。CI は -run '_Live$$' で拾うので、
+	# **規約から外れた検査はどこでも走らなくなる** ——
+	# 実際 TestNPlusOneMatchesSingleQuery が長らくその状態だった。
+	#
+	# REQUIRE を立てるので、URL が欠けていれば**スキップではなく失敗**する。
+	#
+	# 【up に依存させる理由 —— スタックが落ちていると Fatal で止まる】
+	# DB_TEST_REQUIRE=1 を立てているので、接続できないときは
+	# **スキップではなく Fatal** になる (レビュー指摘)。
+	# 環境を立てるところまでこのターゲットが持つ。
+	#
+	# **up-seeded ではなく up にする。** up-seeded は seed.sql を流し、
+	# その先頭が TRUNCATE なので**手元のデータを毎回消す。**
+	# 検査は必要な行を自分で作るようにしてあるので (ensureSomeViewCount /
+	# seedThreadForCompare / seedThreadTitled)、シードに依存する理由が無い。
+	#
+	# 【-p 1 が要る理由 —— パッケージを並列に走らせない】
+	# go test は既定で **GOMAXPROCS 個のテストバイナリを同時に**走らせる。
+	# postgres 側の live 検査は同じ DB にスレッドを**コミットして**作り、
+	# Cleanup で消す。thread/usecase の N+1 比較は 2 つの実装を
+	# **別々の瞬間に**投げて件数と ID 列の完全一致を求めるので、
+	# その間に挿入や削除が挟まると落ちる。
+	# 既定の並びは id の降順なので、**挿入も削除も必ず 1 ページ目の先頭に効く。**
+	cd $(GO_API_DIR) && \
+		DB_TEST_REQUIRE=1 DATABASE_TEST_URL="$(LIVE_DATABASE_URL)" \
+		S3_TEST_REQUIRE=1 S3_TEST_ENDPOINT="$(LIVE_S3_ENDPOINT)" \
+		S3_TEST_BUCKET=bbs-images \
+		S3_TEST_PUBLIC_BASE_URL="$(LIVE_S3_ENDPOINT)/bbs-images" \
+		go test -count=1 -p 1 -run '_Live$$|TestS3Storage|TestNew_' \
+			./internal/infrastructure/postgres/ \
+			./internal/infrastructure/objectstorage/ \
+			./internal/thread/usecase/
 
 # カバレッジの下限。下回ると cover が落ちる。
 #
@@ -246,7 +298,11 @@ cover: ## 手書きロジックのカバレッジを測り、下限を下回っ�
 	# どちらも原因が分からないまま閉じている。成功時は静かなままにしたいので、
 	# ログに落として**失敗したときだけ末尾を出す**形にする。
 	# 全文は /tmp/cover-test.log に残る。
-	@cd $(GO_API_DIR) && 		pkgs=$$(go list ./internal/... | grep -vE 'oapigen|sqlcgen|/infrastructure/' | paste -sd, -) && 		{ go test -count=1 -coverpkg="$$pkgs" -coverprofile=/tmp/cover.out $$(echo "$$pkgs" | tr ',' ' ') > /tmp/cover-test.log 2>&1 || { echo "カバレッジ計測のテストが失敗しました (全文: /tmp/cover-test.log)"; tail -30 /tmp/cover-test.log; exit 1; }; } && 		total=$$(go tool cover -func=/tmp/cover.out | tail -1 | grep -oE '[0-9]+\.[0-9]+') && 		echo "手書きロジックのカバレッジ: $$total% (下限 $(COVER_MIN)%)" && 		awk -v t="$$total" -v m="$(COVER_MIN)" 'BEGIN { if (t+0 < m+0) { print "下限を下回りました"; exit 1 } }'
+	# **test と同じく実 DB / S3 の環境変数を空にする。**
+	# ここを忘れると、check の `test` だけ直しても `cover` の go test が
+	# 環境をそのまま継承し、**実 DB 検査がこれまでどおり走る** ——
+	# thread/usecase は計測対象に入っている (レビュー指摘)。
+	@cd $(GO_API_DIR) && DATABASE_TEST_URL= S3_TEST_ENDPOINT= DB_TEST_REQUIRE= S3_TEST_REQUIRE= 		pkgs=$$(go list ./internal/... | grep -vE 'oapigen|sqlcgen|/infrastructure/' | paste -sd, -) && 		{ go test -count=1 -coverpkg="$$pkgs" -coverprofile=/tmp/cover.out $$(echo "$$pkgs" | tr ',' ' ') > /tmp/cover-test.log 2>&1 || { echo "カバレッジ計測のテストが失敗しました (全文: /tmp/cover-test.log)"; tail -30 /tmp/cover-test.log; exit 1; }; } && 		total=$$(go tool cover -func=/tmp/cover.out | tail -1 | grep -oE '[0-9]+\.[0-9]+') && 		echo "手書きロジックのカバレッジ: $$total% (下限 $(COVER_MIN)%)" && 		awk -v t="$$total" -v m="$(COVER_MIN)" 'BEGIN { if (t+0 < m+0) { print "下限を下回りました"; exit 1 } }'
 
 .PHONY: cover-html
 cover-html: cover ## カバレッジをブラウザで開く (どこが通っていないかを見る)
@@ -442,7 +498,7 @@ nplus1-probe: ## N+1 と単一クエリを実 DB で比較計測する (Phase 4 
 	#
 	# **CI には載せない** (concurrency-probe / viewcount-probe と同じ理由)。
 	cd $(GO_API_DIR) && DATABASE_TEST_URL="$(BENCH_DATABASE_URL)" \
-		go test ./internal/thread/usecase/ -run TestNPlusOneMatchesSingleQuery -v -count=1
+		go test ./internal/thread/usecase/ -run TestNPlusOneMatchesSingleQuery_Live -v -count=1
 	cd $(GO_API_DIR) && DATABASE_TEST_URL="$(BENCH_DATABASE_URL)" \
 		BENCH_MAX_CONNS=$(BENCH_MAX_CONNS) \
 		go test ./internal/thread/usecase/ -run='^$$' \
@@ -559,4 +615,9 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 check: lint test cover verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
-check-all: check smoke logs-verify ## check に加えて実 DB / ログ基盤まで確認する
+# **test-live は smoke の後ろに置く。** 前に置くと、スタックが落ちている
+# 状態では test-live が接続に失敗し、DB_TEST_REQUIRE=1 なので
+# **スキップではなく Fatal** で止まる (レビュー指摘)。
+# いまは test-live 自身が up-seeded に依存するので順序に関係なく立つが、
+# 依存を外したときに黙って壊れないよう、順序でも意図を残しておく。
+check-all: check smoke test-live logs-verify ## check に加えて実 DB / ログ基盤まで確認する
