@@ -161,10 +161,15 @@ def call(method: str, path: str, body: str | None = None,
             return res.status, _decode(raw), res.headers
     except urllib.error.HTTPError as e:
         raw = e.read()
-        try:
-            return e.code, _decode(raw), e.headers
-        except json.JSONDecodeError:
-            return e.code, raw.decode(errors="replace")[:200], e.headers
+        # **JSON でない本文は捨てずに文字列で返す。**
+        # 以前はここが try/except json.JSONDecodeError で囲われていたが、
+        # _decode() が例外を飲んで None を返すため、**except 節に
+        # 到達しなかった。** 結果、HTML のエラーページや素の文字列は
+        # None になり、失敗の理由が検査の出力から消えていた。
+        payload = _decode(raw)
+        if payload is None and raw:
+            payload = raw.decode(errors="replace")[:200]
+        return e.code, payload, e.headers
 
 
 def sql(statement: str, quiet: bool = False) -> None:

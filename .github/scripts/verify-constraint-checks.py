@@ -30,6 +30,13 @@
 値そのものの検査ではないため、CI では Go のテストと両方を回す。
 このスクリプトは DB もネットワークも要らない。
 
+**マイグレーションは前へ直す** (既に走ったものは書き換えない) ので、
+制約を消すときは新しい番号で DROP CONSTRAINT を足すことになる。
+そのため、拾った制約から**後の up.sql が落としたものを引く** ——
+引かないと、消した制約に検査を宣言し続けることを要求され、しかも
+「もう無い制約が対応表に残っています」と同時に言われて、
+どちらにも直しようが無くなる。
+
 設計の背景は docs/adr/0003-open-questions.md の#8。
 """
 
@@ -186,6 +193,38 @@ GUARDED: dict[str, tuple[str, str]] = {
 EXEMPT: dict[str, str] = {}
 
 
+def alive_constraints() -> set[str]:
+    """up.sql を番号順にたどり、最後まで生き残った制約名を返します。
+
+    **ADD と DROP を出現順に畳み込みます。** 落としてから足し直した制約は
+    生きており、足してから落とした制約は死んでいる ——
+    どちらか片方だけを見ると、その区別が付きません。
+    """
+    alive: set[str] = set()
+    for path in sorted(MIGRATIONS.glob("*.up.sql")):
+        for m in re.finditer(
+            r"DROP\s+CONSTRAINT\s+(?:IF\s+EXISTS\s+)?(\w+)"
+            r"|CONSTRAINT\s+(\w+)\s+CHECK\s*\(",
+            _sql_body(path), re.I,
+        ):
+            if m.group(1):
+                alive.discard(m.group(1))
+            else:
+                alive.add(m.group(2))
+    return alive
+
+
+def _sql_body(path: pathlib.Path) -> str:
+    """コメント行を落とした SQL を返します。
+
+    制約の書き方を説明している行に char_length(...) が現れるため。
+    """
+    return "\n".join(
+        line for line in path.read_text(encoding="utf-8").split("\n")
+        if not line.strip().startswith("--")
+    )
+
+
 def constraints() -> list[tuple[str, str, str]]:
     """(マイグレーション, 制約名, 種別) を返します。
 
@@ -194,14 +233,10 @@ def constraints() -> list[tuple[str, str, str]]:
     で途中まで拾ってしまいます。また索引の WHERE 句にも IN (...) が
     現れるため、CHECK の中だけを見る必要があります。
     """
-    found = []
+    found: list[tuple[str, str, str]] = []
+    alive = alive_constraints()
     for path in sorted(MIGRATIONS.glob("*.up.sql")):
-        # コメント行は落とす。制約の書き方を説明している行に
-        # char_length(...) が現れるため。
-        body = "\n".join(
-            line for line in path.read_text(encoding="utf-8").split("\n")
-            if not line.strip().startswith("--")
-        )
+        body = _sql_body(path)
         for m in re.finditer(r"(?:CONSTRAINT\s+(\w+)\s+)?CHECK\s*\(", body):
             name = m.group(1)
             start = m.end() - 1
@@ -231,6 +266,10 @@ def constraints() -> list[tuple[str, str, str]]:
             if name is None:
                 # 無名の CHECK は対応表に載せられない。名前を付けさせる。
                 found.append((path.name, "(無名)", " / ".join(kinds)))
+                continue
+            if name not in alive:
+                # 後の版が DROP CONSTRAINT で落としている。
+                # **前へ直す方式では、消した制約もここに残り続ける。**
                 continue
             found.append((path.name, name, " / ".join(kinds)))
     return found
@@ -274,6 +313,27 @@ def reach(src: str, name: str) -> str | None:
         if called is not None:
             seen.append(called)
     return "\n".join(seen)
+
+
+def _without_comments(src: str) -> str:
+    """Go のコメントを落とします。
+
+    **「マイグレーションを読んでいる」の判定にコメントを数えない。**
+    判定は "db/migrations/" という文字列の有無で行っているので、
+    コメントに書いてあるだけで通ってしまう —— 対応表の側では
+    「制約名が出てくるだけのファイルは駄目」と言っておきながら、
+    本文の側で同じ抜け道を空けていた。
+
+    このスクリプトが探しているのは「検査したつもりで何も検査していない」
+    形そのものなので、ここを緩めると存在意義が消える。
+
+    落としすぎても「読んでいない」と鳴るだけで、見逃す側には倒れない。
+    """
+    out = []
+    for line in src.split("\n"):
+        i = line.find("//")
+        out.append(line[:i] if i >= 0 else line)
+    return re.sub(r"/\*.*?\*/", "", "\n".join(out), flags=re.S)
 
 
 def main() -> int:
@@ -355,7 +415,7 @@ def main() -> int:
         body = reach(src, test)
         if body is None:
             broken.append((name, rel, f"{test} が無い"))
-        elif "db/migrations/" not in body:
+        elif "db/migrations/" not in _without_comments(body):
             broken.append((name, rel, f"{test} からマイグレーションに辿り着けない"))
     if broken:
         failed = True

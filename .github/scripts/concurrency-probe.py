@@ -206,6 +206,19 @@ def probe(mode: str) -> dict:
     conflicts = sum(1 for status, _ in results if status == 409)
     failures = len(results) - len(created) - conflicts
 
+    # **「失敗」を 1 つの数字に潰さない。**
+    #
+    # このプローブは csrfGuard の導入以降ずっと壊れていた (冒頭の ORIGIN を
+    # 参照)。Origin を足して直したが、**次に同じ壊れ方をしたときに
+    # 気づく仕組みは足していなかった** —— 全リクエストが 403 で弾かれても、
+    # created が空なら seqs も空になり、下の「連番か」の検査は
+    # [] == [] で通る。**1 件も測れていないのに緑**になる。
+    #
+    # ステータスの内訳を残せば、403 の壁も 429 の壁も表に出る。
+    statuses: dict[int, int] = {}
+    for status, _ in results:
+        statuses[status] = statuses.get(status, 0) + 1
+
     # **正しさの根拠は API の応答ではなく DB に置く。**
     # 同じ (thread_id, seq) が 2 行あれば、それは一意索引が
     # 張られていないか、張り忘れた経路があるということになる。
@@ -222,6 +235,7 @@ def probe(mode: str) -> dict:
     return {
         "mode": mode,
         "thread_id": thread_id,
+        "statuses": statuses,
         "ok": len(created),
         "conflict": conflicts,
         "failed": failures,
@@ -254,8 +268,26 @@ def main() -> int:
               f"{r['max_attempts']:>9}{r['elapsed_ms']:>9.0f}")
 
     print()
+    print("ステータスの内訳 (成功が 0 のモードがあれば、それは測れていない)")
+    for r in rows:
+        breakdown = ", ".join(
+            f"{code}:{n}" for code, n in sorted(r["statuses"].items()))
+        print(f"  {r['mode']:<12} {breakdown}")
+
+    print()
     problems = []
     for r in rows:
+        # **1 件も成功していないモードは「測れていない」。**
+        # naive でも一意制約違反が出るのは競合したぶんだけで、
+        # 先着の 1 件は必ず通る。0 件なら投稿そのものが届いていない
+        # (csrfGuard の 403、レート制限の 429、起動直後の 5xx など)。
+        if r["ok"] == 0:
+            breakdown = ", ".join(
+                f"{code}:{n}" for code, n in sorted(r["statuses"].items()))
+            problems.append(
+                f"{r['mode']}: 投稿が 1 件も成功していない (内訳 {breakdown})。"
+                " 並行制御ではなく、リクエストが届いていない可能性がある")
+
         # 重複は「あってはならない」。一意索引がある限り DB が拒否するので、
         # ここが 0 でないなら索引が張られていない経路がある。
         if r["duplicates"] not in ("0", "?"):
@@ -274,7 +306,9 @@ def main() -> int:
             print(f"  - {p}")
         return 1
 
-    print("\033[32mレス番号の一意性と連番は、全モードで保たれています\033[0m")
+    total_ok = sum(r["ok"] for r in rows)
+    print(f"\033[32mレス番号の一意性と連番は、全モードで保たれています"
+          f" (成功 {total_ok} 件を根拠にしています)\033[0m")
     print("(naive の「壊れ方」は重複ではなく失敗として現れます —— 上の 失敗 列を参照)")
     return 0
 

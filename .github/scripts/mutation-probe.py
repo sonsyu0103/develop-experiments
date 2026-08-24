@@ -400,7 +400,9 @@ def main():
         for mut, want, actual, ok, _, _, out in results:
             if ok:
                 continue
-            print(f"\n--- {mut.label} ({mut.pkg} -run {mut.test}) ---")
+            where = f"{mut.pkg} -run {mut.test}" if mut.runner == "go" \
+                else f"playwright -g {mut.test}"
+            print(f"\n--- {mut.label} ({where}) ---")
             print(out[-1500:])
         return 1
 

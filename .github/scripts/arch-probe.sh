@@ -88,7 +88,9 @@ if ! check_main || ! check_tests; then
   exit 1
 fi
 
-printf "%-4s %-8s %-8s %-8s %-8s  %s\n" ID 期待 結果 本体用 テスト用 内容
+# 見出しと行で桁を揃える。日本語は printf の幅では 1 文字に数えられるが
+# 表示は 2 桁ぶんになるので、**同じ書式指定を使わないと列がずれる。**
+printf "%-4s %-10s %-8s %-10s %-10s  %s\n" ID 期待 結果 本体用 テスト用 内容
 printf -- "%s\n" "----------------------------------------------------------------------------------"
 
 FAILED=0
@@ -97,7 +99,11 @@ for p in "${PROBES[@]}"; do
 
   mkdir -p "$(dirname "$path")"
   printf 'package %s\n\nimport _ "%s"\n' "$pkg" "$imp" > "$path"
-  CREATED="$path"
+  # **追記する。** 代入だと、1 回のプローブで 2 つ以上のファイルを
+  # 置いた瞬間に、後始末が最後の 1 つしか消さなくなる。
+  # 消し残したファイルは次のプローブの前提を壊す (arch 検査は
+  # ディレクトリ全体を見るため)。
+  CREATED="$CREATED $path"
 
   check_main  && m="通る" || m="落ちる"
   check_tests && t="通る" || t="落ちる"

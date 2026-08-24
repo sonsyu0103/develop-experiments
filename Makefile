@@ -367,6 +367,16 @@ verify-constraint-checks: ## DB の CHECK 制約に、守る検査が付いて�
 	# ここは値を見ない。制約と検査の対応だけを見る。DB は要らない。
 	.github/scripts/verify-constraint-checks.py
 
+.PHONY: checker-probe
+checker-probe: ## 静的検査そのものが「落とすべきものを落とす」かを実測する
+	# **検査は、壊れても出力が変わらない。** 何も検出できない状態でも
+	# 「OK」と出て CI は緑になる。実際に verify-log-events.py には
+	# 「壊しても終了コード 0」の穴が 2 つ空いていた (2026-08-24)。
+	#
+	# arch-probe が arch-lint に、mutation-probe が Go のテストに
+	# しているのと同じことを、ソースを読む静的検査に対して行う。
+	.github/scripts/checker-probe.py
+
 PROBE_VIEWERS ?= 16
 
 .PHONY: viewcount-probe
@@ -546,7 +556,7 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 		fi
 
 .PHONY: check
-check: lint test cover verify-tidy verify-generated verify-log-events verify-constraint-checks arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test cover verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
 check-all: check smoke logs-verify ## check に加えて実 DB / ログ基盤まで確認する
