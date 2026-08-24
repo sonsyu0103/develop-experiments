@@ -94,6 +94,7 @@ make tools             # sqlc / oapi-codegen / golangci-lint / go-arch-lint を�
 make generate          # 仕様書と SQL から生成物をすべて作り直す
 make arch              # モジュール境界とレイヤの依存方向を検査する
 make arch-probe        # 境界検査そのものが機能しているかをプローブで実測する
+make checker-probe     # 静的検査そのものが「落とすべきものを落とす」かを実測する
 make cover             # 手書きロジックのカバレッジを測り、下限を割ったら落とす
 make cover-html        # どこが通っていないかをブラウザで見る
 make check             # 静的検査 + ユニットテスト + カバレッジ + 生成物のドリフト検出 (DB 不要)
@@ -464,6 +465,14 @@ Athena の partition projection がこの規則性だけに依存する。
 エラー経路のログは、手元で 1 回動かしただけでは出ない。
 出ないものは実行時の検査では守れないので、ソース側からも見る。
 
+**「手元」の側は CI に載らない** (`aws` / MinIO が要る)。
+そのため、**そちらにしか無い検査は事実上どこでも回っていない**ことになる。
+実際 [ADR 0010](docs/adr/0010-log-pipeline.md) の 4-5
+(ログに出してはいけない項目) がその状態だった —— 一度 S3 に出したものは
+事実上消せないのに、いちばん検査から遠かった。いまは同じ一覧を
+`verify-log-events` が持ち、**両者がずれたら落とす**
+([ADR 0022](docs/adr/0022-probing-the-checkers.md) 決定 4)。
+
 ### `msg` はイベント名であって自由文ではない
 
 ```go
@@ -522,7 +531,13 @@ make mutation-probe MUTATIONS=<変異リスト>
 | | 検査する対象 | 置き場所 |
 | --- | --- | --- |
 | `arch-probe` | 設定 (arch ファイル)。安定している | リポジトリに固定し、CI で常時回す |
+| `checker-probe` | 静的検査 (`verify-*`)。安定している | リポジトリに固定し、CI で常時回す |
 | `mutation-probe` | 実装。壊し方は変更のたびに陳腐化する | **変異リストは PR ごとの使い捨て** |
+
+**検査は、壊れても出力が変わらない。** 何も検出できない状態でも
+「OK」と出て CI は緑になる。実際 `verify-log-events` には
+**壊しても終了コード 0** の穴が 2 つ空いていた
+([ADR 0022](docs/adr/0022-probing-the-checkers.md))。
 
 スクリプトが引き受けるのは、間違えると害が大きいところだけ。
 
@@ -874,6 +889,7 @@ api/openapi.yaml を書く
 | [ADR 0019](docs/adr/0019-comment-concurrency.md) | コメント投稿の並行制御 —— レス番号を題材に据える |
 | [ADR 0020](docs/adr/0020-frontend-testing.md) | フロントの検査は「状態遷移」を対象にする |
 | [ADR 0021](docs/adr/0021-frontend-screens.md) | 画面を揃える —— 取得の経路と、見た目の持ち方 |
+| [ADR 0022](docs/adr/0022-probing-the-checkers.md) | 検査そのものの検出力を、変異で測る |
 | [インフラ構成](docs/infrastructure.md) | AWS 理想構成 (実際にはデプロイしない) |
 
 [ADR 0015](docs/adr/0015-idempotency.md) と
