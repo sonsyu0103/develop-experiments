@@ -138,6 +138,17 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: .github/scripts/verify-constraint-checks.py
 
+      # **上の 2 つが「落とすべきものを落とす」かを実測する。**
+      #
+      # 検査は壊れても出力が変わらない —— 何も検出できない状態でも
+      # 「OK」と出て、このジョブは緑になる。実際に verify-log-events.py
+      # には「壊しても終了コード 0」の穴が 2 つ空いていた (2026-08-24)。
+      #
+      # arch-probe と同じ位置づけで、こちらはソースを読む静的検査を見る。
+      - name: Probe the checkers
+        working-directory: ${{ github.workspace }}
+        run: .github/scripts/checker-probe.py
+
       - name: Run Vulnerability Check (govulncheck)
         # 脆弱性データベースは新しいほうが良いので、ここだけは latest を使う。
         # そのためキャッシュの対象にせず、毎回入れ直す。

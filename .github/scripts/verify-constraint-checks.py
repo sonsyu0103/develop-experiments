@@ -30,6 +30,13 @@
 値そのものの検査ではないため、CI では Go のテストと両方を回す。
 このスクリプトは DB もネットワークも要らない。
 
+**マイグレーションは前へ直す** (既に走ったものは書き換えない) ので、
+制約を消すときは新しい番号で DROP CONSTRAINT を足すことになる。
+そのため、拾った制約から**後の up.sql が落としたものを引く** ——
+引かないと、消した制約に検査を宣言し続けることを要求され、しかも
+「もう無い制約が対応表に残っています」と同時に言われて、
+どちらにも直しようが無くなる。
+
 設計の背景は docs/adr/0003-open-questions.md の#8。
 """
 
@@ -186,6 +193,92 @@ GUARDED: dict[str, tuple[str, str]] = {
 EXEMPT: dict[str, str] = {}
 
 
+# 制約の生き死にに関わる文。**出現順に畳み込む**ので 1 本の正規表現にする。
+#
+# 引用符つきの識別子 ("foo") も拾う —— (\w+) だけだと開き引用符に当たって
+# 一致せず、**落としたはずの制約が生きていることになる。**
+STATEMENT = re.compile(
+    r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"?(\w+)"?'
+    r'|ALTER\s+TABLE\s+(?:ONLY\s+)?(?:IF\s+EXISTS\s+)?"?(\w+)"?'
+    r'|DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?"?(\w+)"?'
+    r'|DROP\s+CONSTRAINT\s+(?:IF\s+EXISTS\s+)?"?(\w+)"?'
+    r'|DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?"?(\w+)"?'
+    r'|CONSTRAINT\s+"?(\w+)"?\s+CHECK\s*\(',
+    re.I,
+)
+
+
+def _paren_body(text: str, open_index: int) -> str:
+    """開き括弧の位置から、対応する閉じ括弧までの中身を返します。
+
+    **括弧の対応を数えます。** 正規表現で閉じ括弧まで取ると、
+    入れ子のある制約 (images_committed_at_matches_status) で
+    途中まで拾ってしまいます。
+    """
+    depth = 0
+    for i in range(open_index, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1:i]
+    return ""
+
+
+def alive_constraints() -> dict[str, tuple[str, str]]:
+    """生き残った CHECK 制約の 名前 -> (テーブル, 本体) を返します。
+
+    **ADD と DROP を出現順に畳み込みます。** 落としてから足し直した制約は
+    生きており、足してから落とした制約は死んでいる ——
+    どちらか片方だけを見ると、その区別が付きません。
+
+    **制約が消えるのは DROP CONSTRAINT だけではありません。**
+
+        DROP TABLE   そのテーブルの制約はすべて消える
+        DROP COLUMN  その列を参照している CHECK は一緒に消える (Postgres の挙動)
+
+    どちらも追わないと、消えた制約に検査を要求され、同時に
+    「もう無い制約が対応表に残っています」と言われて詰みます ——
+    このスクリプトが直そうとしている状態そのものになります。
+    """
+    alive: dict[str, tuple[str, str]] = {}
+    for path in sorted(MIGRATIONS.glob("*.up.sql")):
+        body = _sql_body(path)
+        table = ""
+        for m in STATEMENT.finditer(body):
+            created, altered, dropped_table, dropped_c, dropped_col, added = m.groups()
+            if created or altered:
+                table = (created or altered).lower()
+            elif dropped_table:
+                gone = dropped_table.lower()
+                alive = {n: v for n, v in alive.items() if v[0] != gone}
+            elif dropped_c:
+                alive.pop(dropped_c, None)
+            elif dropped_col:
+                # **その列を参照している CHECK だけを落とす。**
+                # 語として一致させる (status が image_status に当たらないように)。
+                col = re.compile(rf"\b{re.escape(dropped_col)}\b", re.I)
+                alive = {
+                    n: v for n, v in alive.items()
+                    if not (v[0] == table and col.search(v[1]))
+                }
+            elif added:
+                alive[added] = (table, _paren_body(body, m.end() - 1))
+    return alive
+
+
+def _sql_body(path: pathlib.Path) -> str:
+    """コメント行を落とした SQL を返します。
+
+    制約の書き方を説明している行に char_length(...) が現れるため。
+    """
+    return "\n".join(
+        line for line in path.read_text(encoding="utf-8").split("\n")
+        if not line.strip().startswith("--")
+    )
+
+
 def constraints() -> list[tuple[str, str, str]]:
     """(マイグレーション, 制約名, 種別) を返します。
 
@@ -194,14 +287,10 @@ def constraints() -> list[tuple[str, str, str]]:
     で途中まで拾ってしまいます。また索引の WHERE 句にも IN (...) が
     現れるため、CHECK の中だけを見る必要があります。
     """
-    found = []
+    found: list[tuple[str, str, str]] = []
+    alive = alive_constraints()   # 名前 -> (テーブル, 本体)
     for path in sorted(MIGRATIONS.glob("*.up.sql")):
-        # コメント行は落とす。制約の書き方を説明している行に
-        # char_length(...) が現れるため。
-        body = "\n".join(
-            line for line in path.read_text(encoding="utf-8").split("\n")
-            if not line.strip().startswith("--")
-        )
+        body = _sql_body(path)
         for m in re.finditer(r"(?:CONSTRAINT\s+(\w+)\s+)?CHECK\s*\(", body):
             name = m.group(1)
             start = m.end() - 1
@@ -231,6 +320,10 @@ def constraints() -> list[tuple[str, str, str]]:
             if name is None:
                 # 無名の CHECK は対応表に載せられない。名前を付けさせる。
                 found.append((path.name, "(無名)", " / ".join(kinds)))
+                continue
+            if name not in alive:
+                # 後の版が DROP CONSTRAINT で落としている。
+                # **前へ直す方式では、消した制約もここに残り続ける。**
                 continue
             found.append((path.name, name, " / ".join(kinds)))
     return found
@@ -267,13 +360,40 @@ def reach(src: str, name: str) -> str | None:
     if body is None:
         return None
     seen = [body]
-    for callee in sorted(set(re.findall(r"\b([a-zA-Z]\w*)\s*\(", body))):
+    # **呼び先の抽出でもコメントを剥がす。** 剥がさないと、
+    # コメントアウトした呼び出し (// readMigration(t)) から
+    # ヘルパの本文を引き込めてしまう —— そのヘルパが
+    # "db/migrations/" を直書きしていれば、**何も読んでいないのに通る。**
+    # 判定の側だけ直しても、同じ形の穴が呼び先の側に残る。
+    for callee in sorted(set(
+            re.findall(r"\b([a-zA-Z]\w*)\s*\(", _without_comments(body)))):
         if callee == name:
             continue
         called = func_body(src, callee)
         if called is not None:
             seen.append(called)
     return "\n".join(seen)
+
+
+def _without_comments(src: str) -> str:
+    """Go のコメントを落とします。
+
+    **「マイグレーションを読んでいる」の判定にコメントを数えない。**
+    判定は "db/migrations/" という文字列の有無で行っているので、
+    コメントに書いてあるだけで通ってしまう —— 対応表の側では
+    「制約名が出てくるだけのファイルは駄目」と言っておきながら、
+    本文の側で同じ抜け道を空けていた。
+
+    このスクリプトが探しているのは「検査したつもりで何も検査していない」
+    形そのものなので、ここを緩めると存在意義が消える。
+
+    落としすぎても「読んでいない」と鳴るだけで、見逃す側には倒れない。
+    """
+    out = []
+    for line in src.split("\n"):
+        i = line.find("//")
+        out.append(line[:i] if i >= 0 else line)
+    return re.sub(r"/\*.*?\*/", "", "\n".join(out), flags=re.S)
 
 
 def main() -> int:
@@ -355,7 +475,7 @@ def main() -> int:
         body = reach(src, test)
         if body is None:
             broken.append((name, rel, f"{test} が無い"))
-        elif "db/migrations/" not in body:
+        elif "db/migrations/" not in _without_comments(body):
             broken.append((name, rel, f"{test} からマイグレーションに辿り着けない"))
     if broken:
         failed = True

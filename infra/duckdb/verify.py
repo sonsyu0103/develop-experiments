@@ -116,6 +116,12 @@ def wait_for_http_requests(con: duckdb.DuckDBPyConnection) -> bool:
 # **S3 に長期保管する以上、一度出したものは事実上消せない。**
 # 列名に部分一致で当てる —— session_id でも sessionId でも拾いたいので、
 # 小文字化した列名に対する部分一致にする。
+#
+# **同じ一覧を .github/scripts/verify-log-events.py が持ち、
+# CI ではそちらが検査する。** ここは実環境が要るため CI で回らないので、
+# 4-5 だけを頼りにするとどこでも検査されないことになっていた。
+# あちらはこのファイルを ast で読み、**一覧がずれたら落とす。**
+# 項目を足すときは両方に足すこと。
 FORBIDDEN_FIELD_PARTS = [
     "session",
     "cookie",

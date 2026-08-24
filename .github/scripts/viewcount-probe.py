@@ -36,7 +36,9 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import pathlib
 import shlex
+import signal
 import statistics
 import subprocess
 import sys
@@ -61,6 +63,39 @@ LOG_EXEC = os.environ.get(
     "LOG_EXEC", "docker compose logs fluent-bit --no-log-prefix --tail=6000")
 
 COMPOSE_UP = ["docker", "compose", "up", "-d", "--force-recreate", "go-api"]
+
+# 人気順の索引。**HOT update の比較のために一時的に落とす。**
+POPULAR_INDEX = "threads_alive_popular_idx"
+
+MIGRATIONS = (
+    pathlib.Path(__file__).resolve().parents[2]
+    / "apps" / "go-api" / "db" / "migrations"
+)
+
+
+def popular_index_ddl() -> str:
+    """マイグレーションから CREATE INDEX 文を取り出す。
+
+    **写経しない。** 手で書き写すと、マイグレーション側で列や述語を
+    変えたときにこちらだけ古くなり、**測定後に「別の索引」を張って戻した
+    つもりになる。** 人気順の実行計画は静かに変わり、以降のプローブの
+    数字がすべて別物になる —— しかも誰も気づかない。
+    .github/scripts/verify-partition-pruning.sh が sqlc の生成物から
+    クエリを取り出しているのと同じ理由になる。
+    """
+    for path in sorted(MIGRATIONS.glob("*.up.sql")):
+        text = path.read_text(encoding="utf-8")
+        head = text.find(f"CREATE INDEX {POPULAR_INDEX}")
+        if head < 0:
+            continue
+        end = text.find(";", head)
+        if end < 0:
+            break
+        return text[head:end + 1]
+    raise SystemExit(
+        f"{POPULAR_INDEX} の定義をマイグレーションから取り出せませんでした。"
+        " 索引を落とすと戻せないので、ここで止めます。"
+    )
 
 
 def call(method: str, path: str, body: str | None = None):
@@ -257,6 +292,15 @@ def run_case(label: str, view_mode: str, with_views: bool) -> dict:
     }
 
 
+def restore_popular_index() -> None:
+    """人気順の索引を、マイグレーションの定義どおりに張り直す。"""
+    if not SQL_EXEC:
+        return
+    ddl = popular_index_ddl().replace(
+        f"CREATE INDEX {POPULAR_INDEX}", f"CREATE INDEX IF NOT EXISTS {POPULAR_INDEX}", 1)
+    sql_exec(ddl)
+
+
 def hot_update_ratio(with_index: bool) -> dict:
     """同期 UPDATE の HOT update 率を測る (ADR 0006 の問題 3)。
 
@@ -270,10 +314,9 @@ def hot_update_ratio(with_index: bool) -> dict:
         return {}
 
     if with_index:
-        sql_exec("CREATE INDEX IF NOT EXISTS threads_alive_popular_idx "
-                 "ON threads (view_count DESC, id DESC) WHERE deleted_at IS NULL;")
+        restore_popular_index()
     else:
-        sql_exec("DROP INDEX IF EXISTS threads_alive_popular_idx;")
+        sql_exec(f"DROP INDEX IF EXISTS {POPULAR_INDEX};")
 
     # **統計をリセットしてから測る。** 累積値なので、
     # リセットしないと前の条件の数字が混ざる。
@@ -306,9 +349,83 @@ def hot_update_ratio(with_index: bool) -> dict:
     }
 
 
+def restore_environment() -> None:
+    """このプローブが変えたものを、すべて元に戻す。
+
+    戻す対象は 2 つ:
+
+      索引    HOT update の比較のために threads_alive_popular_idx を落とす。
+              **落としたままだと人気順が全表走査になる。**
+      設定    go-api を sync / 重複抑制 0 で作り直す。
+              **戻さないと sync のまま開発が続く。**
+
+    何度呼んでも同じ結果になるようにしてある (IF NOT EXISTS と再作成)。
+
+    **1 つ目が失敗しても 2 つ目を試す。** 直列に呼ぶと、
+    DB が落ちている状況 (kill する理由として最も多い) で
+    `sql_exec` の `check=True` が例外を投げ、**設定の復元に到達しない** ——
+    go-api が sync のまま残る。片方が駄目でも、もう片方は戻す。
+
+    **例外を外へ出さない。** この関数は finally とシグナルハンドラから
+    呼ばれる。前者で投げると**元の失敗が握り潰され**、後者で投げると
+    ハンドラが中断して**シグナルでプロセスが終わらなくなる。**
+    """
+    for label, step in (
+        ("索引", restore_popular_index),
+        ("設定", lambda: restart("buffered", dedupe_seconds="")),
+    ):
+        try:
+            step()
+        except BaseException as e:  # noqa: BLE001 - 戻すことを最優先する
+            # SystemExit も捕まえる。restart() は起動待ちに失敗すると
+            # sys.exit(1) する。
+            print(f"{label}の復元に失敗しました: {e!r}", file=sys.stderr)
+
+
+def install_restore_on_signal() -> None:
+    """SIGTERM / SIGHUP でも戻してから終わる。
+
+    **finally だけでは足りない。** Python は SIGTERM の既定ハンドラで
+    そのままプロセスを終えるため、例外が上がらず finally に到達しない
+    (.github/scripts/mutation-probe.py の Restorer に実測がある)。
+
+    索引を落とした状態で kill されると、**人気順が全表走査のまま
+    残る**。以降のプローブの数字がすべて別物になり、しかも
+    「なぜか遅い」以外の手がかりが出ない。
+    """
+    def handler(signum, _frame):
+        print(f"\nシグナル {signum} を受けたので、環境を戻して終了します。",
+              file=sys.stderr)
+        # restore_environment() は例外を外へ出さないので、
+        # **必ず下の 2 行に到達する。** 到達しないと、
+        # シグナルを受けてもプロセスが終わらなくなる。
+        restore_environment()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, handler)
+
+
 def main() -> int:
     print(f"投稿 {WORKERS} 並列 / 閲覧 {VIEWERS} 並列 x {VIEWS_PER_CLIENT} 回 "
           f"(コメント投稿は ssi 固定)\n")
+    install_restore_on_signal()
+    try:
+        return _run()
+    finally:
+        # **どう終わっても戻す。** 以前はここが最後の 2 行に
+        # 置いてあるだけで、途中の sys.exit(1) —— create_thread や
+        # restart の失敗 —— を通ると**索引を落としたまま**抜けていた。
+        # hot_update_ratio(False) は索引を落としてから create_thread を
+        # 呼ぶので、実際に到達しうる経路だった。
+        # **元の失敗を握り潰さない。** restore_environment() は
+        # 例外を外へ出さないので、_run() が投げた例外はそのまま伝わる。
+        restore_environment()
+        print("(索引と go-api の設定は元に戻してあります)")
+
+
+def _run() -> int:
 
     cases = [
         # **閲覧なしが基準線。** これが無いと「閲覧ありの数字が悪い」と
@@ -356,17 +473,9 @@ def main() -> int:
             name = "索引あり" if row["with_index"] else "索引なし"
             print(f"{name:<26}{row['updates']:>8}{row['hot_updates']:>8}"
                   f"{row['hot_ratio']:>10.1f}{row['dead_tuples']:>8}")
-
-        # **索引を必ず戻す。** 落としたままだと人気順が全表走査になる。
-        sql_exec("CREATE INDEX IF NOT EXISTS threads_alive_popular_idx "
-                 "ON threads (view_count DESC, id DESC) WHERE deleted_at IS NULL;")
-        print("\n(threads_alive_popular_idx は測定後に復元済み)")
     else:
         print("\nSQL_EXEC が未設定のため、HOT update の比較は行いませんでした")
 
-    # 設定を既定へ戻す。**戻さないと sync のまま開発が続く。**
-    restart("buffered", dedupe_seconds="")
-    print("(go-api は buffered に戻してあります)")
     return 0
 
 
