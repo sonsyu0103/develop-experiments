@@ -206,8 +206,42 @@ generate: sqlc openapi ## 生成物をすべて作り直す
 # ---------------------------------------------------------------------------
 
 .PHONY: test
-test: ## Go のテストを実行する (race detector + カバレッジ)
-	cd $(GO_API_DIR) && go test -race -cover ./...
+test: ## Go のテストを実行する (race detector + カバレッジ。実 DB / S3 は使わない)
+	# **実 DB と S3 を使う検査は、ここでは走らせない。**
+	#
+	# 環境変数を明示的に空にする。**残しておくと、手元に DB があるかどうかで
+	# make check の結果が変わる** —— 実際、開発用シードを流したあとだと
+	# 落ちる状態になっていた (ベンチ用データセットを前提にした検査があった)。
+	# CI の Go Checks には DB が無いので、そちらでは元から走っていない。
+	# **手元と CI で同じものを検査する**ほうを取る。
+	#
+	# 実 DB を使う検査は make test-live (と CI の Migration Check) が持つ。
+	cd $(GO_API_DIR) && DATABASE_TEST_URL= S3_TEST_ENDPOINT= \
+		DB_TEST_REQUIRE= S3_TEST_REQUIRE= \
+		go test -race -cover ./...
+
+# 実 DB / MinIO に対する検査。**環境が要るので check には入れない。**
+LIVE_DATABASE_URL ?= postgres://app:password@localhost:5432/bbs?sslmode=disable
+LIVE_S3_ENDPOINT  ?= http://localhost:9000
+
+.PHONY: test-live
+test-live: ## 実 DB / MinIO に対する検査だけを走らせる (make up が要る)
+	# **CI の Migration Check と同じものを手元で回す。**
+	#
+	# 名前の規約は _Live で終わること。CI は -run '_Live$$' で拾うので、
+	# **規約から外れた検査はどこでも走らなくなる** ——
+	# 実際 TestNPlusOneMatchesSingleQuery が長らくその状態だった。
+	#
+	# REQUIRE を立てるので、URL が欠けていれば**スキップではなく失敗**する。
+	cd $(GO_API_DIR) && \
+		DB_TEST_REQUIRE=1 DATABASE_TEST_URL="$(LIVE_DATABASE_URL)" \
+		S3_TEST_REQUIRE=1 S3_TEST_ENDPOINT="$(LIVE_S3_ENDPOINT)" \
+		S3_TEST_BUCKET=bbs-images \
+		S3_TEST_PUBLIC_BASE_URL="$(LIVE_S3_ENDPOINT)/bbs-images" \
+		go test -count=1 -run '_Live$$|TestS3Storage|TestNew_' \
+			./internal/infrastructure/postgres/ \
+			./internal/infrastructure/objectstorage/ \
+			./internal/thread/usecase/
 
 # カバレッジの下限。下回ると cover が落ちる。
 #
@@ -559,4 +593,4 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 check: lint test cover verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
-check-all: check smoke logs-verify ## check に加えて実 DB / ログ基盤まで確認する
+check-all: check test-live smoke logs-verify ## check に加えて実 DB / ログ基盤まで確認する

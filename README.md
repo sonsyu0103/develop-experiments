@@ -98,6 +98,7 @@ make checker-probe     # 静的検査そのものが「落とすべきものを�
 make cover             # 手書きロジックのカバレッジを測り、下限を割ったら落とす
 make cover-html        # どこが通っていないかをブラウザで見る
 make check             # 静的検査 + ユニットテスト + カバレッジ + 生成物のドリフト検出 (DB 不要)
+make test-live         # 実 DB / MinIO に対する検査だけを走らせる (make up が要る)
 make smoke             # 実 DB を立てて API を起動し、HTTP 越しに疎通を検証
 make logs-verify       # ログ基盤が本番と同じ形で動いているかを実測
 make check-all         # check + smoke + logs-verify
@@ -441,6 +442,15 @@ make logs-query Q=/queries/errors.sql   # 保存したクエリを流す
 make logs-query Q='SELECT msg, count(*) FROM go_api_logs GROUP BY 1'
 ```
 
+**要るのは docker だけ。** AWS の資格情報も `aws` CLI も `mc` も要らない ——
+S3 の役は MinIO が、`mc` と DuckDB はコンテナが持っている
+(`MC := docker compose run --rm ...`)。
+
+CI に載っていないのは「実環境が要る」からではなく、
+**compose の一式 (fluent-bit / MinIO / go-api) を立てる必要がある**ため。
+「手元では回せない」という思い込みで長く未検証のまま置かれていたので、
+ここに書いておく —— **`make logs-verify` は手元で回る。**
+
 キーは Hive 形式 (`logs/service=go-api/dt=.../hour=.../`) で、
 Athena の partition projection がこの規則性だけに依存する。
 **これを外すとスキャン量が全期間に膨らむ。**
@@ -489,7 +499,23 @@ slog.Info("サーバを起動しました", ...)                         // ×
 | 層 | 対象 | DB | コマンド |
 | --- | --- | --- | --- |
 | ユニット | ドメイン / ユースケース / HTTP ハンドラ | フェイク | `make test` |
+| 実 DB / S3 | リポジトリ層と、比較実装の突き合わせ | **実 DB / MinIO** | `make test-live` |
 | スモーク | API 全体を HTTP 越しに | **実 DB** | `make smoke` |
+
+### `make check` は実 DB を使わない —— **環境変数を明示的に空にする**
+
+`make test` は `DATABASE_TEST_URL` などを空にしてから `go test` を呼ぶ。
+
+**残しておくと、手元に DB があるかどうかで `make check` の結果が変わる。**
+実際そうなっていた —— `make seed` を流したあとだと落ちる検査があった
+(ベンチ用データセットが入っている前提で書かれており、**その前提を
+検査していなかった**)。CI の Go Checks には DB が無いので、そちらでは
+元から走っていない。**手元と CI で同じものを検査する**ほうを取る。
+
+実 DB を使う検査は名前を `_Live` で終わらせる規約になっており、
+`make test-live` と CI の Migration Check が拾う。
+**規約から外れると、どこでも走らなくなる** ——
+`thread/usecase` の N+1 比較が長らくその状態だった。
 
 ### カバレッジは「手書きのロジック」だけを測る
 

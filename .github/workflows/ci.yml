@@ -552,12 +552,20 @@ jobs:
       #
       # **この 2 つは対で置く。** URL だけ消えると REQUIRE が残って
       # t.Fatal になり、静かなスキップにはならない (objectstorage と同じ形)。
-      - name: Verify the image repository against the real database
+      #
+      # **対象パッケージを列挙している。** ここから漏れた検査は、
+      # 名前が _Live で終わっていても**どこでも走らない** ——
+      # 実際 thread/usecase の N+1 比較が長らくその状態だった
+      # (make check では手元に DB があるときだけ走り、CI では 1 度も走らなかった)。
+      - name: Verify the repositories against the real database
         working-directory: ./apps/go-api
         env:
           DB_TEST_REQUIRE: "1"
           DATABASE_TEST_URL: postgres://app:password@localhost:5432/bbs?sslmode=disable
-        run: go test -v -run '_Live$' ./internal/infrastructure/postgres/
+        run: |
+          go test -v -run '_Live$' \
+            ./internal/infrastructure/postgres/ \
+            ./internal/thread/usecase/
 
       - name: Run smoke test against the real database
         env:
