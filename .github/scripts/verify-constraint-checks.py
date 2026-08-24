@@ -193,24 +193,78 @@ GUARDED: dict[str, tuple[str, str]] = {
 EXEMPT: dict[str, str] = {}
 
 
-def alive_constraints() -> set[str]:
-    """up.sql を番号順にたどり、最後まで生き残った制約名を返します。
+# 制約の生き死にに関わる文。**出現順に畳み込む**ので 1 本の正規表現にする。
+#
+# 引用符つきの識別子 ("foo") も拾う —— (\w+) だけだと開き引用符に当たって
+# 一致せず、**落としたはずの制約が生きていることになる。**
+STATEMENT = re.compile(
+    r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"?(\w+)"?'
+    r'|ALTER\s+TABLE\s+(?:ONLY\s+)?(?:IF\s+EXISTS\s+)?"?(\w+)"?'
+    r'|DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?"?(\w+)"?'
+    r'|DROP\s+CONSTRAINT\s+(?:IF\s+EXISTS\s+)?"?(\w+)"?'
+    r'|DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?"?(\w+)"?'
+    r'|CONSTRAINT\s+"?(\w+)"?\s+CHECK\s*\(',
+    re.I,
+)
+
+
+def _paren_body(text: str, open_index: int) -> str:
+    """開き括弧の位置から、対応する閉じ括弧までの中身を返します。
+
+    **括弧の対応を数えます。** 正規表現で閉じ括弧まで取ると、
+    入れ子のある制約 (images_committed_at_matches_status) で
+    途中まで拾ってしまいます。
+    """
+    depth = 0
+    for i in range(open_index, len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1:i]
+    return ""
+
+
+def alive_constraints() -> dict[str, tuple[str, str]]:
+    """生き残った CHECK 制約の 名前 -> (テーブル, 本体) を返します。
 
     **ADD と DROP を出現順に畳み込みます。** 落としてから足し直した制約は
     生きており、足してから落とした制約は死んでいる ——
     どちらか片方だけを見ると、その区別が付きません。
+
+    **制約が消えるのは DROP CONSTRAINT だけではありません。**
+
+        DROP TABLE   そのテーブルの制約はすべて消える
+        DROP COLUMN  その列を参照している CHECK は一緒に消える (Postgres の挙動)
+
+    どちらも追わないと、消えた制約に検査を要求され、同時に
+    「もう無い制約が対応表に残っています」と言われて詰みます ——
+    このスクリプトが直そうとしている状態そのものになります。
     """
-    alive: set[str] = set()
+    alive: dict[str, tuple[str, str]] = {}
     for path in sorted(MIGRATIONS.glob("*.up.sql")):
-        for m in re.finditer(
-            r"DROP\s+CONSTRAINT\s+(?:IF\s+EXISTS\s+)?(\w+)"
-            r"|CONSTRAINT\s+(\w+)\s+CHECK\s*\(",
-            _sql_body(path), re.I,
-        ):
-            if m.group(1):
-                alive.discard(m.group(1))
-            else:
-                alive.add(m.group(2))
+        body = _sql_body(path)
+        table = ""
+        for m in STATEMENT.finditer(body):
+            created, altered, dropped_table, dropped_c, dropped_col, added = m.groups()
+            if created or altered:
+                table = (created or altered).lower()
+            elif dropped_table:
+                gone = dropped_table.lower()
+                alive = {n: v for n, v in alive.items() if v[0] != gone}
+            elif dropped_c:
+                alive.pop(dropped_c, None)
+            elif dropped_col:
+                # **その列を参照している CHECK だけを落とす。**
+                # 語として一致させる (status が image_status に当たらないように)。
+                col = re.compile(rf"\b{re.escape(dropped_col)}\b", re.I)
+                alive = {
+                    n: v for n, v in alive.items()
+                    if not (v[0] == table and col.search(v[1]))
+                }
+            elif added:
+                alive[added] = (table, _paren_body(body, m.end() - 1))
     return alive
 
 
@@ -234,7 +288,7 @@ def constraints() -> list[tuple[str, str, str]]:
     現れるため、CHECK の中だけを見る必要があります。
     """
     found: list[tuple[str, str, str]] = []
-    alive = alive_constraints()
+    alive = alive_constraints()   # 名前 -> (テーブル, 本体)
     for path in sorted(MIGRATIONS.glob("*.up.sql")):
         body = _sql_body(path)
         for m in re.finditer(r"(?:CONSTRAINT\s+(\w+)\s+)?CHECK\s*\(", body):
@@ -306,7 +360,13 @@ def reach(src: str, name: str) -> str | None:
     if body is None:
         return None
     seen = [body]
-    for callee in sorted(set(re.findall(r"\b([a-zA-Z]\w*)\s*\(", body))):
+    # **呼び先の抽出でもコメントを剥がす。** 剥がさないと、
+    # コメントアウトした呼び出し (// readMigration(t)) から
+    # ヘルパの本文を引き込めてしまう —— そのヘルパが
+    # "db/migrations/" を直書きしていれば、**何も読んでいないのに通る。**
+    # 判定の側だけ直しても、同じ形の穴が呼び先の側に残る。
+    for callee in sorted(set(
+            re.findall(r"\b([a-zA-Z]\w*)\s*\(", _without_comments(body)))):
         if callee == name:
             continue
         called = func_body(src, callee)

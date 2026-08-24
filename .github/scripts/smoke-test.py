@@ -162,12 +162,19 @@ def call(method: str, path: str, body: str | None = None,
     except urllib.error.HTTPError as e:
         raw = e.read()
         # **JSON でない本文は捨てずに文字列で返す。**
-        # 以前はここが try/except json.JSONDecodeError で囲われていたが、
-        # _decode() が例外を飲んで None を返すため、**except 節に
-        # 到達しなかった。** 結果、HTML のエラーページや素の文字列は
+        # 以前はここが _decode() を try/except json.JSONDecodeError で
+        # 囲っていたが、_decode() が例外を飲んで None を返すため
+        # **except 節に到達しなかった。** HTML のエラーページや素の文字列は
         # None になり、失敗の理由が検査の出力から消えていた。
-        payload = _decode(raw)
-        if payload is None and raw:
+        #
+        # **_decode() は使わない。** 使うと "null" という本文まで
+        # 文字列の "null" になってしまう (JSON としては正しく None)。
+        # ここでは「JSON として読めたか」で分ける必要がある。
+        #
+        # 文字列が返りうるので、受け取る側は as_dict() を通すこと。
+        try:
+            payload = json.loads(raw) if raw else None
+        except json.JSONDecodeError:
             payload = raw.decode(errors="replace")[:200]
         return e.code, payload, e.headers
 
@@ -190,6 +197,18 @@ def sql(statement: str, quiet: bool = False) -> None:
     subprocess.run(shlex.split(SQL_EXEC) + [statement], check=True,
                    stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL if quiet else None)
+
+
+def as_dict(payload) -> dict:
+    """JSON のオブジェクトなら返し、そうでなければ空の dict を返す。
+
+    **call() は JSON でない本文を文字列で返す** (失敗の理由を捨てないため)。
+    そのため `as_dict(payload).get(...)` は、プロキシの 502 HTML や
+    リダイレクトの本文に当たった瞬間に AttributeError で落ちる ——
+    **check() の集計に乗らない形で全体が止まる**ので、
+    _decode() の説明が避けようとしている失敗そのものになる。
+    """
+    return payload if isinstance(payload, dict) else {}
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
@@ -521,7 +540,7 @@ auth_status, auth_payload, auth_headers = call("GET", "/auth/google")
 if auth_status == 503:
     # 認証だけが使えない状態。全体が落ちる設計だと、
     # ここで掲示板の検証がすべて巻き添えになる。
-    code = (auth_payload or {}).get("error", {}).get("code")
+    code = as_dict(auth_payload).get("error", {}).get("code")
     check("認証が未設定なら /auth/google は 503 UNAVAILABLE",
           code == "UNAVAILABLE", f"status={auth_status} code={code}")
 else:
@@ -763,7 +782,7 @@ if SQL_EXEC:
         # (docs/adr/0005-authentication.md 決定 4 / ADR 0003 未決 #16)。
         status, payload, _ = call("GET", "/me", headers=cookie)
         check("ログイン中は /me に role が載る",
-              status == 200 and (payload or {}).get("role") == "user",
+              status == 200 and as_dict(payload).get("role") == "user",
               f"status={status} payload={payload}")
 
         # **昇格が読み出し側に反映されること。**
@@ -771,7 +790,7 @@ if SQL_EXEC:
         sql("UPDATE users SET role = 'moderator' WHERE id = 900002;")
         _, payload, _ = call("GET", "/me", headers=cookie)
         check("ロールを変えると /me に反映される",
-              (payload or {}).get("role") == "moderator", f"payload={payload}")
+              as_dict(payload).get("role") == "moderator", f"payload={payload}")
 
         # **ログアウトは OIDC の設定を要求しない。**
         # 発行済みセッションを捨てるだけで IdP には触れないため。
@@ -790,7 +809,7 @@ if SQL_EXEC:
             ON CONFLICT (id) DO UPDATE SET deleted_at = NULL, author_id = 900002;
         """)
         _, payload, _ = call("GET", "/threads/900002")
-        author = (payload or {}).get("author")
+        author = as_dict(payload).get("author")
         # **先に「投稿者が解決できていること」を確かめる。**
         # 空の辞書へ倒すと、404 などで author が無いときに
         # "role" not in {} が真になり、素通しで OK になる。
@@ -1045,7 +1064,7 @@ if SQL_EXEC:
         storage_enabled = probe_status != 503
 
         if not storage_enabled:
-            code = (probe_body or {}).get("error", {}).get("code")
+            code = as_dict(probe_body).get("error", {}).get("code")
             check("ストレージが未設定なら POST /images は 503 UNAVAILABLE",
                   code == "UNAVAILABLE", f"status={probe_status} code={code}")
             skip("画像", "ストレージが未設定")
@@ -1439,7 +1458,7 @@ if SQL_EXEC:
         # 404 に化けると、権限の無い利用者が 403 と 404 の差で
         # 「その ID の対象が存在すること」を確かめられる。
         s, payload, _ = moderate({"action": "delete_thread", "targetId": "900030"}, plain_cookie)
-        code = ((payload or {}).get("error") or {}).get("code")
+        code = (as_dict(payload).get("error") or {}).get("code")
         check("一般利用者のモデレーションは 403 / PERMISSION_DENIED",
               s == 403 and code == "PERMISSION_DENIED", f"status={s} code={code}")
 
@@ -1464,7 +1483,7 @@ if SQL_EXEC:
         check("モデレーターは匿名スレッドを削除できる", s == 201, f"status={s} payload={payload}")
         # **対象種別はリクエストではなく操作から導く。**
         check("応答の targetType が action から導かれる",
-              (payload or {}).get("targetType") == "thread", f"payload={payload}")
+              as_dict(payload).get("targetType") == "thread", f"payload={payload}")
 
         s, _, _ = call("GET", "/threads/900030")
         check("削除したスレッドは 404 になる", s == 404, f"status={s}")
@@ -1501,7 +1520,7 @@ if SQL_EXEC:
             check("モデレーターはコメントを削除できる", s == 201, f"status={s}")
 
             _, payload, _ = call("GET", "/threads/900031/comments")
-            ids = [c["id"] for c in (payload or {}).get("comments", [])]
+            ids = [c["id"] for c in as_dict(payload).get("comments", [])]
             check("削除したコメントは一覧から消える", comment_id not in ids, f"ids={ids}")
         else:
             check("コメントを用意できた", False, "投稿に失敗した")
@@ -1652,7 +1671,7 @@ if SQL_EXEC:
         if my_thread and anon_thread:
             # --- 他人・匿名は消せない ---
             s, payload, _ = call("DELETE", f"/threads/{my_thread}", headers=stranger_cookie)
-            code = ((payload or {}).get("error") or {}).get("code")
+            code = (as_dict(payload).get("error") or {}).get("code")
             check("他人のスレッドは 403 / PERMISSION_DENIED",
                   s == 403 and code == "PERMISSION_DENIED", f"status={s} code={code}")
 
@@ -1711,7 +1730,7 @@ if SQL_EXEC:
                 check("自分のコメントは 204 で消せる", s == 204, f"status={s}")
 
                 _, payload, _ = call("GET", f"/threads/{anon_thread}/comments")
-                ids = [c["id"] for c in (payload or {}).get("comments", [])]
+                ids = [c["id"] for c in as_dict(payload).get("comments", [])]
                 check("削除したコメントは一覧から消える", my_comment not in ids, f"ids={ids}")
 
                 # **レス番号は空いたまま** (ADR 0019 決定 5)。

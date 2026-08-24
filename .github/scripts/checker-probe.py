@@ -72,6 +72,7 @@ ROLE_TEST = "apps/go-api/internal/user/domain/model/role_test.go"
 ROLE_MIGRATION = "apps/go-api/db/migrations/000003_add_user_role.up.sql"
 DUCKDB_VERIFY = "infra/duckdb/verify.py"
 CHECKER = f".github/scripts/{CONSTRAINTS}"
+CONTACT_MIGRATION = "apps/go-api/db/migrations/000012_add_contact_messages.up.sql"
 
 # 共通で差し替えるログ行。**起動時に必ず 1 回出る行**なので、
 # 消えたときは置換が 0 件になり、このスクリプトが先に気づく。
@@ -85,7 +86,16 @@ class Probe:
         self.file = file
         self.frm = frm
         self.to = to
-        # 期待する NG の文言。**None は「落ちてはいけない」**を意味する。
+        # 期待する NG 行の文言。**NG で始まる行だけを見る** ——
+        # 出力全体への部分一致にすると、**成功したときの OK 行にも
+        # 当たってしまう。**
+        #
+        # 実際に踏んだ (レビュー指摘)。"ログに出してはいけない項目" は
+        #   NG  ログに出してはいけない項目が 1 件あります   (検出した)
+        #   OK  ログに出してはいけない項目は使っていません   (検出していない)
+        # の**両方**に含まれる。しかも変異が別の検査にも当たるため
+        # 終了コードは 1 になる。結果、**その検査を完全に殺しても
+        # プローブは緑のまま**だった。
         self.expect_text = expect_text
         self.desc = desc
 
@@ -94,35 +104,35 @@ PROBES = [
     # ---- verify-log-events.py -------------------------------------------
     Probe("A", LOG_EVENTS, LOGGING, VERSION_FIELD,
           'slog.String("http2_streams", "x"),',
-          "Athena の DDL に無いフィールド",
+          "Athena の DDL に無いフィールドが",
           "数字を含む名前 (旧実装は正規表現に当たらず素通りしていた)"),
     Probe("B", LOG_EVENTS, LOGGING, VERSION_FIELD,
           'slog.String("Version", Version()),',
-          "フィールド名の形が正しくない",
+          "フィールド名の形が正しくないものが",
           "大文字を含む名前"),
     Probe("C", LOG_EVENTS, LOGGING, VERSION_FIELD,
           'slog.String("dt", "x"),',
-          "パーティション列と同じ名前",
+          "パーティション列と同じ名前のフィールドが",
           "パーティション列との衝突 (罠 1。DDL がそもそも作れなくなる)"),
     Probe("D", LOG_EVENTS, LOGGING, VERSION_FIELD,
           'slog.Int64("version", 1),',
-          "DDL の型と食い違うフィールド",
+          "DDL の型と食い違うフィールドが",
           "DDL は string なのに slog.Int64 で出す (罠 3)"),
     Probe("E", LOG_EVENTS, LOGGING, VERSION_FIELD,
           'slog.String("session_id", "x"),',
-          "ログに出してはいけない項目",
+          "ログに出してはいけない項目が",
           "ADR 0010 の 4-5 が禁じた項目"),
     Probe("F", LOG_EVENTS, LOGGING, VERSION_FIELD,
           'slog.Duration("version", 0),',
-          "Athena に載せられない型",
+          "Athena に載せられない型のフィールドが",
           "slog.Duration (ナノ秒になる)"),
     Probe("G", LOG_EVENTS, LOGGING, VERSION_FIELD,
           'slog.Int64("addr", 1),',
-          "同じ名前で型が違うフィールド",
+          "同じ名前で型が違うフィールドが",
           "同じ名前を 2 つの型で出す"),
     Probe("H", LOG_EVENTS, MAIN, 'slog.Info("server_started"',
           'slog.Info("サーバを起動しました"',
-          "自由文の msg",
+          "自由文の msg が",
           "msg を日本語の自由文にする (ADR 0010 の 4-2)"),
     Probe("I", LOG_EVENTS, DUCKDB_VERIFY, '    "cookie",\n', "",
           "禁止項目の一覧が infra/duckdb/verify.py とずれています",
@@ -131,18 +141,18 @@ PROBES = [
     # ---- verify-constraint-checks.py ------------------------------------
     Probe("J", CONSTRAINTS, ROLE_MIGRATION, "users_role_valid",
           "users_role_valid_zz",
-          "守る検査が宣言されていない CHECK 制約",
+          "守る検査が宣言されていない CHECK 制約が",
           "検査を宣言していない制約を足す"),
     Probe("K", CONSTRAINTS, ROLE_TEST,
           "func TestRole_DefinitionsAgreeAcrossSources(",
           "func TestRole_DefinitionsAgreeAcrossSourcesZZ(",
-          "宣言と実物が食い違っている検査",
+          "宣言と実物が食い違っている検査が",
           "対応表が指すテストを改名する"),
     Probe("L", CONSTRAINTS, ROLE_TEST,
           '\tsrc := readRepoFile(t, "apps/go-api/db/migrations/'
           '000003_add_user_role.up.sql")',
           '\tsrc := "" // apps/go-api/db/migrations/000003_add_user_role.up.sql',
-          "宣言と実物が食い違っている検査",
+          "宣言と実物が食い違っている検査が",
           "マイグレーションの読み取りをコメントへ移す (旧実装は素通り)"),
     Probe("M", CONSTRAINTS, CHECKER,
           '    "users_role_valid": (\n'
@@ -150,8 +160,19 @@ PROBES = [
           '        "TestRole_DefinitionsAgreeAcrossSources",\n'
           '    ),\n',
           "",
-          "守る検査が宣言されていない CHECK 制約",
+          "守る検査が宣言されていない CHECK 制約が",
           "対応表から 1 件消す"),
+    Probe("N", CONSTRAINTS, CONTACT_MIGRATION,
+          "CREATE INDEX contact_ip_scrub_idx",
+          "ALTER TABLE contact_messages DROP COLUMN status;\n"
+          "CREATE INDEX contact_ip_scrub_idx",
+          "もう存在しない CHECK 制約が対応表に",
+          "DROP COLUMN で消える CHECK を追えているか"),
+    Probe("O", CONSTRAINTS, ROLE_TEST,
+          '\tassertSameSet(t, "DB の CHECK 制約", registered, valuesFromMigration(t))',
+          '\t// assertSameSet(t, "DB の CHECK 制約", registered, valuesFromMigration(t))',
+          "宣言と実物が食い違っている検査が",
+          "コメントアウトした呼び出しからヘルパを引き込めないか"),
 ]
 
 
@@ -235,10 +256,11 @@ def main() -> int:
 
         if rc == 0:
             ok, note = False, "落ちなかった (この検査は壊れても気づけない)"
-        elif probe.expect_text not in out:
-            # **文言まで見る。** 別の理由で落ちたものを
-            # 「検出できた」と数えない。
-            ok, note = False, f"落ちたが理由が違う ({probe.expect_text!r} が出ていない)"
+        elif not any(probe.expect_text in line
+                     for line in out.splitlines() if line.startswith("NG")):
+            # **NG 行だけを見る。** 出力全体への部分一致だと、
+            # 同じ語を含む OK 行に当たって素通りする (Probe の説明を参照)。
+            ok, note = False, f"落ちたが理由が違う (NG 行に {probe.expect_text!r} が無い)"
         else:
             ok, note = True, ""
 

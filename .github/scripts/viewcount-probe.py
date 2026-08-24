@@ -360,9 +360,26 @@ def restore_environment() -> None:
               **戻さないと sync のまま開発が続く。**
 
     何度呼んでも同じ結果になるようにしてある (IF NOT EXISTS と再作成)。
+
+    **1 つ目が失敗しても 2 つ目を試す。** 直列に呼ぶと、
+    DB が落ちている状況 (kill する理由として最も多い) で
+    `sql_exec` の `check=True` が例外を投げ、**設定の復元に到達しない** ——
+    go-api が sync のまま残る。片方が駄目でも、もう片方は戻す。
+
+    **例外を外へ出さない。** この関数は finally とシグナルハンドラから
+    呼ばれる。前者で投げると**元の失敗が握り潰され**、後者で投げると
+    ハンドラが中断して**シグナルでプロセスが終わらなくなる。**
     """
-    restore_popular_index()
-    restart("buffered", dedupe_seconds="")
+    for label, step in (
+        ("索引", restore_popular_index),
+        ("設定", lambda: restart("buffered", dedupe_seconds="")),
+    ):
+        try:
+            step()
+        except BaseException as e:  # noqa: BLE001 - 戻すことを最優先する
+            # SystemExit も捕まえる。restart() は起動待ちに失敗すると
+            # sys.exit(1) する。
+            print(f"{label}の復元に失敗しました: {e!r}", file=sys.stderr)
 
 
 def install_restore_on_signal() -> None:
@@ -379,6 +396,9 @@ def install_restore_on_signal() -> None:
     def handler(signum, _frame):
         print(f"\nシグナル {signum} を受けたので、環境を戻して終了します。",
               file=sys.stderr)
+        # restore_environment() は例外を外へ出さないので、
+        # **必ず下の 2 行に到達する。** 到達しないと、
+        # シグナルを受けてもプロセスが終わらなくなる。
         restore_environment()
         signal.signal(signum, signal.SIG_DFL)
         os.kill(os.getpid(), signum)
@@ -399,6 +419,8 @@ def main() -> int:
         # restart の失敗 —— を通ると**索引を落としたまま**抜けていた。
         # hot_update_ratio(False) は索引を落としてから create_thread を
         # 呼ぶので、実際に到達しうる経路だった。
+        # **元の失敗を握り潰さない。** restore_environment() は
+        # 例外を外へ出さないので、_run() が投げた例外はそのまま伝わる。
         restore_environment()
         print("(索引と go-api の設定は元に戻してあります)")
 
