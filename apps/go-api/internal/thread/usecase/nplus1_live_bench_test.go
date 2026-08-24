@@ -234,13 +234,13 @@ func TestNPlusOneMatchesSingleQuery_Live(t *testing.T) {
 	// **閲覧数の検査の前提を、ここで用意する。**
 	// 「0 以外が 1 件でもあること」に依存するので、
 	// 入っているデータ次第で成否が変わってはいけない。
-	ensureSomeViewCount(t, pool)
+	ensureSomeViewCount(t, pool, comparePageSize)
 
 	repo := postgres.NewThreadRepository(pool)
 	single := NewThreadInteractor(repo, nil)
 	nplus1 := NewNPlusOneInteractor(repo, 8)
 
-	page, err := pagination.NewPage(nil, 50)
+	page, err := pagination.NewPage(nil, comparePageSize)
 	if err != nil {
 		t.Fatalf("ページの組み立てに失敗した: %v", err)
 	}
@@ -294,6 +294,33 @@ func TestNPlusOneMatchesSingleQuery_Live(t *testing.T) {
 	}
 }
 
+// comparePageSize は比較に使うページの件数です。
+//
+// **ensureSomeViewCount と assert が同じ範囲を見るために 1 箇所に置きます。**
+// ずれると「前提を用意した範囲」と「検査が見る範囲」が食い違います。
+const comparePageSize int32 = 50
+
+// seedThreadForCompare は比較用のスレッドを 1 件作り、後で消します。
+func seedThreadForCompare(t *testing.T, pool *pgxpool.Pool) int64 {
+	t.Helper()
+
+	var id int64
+	err := pool.QueryRow(t.Context(),
+		`INSERT INTO threads (title) VALUES ($1) RETURNING id`,
+		"N+1 比較のための下ごしらえ",
+	).Scan(&id)
+	if err != nil {
+		t.Fatalf("スレッドを作れなかった: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx := context.Background()
+		if _, err := pool.Exec(ctx, `DELETE FROM threads WHERE id = $1`, id); err != nil {
+			t.Logf("下ごしらえのスレッドを消せなかった (id=%d): %v", id, err)
+		}
+	})
+	return id
+}
+
 // requireLiveDB は実 DB への検証を必須とするかを返します。
 //
 // **postgres パッケージの同名関数と揃えてあります。** 片方だけ規約が
@@ -315,29 +342,56 @@ func requireLiveDB() bool {
 //
 // 検査したいのは「N+1 側が view_count を引いているか」だけなので、
 // **1 件だけ 0 でない行があれば足ります。** データセットに依存する理由が無い。
-func ensureSomeViewCount(t *testing.T, pool *pgxpool.Pool) {
+func ensureSomeViewCount(t *testing.T, pool *pgxpool.Pool, pageSize int32) {
 	t.Helper()
 
-	var maxCount int64
-	err := pool.QueryRow(t.Context(),
-		`SELECT COALESCE(max(view_count), 0) FROM threads WHERE deleted_at IS NULL`,
-	).Scan(&maxCount)
+	// **1 ページ目だけを見る。** 検査が見るのもそこだけなので、
+	// テーブル全体で max を取ると範囲がずれる ——
+	// 「どこかに 0 でない行はあるが、id 降順の上位 N 件は全部 0」という
+	// 状態で用意をスキップし、検査だけが落ちる (レビュー指摘)。
+	// しかもそのとき出るのは「view_count を引いていない」という、
+	// **この関数が消したかったはずの誤った説明**になる。
+	const firstPage = `SELECT id, view_count FROM threads
+	                   WHERE deleted_at IS NULL ORDER BY id DESC LIMIT $1`
+
+	rows, err := pool.Query(t.Context(), firstPage, pageSize)
 	if err != nil {
 		t.Fatalf("閲覧数を読めなかった: %v", err)
 	}
-	if maxCount > 0 {
+	var (
+		topID   int64
+		found   bool
+		hasView bool
+	)
+	for rows.Next() {
+		var id, count int64
+		if err := rows.Scan(&id, &count); err != nil {
+			rows.Close()
+			t.Fatalf("閲覧数を読めなかった: %v", err)
+		}
+		if !found {
+			topID, found = id, true
+		}
+		if count > 0 {
+			hasView = true
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("閲覧数を読めなかった: %v", err)
+	}
+	if hasView {
 		return
 	}
 
-	// **一覧の先頭に来る 1 件を選ぶ。** 既定の並びは id の降順なので、
-	// 最大の id を持つ生存スレッドなら 1 ページ目に必ず入る。
-	var id int64
-	err = pool.QueryRow(t.Context(),
-		`SELECT id FROM threads WHERE deleted_at IS NULL ORDER BY id DESC LIMIT 1`,
-	).Scan(&id)
-	if err != nil {
-		t.Fatalf("スレッドが 1 件も無い: %v", err)
+	if !found {
+		// **行が 1 つも無いなら作る。** make up はマイグレーションまでで
+		// シードを流さないので、ボリュームを作り直した直後はこの状態になる
+		// (レビュー指摘)。ここで落とすと、検査したいこととは無関係な理由で
+		// make test-live が止まる。
+		topID = seedThreadForCompare(t, pool)
 	}
+	id := topID
 
 	if _, err := pool.Exec(t.Context(),
 		`UPDATE threads SET view_count = 1 WHERE id = $1`, id); err != nil {
