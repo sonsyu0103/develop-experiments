@@ -98,11 +98,17 @@ make checker-probe     # 静的検査そのものが「落とすべきものを�
 make cover             # 手書きロジックのカバレッジを測り、下限を割ったら落とす
 make cover-html        # どこが通っていないかをブラウザで見る
 make check             # 静的検査 + ユニットテスト + カバレッジ + 生成物のドリフト検出 (DB 不要)
-make test-live         # 実 DB / MinIO に対する検査だけを走らせる (make up が要る)
+make test-live         # 実 DB / MinIO に対する検査だけを走らせる (環境も立てる)
 make smoke             # 実 DB を立てて API を起動し、HTTP 越しに疎通を検証
 make logs-verify       # ログ基盤が本番と同じ形で動いているかを実測
 make check-all         # check + smoke + test-live + logs-verify
 ```
+
+**`make smoke` と `make check-all` は、手元の DB のスレッドとコメントを消す。**
+smoke が `make seed` を呼び、`seed.sql` の先頭が
+`TRUNCATE TABLE comments, threads RESTART IDENTITY CASCADE` になっているため
+(毎回同じ状態から検証するのが狙い)。ベンチ用データセットを入れていた場合は
+`make bench-dataset` で入れ直す。`make test-live` 単体なら消えない。
 
 **`docker compose logs go-api` は空になる。** ログは fluent-bit へ
 転送されるため (下の「ログ基盤」節)。`make logs` なら両方まとめて見える。

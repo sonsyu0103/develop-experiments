@@ -309,7 +309,7 @@ cover-html: cover ## カバレッジをブラウザで開く (どこが通って
 	cd $(GO_API_DIR) && go tool cover -html=/tmp/cover.out
 
 .PHONY: smoke
-smoke: ## 実 DB に対して API を起動し、HTTP 越しに疎通を検証する
+smoke: ## 実 DB に対して API を起動し、HTTP 越しに疎通を検証する (既存データは消える)
 	# ユニットテストはフェイクのリポジトリで動くため、
 	# 「SQL が意図どおり動くか」は検証できない。その穴を埋める。
 	@$(MAKE) --no-print-directory up
@@ -618,6 +618,20 @@ check: lint test cover verify-tidy verify-generated verify-log-events verify-con
 # **test-live は smoke の後ろに置く。** 前に置くと、スタックが落ちている
 # 状態では test-live が接続に失敗し、DB_TEST_REQUIRE=1 なので
 # **スキップではなく Fatal** で止まる (レビュー指摘)。
-# いまは test-live 自身が up-seeded に依存するので順序に関係なく立つが、
+# いまは test-live 自身が up に依存するので順序に関係なく立つが、
 # 依存を外したときに黙って壊れないよう、順序でも意図を残しておく。
-check-all: check smoke test-live logs-verify ## check に加えて実 DB / ログ基盤まで確認する
+#
+# 【手元の DB は消える】
+# smoke が make seed を呼び、db/seed/seed.sql の先頭が
+# TRUNCATE TABLE comments, threads RESTART IDENTITY CASCADE。
+# **check-all を通すと、手元のスレッドとコメントは毎回消える。**
+# ベンチ用データセットを入れてある場合は make bench-dataset で入れ直すこと。
+#
+# **「開発用シードの状態に戻る」ではない。** seed.sql が入れるのは 5 件だが、
+# そのあと smoke-test.py が実 API を叩いて自分の行を残す (実測 9 件 / max(id)=9)。
+# **check-all は DB 状態に対して冪等ではない** —— リセット手段として使わないこと。
+#
+# test-live 単体は消さない (up-seeded ではなく up に依存させてある) が、
+# **check-all の中では smoke が先に消す。** 単体で回したときと
+# 通しで回したときで、test-live が見るデータ規模が変わる。
+check-all: check smoke test-live logs-verify ## check に加えて実 DB / ログ基盤まで確認する (手元の DB は消える)

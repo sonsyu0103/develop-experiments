@@ -117,7 +117,12 @@ func (r *CommentRepository) ListByAuthor(
 // 親スレッドが無ければ apperr.ErrNotFound、
 // リトライしても競合が解けなければ apperr.ErrConflict を返します。
 //
-// **naive モードだけはレス番号が重複します。** それを実測するための実装です。
+// **naive モードだけは、並行投稿が失われます。** それを実測するための実装です。
+// 重複はしません —— UNIQUE (thread_id, seq) が 2 件目を拒否し、
+// naive はリトライしないので 23505 がそのまま上がります (ADR 0019)。
+//
+// **これは Create の話です。** CreateIdempotent は同じ 23505 を
+// apperr.ErrConflict に包み直すので、naive でも 409 になります。
 func (r *CommentRepository) Create(ctx context.Context, comment *model.Comment) (*model.Comment, error) {
 	var (
 		created  *model.Comment
