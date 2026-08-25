@@ -57,3 +57,8 @@ output "region" {
   description = "リソースを置いたリージョン。デプロイスクリプトが読む"
   value       = var.region
 }
+
+output "project" {
+  description = "リソース名と Project タグの接頭辞。消し忘れの確認に使う"
+  value       = var.project
+}

@@ -175,14 +175,26 @@ data "aws_iam_policy_document" "github_actions" {
     resources = [for r in aws_ecr_repository.this : r.arn]
   }
 
+  # **deploy.yml が実際に呼ぶ API をすべて挙げる。**
+  #
+  # 手元のスクリプトは開発者の管理者権限で動くので、
+  # **この不足はローカルでは一度も露見しない。**
+  # DescribeClusters が欠けていると、ワークフローは最初の確認で
+  # 「クラスタが見つかりません。先に make tf-apply してください」と
+  # 表示して止まる —— AccessDenied が grep に吸われ、
+  # **原因と違うメッセージが出る**。
   statement {
     sid    = "DeployService"
     effect = "Allow"
     actions = [
+      "ecs:DescribeClusters",
       "ecs:DescribeServices",
       "ecs:UpdateService",
       "ecs:DescribeTaskDefinition",
       "ecs:RegisterTaskDefinition",
+      # マイグレーションを run-task で流し、終了コードを見るために要る。
+      "ecs:RunTask",
+      "ecs:DescribeTasks",
     ]
     resources = ["*"]
   }

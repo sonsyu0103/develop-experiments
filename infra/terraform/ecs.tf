@@ -135,7 +135,16 @@ resource "aws_ecs_task_definition" "api" {
 
       { name = "S3_BUCKET", value = aws_s3_bucket.images.bucket },
       { name = "S3_REGION", value = var.region },
-      { name = "S3_PUBLIC_BASE_URL", value = "${local.public_url}/images" },
+      # **末尾に /images を付けない。**
+      # オブジェクトキー自体が "images/<uuid>.webp" で始まる
+      # (image/domain/model/image.go)。付けると
+      # https://<cf>/images/images/<uuid>.webp になり、
+      # CloudFront はプレフィックスを剥がさないので S3 が 403 を返す。
+      #
+      # 手元の Caddy は handle_path が /images を剥がしてから
+      # /bbs-images を足すので、同じ値でも成立していた ——
+      # **その値をそのまま持ってきたのが原因。**
+      { name = "S3_PUBLIC_BASE_URL", value = local.public_url },
 
       # 認証は任意 (未設定ならログインの 2 経路だけが 503。ADR 0005)。
       { name = "GOOGLE_CLIENT_ID", value = var.google_client_id },
@@ -215,8 +224,11 @@ resource "aws_ecs_task_definition" "web" {
       # いまは動かすことを優先し、ADR 0024「やり残し」に回す。
       { name = "API_URL", value = "${local.public_url}/api" },
 
-      # ブラウザから叩く経路は CloudFront 越し。
-      { name = "NEXT_PUBLIC_API_URL", value = "${local.public_url}/api" },
+      # **NEXT_PUBLIC_API_URL はここに置かない。**
+      # ビルド時に定数へ置換される値なので、実行時の環境変数では
+      # 上書きできない (apps/next-app/Dockerfile の ARG で渡している)。
+      # ここに書くと「設定したのに効かない」変数が残り、
+      # 次に読む人を確実に誤解させる。
     ]
 
     logConfiguration = {
@@ -306,12 +318,16 @@ resource "aws_ecs_service" "api" {
   # 障害時に debug イメージへ差し替えれば使えるようにするため。
   enable_execute_command = true
 
-  # **CD がイメージを差し替えるので、タスク定義の変更を無視する。**
-  # 無視しないと、CD の後に terraform apply すると
-  # 古いイメージへ巻き戻る。
-  lifecycle {
-    ignore_changes = [task_definition]
-  }
+  # **task_definition を無視しない。**
+  #
+  # 当初は「CD がイメージを差し替えるから」と ignore_changes に入れていたが、
+  # **環境変数を変えても届かなくなる** —— Terraform が新しいリビジョンを
+  # 登録して「適用した」と報告する一方、サービスは古いリビジョンのまま走る。
+  # 実際に API_URL を直したときに踏み、手で update-service する羽目になった。
+  #
+  # CD (deploy.yml) はイメージタグを固定 (latest) して
+  # --force-new-deployment するだけで、**タスク定義は登録し直さない**。
+  # だから無視する理由がそもそも無い。
 
   depends_on = [aws_lb_listener.api]
 }
@@ -341,9 +357,7 @@ resource "aws_ecs_service" "web" {
 
   enable_execute_command = true
 
-  lifecycle {
-    ignore_changes = [task_definition]
-  }
+  # api 側と同じ理由で ignore_changes は使わない。
 
   depends_on = [aws_lb_listener.web]
 }

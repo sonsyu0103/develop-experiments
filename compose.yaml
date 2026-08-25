@@ -583,6 +583,11 @@ services:
       # 既定は max-age=0 (= 記憶しない)。理由は Caddyfile に書いてある ——
       # HSTS はポートを区別しないので、localhost に付けると
       # http://localhost:3000 での開発まで巻き添えで止まる。
+      #
+      # **この行を消すと、Caddyfile 側の {$HSTS:max-age=0} が
+      # 既定にフォールバックして動くように見える** —— だが
+      # HSTS="..." を渡しても届かなくなり、逃がし道が黙って死ぬ。
+      HSTS: ${HSTS:-max-age=0}
       # X-Forwarded-Proto の値。既定は https (エッジが必ず TLS 終端するため)。
       #
       # **既定値をここに書く必要がある。** Caddyfile 側にも {$XFP:https} と

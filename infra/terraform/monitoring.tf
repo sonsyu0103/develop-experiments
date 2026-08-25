@@ -11,6 +11,58 @@ resource "aws_sns_topic" "alarms" {
   name = "${local.name}-alarms"
 }
 
+# **Budgets からの publish を明示的に許す。**
+#
+# CloudWatch アラームは SNS の既定ポリシーで publish できるが、
+# **Budgets は別のサービスプリンシパルなので許可が要る。**
+# 無いと通知が届かず、**消し忘れを金額で見張る仕組み (決定 1) が
+# 黙って機能しない** —— この構成でいちばん怖い失敗そのものになる。
+data "aws_iam_policy_document" "alarms_topic" {
+  statement {
+    sid    = "AllowBudgets"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["budgets.amazonaws.com"]
+    }
+
+    actions   = ["SNS:Publish"]
+    resources = [aws_sns_topic.alarms.arn]
+
+    # 他人のアカウントの予算から publish されないよう絞る。
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+
+  statement {
+    sid    = "AllowCloudWatchAlarms"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudwatch.amazonaws.com"]
+    }
+
+    actions   = ["SNS:Publish"]
+    resources = [aws_sns_topic.alarms.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+  }
+}
+
+resource "aws_sns_topic_policy" "alarms" {
+  arn    = aws_sns_topic.alarms.arn
+  policy = data.aws_iam_policy_document.alarms_topic.json
+}
+
 resource "aws_sns_topic_subscription" "alarms_email" {
   count = var.alarm_email == "" ? 0 : 1
 

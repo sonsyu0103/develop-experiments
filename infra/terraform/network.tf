@@ -196,23 +196,20 @@ resource "aws_vpc_security_group_ingress_rule" "alb_api_from_cloudfront" {
   prefix_list_id = data.aws_ec2_managed_prefix_list.cloudfront_origin_facing.id
 }
 
-# **next-app の Server Components が go-api を叩く経路。**
+# **ECS から ALB への ingress は置かない。**
 #
-# 手元では `API_URL=http://go-api:8080` とサービス名で解決していた。
-# ECS には同じ名前解決が無いので、ALB の API リスナーを経由させる。
-# CloudFront を回さないのは、外に出て戻る往復を避けるため。
+# 当初は「next-app の Server Components が go-api を叩く経路」として
+# 開けていたが、**この許可は成立しない** (ADR 0024 の 12):
 #
-# ここを開けないと **画面だけが真っ白になる** —— API は正常、
-# ALB も正常、Server Components からの取得だけが落ちる。
-resource "aws_vpc_security_group_ingress_rule" "alb_api_from_ecs" {
-  security_group_id = aws_security_group.alb_api.id
-  description       = "From next-app server components to go-api"
-
-  ip_protocol                  = "tcp"
-  from_port                    = 8080
-  to_port                      = 8080
-  referenced_security_group_id = aws_security_group.ecs.id
-}
+#   internet-facing な ALB の DNS 名は VPC の中から引いてもパブリック IP を
+#   返し、パブリック IP を持つ ECS タスクからの通信は
+#   **いったんインターネットに出て戻る**。ALB から見た送信元は
+#   「ECS のパブリック IP」であって Security Group ではないので、
+#   referenced_security_group_id による許可は効かない。
+#
+# いまは API_URL が CloudFront を経由する (ecs.tf)。
+# **効かない規則を残さない** —— プレフィックスリストで
+# 46/60 まで埋まっている SG では、1 枠も無駄にできない。
 
 resource "aws_vpc_security_group_egress_rule" "alb_api_all" {
   security_group_id = aws_security_group.alb_api.id

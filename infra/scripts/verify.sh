@@ -134,11 +134,48 @@ fi
 
 echo
 echo "=== 6. 画像経路 (S3 + OAC) ==="
-img_code="$(status "$BASE/images/")"
-case "$img_code" in
-	200|403|404) pass "S3 オリジンに到達している (status=$img_code)" ;;
-	*)           bad  "S3 オリジンに届いていない (status=$img_code)" ;;
-esac
+# **「到達した」で通してはいけない。**
+# 初版は 200/403/404 をまとめて成功にしていたため、
+# S3_PUBLIC_BASE_URL が images/ を二重に付ける不具合
+# (ADR 0024 の 14) を素通しした。**403 は失敗**として扱う。
+#
+# 本当に確かめたいのは「API が返した URL で画像が引けるか」なので、
+# 実際に 1 枚投稿して、その URL を叩く。
+img_probe="$(mktemp -t bbs-probe).png"
+# 1x1 の PNG (base64)。画像として妥当な最小の入力。
+printf '%s' \
+'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' \
+	| base64 -d > "$img_probe" 2>/dev/null || \
+	printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' \
+	| base64 --decode > "$img_probe"
+
+img_json="$(req -X POST "$BASE/api/images" -H "Origin: $BASE" -F "file=@$img_probe" || true)"
+rm -f "$img_probe"
+
+img_url="$(printf '%s' "$img_json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for k in ("url", "imageUrl", "location"):
+    if isinstance(d.get(k), str):
+        print(d[k]); break
+' 2>/dev/null || true)"
+
+if [ -z "$img_url" ]; then
+	skip "画像を投稿できなかったので経路を検査できない (認証が要る可能性)"
+	img_code="$(status "$BASE/images/")"
+	case "$img_code" in
+		403) bad  "/images/ が 403 —— S3_PUBLIC_BASE_URL の二重プレフィックスを疑う" ;;
+		*)   pass "S3 オリジンには到達している (status=$img_code)" ;;
+	esac
+else
+	fetched="$(status "$img_url")"
+	[ "$fetched" = "200" ] \
+		&& pass "API が返した URL で画像が引ける ($img_url)" \
+		|| bad  "API が返した URL が $fetched —— S3_PUBLIC_BASE_URL とキーの組み立てが噛み合っていない ($img_url)"
+fi
 
 echo
 echo "=== 後片付け ==="

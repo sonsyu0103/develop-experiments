@@ -235,7 +235,12 @@ tf-destroy: ## AWS の環境を消す (**消し忘れると課金され続ける
 	@rm -f $(TF_DESTROY_PLAN)
 	@echo
 	@echo "消えたことを確かめる:"
-	@echo "  aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=$(SITE_ADDRESS:localhost=bbs) --query 'length(ResourceTagMappingList)'"
+	# **SITE_ADDRESS から導出しない。** あれはローカルのエッジの
+	# ホスト名で、AWS の Project タグとは無関係。
+	# SITE_ADDRESS=bbs.localhost のとき Values=bbs.bbs になり、
+	# **0 件と表示されて「消えている」と誤読する** —— 消し忘れを
+	# 確かめるための手順が、いちばん危ない場面で嘘をつく。
+	@echo "  aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=$$($(TF) output -raw project 2>/dev/null || echo bbs) --query 'length(ResourceTagMappingList)'"
 
 
 .PHONY: tf-push

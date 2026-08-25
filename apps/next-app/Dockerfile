@@ -29,6 +29,19 @@ CMD ["npm", "run", "dev"]
 # ---------------------------------------------------------------------------
 FROM base AS builder
 
+# **NEXT_PUBLIC_* はビルド時に定数へ置換される。**
+# 実行時の環境変数では上書きできないので、ここで渡す
+# (app/lib/api.ts が「本番のイメージを作る段になったら、
+# ビルド引数として渡すこと」と書いているのはこのこと)。
+#
+# **既定を相対パスにする。** エッジ (Caddy / CloudFront) の背後では
+# 画面と API が同一オリジンに載るので、ホスト名を焼き込む必要がない。
+# CloudFront のドメインは apply するまで決まらないので、
+# ホスト名を焼く設計だと「イメージを作るには URL が要る、
+# URL を得るには apply が要る」という循環に入る。
+ARG NEXT_PUBLIC_API_URL=/api
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+
 COPY . .
 
 # next.config.ts の output: 'standalone' により

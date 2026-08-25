@@ -119,7 +119,11 @@ done
 # HSTS はホスト単位でポートを区別しないので、localhost に有効な max-age を
 # 付けると http://localhost:3000 での開発まで巻き添えで止まる
 # (ADR 0013 決定 2 が「付けるとブラウザに記憶されて開発が壊れる」と書いている)。
-hsts="$(req -D - -o /dev/null "$BASE/" | grep -i '^strict-transport-security:' | tr -d '\r')"
+# **`|| true` が要る。**
+# set -euo pipefail のもとでは、ヘッダが無いと grep が 1 を返し、
+# pipefail でパイプ全体が失敗し、**その場でスクリプトが死ぬ** ——
+# 下の「HSTS ヘッダが無い」を報告する分岐に到達しない。
+hsts="$(req -D - -o /dev/null "$BASE/" | grep -i '^strict-transport-security:' | tr -d '\r')" || true
 case "$hsts" in
 	*"max-age=0"*) pass "HSTS の既定が max-age=0 (手元の開発を壊さない)" ;;
 	"")            bad  "HSTS ヘッダが無い" ;;

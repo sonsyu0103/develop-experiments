@@ -146,10 +146,13 @@ CloudFront ←→ ALB を HTTP にすると ALB が `X-Forwarded-Proto` を
 `http` で上書きするため、`CORS_ALLOWED_ORIGINS` を明示しないと
 **書き込みだけが全部 403 になる** (ADR 0023 の 3 で手元に再現済み)。
 
-**`terraform apply` はまだ実行していない。**
-検証済みなのは `validate` と、3 つのイメージが ARM64 でビルドできて
-起動することまで。未検証の箇所は ADR 0024 の
-「まだ確かめていないこと」に列挙してある。
+**実際に `apply` して動かし、`destroy` まで一周した** (2026-08-25)。
+`make tf-verify` は全項目を通っている。実績コストは約 $0.07 (稼働 1 時間)。
+途中で 14 件つまずいた記録が ADR 0024 にある —— いずれも
+`validate` と `plan` を通り抜け、**`apply` して初めて分かった**もの。
+
+残る未検証は CD (GitHub Actions からのデプロイ) で、
+ADR 0024 の「まだ確かめていないこと」に挙げてある。
 
 ## 開発
 
@@ -835,7 +838,7 @@ DB の中で待たれると全員が一緒に遅くなる。
 | Phase 10 | モデレーション (ロール・通報・管理画面) | **完了** |
 | Phase 11 | スレッド検索 (`pg_trgm`) | **完了** |
 | Phase 12 | ローカルのエッジ (TLS 終端) と、プロキシ配下の実測 | **完了** ([ADR 0023](docs/adr/0023-local-edge-and-https.md)) |
-| Phase 13 | AWS の IaC (Terraform) と CD | **コードは完了、apply は未実施** ([ADR 0024](docs/adr/0024-aws-deployment.md)) |
+| Phase 13 | AWS の IaC (Terraform) と CD | **完了** (apply → verify → destroy を実機で一周。CD の実行のみ未検証) ([ADR 0024](docs/adr/0024-aws-deployment.md)) |
 
 ### 着手順
 
