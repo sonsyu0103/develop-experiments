@@ -15,6 +15,28 @@ AWS 上に構築する予定はない。それでもこの図を先に描くの�
 
 実装が進んで実態がズレたら、この文書を更新する。
 
+## エッジだけは手元にも置いた (2026-08-24)
+
+この図のうち **TLS 終端とパス振り分けだけは、ローカルにも実物を置いた**
+(`infra/caddy` / `make up-https`)。[ADR 0023](adr/0023-local-edge-and-https.md)。
+
+```
+本番                              手元 (make up-https)
+────────────────────────────────  ────────────────────────────────
+CloudFront (TLS 終端)             Caddy (ローカル CA で TLS 終端)
+  /       -> ALB -> next-app        /       -> next-app:3000
+  /api/*  -> ALB -> go-api          /api/*  -> go-api:8080
+  /images/* -> S3 (OAC)             /images/* -> minio:9000
+```
+
+**デプロイの予定が変わったわけではない。**
+狙いは、プロキシの背後でしか通らない分岐 (`X-Forwarded-Proto` /
+`SecureCookie` / `TRUSTED_PROXIES`) を実際に通すこと。
+これらは実装済みだったが、compose が全部 http だったため
+**一度も実行されていなかった。**
+
+AWS 側 (ECS / RDS / SES / Athena) は引き続き設計のみになる。
+
 ## 全体構成
 
 ```mermaid

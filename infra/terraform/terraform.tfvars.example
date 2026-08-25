@@ -1,0 +1,21 @@
+# 値を入れて terraform.tfvars にコピーする (.gitignore 済み)。
+# **すべて任意。** 何も設定しなくても apply は通る。
+
+# 認証 (ADR 0005)。未設定でも API は起動し、ログインの 2 経路だけが 503。
+# **リダイレクト URI を Google 側にも登録する必要がある。**
+# apply 後に make tf-url で出る URL の /api/auth/google/callback を登録する。
+# google_client_id     = ""
+# google_client_secret = ""
+
+# アラームの通知先。設定すると SNS の購読確認メールが届く
+# (**クリックするまで通知は来ない**)。
+# alarm_email = "you@example.com"
+
+# 消し忘れの見張り。実績 80% と予測 100% で通知する。
+# monthly_budget_usd = "20"
+
+# OIDC プロバイダを既に別プロジェクトで作っている場合は false。
+# create_github_oidc_provider = true
+
+# 通常の Fargate を使いたい場合 (中断されたくないとき)。
+# use_fargate_spot = false

@@ -50,12 +50,15 @@ Go (Gin) + PostgreSQL + Next.js による掲示板アプリケーション。
 │       │   └── globals.css      配色と部品の見た目 (ADR 0021)
 │       └── e2e/                 Playwright。応答は page.route で差し替える
 ├── infra/
+│   ├── caddy/                   ローカルのエッジ (TLS 終端。CloudFront + ALB 相当)
+│   ├── terraform/               AWS の構成 (ECS Fargate / RDS / CloudFront)
+│   ├── scripts/                 push / migrate / deploy の手順
 │   ├── fluent-bit/              ログ転送の設定 (本番の FireLens と共通)
 │   ├── athena/                  テーブル定義 (列の正) と分析クエリ
 │   └── duckdb/                  S3 上のログを手元で SQL で読む
 ├── docs/
 │   ├── adr/                     設計判断の記録
-│   ├── infrastructure.md        AWS 理想構成 (実際にはデプロイしない)
+│   ├── infrastructure.md        AWS の理想構成 (Terraform で出すのはこの一部)
 │   └── postgres-ssi.md          SSI (直列化スナップショット分離) の解説
 └── compose.yaml
 ```
@@ -87,6 +90,67 @@ make down    # 停止 (データは残る)
 make clean   # 停止 + データ削除
 ```
 
+### https で動かす (擬似 AWS のエッジ)
+
+```bash
+make up-https   # TLS 終端 (Caddy) ごと起動する
+```
+
+- 画面 / API / 画像すべて **https://localhost の単一オリジン**
+  (`/api/*` → go-api、`/images/*` → MinIO)
+- 本番構成の CloudFront + ALB に相当する ([ADR 0023](docs/adr/0023-local-edge-and-https.md))
+- **従来の http://localhost:3000 / :8080 もそのまま生きている。**
+  置き換えではなく、本番同型の経路を 1 本足している
+
+証明書は Caddy 内蔵の CA が発行するので、ブラウザは初回に警告を出す。
+`make trust-ca` で CA 証明書を取り出せる (キーチェーンへの入れ方も案内が出る)。
+
+置く理由は「手元でも https で見たい」ではなく、
+**プロキシの背後でしか通らない分岐を実際に通すこと**にある ——
+`X-Forwarded-Proto` によるスキーム判定、Cookie の `Secure`、`TRUSTED_PROXIES` は
+どれも実装済みだったが、compose が全部 http だったため
+**一度も実行されていなかった。**
+
+## AWS に出す
+
+```bash
+make tf-init     # 最初の 1 回
+make tf-apply    # 環境を作る (課金が発生する。15 分ほど)
+make tf-push     # イメージを ECR へ (ARM64)
+make tf-migrate  # マイグレーションを流す
+make tf-url      # 公開 URL
+make tf-verify   # 立てた環境を実測する (手元の https-verify の AWS 版)
+make tf-destroy  # 消す
+```
+
+**常時公開しない運用にしている** ([ADR 0024](docs/adr/0024-aws-deployment.md))。
+見せたい日に `apply` して、終わったら `destroy` する。
+そのために **「消せること」を構成の要件**にしてあり、
+RDS の最終スナップショットや S3 の中身が destroy を止めないよう
+既定を明示的に外している。消し忘れは AWS Budgets で見張る。
+
+| リソース | 月額 | |
+| --- | --- | --- |
+| ALB | $18 | 固定費。いちばん高い |
+| RDS `db.t4g.micro` | $15 | Single-AZ |
+| Fargate Spot × 2 | $5 | 通常の Fargate なら $15 |
+| その他 | ~$1 | CloudFront / S3 / ECR / Logs |
+| **NAT Gateway** | **$0** | **置かない** |
+| **ドメイン + Route 53** | **$0** | **取らない** (CloudFront の既定ドメインで HTTPS) |
+| 合計 | 約 $39/月 | **1 日あたり約 $1.3** |
+
+構成は手元のエッジ (Caddy) と対応している ——
+CloudFront が TLS を終端し、`/api/*` は go-api、`/images/*` は S3 へ。
+**手元でエッジを立てて実測したことが、そのまま効いた**:
+CloudFront ←→ ALB を HTTP にすると ALB が `X-Forwarded-Proto` を
+`http` で上書きするため、`CORS_ALLOWED_ORIGINS` を明示しないと
+**書き込みだけが全部 403 になる** (ADR 0023 の 3 で手元に再現済み)。
+
+**`terraform apply` はまだ実行していない。**
+検証済みなのは `validate` と、3 つのイメージが ARM64 でビルドできて
+起動することまで。未検証の箇所は ADR 0024 の
+「まだ確かめていないこと」に列挙してある。
+
 ## 開発
 
 ```bash
@@ -101,6 +165,7 @@ make check             # 静的検査 + ユニットテスト + カバレッジ 
 make test-live         # 実 DB / MinIO に対する検査だけを走らせる (環境も立てる)
 make smoke             # 実 DB を立てて API を起動し、HTTP 越しに疎通を検証
 make logs-verify       # ログ基盤が本番と同じ形で動いているかを実測
+make https-verify      # エッジ配下でしか通らない分岐を実測 (XFP を壊して効きも見る)
 make check-all         # check + smoke + test-live + logs-verify
 ```
 
@@ -769,6 +834,8 @@ DB の中で待たれると全員が一緒に遅くなる。
 | Phase 9 | ログ基盤 (Fluent Bit → S3 → Athena) | **完了** |
 | Phase 10 | モデレーション (ロール・通報・管理画面) | **完了** |
 | Phase 11 | スレッド検索 (`pg_trgm`) | **完了** |
+| Phase 12 | ローカルのエッジ (TLS 終端) と、プロキシ配下の実測 | **完了** ([ADR 0023](docs/adr/0023-local-edge-and-https.md)) |
+| Phase 13 | AWS の IaC (Terraform) と CD | **コードは完了、apply は未実施** ([ADR 0024](docs/adr/0024-aws-deployment.md)) |
 
 ### 着手順
 
@@ -922,7 +989,9 @@ api/openapi.yaml を書く
 | [ADR 0020](docs/adr/0020-frontend-testing.md) | フロントの検査は「状態遷移」を対象にする |
 | [ADR 0021](docs/adr/0021-frontend-screens.md) | 画面を揃える —— 取得の経路と、見た目の持ち方 |
 | [ADR 0022](docs/adr/0022-probing-the-checkers.md) | 検査そのものの検出力を、変異で測る |
-| [インフラ構成](docs/infrastructure.md) | AWS 理想構成 (実際にはデプロイしない) |
+| [ADR 0023](docs/adr/0023-local-edge-and-https.md) | ローカルにエッジを置き、「本番ならこう動く」を実測に変える |
+| [ADR 0024](docs/adr/0024-aws-deployment.md) | AWS へのデプロイ —— 「消せること」を構成の要件にする |
+| [インフラ構成](docs/infrastructure.md) | AWS の理想構成 (Terraform で出すのはこの一部) |
 
 [ADR 0015](docs/adr/0015-idempotency.md) と
 [ADR 0019](docs/adr/0019-comment-concurrency.md) には、
@@ -933,4 +1002,5 @@ api/openapi.yaml を書く
 ## 技術スタック
 
 Go 1.25 / Gin / pgx v5 / sqlc / oapi-codegen / PostgreSQL 17 /
-Next.js 16 (App Router, RSC) / React 19 / TypeScript 5.9 / ESLint 9
+Next.js 16 (App Router, RSC) / React 19 / TypeScript 5.9 / ESLint 9 /
+Caddy (ローカルの TLS 終端) / Terraform (AWS) / ECS Fargate / CloudFront

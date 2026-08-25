@@ -34,3 +34,23 @@ Thumbs.db
 # .env.example はコミットする (雛形なので)
 .env
 .env*.local
+
+# Terraform (infra/terraform)
+#
+# **tfstate は秘密として扱う。** DB のパスワードを Terraform に
+# 生成させているので (random_password)、state に平文で入る。
+# backend を local にしている以上、ここで遮断するしかない
+# (docs/adr/0024-aws-deployment.md 決定 1)。
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# 実際の値を入れた tfvars。**雛形 (.example) はコミットする。**
+*.tfvars
+!*.tfvars.example
+
+# **.terraform.lock.hcl はコミットする** (無視しない)。
+# プロバイダのバージョンを固定するファイルで、
+# Makefile 冒頭でツールを固定しているのと同じ役割になる。

@@ -243,6 +243,67 @@ func TestLoad_LogFormat(t *testing.T) {
 	}
 }
 
+// TestLoad_SecureCookie は Cookie の Secure 属性が ENV から独立していることを
+// 確かめます。
+//
+// **「localhost は HTTP だから開発中は付けられない」は前提が変わりました。**
+// エッジ (infra/caddy) を置くと手元でも https://localhost になるため、
+// 開発モードのまま Secure を付けられる必要があります。付けられないと、
+// **開発環境だけが本番と違う Cookie を配る**ことになり、
+// Secure 起因の不具合が手元で一度も再現しません。
+//
+// 逆に、素の http で開発しているところに true を渡すと
+// **ブラウザが Cookie を黙って捨てます。** どちらの向きも選べる必要があります。
+func TestLoad_SecureCookie(t *testing.T) {
+	tests := []struct {
+		name    string
+		env     string
+		devMode bool
+		want    bool
+		wantErr bool
+	}{
+		{name: "未設定かつ本番相当なら付ける", env: "", want: true},
+		{name: "未設定かつ開発なら付けない (従来の挙動を変えない)", env: "", devMode: true, want: false},
+
+		// ここが本題。エッジ経由なら開発モードのままでも https なので付けられる。
+		{name: "開発モードでも true を選べる", env: "true", devMode: true, want: true},
+		{name: "本番相当でも false を選べる", env: "false", want: false},
+		{name: "大文字と空白を許す", env: "  TRUE ", devMode: true, want: true},
+
+		// **読めない値を false に落とさない。** 打ち間違いが
+		// 「Secure の付いていない本番」として黙って成立するのを防ぎます。
+		{name: "未知の値は起動時に落とす", env: "yes", wantErr: true},
+		{name: "空白だけも落とす", env: "   ", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://app:password@localhost:5432/bbs")
+			t.Setenv("SECURE_COOKIE", tt.env)
+			if tt.devMode {
+				t.Setenv("ENV", "development")
+			} else {
+				t.Setenv("ENV", "")
+			}
+
+			cfg, err := Load()
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("SECURE_COOKIE=%q で Load が成功した (secure=%v)",
+						tt.env, cfg.Auth.SecureCookie)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load が失敗した: %v", err)
+			}
+			if cfg.Auth.SecureCookie != tt.want {
+				t.Errorf("SecureCookie = %v, want %v", cfg.Auth.SecureCookie, tt.want)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 画像のストレージ (docs/adr/0007-image-storage.md)
 // ---------------------------------------------------------------------------

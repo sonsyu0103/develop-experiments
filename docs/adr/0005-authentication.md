@@ -105,7 +105,7 @@ Redis を入れる主な動機は速度ではなく、
 | 属性 | 値 | 理由 |
 | --- | --- | --- |
 | `HttpOnly` | あり | JavaScript から読めなくする (XSS でのセッション奪取を防ぐ) |
-| `Secure` | 本番のみ | localhost は HTTP なので開発時は付けない |
+| `Secure` | `SECURE_COOKIE` で決まる | 未設定なら `ENV=development` 以外で付く。**エッジ経由 (`make up-https`) なら手元でも https なので開発中も付ける** ([ADR 0023](0023-local-edge-and-https.md) 決定 3) |
 | `SameSite` | `Lax` | 下記参照 |
 | `Path` | `/` | |
 

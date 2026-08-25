@@ -37,8 +37,54 @@ env:
   # (docs/adr/0007-image-storage.md)
   MINIO_VERSION: RELEASE.2025-04-22T22-12-26Z
   MC_VERSION: RELEASE.2025-04-16T18-13-26Z
+  # Terraform も同じ扱い。infra/terraform/versions.tf の
+  # required_version (~> 1.10) を満たす範囲で固定する。
+  TERRAFORM_VERSION: 1.15.8
 
 jobs:
+  # --------------------------------------------------
+  # Terraform Checks
+  # --------------------------------------------------
+  #
+  # **AWS には触らない。** fmt と validate だけを見る。
+  # plan には認証が要るうえ、実行のたびに state を読むことになるので
+  # CI では回さない (docs/adr/0024-aws-deployment.md)。
+  #
+  # 落とせるのはこの範囲:
+  #   - 書式のブレ
+  #   - 参照の不整合 (存在しないリソースを参照している)
+  #   - 型の不一致、必須引数の欠落
+  #
+  # **落とせないもの**もはっきりさせておく ——
+  # IAM ポリシーが実際に足りるか、SG が本当に通るかは apply して
+  # make tf-verify を回すまで分からない。
+  terraform-ci:
+    name: Terraform Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          # ラッパーを無効にする。有効だと標準出力に余計な装飾が入り、
+          # 失敗時のログが読みにくくなる。
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform -chdir=infra/terraform fmt -check -recursive -diff
+
+      - name: Initialize (without backend)
+        # **backend を使わずに初期化する。**
+        # backend は local なので CI に state は無い。
+        # ここで見たいのはプロバイダの解決と構成の妥当性だけになる。
+        run: terraform -chdir=infra/terraform init -backend=false
+
+      - name: Validate
+        run: terraform -chdir=infra/terraform validate
+
   # --------------------------------------------------
   # Go Backend Checks
   # --------------------------------------------------

@@ -82,13 +82,229 @@ up-seeded: up ## 起動したうえでシードデータまで投入する (既�
 	# make up にまとめると、起動のたびに手入力のデータが消える。
 	@$(MAKE) --no-print-directory seed
 
+# ---------------------------------------------------------------------------
+# エッジ (TLS 終端) —— ローカルの擬似 AWS
+# ---------------------------------------------------------------------------
+
+# エッジが名乗るホスト名。**既定は localhost。**
+# bbs.localhost のような .localhost サブドメインを既定にすると、
+# ブラウザでは見えるのに curl だけ名前解決に失敗する環境がある。
+SITE_ADDRESS ?= localhost
+
+# X-Forwarded-For を信じる送信元。compose の既定ネットワークは
+# 172.16.0.0/12 の中から動的に割り当てられるので、その範囲を丸ごと信じる。
+# **本番でこの書き方はしない** —— ALB が居るサブネットだけを指定する。
+TRUSTED_PROXIES ?= 172.16.0.0/12
+
+# エッジ経由の構成に切り替えるための環境変数一式。
+#
+# **単一オリジンにする** (https://localhost だけ)。本番構成の
+# CloudFront が / と /api/* を 1 つのドメインに集約するのと同じ形で、
+# こうすると CORS が本当に不要になり、csrfGuard は selfOrigin() の
+# 一致だけで通る —— つまり X-Forwarded-Proto が唯一の生命線になる。
+HTTPS_ENV := \
+	SITE_ADDRESS=$(SITE_ADDRESS) \
+	CORS_ALLOWED_ORIGINS=https://$(SITE_ADDRESS) \
+	AUTH_REDIRECT_URL=https://$(SITE_ADDRESS)/api/auth/google/callback \
+	AUTH_FRONTEND_URL=https://$(SITE_ADDRESS) \
+	NEXT_PUBLIC_API_URL=https://$(SITE_ADDRESS)/api \
+	S3_PUBLIC_BASE_URL=https://$(SITE_ADDRESS)/images \
+	TRUSTED_PROXIES=$(TRUSTED_PROXIES) \
+	SECURE_COOKIE=true
+
+.PHONY: up-https
+up-https: ## エッジ (TLS 終端) ごと起動する (https://localhost)
+	# **ENV は development のまま。** ENV=production にすると
+	# COMMENT_POST_MODE=naive などの実測用モードが選べなくなるため、
+	# 本番同型を試したいときだけ明示する:
+	#   ENV=production make up-https
+	#
+	# ただし **Cookie の Secure だけは ENV と切り離して常に付ける**
+	# (SECURE_COOKIE=true)。エッジ経由は https なので付けられるし、
+	# 付けないと開発環境だけが本番と違う Cookie を配ることになる。
+	#
+	# 証明書は Caddy 内蔵の CA が発行する。ブラウザは初回に警告を出す ——
+	# 消したければ make trust-ca。
+	$(HTTPS_ENV) docker compose --profile edge up -d --build
+	@$(MAKE) --no-print-directory verify-search-locale
+	@echo
+	@echo "  https://$(SITE_ADDRESS)        画面"
+	@echo "  https://$(SITE_ADDRESS)/api/   API (プレフィックスは剥がされる)"
+	@echo "  https://$(SITE_ADDRESS)/images/ 画像 (MinIO へ直結)"
+	@echo
+	@echo "  従来の http://localhost:3000 / :8080 もそのまま生きている。"
+
+.PHONY: trust-ca
+trust-ca: ## エッジの CA 証明書を取り出す (ブラウザの警告を消したいとき)
+	# Caddy が発行したローカル CA のルート証明書を取り出す。
+	# **この CA はこの環境専用**で、caddy-data ボリュームを消すと変わる。
+	@mkdir -p $(dir $(CADDY_ROOT_CA))
+	@docker compose --profile edge exec -T edge \
+		cat /data/caddy/pki/authorities/local/root.crt > $(CADDY_ROOT_CA)
+	@echo "取り出した: $(CADDY_ROOT_CA)"
+	@echo
+	@echo "macOS のキーチェーンに入れる (管理者パスワードを聞かれる):"
+	@echo "  sudo security add-trusted-cert -d -r trustRoot \\"
+	@echo "    -k /Library/Keychains/System.keychain $(CADDY_ROOT_CA)"
+	@echo
+	@echo "戻すとき (CN は発行年を含むので、実際の値から引く):"
+	@echo "  sudo security delete-certificate -c \"$$(openssl x509 -in $(CADDY_ROOT_CA) -noout -subject | sed 's/.*CN=//')\""
+
+# 取り出した CA の置き場。**リポジトリの外に出す。**
+# 中身は「この環境だけを信頼させる鍵」なので、コミットする理由がない。
+CADDY_ROOT_CA ?= $(HOME)/claude-artifacts/caddy-local-root.crt
+
+.PHONY: https-verify
+https-verify: ## エッジ配下でしか通らない分岐を実測する (XFP を壊して効きも見る)
+	# **プロキシの背後でしか通らない分岐を、実際に通して確かめる。**
+	#
+	# ADR 0013 (HTTP 防御) と ADR 0005 (Cookie) は「本番ならこう振る舞う」
+	# という推論のうえに書かれていた。compose が全部 http だったため、
+	# X-Forwarded-Proto / Secure / TRUSTED_PROXIES はどれも一度も
+	# 実行されていない。
+	#
+	# **検査の効きも見る。** XFP をわざと落として書き込みが 403 になることを
+	# 確認する —— 壊しても通るなら、この検査は何も守っていない
+	# (LOG_FORMAT=text make logs-verify と同じ考え方)。
+	#
+	# 検査で作ったスクラッチのスレッドは最後に消す。
+	@$(MAKE) --no-print-directory up-https
+	# **HTTPS_ENV をスクリプトにも渡す。** 渡さないと、スクリプト内の
+	# docker compose が既定値 (http) で go-api を作り直し、
+	# その起動待ちに出る 502 を検査結果と取り違える。
+	@$(HTTPS_ENV) bash .github/scripts/https-probe.sh
+
+# ---------------------------------------------------------------------------
+# AWS (Terraform) —— 必要な日だけ立てる
+# ---------------------------------------------------------------------------
+#
+# **常時公開しない運用にしている。**
+# 立てっぱなしにすると月 $40 前後かかる。見せたい日に apply して、
+# 終わったら destroy する。1 日あたり $1.3 ほど。
+#
+# そのために「消せること」を構成の要件にしてある
+# (docs/adr/0024-aws-deployment.md)。RDS の最終スナップショットや
+# S3 の中身が destroy を止めないよう、既定を明示的に外している。
+
+TF_DIR := infra/terraform
+TF     := terraform -chdir=$(TF_DIR)
+
+.PHONY: tf-init
+tf-init: ## Terraform を初期化する (最初の 1 回)
+	$(TF) init
+
+.PHONY: tf-fmt
+tf-fmt: ## Terraform の書式を揃える
+	$(TF) fmt -recursive
+
+.PHONY: tf-validate
+tf-validate: ## Terraform の構成を検査する (AWS に触らない)
+	$(TF) validate
+
+.PHONY: tf-plan
+tf-plan: ## 何が作られるかを見る (課金は発生しない)
+	$(TF) plan
+
+.PHONY: tf-apply
+tf-apply: ## AWS に環境を作る (**課金が発生する**)
+	# RDS の作成に 5〜10 分かかる。全体で 15 分ほど見ておく。
+	$(TF) apply
+	@echo
+	@echo "次にやること:"
+	@echo "  make tf-push     イメージを ECR へ送る"
+	@echo "  make tf-migrate  マイグレーションを流す"
+	@echo "  make tf-url      公開 URL を見る"
+
+# destroy の計画を固めるファイル。**リポジトリに置かない。**
+TF_DESTROY_PLAN ?= $(HOME)/claude-artifacts/bbs-destroy.tfplan
+
+.PHONY: tf-destroy
+tf-destroy: ## AWS の環境を消す (**消し忘れると課金され続ける**)
+	# **plan をファイルに固めてから適用する。**
+	#
+	# 素の `terraform destroy` は対話で確認を求めるため、
+	# 端末の無い環境 (Claude Code の ! 実行など) では
+	# **プロンプトで止まったまま何も消えない** —— 消したつもりで
+	# 課金が続く、といういちばん避けたい失敗になる。
+	#
+	# plan を挟めば「何が消えるか」は下に全部出るし、
+	# 適用は非対話で完了する。
+	@mkdir -p $(dir $(TF_DESTROY_PLAN))
+	$(TF) plan -destroy -out=$(TF_DESTROY_PLAN)
+	$(TF) apply $(TF_DESTROY_PLAN)
+	@rm -f $(TF_DESTROY_PLAN)
+	@echo
+	@echo "消えたことを確かめる:"
+	@echo "  aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=$(SITE_ADDRESS:localhost=bbs) --query 'length(ResourceTagMappingList)'"
+
+
+.PHONY: tf-push
+tf-push: ## イメージをビルドして ECR へ push する (ARM64)
+	@bash infra/scripts/push-images.sh
+
+.PHONY: tf-migrate
+tf-migrate: ## マイグレーションを AWS 上で 1 回流す (make tf-migrate ARGS="force 9")
+	# **失敗して dirty になったら force で解除する。**
+	# golang-migrate は途中で失敗するとフラグを立て、
+	# 人間が確認するまで再開しない (安全装置)。
+	#   make tf-migrate ARGS="force 9"   直前の版まで戻して解除
+	#   make tf-migrate                  up (既定)
+	@bash infra/scripts/run-migrate.sh $(ARGS)
+
+.PHONY: tf-deploy
+tf-deploy: ## push してサービスを入れ替える (安定するまで待つ)
+	@bash infra/scripts/deploy.sh
+
+.PHONY: tf-url
+tf-url: ## 公開 URL を表示する
+	@$(TF) output -raw public_url && echo
+
+.PHONY: tf-github-vars
+tf-github-vars: ## CD が使う値を GitHub の Variables に登録する
+	# **terraform output から取る。** 立て直すと CloudFront の
+	# ドメインが変わるので、手で貼り直すと必ず古い値が残る。
+	#
+	# 入るのはロール ARN やクラスタ名だけで、資格情報は 1 つも置かない
+	# (OIDC。infra/terraform/iam.tf)。
+	@bash infra/scripts/setup-github-vars.sh
+
+.PHONY: tf-verify
+tf-verify: ## apply した AWS 環境を実測する (手元の https-verify の AWS 版)
+	# **ADR 0024 の「まだ確かめていないこと」を潰す。**
+	#
+	# とくに見たいのは 2 つ:
+	#   - CloudFront Function がパスを剥がせているか
+	#   - **書き込みが 201 になるか** —— ALB が X-Forwarded-Proto を
+	#     http で上書きするため、CORS_ALLOWED_ORIGINS の明示だけが
+	#     書き込みを守っている (ADR 0023 の 3 で手元に再現した形)
+	#
+	# ALB を直接叩いて届かないこと (CloudFront を迂回できないこと) も見る。
+	@bash infra/scripts/verify.sh
+
+.PHONY: tf-secret
+tf-secret: ## DB の接続情報を表示する (Secrets Manager から読む)
+	# **RDS はプライベートサブネットに居るので、手元からは直接つなげない。**
+	# go-api は distroless なので ECS Exec でも入れない (shell が無い)。
+	# つなぐ必要が出たら、next-app のタスク (alpine) に入るか、
+	# 一時的な psql タスクを run-task で立てる。
+	@aws secretsmanager get-secret-value \
+		--region $$($(TF) output -raw region) \
+		--secret-id $$($(TF) output -raw db_secret_arn) \
+		--query SecretString --output text | python3 -m json.tool
+
 .PHONY: down
 down: ## 全サービスを停止する (データは残る)
-	docker compose down
+	# **--profile edge を付ける。** profile 付きのサービスは
+	# 素の down では止まらず、エッジだけが 80 / 443 を握ったまま残る。
+	# しかも upstream が全部落ちた状態なので、
+	# https://localhost は 502 を返し続ける —— 止めたつもりで止まっていない。
+	docker compose --profile edge down
 
 .PHONY: clean
 clean: ## 全サービスを停止し、DB のデータも消す
-	docker compose down -v
+	# caddy-data も消えるので、次の up-https では CA が作り直される。
+	# make trust-ca でキーチェーンに入れていた場合は入れ直しになる。
+	docker compose --profile edge down -v
 
 .PHONY: logs
 logs: ## ログを追尾する
