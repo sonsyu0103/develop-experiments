@@ -1084,7 +1084,7 @@ api/openapi.yaml を書く
 | [ADR 0022](docs/adr/0022-probing-the-checkers.md) | 検査そのものの検出力を、変異で測る |
 | [ADR 0023](docs/adr/0023-local-edge-and-https.md) | ローカルにエッジを置き、「本番ならこう動く」を実測に変える |
 | [ADR 0024](docs/adr/0024-aws-deployment.md) | AWS へのデプロイ —— 「消せること」を構成の要件にする |
-| [ADR 0025](docs/adr/0025-language-and-framework.md) | 言語とフレームワークの選択 —— AI と組んで書くことを前提にする |
+| [ADR 0025](docs/adr/0025-language-and-framework.md) | 言語とフレームワークの選択と、その使い方 (Gin は薄く使う) |
 | [インフラ構成](docs/infrastructure.md) | AWS の理想構成 (Terraform で出すのはこの一部) |
 
 [ADR 0015](docs/adr/0015-idempotency.md) と
