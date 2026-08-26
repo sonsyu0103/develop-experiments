@@ -463,6 +463,43 @@ CloudFront のドメインが apply するまで決まらない循環も同時�
 形になり、[ADR 0022](0022-probing-the-checkers.md) の
 「検査そのものを検査する」がここでも要るという話になる。
 
+### 15. 「直したつもり」が 1 段浅かった —— XFF は経路の段数だけ深くなる
+
+[ADR 0023](0023-local-edge-and-https.md) で、`TRUSTED_PROXIES` を設定すると
+`ClientIP` が Caddy の IP (`172.23.0.8`) から実際の送信元 (`172.23.0.1`) に
+変わることを実測した。同じ考えで AWS 側にも VPC CIDR を渡していた。
+
+**足りなかった。** 手元は Caddy が 1 段だけの構成だったが、
+AWS は CloudFront と ALB で 2 段になる。XFF はこう届く:
+
+```
+X-Forwarded-For: viewer-ip, cloudfront-edge-ip
+                             ^ ALB が直前ピア (エッジ) を追記する
+```
+
+gin の `ClientIP` は XFF を**右から辿り、最初の「信頼していない IP」を返す**。
+VPC CIDR だけを信頼すると、右端のエッジ IP がそのまま `ClientIP` になる。
+
+手元で対照実験して確かめた (compose のネットワークを VPC に見立て、
+`13.32.0.0/16` をエッジに見立てる):
+
+| `TRUSTED_PROXIES` | `client_ip` |
+| --- | --- |
+| VPC のみ | `13.32.0.5` (エッジ) |
+| VPC + エッジ | `203.0.113.9` (閲覧者) |
+
+**ALB の IP に潰れる問題を直したつもりが、エッジの IP に潰れる形で
+残っていた。** 問い合わせのレート制限は同じ PoP を通る利用者どうしで
+共有され、閲覧数の重複抑制 ([ADR 0006](0006-view-count-and-popularity.md) の
+`visitorKey`) も同じ値を使うので、同じ PoP からの閲覧が 1 人分に丸められる。
+
+対処は、SG で使っているのと同じプレフィックスリストから CIDR を取り、
+信頼範囲に含めること (`locals.tf`)。47 個の CIDR (677 文字) を
+環境変数で渡しても gin が問題なく受けることは実測した。
+
+**教訓は「実測した結論にも射程がある」ということになる。**
+手元の 1 段構成で得た答えは、2 段構成では成り立たなかった。
+
 ## 実機で確かめたこと (2026-08-25)
 
 `apply` → `make tf-push` → `make tf-migrate` → `make tf-verify` → `destroy` を
