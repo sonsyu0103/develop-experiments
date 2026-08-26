@@ -1084,6 +1084,7 @@ api/openapi.yaml を書く
 | [ADR 0022](docs/adr/0022-probing-the-checkers.md) | 検査そのものの検出力を、変異で測る |
 | [ADR 0023](docs/adr/0023-local-edge-and-https.md) | ローカルにエッジを置き、「本番ならこう動く」を実測に変える |
 | [ADR 0024](docs/adr/0024-aws-deployment.md) | AWS へのデプロイ —— 「消せること」を構成の要件にする |
+| [ADR 0025](docs/adr/0025-language-and-framework.md) | 言語とフレームワークの選択 —— AI と組んで書くことを前提にする |
 | [インフラ構成](docs/infrastructure.md) | AWS の理想構成 (Terraform で出すのはこの一部) |
 
 [ADR 0015](docs/adr/0015-idempotency.md) と
@@ -1097,3 +1098,9 @@ api/openapi.yaml を書く
 Go 1.25 / Gin / pgx v5 / sqlc / oapi-codegen / PostgreSQL 17 /
 Next.js 16 (App Router, RSC) / React 19 / TypeScript 5.9 / ESLint 9 /
 Caddy (ローカルの TLS 終端) / Terraform (AWS) / ECS Fargate / CloudFront
+
+**なぜこれを選んだかは [ADR 0025](docs/adr/0025-language-and-framework.md)。**
+最重要の理由は「速いから」でも「安全だから」でもなく、
+**AI と組んで書くときに、生成されたコードを機械が先に検証できること**。
+Rust を落としたのは期間の制約であって技術的な優劣ではない、
+React と Vue の差は小さいと考えている、といった点も正直に書いてある。
