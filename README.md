@@ -2,7 +2,10 @@
 
 Go (Gin) + PostgreSQL + Next.js。**設計を実測で決める**ことを主題にした掲示板。
 
-![スレッド一覧](docs/images/threads.png)
+![人気順のスレッド一覧](docs/images/threads-popular.png)
+
+<sub>閲覧数が「**約**」なのは、同期 UPDATE をやめてバッファリングしているから
+([ADR 0006](docs/adr/0006-view-count-and-popularity.md))。設計がそのまま画面に出ている。</sub>
 
 ## 3 分で分かる見どころ
 
@@ -19,7 +22,8 @@ make scale-probe         # 読み取りのスループットが接続数のど�
 ```
 
 たとえば閲覧数を同期 UPDATE にしなかったのは、
-**ピーク時に毎秒 1,390 件の書き込みが同じ行に集中する**と見積もったから
+**ピーク時に毎秒 1,390 件の `UPDATE threads` が発生し、
+しかも人気スレッドほど同じ行に集中する**と見積もったから
 ([ADR 0009](docs/adr/0009-scaling-strategy.md))。
 その判断が正しいことを `viewcount-probe` で確かめている。
 
@@ -29,16 +33,20 @@ make scale-probe         # 読み取りのスループットが接続数のど�
 **わざと壊して、検査が落ちることを確かめる仕組み**を持っている。
 
 ```bash
-make mutation-probe      # 実装をわざと壊し、テストが落ちるかを測る
+make mutation-probe MUTATIONS=<変異リスト>   # 実装をわざと壊し、テストが落ちるかを測る
 make arch-probe          # 依存方向の検査が、違反を本当に検出するか
 make checker-probe       # 静的検査が「落とすべきものを落とす」か
 make https-verify        # プロキシ配下の分岐を実測。壊して効きも見る
 ```
 
-実際にこれで穴が見つかっている。下は `make https-verify` の出力で、
-**`X-Forwarded-Proto` を落とすと書き込みだけが 403 になり、GET と画面は 200 のまま**
-—— GET のヘルスチェックしか見ていない監視では気づけない壊れ方を捕まえている
-([ADR 0023](docs/adr/0023-local-edge-and-https.md)):
+実際にこれで穴が見つかっている。下は `make https-verify` の出力。
+**`CORS_ALLOWED_ORIGINS` に自分のオリジンを入れていない構成**で
+`X-Forwarded-Proto` を落とすと、**書き込みだけが 403 になり、GET と画面は 200 のまま**
+—— GET のヘルスチェックしか見ていない監視では気づけない
+([ADR 0023](docs/adr/0023-local-edge-and-https.md))。
+
+検査はこの因果を切り分けるために、エッジを迂回して go-api を直接叩いている
+(許可リストに無いホスト名を名乗らせ、`selfOrigin()` だけを頼りにさせる):
 
 ```
 === 5. X-Forwarded-Proto と selfOrigin の因果 (検査が効いているかの確認) ===
@@ -47,21 +55,23 @@ make https-verify        # プロキシ配下の分岐を実測。壊して効�
   OK    その状態でも GET は 200 (監視では気づけない)
 ```
 
+全 6 節の出力は [`docs/verify-output/https-verify.txt`](docs/verify-output/https-verify.txt) にある。
+
 ### 3. AWS に実際に出して、消せる —— IaC は書くだけで終わらせない
 
 `infra/terraform` に 71 リソース。**apply して動作を確認し、destroy まで一周している**
 (実績コスト $0.07 / 稼働 1 時間)。
 
 ```bash
-make tf-apply CONFIRM=1   # 環境を作る (15 分)
+make tf-apply CONFIRM=1   # 環境を作る (**課金が発生する**。15 分)
 make tf-up                # イメージを載せて、マイグレーションして、実測する
 make tf-destroy           # 消す
 ```
 
 NAT Gateway (月 $33) もドメインも使わない構成にして **1 日 $1.3** に収めている。
-`apply` の途中で踏んだ **15 件のつまずき**は
+途中で踏んだ **15 件のつまずき**は
 [ADR 0024](docs/adr/0024-aws-deployment.md) に全部残した ——
-いずれも `terraform validate` と `plan` を通り抜け、**`apply` して初めて分かった**もの。
+多くは `terraform validate` と `plan` を通り抜け、**実際に動かして初めて分かった**もの。
 
 ## この 3 つを支えているもの
 
@@ -69,7 +79,7 @@ NAT Gateway (月 $33) もドメインも使わない構成にして **1 日 $1.3
 | --- | --- |
 | **設計判断の記録** | [ADR 24 本](docs/adr/)。決定だけでなく**実装後に分かったこと**を追記している |
 | **単一の情報源** | [`api/openapi.yaml`](api/openapi.yaml) から Go スタブと TS 型を生成。CI がドリフトを検出 |
-| **境界の強制** | `go-arch-lint` でモジュール間の依存方向を機械的に検査 ([ADR 0004](docs/adr/0004-modular-monolith.md)) |
+| **境界の強制** | `go-arch-lint` でモジュール間の依存方向を機械的に検査 ([ADR 0017](docs/adr/0017-arch-lint-and-depguard.md)。境界そのものは [ADR 0004](docs/adr/0004-modular-monolith.md)) |
 | **CI** | 静的解析 / race detector / カバレッジ下限 / 脆弱性検査 / 生成物のドリフト / Terraform |
 
 ---
@@ -83,9 +93,9 @@ NAT Gateway (月 $33) もドメインも使わない構成にして **1 日 $1.3
 
 ## 画面
 
-| スレッド一覧 | スレッド詳細 |
-| --- | --- |
-| ![一覧](docs/images/threads.png) | ![詳細](docs/images/thread-detail.png) |
+| 新着順 | 人気順 | スレッド詳細 |
+| --- | --- | --- |
+| ![新着順](docs/images/threads.png) | ![人気順](docs/images/threads-popular.png) | ![詳細](docs/images/thread-detail.png) |
 
 **匿名投稿とログインが共存する。** ログインしなくても書けるが、
 画像の添付と自分の投稿の削除にはログインが要る ([ADR 0005](docs/adr/0005-authentication.md) 決定 2)。
