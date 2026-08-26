@@ -20,10 +20,15 @@ on:
         description: "マイグレーションを流すか"
         type: boolean
         default: true
-      image_tag:
-        description: "イメージタグ"
-        type: string
-        default: latest
+      # **image_tag の入力は置かない。**
+      # タスク定義の image は var.api_image_tag (既定 latest) で固定されており、
+      # デプロイは --force-new-deployment でそれを引き直すだけ。
+      # 任意のタグを入力できるようにすると、そのタグを push した一方で
+      # **サービスは latest (前回のビルド) を引く**という食い違いが起き、
+      # ワークフローは成功として URL を表示してしまう。
+      #
+      # 特定のタグを出したくなったら、tfvars の api_image_tag を変えて
+      # apply する経路を用意すること。
 
 concurrency:
   # **同時に走らせない。** 2 つのデプロイが同じサービスを
@@ -37,7 +42,12 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: ap-northeast-1
+  # **Variables から取る。** ここだけハードコードすると、
+  # var.region を変えたときに CD が誤ったリージョンを見て
+  # 「クラスタが見つかりません」と表示する ——
+  # iam.tf が警告している「原因と違うメッセージ」と同じ形になる。
+  # 値は make tf-github-vars が terraform output から入れる。
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-northeast-1' }}
 
 jobs:
   deploy:
@@ -66,16 +76,22 @@ jobs:
       # サービス更新で失敗する —— 中途半端に課金が発生する。
       - name: Ensure the environment exists
         run: |
-          if ! aws ecs describe-clusters --clusters "${{ vars.ECS_CLUSTER }}" \
-              --query 'clusters[0].status' --output text | grep -q ACTIVE; then
-            echo "::error::クラスタ ${{ vars.ECS_CLUSTER }} が見つかりません。先に make tf-apply してください。"
+          # **部分一致で見ない。** destroy 済みのクラスタは INACTIVE として
+          # 残り続けるので (2026-08-25 に実測)、grep -q ACTIVE だと
+          # **INACTIVE に一致してガードが素通りする** ——
+          # イメージだけ push されて update-service で落ち、
+          # このステップが防ごうとした失敗がそのまま起きる。
+          status="$(aws ecs describe-clusters --clusters "${{ vars.ECS_CLUSTER }}" \
+            --query 'clusters[0].status' --output text 2>/dev/null || echo NONE)"
+          if [ "$status" != "ACTIVE" ]; then
+            echo "::error::クラスタ ${{ vars.ECS_CLUSTER }} が使えません (status=$status)。先に make tf-apply してください。"
             exit 1
           fi
 
       - name: Build and push go-api
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
-          TAG: ${{ inputs.image_tag }}
+          TAG: latest
         run: |
           docker build --target prod \
             -t "$REGISTRY/${{ vars.ECR_REPO_API }}:$TAG" apps/go-api
@@ -84,7 +100,7 @@ jobs:
       - name: Build and push next-app
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
-          TAG: ${{ inputs.image_tag }}
+          TAG: latest
         run: |
           docker build --target prod \
             -t "$REGISTRY/${{ vars.ECR_REPO_WEB }}:$TAG" apps/next-app
@@ -93,7 +109,7 @@ jobs:
       - name: Build and push migrate
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
-          TAG: ${{ inputs.image_tag }}
+          TAG: latest
         run: |
           docker build \
             -t "$REGISTRY/${{ vars.ECR_REPO_MIGRATE }}:$TAG" apps/go-api/db

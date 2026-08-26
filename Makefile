@@ -114,10 +114,13 @@ HTTPS_ENV := \
 
 .PHONY: up-https
 up-https: ## エッジ (TLS 終端) ごと起動する (https://localhost)
-	# **ENV は development のまま。** ENV=production にすると
+	# **ENV は development のまま。** production にすると
 	# COMMENT_POST_MODE=naive などの実測用モードが選べなくなるため、
 	# 本番同型を試したいときだけ明示する:
-	#   ENV=production make up-https
+	#   BBS_ENV=production make up-https
+	#
+	# (compose が読むのは BBS_ENV。ENV はシェルの予約的な名前と
+	#  衝突するため避けている)
 	#
 	# ただし **Cookie の Secure だけは ENV と切り離して常に付ける**
 	# (SECURE_COOKIE=true)。エッジ経由は https なので付けられるし、
@@ -224,6 +227,19 @@ tf-apply: ## AWS に環境を作る (**課金が発生する**)
 	#
 	# 何が作られるかは下の plan の出力に全部出る。
 	# RDS の作成に 5〜10 分かかる。全体で 15 分ほど見ておく。
+	# **非対話にしたぶん、誤操作の余地が増えた。**
+	# terraform の確認プロンプトが無くなったので、打ち間違いや
+	# タブ補完のミスが 71 リソースを無確認で作りうる。
+	# destroy より apply 側のほうが危ない (RDS 込みで途中中断もしにくい)。
+	# 明示的な合図を要求する。
+	@if [ "$(CONFIRM)" != "1" ]; then \
+		echo; \
+		echo "  **課金の発生する操作です。**"; \
+		echo "  何が作られるかを見るだけなら:  make tf-plan"; \
+		echo "  作ってよければ:                make tf-apply CONFIRM=1"; \
+		echo; \
+		exit 1; \
+	fi
 	@mkdir -p $(dir $(TF_PLAN))
 	$(TF) plan -out=$(TF_PLAN)
 	$(TF) apply $(TF_PLAN)
@@ -294,6 +310,31 @@ tf-github-vars: ## CD が使う値を GitHub の Variables に登録する
 	# 入るのはロール ARN やクラスタ名だけで、資格情報は 1 つも置かない
 	# (OIDC。infra/terraform/iam.tf)。
 	@bash infra/scripts/setup-github-vars.sh
+
+.PHONY: tf-up
+tf-up: ## apply 済みの環境にイメージを載せて実測まで通す (push -> migrate -> verify)
+	# **apply は含めない。** あれは課金の始まる操作なので、
+	# 「気軽に打てる」形にしない。ここは apply の後に必ず続く
+	# 3 つをまとめるだけになる (tf-apply の出力が案内しているとおり)。
+	#
+	# 環境が無ければ最初の push が理由を出して止まる (_common.sh)。
+	#
+	# **push のあとに必ずサービスを入れ替える。** 稼働中のタスクは
+	# 古いイメージのまま走り続けるので、これが無いと
+	# **新しいイメージを push したまま古いタスクを計測して
+	# 「すべて通った」と出る** —— いちばん気づけない失敗になる。
+	#
+	# 順序にも意味がある。**マイグレーションはアプリより先。**
+	# 新しいコードが古いスキーマに当たるほうが壊れやすい
+	# (deploy.yml も同じ順序)。
+	@bash infra/scripts/push-images.sh
+	@bash infra/scripts/run-migrate.sh
+	@bash -c 'source infra/scripts/_common.sh; require_applied; roll_services'
+	@bash infra/scripts/verify.sh
+	@echo
+	@echo "  $$($(TF) output -raw public_url 2>/dev/null || echo '(URL は terraform output で)')"
+	@echo
+	@echo "  **見終わったら消す。** make tf-destroy"
 
 .PHONY: tf-verify
 tf-verify: ## apply した AWS 環境を実測する (手元の https-verify の AWS 版)

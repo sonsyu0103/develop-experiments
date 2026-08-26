@@ -16,24 +16,7 @@ require_applied
 
 bash "$SCRIPT_DIR/push-images.sh"
 
-REGION="$(tf output -raw region)"
-CLUSTER="$(tf output -raw ecs_cluster_name)"
-API_SVC="$(tf_output_key ecs_service_names api)"
-WEB_SVC="$(tf_output_key ecs_service_names web)"
-
-echo
-echo "== サービスを入れ替えています =="
-for svc in "$API_SVC" "$WEB_SVC"; do
-	aws ecs update-service --region "$REGION" --cluster "$CLUSTER" \
-		--service "$svc" --force-new-deployment >/dev/null
-	echo "   $svc"
-done
-
-# **安定するまで待つ。** 待たないと、まだ古いタスクが動いている状態で
-# 「デプロイできた」と言うことになる。
-echo "== 安定するのを待っています (数分かかる) =="
-aws ecs wait services-stable --region "$REGION" --cluster "$CLUSTER" \
-	--services "$API_SVC" "$WEB_SVC"
+roll_services
 
 echo
 echo "デプロイしました: $(tf output -raw public_url)"

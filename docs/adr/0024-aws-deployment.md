@@ -412,24 +412,6 @@ csrfGuard にも当たらない ([ADR 0013](0013-http-defense.md) の 7)。
 `terraform` の対話は「人間が端末の前にいる」ことを前提にしており、
 **自動化の経路では必ずこれを外す**必要がある。
 
-## 本番ならこうする
-
-**この構成はポートフォリオ用であり、本番構成ではない。**
-どこを変えるかを明示しておく。
-
-| 項目 | この構成 | 本番 |
-| --- | --- | --- |
-| ECS の配置 | パブリックサブネット + パブリック IP | プライベート + NAT / VPC エンドポイント |
-| ドメイン | CloudFront 既定 | 独自ドメイン + ACM |
-| CloudFront ↔ ALB | HTTP | HTTPS (`X-Forwarded-Proto` も正しくなる) |
-| RDS | Single-AZ / バックアップ無し | Multi-AZ / PITR |
-| 削除保護 | すべて無効 | すべて有効 |
-| Fargate | Spot のみ | On-Demand + Spot の混在 |
-| ログ | CloudWatch (7 日) | FireLens → S3 → Athena ([ADR 0010](0010-log-pipeline.md)) |
-| デプロイ | ローリング | Blue/Green (CodeDeploy) |
-| tfstate | local | S3 backend (`use_lockfile`) |
-| WAF | 無し | あり ([インフラ構成](../infrastructure.md) の図) |
-
 ### 14. 「動いた」の裏で壊れていた 2 つ —— 検査が通ることと正しいことは違う
 
 `make tf-verify` が全項目を通り、画面も表示された。
@@ -499,6 +481,24 @@ VPC CIDR だけを信頼すると、右端のエッジ IP がそのまま `Clien
 
 **教訓は「実測した結論にも射程がある」ということになる。**
 手元の 1 段構成で得た答えは、2 段構成では成り立たなかった。
+
+## 本番ならこうする
+
+**この構成はポートフォリオ用であり、本番構成ではない。**
+どこを変えるかを明示しておく。
+
+| 項目 | この構成 | 本番 |
+| --- | --- | --- |
+| ECS の配置 | パブリックサブネット + パブリック IP | プライベート + NAT / VPC エンドポイント |
+| ドメイン | CloudFront 既定 | 独自ドメイン + ACM |
+| CloudFront ↔ ALB | HTTP | HTTPS (`X-Forwarded-Proto` も正しくなる) |
+| RDS | Single-AZ / バックアップ無し | Multi-AZ / PITR |
+| 削除保護 | すべて無効 | すべて有効 |
+| Fargate | Spot のみ | On-Demand + Spot の混在 |
+| ログ | CloudWatch (7 日) | FireLens → S3 → Athena ([ADR 0010](0010-log-pipeline.md)) |
+| デプロイ | ローリング | Blue/Green (CodeDeploy) |
+| tfstate | local | S3 backend (`use_lockfile`) |
+| WAF | 無し | あり ([インフラ構成](../infrastructure.md) の図) |
 
 ## 実機で確かめたこと (2026-08-25)
 

@@ -34,6 +34,7 @@ set_var() {
 	gh variable set "$1" --repo "$REPO" --body "$2" >/dev/null
 }
 
+set_var AWS_REGION          "$(tf output -raw region)"
 set_var AWS_DEPLOY_ROLE_ARN "$(tf output -raw github_actions_role_arn)"
 set_var ECS_CLUSTER         "$(tf output -raw ecs_cluster_name)"
 set_var ECS_SERVICE_API     "$(tf_output_key ecs_service_names api)"

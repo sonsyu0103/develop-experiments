@@ -18,8 +18,16 @@
 # 落とすと、selfOrigin() が "http://localhost" を組み立て、
 # Origin ヘッダ ("https://localhost") と一致しなくなり、
 # csrfGuard が **すべての書き込みを 403 にする**。
-# しかも同一オリジン構成では CORS_ALLOWED_ORIGINS を設定する理由がないので
-# (middleware.go:213)、救いが無い。make https-verify がこれを実測する。
+#
+# **ただし逃げ道はある。** isAllowedOrigin は許可リストを先に見るので、
+# CORS_ALLOWED_ORIGINS に自分のオリジンを明示していれば selfOrigin まで
+# 到達せずに通る。「同一オリジンなら設定する理由がない」という当初の読みは
+# 誤りで、**XFP 落ちの保険になる** (ADR 0023 の 3 で訂正)。
+# make up-https と AWS の両方で明示してあるのはこのため ——
+# **ここを外すと保険が消える。**
+#
+# make https-verify がこの因果を実測する (go-api を直接叩き、
+# 許可リストに無いホスト名で selfOrigin だけを頼りにさせる)。
 #
 # あわせて ADR 0013 決定 2 (セキュリティヘッダ、未実装のまま残っていた) を
 # ここで満たす。ADR は「フロント側の応答に付ける」と書いているが、

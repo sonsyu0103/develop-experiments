@@ -50,3 +50,31 @@ MSG
 tf_output_key() {
 	tf output -json "$1" | python3 -c "import json,sys;print(json.load(sys.stdin)['$2'])"
 }
+
+# サービスを新しいイメージで入れ替え、安定するまで待つ。
+#
+# **push だけでは切り替わらない。** 稼働中のタスクは古いイメージのまま
+# 走り続けるので、force-new-deployment で引き直させる必要がある。
+# これを忘れると「新しいイメージを push したのに、古いタスクを計測して
+# 検査が通る」という、いちばん気づけない形になる。
+roll_services() {
+	local region cluster api web
+	region="$(tf output -raw region)"
+	cluster="$(tf output -raw ecs_cluster_name)"
+	api="$(tf_output_key ecs_service_names api)"
+	web="$(tf_output_key ecs_service_names web)"
+
+	echo "== サービスを入れ替えています =="
+	local svc
+	for svc in "$api" "$web"; do
+		aws ecs update-service --region "$region" --cluster "$cluster" \
+			--service "$svc" --force-new-deployment >/dev/null
+		echo "   $svc"
+	done
+
+	# **安定するまで待つ。** 待たないと、古いタスクが動いている状態で
+	# 「デプロイできた」と言うことになる。
+	echo "== 安定するのを待っています (数分かかる) =="
+	aws ecs wait services-stable --region "$region" --cluster "$cluster" \
+		--services "$api" "$web"
+}

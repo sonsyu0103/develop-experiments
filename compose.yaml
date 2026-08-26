@@ -357,7 +357,15 @@ services:
       # ホストの GOPATH と混ざらないよう、モジュールキャッシュはボリュームに逃がす
       - go-mod-cache:/go/pkg/mod
     environment:
-      ENV: ${ENV:-development}
+      # **BBS_ENV から取る。** ENV は POSIX sh / ksh が起動スクリプトの
+      # パスに使う名前で、export している開発者が存在しうる。
+      # ${ENV:-development} にすると、その環境では make up が
+      # **勝手に production 扱い**になり、SECURE_COOKIE も既定で true に
+      # 倒れて、素の http://localhost:3000 で
+      # **ブラウザが Cookie を黙って捨てる** (下の SECURE_COOKIE の注記どおり)。
+      #
+      # go-api が読むのは ENV のままなので、渡す側の名前だけ分けている。
+      ENV: ${BBS_ENV:-development}
       # **ENV とは別に指定する** (ADR 0010「実装して分かったこと 1」)。
       #
       # ENV=development の既定はテキスト形式 (人間が読む用) だが、

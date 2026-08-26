@@ -148,7 +148,7 @@ CloudFront ←→ ALB を HTTP にすると ALB が `X-Forwarded-Proto` を
 
 **実際に `apply` して動かし、`destroy` まで一周した** (2026-08-25)。
 `make tf-verify` は全項目を通っている。実績コストは約 $0.07 (稼働 1 時間)。
-途中で 14 件つまずいた記録が ADR 0024 にある —— いずれも
+途中で 15 件つまずいた記録が ADR 0024 にある —— いずれも
 `validate` と `plan` を通り抜け、**`apply` して初めて分かった**もの。
 
 残る未検証は CD (GitHub Actions からのデプロイ) で、

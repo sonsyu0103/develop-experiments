@@ -134,53 +134,45 @@ fi
 
 echo
 echo "=== 6. 画像経路 (S3 + OAC) ==="
-# **「到達した」で通してはいけない。**
-# 初版は 200/403/404 をまとめて成功にしていたため、
-# S3_PUBLIC_BASE_URL が images/ を二重に付ける不具合
-# (ADR 0024 の 14) を素通しした。**403 は失敗**として扱う。
+# **アップロードして確かめることはできない。**
+# POST /images は sessionCookie を要求する (api/openapi.yaml) ので、
+# セッションを持たないこのスクリプトからは必ず 401 になる。
+# 初版はそこで SKIP に落ち、**S3_PUBLIC_BASE_URL を一度も通らないまま
+# 「到達している」と報告していた** —— ADR 0024 の 14 で踏んだ
+# 二重プレフィックスを、強化したはずの検査が構造的に見逃す形だった。
 #
-# 本当に確かめたいのは「API が返した URL で画像が引けるか」なので、
-# 実際に 1 枚投稿して、その URL を叩く。
-# **mktemp が作ったファイルにそのまま書く。**
-# "$(mktemp ...).png" と書くと、mktemp が作った拡張子なしの一時ファイルを
-# 残したまま別のパスへ書き込むことになり、後始末も外れる。
-# 拡張子は Content-Type を明示することで不要にする。
-img_probe="$(mktemp -t bbs-probe.XXXXXX)"
-# 1x1 の PNG (base64)。画像として妥当な最小の入力。
-printf '%s' \
-'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' \
-	| base64 -d > "$img_probe" 2>/dev/null || \
-	printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' \
-	| base64 --decode > "$img_probe"
+# 代わりに**設定値そのものを見る。** オブジェクトキーが
+# "images/<uuid>" で始まる (image/domain/model/image.go) ので、
+# S3_PUBLIC_BASE_URL が /images で終わっていたら必ず二重になる。
+# これはアップロードしなくても判定できる。
+region="$(tf output -raw region)"
+s3_base="$(aws ecs describe-task-definition \
+	--region "$region" \
+	--task-definition "$(tf output -raw ecs_cluster_name)-go-api" \
+	--query "taskDefinition.containerDefinitions[0].environment[?name=='S3_PUBLIC_BASE_URL'].value | [0]" \
+	--output text 2>/dev/null || echo "")"
 
-img_json="$(req -X POST "$BASE/api/images" -H "Origin: $BASE" \
-	-F "file=@$img_probe;type=image/png;filename=probe.png" || true)"
-rm -f "$img_probe"
+case "$s3_base" in
+	"")
+		bad "S3_PUBLIC_BASE_URL がタスク定義から読めない" ;;
+	*/images | */images/)
+		bad "S3_PUBLIC_BASE_URL が /images で終わっている ($s3_base) —— キーが images/ で始まるので二重になる" ;;
+	"$BASE")
+		pass "S3_PUBLIC_BASE_URL が公開 URL と一致している ($s3_base)" ;;
+	*)
+		bad "S3_PUBLIC_BASE_URL が公開 URL と違う (got $s3_base, want $BASE)" ;;
+esac
 
-img_url="$(printf '%s' "$img_json" | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-for k in ("url", "imageUrl", "location"):
-    if isinstance(d.get(k), str):
-        print(d[k]); break
-' 2>/dev/null || true)"
-
-if [ -z "$img_url" ]; then
-	skip "画像を投稿できなかったので経路を検査できない (認証が要る可能性)"
-	img_code="$(status "$BASE/images/")"
-	case "$img_code" in
-		403) bad  "/images/ が 403 —— S3_PUBLIC_BASE_URL の二重プレフィックスを疑う" ;;
-		*)   pass "S3 オリジンには到達している (status=$img_code)" ;;
-	esac
-else
-	fetched="$(status "$img_url")"
-	[ "$fetched" = "200" ] \
-		&& pass "API が返した URL で画像が引ける ($img_url)" \
-		|| bad  "API が返した URL が $fetched —— S3_PUBLIC_BASE_URL とキーの組み立てが噛み合っていない ($img_url)"
-fi
+# 経路そのものの到達性も見る。存在しないキーは 403 ではなく 404 が返る
+# (バケットポリシーが arn/* に GetObject を与えているため)。
+# **403 は OAC かポリシーが効いていない合図**になる。
+probe_key="images/00000000-0000-0000-0000-000000000000.webp"
+img_code="$(status "$BASE/$probe_key")"
+case "$img_code" in
+	404) pass "S3 オリジンに到達し、存在しないキーは 404 (OAC が効いている)" ;;
+	403) bad  "存在しないキーが 403 —— OAC かバケットポリシーが効いていない" ;;
+	*)   bad  "S3 オリジンの応答が想定外 (status=$img_code)" ;;
+esac
 
 echo
 echo "=== 後片付け ==="
