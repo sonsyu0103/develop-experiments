@@ -141,7 +141,11 @@ echo "=== 6. 画像経路 (S3 + OAC) ==="
 #
 # 本当に確かめたいのは「API が返した URL で画像が引けるか」なので、
 # 実際に 1 枚投稿して、その URL を叩く。
-img_probe="$(mktemp -t bbs-probe).png"
+# **mktemp が作ったファイルにそのまま書く。**
+# "$(mktemp ...).png" と書くと、mktemp が作った拡張子なしの一時ファイルを
+# 残したまま別のパスへ書き込むことになり、後始末も外れる。
+# 拡張子は Content-Type を明示することで不要にする。
+img_probe="$(mktemp -t bbs-probe.XXXXXX)"
 # 1x1 の PNG (base64)。画像として妥当な最小の入力。
 printf '%s' \
 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' \
@@ -149,7 +153,8 @@ printf '%s' \
 	printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' \
 	| base64 --decode > "$img_probe"
 
-img_json="$(req -X POST "$BASE/api/images" -H "Origin: $BASE" -F "file=@$img_probe" || true)"
+img_json="$(req -X POST "$BASE/api/images" -H "Origin: $BASE" \
+	-F "file=@$img_probe;type=image/png;filename=probe.png" || true)"
 rm -f "$img_probe"
 
 img_url="$(printf '%s' "$img_json" | python3 -c '

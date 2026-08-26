@@ -6,7 +6,18 @@
 # 読み取れない。** CD (.github/workflows/deploy.yml) には
 # 同じ確認を入れてあったのに、手元のスクリプトには無かった。
 
-TF_DIR="${TF_DIR:-infra/terraform}"
+# **cwd に依存しない。**
+# 相対パスにすると、リポジトリルート以外から実行したときに
+# terraform -chdir がディレクトリ不在で落ちるが、
+# require_applied が stderr を捨てるので
+# **「AWS 環境がまだありません」という誤った診断**に化ける ——
+# このファイルが直そうとした失敗と同じ形になる。
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPTS_DIR/../.." && pwd)"
+TF_DIR="${TF_DIR:-$REPO_ROOT/infra/terraform}"
+
+# docker build のコンテキストも同じ理由で絶対パスにする。
+cd "$REPO_ROOT"
 
 tf() { terraform -chdir="$TF_DIR" "$@"; }
 

@@ -189,6 +189,11 @@ https-verify: ## エッジ配下でしか通らない分岐を実測する (XFP 
 TF_DIR := infra/terraform
 TF     := terraform -chdir=$(TF_DIR)
 
+# リソース名と Project タグの接頭辞。**infra/terraform/variables.tf の
+# 既定と揃える。** destroy 後は state から output が消えるので、
+# 確認手順はこちらを使う (terraform に問い合わせない)。
+PROJECT ?= bbs
+
 .PHONY: tf-init
 tf-init: ## Terraform を初期化する (最初の 1 回)
 	$(TF) init
@@ -205,10 +210,24 @@ tf-validate: ## Terraform の構成を検査する (AWS に触らない)
 tf-plan: ## 何が作られるかを見る (課金は発生しない)
 	$(TF) plan
 
+# apply / destroy の計画を固めるファイル。**リポジトリに置かない。**
+TF_PLAN ?= $(HOME)/claude-artifacts/bbs-apply.tfplan
+
 .PHONY: tf-apply
 tf-apply: ## AWS に環境を作る (**課金が発生する**)
+	# **plan をファイルに固めてから適用する** (tf-destroy と同じ形)。
+	#
+	# 素の `terraform apply` は対話で確認を求めるため、端末の無い経路
+	# (CI、エディタからの実行) では**プロンプトで止まる**。
+	# apply 側で止まると、RDS や ALB が中途半端に作られたまま
+	# 放置されうるので、destroy 側より始末が悪い。
+	#
+	# 何が作られるかは下の plan の出力に全部出る。
 	# RDS の作成に 5〜10 分かかる。全体で 15 分ほど見ておく。
-	$(TF) apply
+	@mkdir -p $(dir $(TF_PLAN))
+	$(TF) plan -out=$(TF_PLAN)
+	$(TF) apply $(TF_PLAN)
+	@rm -f $(TF_PLAN)
 	@echo
 	@echo "次にやること:"
 	@echo "  make tf-push     イメージを ECR へ送る"
@@ -235,12 +254,15 @@ tf-destroy: ## AWS の環境を消す (**消し忘れると課金され続ける
 	@rm -f $(TF_DESTROY_PLAN)
 	@echo
 	@echo "消えたことを確かめる:"
-	# **SITE_ADDRESS から導出しない。** あれはローカルのエッジの
-	# ホスト名で、AWS の Project タグとは無関係。
-	# SITE_ADDRESS=bbs.localhost のとき Values=bbs.bbs になり、
-	# **0 件と表示されて「消えている」と誤読する** —— 消し忘れを
-	# 確かめるための手順が、いちばん危ない場面で嘘をつく。
-	@echo "  aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=$$($(TF) output -raw project 2>/dev/null || echo bbs) --query 'length(ResourceTagMappingList)'"
+	# **terraform output から取らない。** destroy が終わると state ごと
+	# output も消えるので、必ずフォールバック側に落ちる ——
+	# project を変えた環境では存在しないタグを引き、
+	# **0 件と表示されて「消えている」と誤読する。**
+	# 消し忘れを確かめるための手順が、いちばん危ない場面で嘘をつく。
+	#
+	# SITE_ADDRESS から導出するのも同じ理由で誤り (あれはローカルの
+	# エッジのホスト名で、AWS の Project タグとは無関係)。
+	@echo "  aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=$(PROJECT) --query 'length(ResourceTagMappingList)'"
 
 
 .PHONY: tf-push

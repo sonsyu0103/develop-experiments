@@ -119,12 +119,16 @@ resource "aws_ecs_task_definition" "api" {
       # **すべての書き込みが 403 になる** (ADR 0023 の 3 で実測した形)。
       { name = "CORS_ALLOWED_ORIGINS", value = local.public_url },
 
-      # **ALB を信頼するプロキシとして宣言する。**
-      # 宣言しないと ClientIP が ALB の IP になり、
-      # 問い合わせのレート制限 (5 件/時) が全利用者で共有される
-      # —— 誰か 5 人で全員が 429 になる (ADR 0023、手元で実測)。
-      # ALB は VPC 内の IP を持つので、VPC の CIDR を渡す。
-      { name = "TRUSTED_PROXIES", value = var.vpc_cidr },
+      # **ALB と CloudFront のエッジを信頼するプロキシとして宣言する。**
+      #
+      # 宣言しないと ClientIP がプロキシの IP になり、問い合わせの
+      # レート制限 (5 件/時) が全利用者で共有される —— 誰か 5 人で
+      # 全員が 429 (ADR 0023、手元で実測)。
+      #
+      # **VPC CIDR だけでは足りない。** XFF は
+      # `viewer, cloudfront-edge` の形で届き、gin は右から辿るので、
+      # エッジを信頼しないとエッジ IP で止まる (locals.tf の注記)。
+      { name = "TRUSTED_PROXIES", value = join(",", local.trusted_proxies) },
 
       # ENV=production でも既定で true になるが、**明示する。**
       # この値が外れると Cookie が平文で飛ぶ。既定に頼らない。

@@ -82,7 +82,7 @@ Google OIDC を使うなら、**Google 側にリダイレクト URI を登録す
 | 症状 | 原因 |
 | --- | --- |
 | タスクが起動しては落ちる | イメージが x86。ARM64 で焼き直す (`make tf-push`) |
-| 画面は出るが真っ白 | ALB の 8080 が ECS から届いていない。SG を確認 |
+| 画面は出るが真っ白 | `API_URL` が CloudFront 経由になっているか確認 (`ecs.tf`)。**SG は疑わない** —— internet-facing ALB へは VPC の外を通るので、SG 参照は効かない (ADR 0024 の 12) |
 | 書き込みだけ 403 | `CORS_ALLOWED_ORIGINS` が CloudFront のドメインと違う (ADR 0024 の 2) |
 | apply が `already scheduled for deletion` | Secrets Manager の復旧猶予。`recovery_window_in_days = 0` になっているか確認 |
 | destroy が途中で止まる | S3 に中身、ECR にイメージが残っている。`force_destroy` / `force_delete` を確認 |

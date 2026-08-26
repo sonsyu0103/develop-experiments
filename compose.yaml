@@ -615,12 +615,14 @@ services:
       # 自己署名なので --no-check-certificate が要る。
       # ここで検証したいのは「エッジが応答するか」だけで、
       # 証明書の中身は make https-verify が別に見る。
+      #
+      # **URL を localhost で決め打ちしない。** Caddyfile のサイトは
+      # {$SITE_ADDRESS:localhost} の 1 つだけなので、
+      # SITE_ADDRESS=bbs.localhost で立てると Host: localhost に
+      # 一致するサイトが無く 404 になり、**edge が永久に unhealthy** になる。
       test:
-        - CMD
-        - wget
-        - --no-check-certificate
-        - -qO-
-        - https://localhost/edge-healthz
+        - CMD-SHELL
+        - wget --no-check-certificate -qO- "https://$${SITE_ADDRESS:-localhost}/edge-healthz"
       interval: 5s
       timeout: 3s
       retries: 10
