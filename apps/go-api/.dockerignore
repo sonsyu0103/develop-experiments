@@ -1,0 +1,16 @@
+# **ビルドに要らないものをコンテキストから外す。**
+# go build はモジュールキャッシュを使うので、ホストの成果物は不要。
+
+bin
+dist
+docs
+*.out
+
+# 秘密
+.env
+.env*.local
+
+.git
+.gitignore
+Dockerfile
+.dockerignore

@@ -386,6 +386,32 @@ func parseLogFormat(raw string, debug bool) (LogFormat, error) {
 	return format, nil
 }
 
+// parseSecureCookie は SECURE_COOKIE を読み取ります。
+//
+// 未設定のときは debug から決めます (development 以外は付ける)。
+// **既定を残すのは、この変更で既存の環境の挙動を変えないためです** ——
+// parseLogFormat と同じ形になります。
+//
+// 空文字は compose の ${SECURE_COOKIE:-} が普通に生む形なので未設定と
+// 同義に扱いますが、**空白だけ・綴り違いはエラーです。**
+// ここを「読めなければ false」にすると、打ち間違いが
+// **Secure の付いていない本番**として黙って成立してしまいます。
+func parseSecureCookie(raw string, debug bool) (bool, error) {
+	if raw == "" {
+		return !debug, nil
+	}
+
+	switch strings.TrimSpace(strings.ToLower(raw)) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf(
+			"config: SECURE_COOKIE が不正です (got %q, 選べるのは true / false)", raw)
+	}
+}
+
 // AuthConfig は Google OIDC による認証の設定です。
 //
 // **すべて任意です。** 揃っていない場合、API は起動しますが
@@ -429,9 +455,18 @@ type AuthConfig struct {
 	BootstrapAdminGoogleSub string
 	// SecureCookie は Cookie に Secure 属性を付けるかどうかです。
 	//
-	// localhost は HTTP なので開発時は付けられません。
-	// ENV=development 以外では既定で true になります —— 設定を忘れた本番が
-	// Secure なしで動くほうが危険なため、安全側に倒しています。
+	// 未設定なら ENV から決めます (development 以外は true) —— 設定を忘れた
+	// 本番が Secure なしで動くほうが危険なため、安全側に倒しています。
+	//
+	// **ENV とは別に指定できます** (SECURE_COOKIE)。LOG_FORMAT を独立させたのと
+	// 同じ理由になります。「localhost は HTTP だから開発中は付けられない」は
+	// **エッジ (infra/caddy) を置いた時点で前提が崩れました。** https://localhost
+	// で動かしているのに Secure が外れたままだと、開発環境は
+	// **本番と違う Cookie を配ることになり、Secure 起因の不具合が手元で再現しません。**
+	//
+	// 逆向きの事故も同じ重さです。ENV=development のまま素の http://localhost:3000
+	// で開発しているところに SECURE_COOKIE=true を渡すと、**ブラウザが Cookie を
+	// 黙って捨てて、ログインだけが失敗します** (サーバ側にはエラーが 1 行も出ません)。
 	SecureCookie bool
 }
 
@@ -519,6 +554,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	secureCookie, err := parseSecureCookie(os.Getenv("SECURE_COOKIE"), debug)
+	if err != nil {
+		return nil, err
+	}
+
 	// 既定は 5 秒 (ADR 0006 の「一定間隔 (既定 5 秒)」)。
 	// **0 を許さない。** 0 だとスケジューラが既定値 (10 分) へ丸めるので、
 	// 「即時に反映されるつもりで 0 にしたら、いちばん遅くなった」が起きる。
@@ -573,7 +613,7 @@ func Load() (*Config, error) {
 			// 一致しなければ昇格が起きず、しかも気づきにくい。
 			BootstrapAdminGoogleSub: strings.TrimSpace(os.Getenv("BOOTSTRAP_ADMIN_GOOGLE_SUB")),
 			// 開発時だけ Secure を外す。未設定の環境は本番扱いで付ける。
-			SecureCookie: !debug,
+			SecureCookie: secureCookie,
 		},
 		Storage: StorageConfig{
 			Bucket: os.Getenv("S3_BUCKET"),

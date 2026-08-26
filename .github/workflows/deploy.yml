@@ -1,0 +1,159 @@
+# AWS へのデプロイ。
+#
+# **push では動かさない。**
+# この環境は「見せたい日だけ立てる」運用なので (ADR 0024)、
+# 立っていない日のほうが多い。push のたびに走らせると、
+# **存在しないクラスタに向かって失敗し続ける**ことになる。
+# 手動 (workflow_dispatch) で起動する。
+#
+# **アクセスキーを Secrets に置かない。**
+# OIDC でロールを引き受ける (infra/terraform/iam.tf)。
+# 置いた鍵は失効させるまで有効なまま残るが、OIDC なら
+# 実行ごとに短命の資格情報が発行される。
+
+name: Deploy to AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_migration:
+        description: "マイグレーションを流すか"
+        type: boolean
+        default: true
+      # **image_tag の入力は置かない。**
+      # タスク定義の image は var.api_image_tag (既定 latest) で固定されており、
+      # デプロイは --force-new-deployment でそれを引き直すだけ。
+      # 任意のタグを入力できるようにすると、そのタグを push した一方で
+      # **サービスは latest (前回のビルド) を引く**という食い違いが起き、
+      # ワークフローは成功として URL を表示してしまう。
+      #
+      # 特定のタグを出したくなったら、tfvars の api_image_tag を変えて
+      # apply する経路を用意すること。
+
+concurrency:
+  # **同時に走らせない。** 2 つのデプロイが同じサービスを
+  # 別のイメージで入れ替えると、どちらが残るか分からなくなる。
+  group: deploy-aws
+  cancel-in-progress: false
+
+permissions:
+  # OIDC のトークンを発行するために要る。
+  id-token: write
+  contents: read
+
+env:
+  # **Variables から取る。** ここだけハードコードすると、
+  # var.region を変えたときに CD が誤ったリージョンを見て
+  # 「クラスタが見つかりません」と表示する ——
+  # iam.tf が警告している「原因と違うメッセージ」と同じ形になる。
+  # 値は make tf-github-vars が terraform output から入れる。
+  AWS_REGION: ${{ vars.AWS_REGION || 'ap-northeast-1' }}
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    # **ARM ランナーを使う。**
+    # ECS のタスク定義が Graviton (ARM64) を指定しているため
+    # (infra/terraform/ecs.tf)。x86 ランナーで QEMU を挟むと
+    # ビルドが数倍遅くなる。
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # **クラスタが無い場合はここで止める。**
+      # destroy 済みの状態で走らせると、イメージだけ push されて
+      # サービス更新で失敗する —— 中途半端に課金が発生する。
+      - name: Ensure the environment exists
+        run: |
+          # **部分一致で見ない。** destroy 済みのクラスタは INACTIVE として
+          # 残り続けるので (2026-08-25 に実測)、grep -q ACTIVE だと
+          # **INACTIVE に一致してガードが素通りする** ——
+          # イメージだけ push されて update-service で落ち、
+          # このステップが防ごうとした失敗がそのまま起きる。
+          status="$(aws ecs describe-clusters --clusters "${{ vars.ECS_CLUSTER }}" \
+            --query 'clusters[0].status' --output text 2>/dev/null || echo NONE)"
+          if [ "$status" != "ACTIVE" ]; then
+            echo "::error::クラスタ ${{ vars.ECS_CLUSTER }} が使えません (status=$status)。先に make tf-apply してください。"
+            exit 1
+          fi
+
+      - name: Build and push go-api
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: latest
+        run: |
+          docker build --target prod \
+            -t "$REGISTRY/${{ vars.ECR_REPO_API }}:$TAG" apps/go-api
+          docker push "$REGISTRY/${{ vars.ECR_REPO_API }}:$TAG"
+
+      - name: Build and push next-app
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: latest
+        run: |
+          docker build --target prod \
+            -t "$REGISTRY/${{ vars.ECR_REPO_WEB }}:$TAG" apps/next-app
+          docker push "$REGISTRY/${{ vars.ECR_REPO_WEB }}:$TAG"
+
+      - name: Build and push migrate
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          TAG: latest
+        run: |
+          docker build \
+            -t "$REGISTRY/${{ vars.ECR_REPO_MIGRATE }}:$TAG" apps/go-api/db
+          docker push "$REGISTRY/${{ vars.ECR_REPO_MIGRATE }}:$TAG"
+
+      # **アプリより先にマイグレーションを流す。**
+      # 新しいコードが古いスキーマに当たるほうが壊れやすい。
+      - name: Run migrations
+        if: ${{ inputs.run_migration }}
+        run: |
+          NET="$(aws ecs describe-services \
+            --cluster "${{ vars.ECS_CLUSTER }}" \
+            --services "${{ vars.ECS_SERVICE_API }}" \
+            --query 'services[0].networkConfiguration.awsvpcConfiguration' --output json)"
+
+          TASK_ARN="$(aws ecs run-task \
+            --cluster "${{ vars.ECS_CLUSTER }}" \
+            --task-definition "${{ vars.ECS_TASK_MIGRATE }}" \
+            --launch-type FARGATE \
+            --network-configuration "{\"awsvpcConfiguration\":$NET}" \
+            --query 'tasks[0].taskArn' --output text)"
+
+          echo "task: $TASK_ARN"
+          aws ecs wait tasks-stopped --cluster "${{ vars.ECS_CLUSTER }}" --tasks "$TASK_ARN"
+
+          # **終了コードを必ず見る。**
+          # run-task はタスクの起動に成功しただけで成功を返す。
+          CODE="$(aws ecs describe-tasks --cluster "${{ vars.ECS_CLUSTER }}" --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' --output text)"
+          echo "exitCode=$CODE"
+          [ "$CODE" = "0" ] || { echo "::error::マイグレーションが失敗しました"; exit 1; }
+
+      - name: Deploy services
+        run: |
+          for svc in "${{ vars.ECS_SERVICE_API }}" "${{ vars.ECS_SERVICE_WEB }}"; do
+            aws ecs update-service --cluster "${{ vars.ECS_CLUSTER }}" \
+              --service "$svc" --force-new-deployment >/dev/null
+            echo "updated: $svc"
+          done
+
+          # 安定するまで待つ。待たないと、古いタスクが動いている状態で
+          # 「デプロイできた」と言うことになる。
+          aws ecs wait services-stable --cluster "${{ vars.ECS_CLUSTER }}" \
+            --services "${{ vars.ECS_SERVICE_API }}" "${{ vars.ECS_SERVICE_WEB }}"
+
+      - name: Show the URL
+        run: echo "https://${{ vars.CLOUDFRONT_DOMAIN }}" >> "$GITHUB_STEP_SUMMARY"

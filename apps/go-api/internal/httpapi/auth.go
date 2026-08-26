@@ -149,13 +149,15 @@ func newAuthenticationFunc() openapi3filter.AuthenticationFunc {
 //
 // 属性の理由 (docs/adr/0005-authentication.md):
 //   - HttpOnly: JavaScript から読めなくする (XSS でのセッション奪取を防ぐ)
-//   - Secure:   本番のみ。localhost は HTTP なので開発時は付けられない
+//   - Secure:   SECURE_COOKIE で決まる。未設定なら ENV=development 以外で付く。
+//     エッジ (infra/caddy) 経由なら手元でも https なので、開発中でも付けられる
 //   - SameSite=Lax: フロントと API が same-site に収まるため None は不要。
 //     same-site の判定にポートは含まれないので localhost:3000 → :8080 も同一
 func (s *Server) setSessionCookie(c *gin.Context, token usermodel.SessionToken, maxAge int) {
 	// gosec G124 は Secure が定数 true であることを求めるが、
-	// localhost は HTTP なので開発時は付けられない (ADR 0005 の Cookie 属性)。
+	// 素の http://localhost では付けられない (ADR 0005 の Cookie 属性)。
 	// 既定は本番扱い (SecureCookie=true) で、ENV=development のときだけ外れる。
+	// エッジ経由 (make up-https) なら SECURE_COOKIE=true で手元でも付けられる。
 	//nolint:gosec // Secure は設定で切り替える。既定は付ける側
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name:     sessionCookieName,

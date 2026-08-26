@@ -22,7 +22,7 @@
 | `apps/next-app` | Next.js のフロント。OpenAPI から TypeScript 型を生成 |
 | `api/openapi.yaml` | API のスキーマ。**ここが単一の情報源**。ハンドラの型を直接いじらない |
 | `apps/go-api/db` | マイグレーションとクエリ |
-| `infra` | ログ基盤 (fluent-bit の設定、Athena のテーブル定義、DuckDB での検証) |
+| `infra` | ログ基盤 (fluent-bit / Athena / DuckDB)、ローカルのエッジ (`caddy`)、AWS の IaC (`terraform`) |
 | `docs/adr` | 設計判断の記録。大きめの判断をしたら 1 件足す |
 
 ## コマンド
@@ -37,7 +37,16 @@ make lint             # Go / TypeScript の静的解析
 make generate         # 生成物をすべて作り直す
 make verify-generated # 生成物がコミット済みと一致するか検査
 make logs-verify      # ログ基盤が本番と同じ形で動いているか実測 (実環境が要る)
+make up-https         # エッジ (TLS 終端) ごと起動する (https://localhost)
+make https-verify     # プロキシ配下でしか通らない分岐を実測する
+make tf-plan          # AWS に何が作られるかを見る (課金なし)
+make tf-apply         # AWS に環境を作る (**課金が発生する**)
+make tf-destroy       # AWS の環境を消す
 ```
+
+**AWS は常時公開しない。** 見せたい日に `tf-apply` して、終わったら
+`tf-destroy` する運用にしてある (docs/adr/0024-aws-deployment.md)。
+**`tf-apply` と `tf-destroy` は明示的に頼まれるまで実行しない。**
 
 `make help` で全ターゲットが出る。
 

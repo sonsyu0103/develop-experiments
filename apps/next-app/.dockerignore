@@ -1,0 +1,27 @@
+# **本番ビルドの COPY . . にホストの生成物を混ぜない。**
+#
+# 無いと、npm ci 済みの /app/node_modules の上に
+# ホストの node_modules (macOS 向けバイナリ) が重なり、
+# .env*.local まで builder 層に焼かれる ——
+# NEXT_PUBLIC_* を .env.local に置いている開発者がいると、
+# next build がそれを拾う (ADR 0024 の 14 で直した経路と同じ種類の事故)。
+#
+# ビルドコンテキストも数百 MB から数 MB に落ちる。
+
+node_modules
+.next
+out
+
+# 検査の出力
+playwright-report
+test-results
+tsconfig.tsbuildinfo
+
+# 秘密。**.env.example のような雛形は無いので一括で落とす。**
+.env
+.env*.local
+
+.git
+.gitignore
+Dockerfile
+.dockerignore

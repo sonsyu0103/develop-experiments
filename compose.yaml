@@ -357,7 +357,15 @@ services:
       # ホストの GOPATH と混ざらないよう、モジュールキャッシュはボリュームに逃がす
       - go-mod-cache:/go/pkg/mod
     environment:
-      ENV: development
+      # **BBS_ENV から取る。** ENV は POSIX sh / ksh が起動スクリプトの
+      # パスに使う名前で、export している開発者が存在しうる。
+      # ${ENV:-development} にすると、その環境では make up が
+      # **勝手に production 扱い**になり、SECURE_COOKIE も既定で true に
+      # 倒れて、素の http://localhost:3000 で
+      # **ブラウザが Cookie を黙って捨てる** (下の SECURE_COOKIE の注記どおり)。
+      #
+      # go-api が読むのは ENV のままなので、渡す側の名前だけ分けている。
+      ENV: ${BBS_ENV:-development}
       # **ENV とは別に指定する** (ADR 0010「実装して分かったこと 1」)。
       #
       # ENV=development の既定はテキスト形式 (人間が読む用) だが、
@@ -387,7 +395,34 @@ services:
       # 出しているのと同じ理由になる。
       DB_MAX_CONNS: ${DB_MAX_CONNS:-}
       DB_MIN_CONNS: ${DB_MIN_CONNS:-}
-      CORS_ALLOWED_ORIGINS: http://localhost:3000
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      # X-Forwarded-For を信じてよい送信元 (ADR 0009 / server.go の SetTrustedProxies)。
+      #
+      # **既定は空 (= 誰も信じない)。** 素の make up にはプロキシが居ないので、
+      # ClientIP は接続元アドレスそのもので正しい。
+      #
+      # エッジ (make up-https) を前に置くと話が逆転する。**全員が
+      # Caddy コンテナの IP になる** ため、問い合わせのレート制限
+      # (既定 5 件/時) が誰か 5 人で使い切られ、その 1 時間は全員 429 になる。
+      # main.go:110 の trusted_proxies_unset は本番でしか出ないので、
+      # 開発中は警告すら出ないまま壊れる。
+      #
+      # make https-verify がこの両側を実測する。
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      # Cookie に Secure 属性を付けるか (ADR 0005 の Cookie 属性)。
+      #
+      # **ENV とは別に指定する** —— LOG_FORMAT / COMMENT_POST_MODE と同じ理由。
+      # 「localhost は HTTP だから開発中は付けられない」は、エッジ
+      # (infra/caddy) を置いた時点で前提が変わった。https://localhost で
+      # 動かしているのに Secure が外れたままだと、**開発環境だけが本番と違う
+      # Cookie を配る**ことになり、Secure 起因の不具合が手元で再現しない。
+      #
+      # **既定値をここに書かない。** config 側 (parseSecureCookie) が
+      # 未設定を「ENV から決める」として扱う。両方に既定を書くと二重管理になる。
+      #
+      # make up-https は true を渡す。素の make up (http) で true にすると
+      # **ブラウザが Cookie を黙って捨てて、ログインだけが失敗する。**
+      SECURE_COOKIE: ${SECURE_COOKIE:-}
       # コメント投稿の並行制御の方式 (docs/adr/0019-comment-concurrency.md 決定 2)。
       # ssi / pessimistic / unique / naive。
       #
@@ -416,8 +451,8 @@ services:
       # セッションの検証は設定に依らず動く (ADR 0005 決定 4)。
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
-      AUTH_REDIRECT_URL: http://localhost:8080/auth/google/callback
-      AUTH_FRONTEND_URL: http://localhost:3000
+      AUTH_REDIRECT_URL: ${AUTH_REDIRECT_URL:-http://localhost:8080/auth/google/callback}
+      AUTH_FRONTEND_URL: ${AUTH_FRONTEND_URL:-http://localhost:3000}
       # 最初の管理者。値はここに書かず .env から補間する (ADR 0011 決定 1)
       BOOTSTRAP_ADMIN_GOOGLE_SUB: ${BOOTSTRAP_ADMIN_GOOGLE_SUB:-}
       # 画像のストレージ (ADR 0007)。
@@ -433,7 +468,7 @@ services:
       # **ブラウザから見える URL にする。** コンテナ内の名前 (minio:9000) を
       # 入れると、API は動くのに <img src> が解決できない。
       # API はこの値をそのまま絶対 URL として返す (ADR 0007 決定 5)。
-      S3_PUBLIC_BASE_URL: http://localhost:9000/bbs-images
+      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL:-http://localhost:9000/bbs-images}
       # 問い合わせメール (ADR 0008)。
       #
       # **揃っていなければ送信ワーカーだけが登録されない。**
@@ -510,6 +545,10 @@ services:
     build:
       context: ./apps/next-app
       dockerfile: Dockerfile
+      # **dev ステージを明示する** (go-api と同じ)。
+      # Dockerfile に prod ステージを足したので、指定しないと
+      # 最終ステージ (本番ビルド) が使われ、ホットリロードが効かなくなる。
+      target: dev
     ports:
       - "3000:3000"
     volumes:
@@ -521,12 +560,84 @@ services:
       # Server Components はコンテナ内から叩くのでサービス名で解決する
       API_URL: http://go-api:8080
       # ブラウザから叩く経路はホスト側のポートを見る
-      NEXT_PUBLIC_API_URL: http://localhost:8080
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
     depends_on:
       go-api:
         condition: service_started
+
+  # ローカルの擬似 AWS における「エッジ」= TLS 終端 + パス振り分け。
+  # 本番構成 (docs/infrastructure.md) の CloudFront + ALB に相当する。
+  #
+  # profiles が付いているので通常の up では起動しない:
+  #
+  #   make up-https      https://localhost ごと起動する
+  #   make https-verify  プロキシ配下でしか通らない分岐を実測する
+  #
+  # **既存の経路を塞がない。** 8080 / 3000 の公開はそのままなので、
+  # make up での開発は今までどおり http のまま動く。
+  # 置き換えではなく、本番同型の経路を「もう 1 本」足している。
+  edge:
+    # **@latest にしない** (Makefile 冒頭のツール固定と同じ理由)。
+    # 2 系の最新は v2.11.4 (2026-08-24 確認)。
+    image: caddy:2.11.4-alpine
+    profiles:
+      - edge
+    ports:
+      # 80 は https へのリダイレクト専用 (Caddy が自動で張る)。
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+      # 既定は max-age=0 (= 記憶しない)。理由は Caddyfile に書いてある ——
+      # HSTS はポートを区別しないので、localhost に付けると
+      # http://localhost:3000 での開発まで巻き添えで止まる。
+      #
+      # **この行を消すと、Caddyfile 側の {$HSTS:max-age=0} が
+      # 既定にフォールバックして動くように見える** —— だが
+      # HSTS="..." を渡しても届かなくなり、逃がし道が黙って死ぬ。
+      HSTS: ${HSTS:-max-age=0}
+      # X-Forwarded-Proto の値。既定は https (エッジが必ず TLS 終端するため)。
+      #
+      # **既定値をここに書く必要がある。** Caddyfile 側にも {$XFP:https} と
+      # 書いてあるが、Caddy の環境変数の既定は「**未設定**なら既定値」であって、
+      # 空文字は空文字のまま採用される。ここを ${XFP:-} にすると
+      # 空の X-Forwarded-Proto が go-api に届き、selfOrigin() が
+      # http:// を組み立てて **全書き込みが 403 になる** (実測済み)。
+      #
+      # XFP=http にすると同じ壊れ方を意図的に起こせる。make https-verify が使う。
+      XFP: ${XFP:-https}
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # **発行した CA と証明書を永続化する。** 消すと CA が変わるので、
+      # ブラウザに入れた信頼 (make trust-ca) をやり直すことになる。
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      go-api:
+        condition: service_started
+      next-app:
+        condition: service_started
+      minio:
+        condition: service_started
+    healthcheck:
+      # 自己署名なので --no-check-certificate が要る。
+      # ここで検証したいのは「エッジが応答するか」だけで、
+      # 証明書の中身は make https-verify が別に見る。
+      #
+      # **URL を localhost で決め打ちしない。** Caddyfile のサイトは
+      # {$SITE_ADDRESS:localhost} の 1 つだけなので、
+      # SITE_ADDRESS=bbs.localhost で立てると Host: localhost に
+      # 一致するサイトが無く 404 になり、**edge が永久に unhealthy** になる。
+      test:
+        - CMD-SHELL
+        - wget --no-check-certificate -qO- "https://$${SITE_ADDRESS:-localhost}/edge-healthz"
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   postgres-data:
   go-mod-cache:
   minio-data:
+  caddy-data:
+  caddy-config:
