@@ -1,0 +1,42 @@
+=== 1. エッジが本番と同じ形で振り分けているか ===
+  OK    エッジ自身が応答する
+  OK    / が next-app に届く
+  OK    /api/* が go-api に届く (プレフィックスが剥がれている)
+  OK    /images/* が MinIO に届く (本番の S3 + OAC 相当)
+  OK    http は https へリダイレクトされる (308)
+
+=== 2. セキュリティヘッダ (ADR 0013 決定 2) ===
+  OK    / に x-content-type-options が付く
+  OK    / に referrer-policy が付く
+  OK    / に x-frame-options が付く
+  OK    / は Server ヘッダを出さない
+  OK    /api/threads に x-content-type-options が付く
+  OK    /api/threads に referrer-policy が付く
+  OK    /api/threads に x-frame-options が付く
+  OK    /api/threads は Server ヘッダを出さない
+  OK    HSTS の既定が max-age=0 (手元の開発を壊さない)
+
+=== 3. Cookie の Secure 属性 (ADR 0005) ===
+  OK    セッション経路の Cookie に Secure が付く
+  OK    Cookie に HttpOnly が付く
+
+=== 4. csrfGuard (ADR 0013 決定 1) ===
+  OK    正しい Origin の書き込みは通る (201)
+  OK    別オリジンからの書き込みは 403
+  OK    Origin なしの書き込みは 403
+
+=== 5. X-Forwarded-Proto と selfOrigin の因果 (検査が効いているかの確認) ===
+  OK    XFP があれば selfOrigin が https を組み立て、書き込みが通る
+  OK    XFP を落とすと 403 になる (検査が効いている)
+  OK    その状態でも GET は 200 (監視では気づけない)
+
+=== 6. 多層防御: CORS の明示が XFP 落ちの保険になっているか ===
+  XFP=http でエッジを作り直しています...
+  OK    XFP を落としてもエッジ経由の書き込みは通る (CORS の明示が保険になっている)
+  エッジを既定に戻しています...
+  OK    既定に戻しても書き込みが通る (201)
+
+=== 後片付け ===
+  検査で作ったスレッドを削除: DELETE 4
+
+すべて通った。
