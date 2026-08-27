@@ -54,3 +54,7 @@ crash.log
 # **.terraform.lock.hcl はコミットする** (無視しない)。
 # プロバイダのバージョンを固定するファイルで、
 # Makefile 冒頭でツールを固定しているのと同じ役割になる。
+
+# スクリーンショットの元にした一時ファイル。**画像そのものはコミットする**
+# (docs/images/*.png は README が参照している)。
+docs/images/*.tmp

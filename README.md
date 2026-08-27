@@ -1,14 +1,107 @@
 # 掲示板 API & Web アプリ
 
-Go (Gin) + PostgreSQL + Next.js による掲示板アプリケーション。
-並行処理・排他制御・集計クエリの設計と、その**実測**を主題としている。
+Go (Gin) + PostgreSQL + Next.js。**設計を実測で決める**ことを主題にした掲示板。
 
-認証・画像投稿・検索といった実用的な機能も揃えるが、
-これらは主題を薄める方向ではなく、**主題に新しい題材を持ち込む形**で入れている。
-たとえば閲覧数の計上は、そのまま
+![人気順のスレッド一覧](docs/images/threads-popular.png)
+
+<sub>閲覧数が「**約**」なのは、同期 UPDATE をやめてバッファリングしているから
+([ADR 0006](docs/adr/0006-view-count-and-popularity.md))。設計がそのまま画面に出ている。</sub>
+
+## 3 分で分かる見どころ
+
+### 1. 「たぶん速い」で決めない —— 判断はすべて実測で裏を取る
+
+比較を実行するコマンドがリポジトリに入っている。**設計の候補を両方実装して、
+実 DB で測ってから選んでいる。**
+
+```bash
+make concurrency-probe   # コメント投稿の並行制御 4 方式を実 DB で比較 (SSI / 悲観ロック / 一意制約 / 素朴)
+make viewcount-probe     # 閲覧数の反映方式を比較 (バッファリング / 同期 UPDATE)
+make partition-probe     # comments の 8 分割がどの規模から効き始めるか
+make scale-probe         # 読み取りのスループットが接続数のどこで折り返すか
+```
+
+たとえば閲覧数を同期 UPDATE にしなかったのは、
+**ピーク時に毎秒 1,390 件の `UPDATE threads` が発生し、
+しかも人気スレッドほど同じ行に集中する**と見積もったから
+([ADR 0009](docs/adr/0009-scaling-strategy.md))。
+その判断が正しいことを `viewcount-probe` で確かめている。
+
+### 2. 検査そのものを検査する —— 「壊しても通る検査」を許さない
+
+テストが通ることと、テストが機能していることは違う。
+**わざと壊して、検査が落ちることを確かめる仕組み**を持っている。
+
+```bash
+make mutation-probe MUTATIONS=<変異リスト>   # 実装をわざと壊し、テストが落ちるかを測る
+make arch-probe          # 依存方向の検査が、違反を本当に検出するか
+make checker-probe       # 静的検査が「落とすべきものを落とす」か
+make https-verify        # プロキシ配下の分岐を実測。壊して効きも見る
+```
+
+実際にこれで穴が見つかっている。下は `make https-verify` の出力。
+**`CORS_ALLOWED_ORIGINS` に自分のオリジンを入れていない構成**で
+`X-Forwarded-Proto` を落とすと、**書き込みだけが 403 になり、GET と画面は 200 のまま**
+—— GET のヘルスチェックしか見ていない監視では気づけない
+([ADR 0023](docs/adr/0023-local-edge-and-https.md))。
+
+検査はこの因果を切り分けるために、エッジを迂回して go-api を直接叩いている
+(許可リストに無いホスト名を名乗らせ、`selfOrigin()` だけを頼りにさせる):
+
+```
+=== 5. X-Forwarded-Proto と selfOrigin の因果 (検査が効いているかの確認) ===
+  OK    XFP があれば selfOrigin が https を組み立て、書き込みが通る
+  OK    XFP を落とすと 403 になる (検査が効いている)
+  OK    その状態でも GET は 200 (監視では気づけない)
+```
+
+全 6 節の出力は [`docs/verify-output/https-verify.txt`](docs/verify-output/https-verify.txt) にある。
+
+### 3. AWS に実際に出して、消せる —— IaC は書くだけで終わらせない
+
+`infra/terraform` に 71 リソース。**apply して動作を確認し、destroy まで一周している**
+(実績コスト $0.07 / 稼働 1 時間)。
+
+```bash
+make tf-apply CONFIRM=1   # 環境を作る (課金が発生する。15 分)
+make tf-up                # イメージを載せて、マイグレーションして、実測する
+make tf-destroy           # 消す
+```
+
+**`CONFIRM=1` は安全弁**で、打ち間違いが 71 リソースを無確認で作るのを防いでいる。
+`make tf-apply` だけでは実行されず、何が作られるかを出して止まる。
+
+NAT Gateway (月 $33) もドメインも使わない構成にして **1 日 $1.3** に収めている。
+途中で踏んだ **15 件のつまずき**は
+[ADR 0024](docs/adr/0024-aws-deployment.md) に全部残した ——
+多くは `terraform validate` と `plan` を通り抜け、**実際に動かして初めて分かった**もの。
+
+## この 3 つを支えているもの
+
+| | |
+| --- | --- |
+| **設計判断の記録** | [ADR 25 本](docs/adr/)。決定だけでなく**実装後に分かったこと**を追記している |
+| **単一の情報源** | [`api/openapi.yaml`](api/openapi.yaml) から Go スタブと TS 型を生成。CI がドリフトを検出 |
+| **境界の強制** | `go-arch-lint` でモジュール間の依存方向を機械的に検査 ([ADR 0017](docs/adr/0017-arch-lint-and-depguard.md)。境界そのものは [ADR 0004](docs/adr/0004-modular-monolith.md)) |
+| **CI** | 静的解析 / race detector / カバレッジ下限 / 脆弱性検査 / 生成物のドリフト / Terraform |
+
+---
+
+以下は詳細。**主題は並行処理・排他制御・集計クエリの設計とその実測**で、
+認証・画像投稿・検索といった機能は主題を薄めるのではなく、
+**新しい題材を持ち込む形**で入れている。たとえば閲覧数の計上は、そのまま
 「同一行への書き込み集中をどう捌くか」という並行制御の問題になり
 ([ADR 0006](docs/adr/0006-view-count-and-popularity.md))、
 その分析はログ基盤の上で行う ([ADR 0010](docs/adr/0010-log-pipeline.md))。
+
+## 画面
+
+| 新着順 | 人気順 | スレッド詳細 |
+| --- | --- | --- |
+| ![新着順](docs/images/threads.png) | ![人気順](docs/images/threads-popular.png) | ![詳細](docs/images/thread-detail.png) |
+
+**匿名投稿とログインが共存する。** ログインしなくても書けるが、
+画像の添付と自分の投稿の削除にはログインが要る ([ADR 0005](docs/adr/0005-authentication.md) 決定 2)。
 
 ## 構成
 
@@ -994,6 +1087,7 @@ api/openapi.yaml を書く
 | [ADR 0022](docs/adr/0022-probing-the-checkers.md) | 検査そのものの検出力を、変異で測る |
 | [ADR 0023](docs/adr/0023-local-edge-and-https.md) | ローカルにエッジを置き、「本番ならこう動く」を実測に変える |
 | [ADR 0024](docs/adr/0024-aws-deployment.md) | AWS へのデプロイ —— 「消せること」を構成の要件にする |
+| [ADR 0025](docs/adr/0025-language-and-framework.md) | 言語とフレームワークの選択と、その使い方 (Gin は薄く使う) |
 | [インフラ構成](docs/infrastructure.md) | AWS の理想構成 (Terraform で出すのはこの一部) |
 
 [ADR 0015](docs/adr/0015-idempotency.md) と
@@ -1007,3 +1101,9 @@ api/openapi.yaml を書く
 Go 1.25 / Gin / pgx v5 / sqlc / oapi-codegen / PostgreSQL 17 /
 Next.js 16 (App Router, RSC) / React 19 / TypeScript 5.9 / ESLint 9 /
 Caddy (ローカルの TLS 終端) / Terraform (AWS) / ECS Fargate / CloudFront
+
+**なぜこれを選んだかは [ADR 0025](docs/adr/0025-language-and-framework.md)。**
+最重要の理由は「速いから」でも「安全だから」でもなく、
+**AI と組んで書くときに、生成されたコードを機械が先に検証できること**。
+Rust を落としたのは期間の制約であって技術的な優劣ではない、
+React と Vue の差は小さいと考えている、といった点も正直に書いてある。
