@@ -1,19 +1,554 @@
+# fluent-bit が S3 へアップロードする契機 (ADR 0010 決定 2)。
+#
+# **本番の値 (5m) とは変えている。** 手元で 5 分待たないと着地しないと
+# 確認にならない。アップロードの契機が設定で決まるという性質は同じ。
+#
+# **2 か所から参照する。** fluent-bit (出す側) と logs-query (待つ側) が
+# 同じ値を見る必要があるため —— ずれると、検査が「まだ来ていないログ」を
+# 見て落ちるか、逆に待ちすぎるかのどちらかになる。
+x-log-upload-timeout: &log-upload-timeout "10s"
+
 services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: bbs
+      # 照合順序 (LC_COLLATE) を C に固定する理由:
+      #   - 比較が「バイト順」になり、比較のたびに ICU/libc を呼ばなくなるので
+      #     ソートとインデックス走査が速い
+      #   - LIKE 'prefix%' が B-Tree インデックスで効くようになる
+      #     (C 以外のロケールでは text_pattern_ops を明示する必要がある)
+      #   - glibc のバージョン差でインデックスが壊れる事故を避けられる
+      # 日本語の「辞書順」ソートが必要になったら、その列だけ COLLATE を指定する。
+      #
+      # **文字種判定 (LC_CTYPE) だけは C.UTF-8 にする。** ここを C にすると、
+      # PostgreSQL は「1 バイト = 1 文字」の速い経路に入り、
+      # **日本語の文字が「文字」と判定されなくなる。**
+      # pg_trgm は語をなす文字の並びからトライグラムを切り出すため、
+      # LC_CTYPE=C では日本語のタイトルから 1 つもトライグラムが作られず、
+      # 検索用の GIN インデックスが丸ごと無効になる (ADR 0012 で実測)。
+      #
+      #   LC_CTYPE=C       : show_trgm('検証') = {}
+      #   LC_CTYPE=C.UTF-8 : show_trgm('検証') = {0x0b1253,osW,0x912f90}
+      #
+      # 上に挙げた 3 つの利点はすべて LC_COLLATE 側のものなので、
+      # 分けて指定すれば両立する。
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C.UTF-8"
+    command:
+      - postgres
+      # pg_stat_statements: クエリ単位の実行時間・呼び出し回数を集計する拡張。
+      #   「どのクエリが重いか」を実測して README に残すために有効化している。
+      # auto_explain: SQL 拡張ではなく共有ライブラリなので、
+      #   CREATE EXTENSION ではなくここで読み込む必要がある。
+      - -c
+      - shared_preload_libraries=pg_stat_statements,auto_explain
+      # 開発中は全クエリをログに出して、N+1 の発生を目視できるようにする。
+      # 本番でこの設定にするとログが爆発するので注意。
+      - -c
+      - log_statement=all
+      # 100ms 以上かかったクエリに実行計画を添えて出力する。
+      - -c
+      - auto_explain.log_min_duration=100ms
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./apps/go-api/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # pg_isready だけだと初期化スクリプト実行中でも通ってしまうため、
+      # 実際にクエリを投げて確認する。
+      test: ["CMD-SHELL", "pg_isready -U app -d bbs && psql -U app -d bbs -c 'SELECT 1' > /dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # 拡張を作って終了する使い捨てコンテナ。
+  #
+  # **db/init はボリュームの初回作成時にしか実行されない。**
+  # Phase 11 より前に作ったボリュームには pg_trgm が入っておらず、
+  # マイグレーション 000010 がガードで落ちる。しかも migrate は
+  # restart: on-failure なので、**最初に出した「make clean && make up して
+  # ください」は再試行のログに流され**、以後は golang-migrate の
+  # 「Dirty database version 10」しか見えなくなる (レビュー指摘)。
+  #
+  # 同じファイルをここでも流して、既存のボリュームにも行き渡らせる。
+  # CI も services: に initdb.d の口が無いため同じことをしており
+  # (.github/workflows/ci.yml)、3 者が同じファイルを見る形になる。
+  #
+  # **拡張の作成が運用の作業であること自体は変えていない** (ADR 0012)。
+  # 実行する主体が「初回起動の entrypoint」から「毎回走る使い捨てコンテナ」に
+  # 変わっただけで、内容は db/init/*.sql のままになる。
+  db-init:
+    image: postgres:17-alpine
+    volumes:
+      - ./apps/go-api/db/init:/init:ro
+    environment:
+      PGHOST: postgres
+      PGUSER: app
+      PGPASSWORD: password
+      PGDATABASE: bbs
+    # ON_ERROR_STOP=1 が無いと、途中で失敗しても psql が続行して
+    # 終了コード 0 を返す (seed と同じ理由)。
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'set -e; for f in /init/*.sql; do psql -v ON_ERROR_STOP=1 -f "$$f"; done'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # マイグレーションを実行して終了する使い捨てコンテナ。
+  # go-api はこれの正常終了を待ってから起動する。
+  migrate:
+    image: migrate/migrate:v4.18.1
+    volumes:
+      - ./apps/go-api/db/migrations:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://app:password@postgres:5432/bbs?sslmode=disable
+      - up
+    depends_on:
+      # 拡張を要する索引があるので、postgres が healthy なだけでは足りない。
+      db-init:
+        condition: service_completed_successfully
+    restart: on-failure
+
+  # 開発用のシードデータを投入して終了する使い捨てコンテナ。
+  #
+  # profiles が付いているので、通常の docker compose up では起動しない。
+  # seed.sql は先頭で TRUNCATE するため、既定で走らせると
+  # 「起動しただけで手入力のデータが消える」ことになる。
+  #
+  #   docker compose --profile seed up -d   起動と同時に投入する
+  #   docker compose run --rm seed          起動済みの環境に投入し直す (make seed)
+  seed:
+    image: postgres:17-alpine
+    profiles:
+      - seed
+    volumes:
+      - ./apps/go-api/db/seed:/seed:ro
+    # ON_ERROR_STOP=1 が無いと、途中の失敗で psql が続行し、
+    # BEGIN/COMMIT の中なので COMMIT が ROLLBACK に化けたうえで
+    # 終了コード 0 を返す。「成功したのに空のまま」を防ぐ。
+    command:
+      - psql
+      # sslmode=disable は migrate / go-api と揃えている。
+      # 省くと libpq の既定 (prefer) になり、postgres 側で SSL を
+      # 有効にした日に、このサービスだけ挙動が分岐する。
+      - postgres://app:password@postgres:5432/bbs?sslmode=disable
+      - -v
+      - ON_ERROR_STOP=1
+      - -f
+      - /seed/seed.sql
+    depends_on:
+      # テーブルが出来る前に流しても失敗する。
+      # postgres の healthy 待ちは migrate 側が済ませている。
+      migrate:
+        condition: service_completed_successfully
+
+  # S3 互換のオブジェクトストレージ (docs/adr/0007-image-storage.md 決定 4)。
+  #
+  # 本番は S3 + CloudFront を想定しており、アプリ側は S3 互換の
+  # インターフェースだけを見る。エンドポイントの差し替えで両方に対応できる。
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      # 9000 が S3 API、9001 が管理画面。
+      # 管理画面を開けているのは、アップロードされた実体を目で確認するため。
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      # mc ready はクラスタが要求を受けられる状態かを見る。
+      # **HTTP の /minio/health/live とは別物** (あちらはプロセスの生存だけ)。
+      # ここで mc を使えるのは、minio イメージが mc を同梱しているため。
+      #
+      # CI は同じイメージを services ではなく docker run で起動しており、
+      # 待ち合わせは curl で /minio/health/live を叩いている。
+      # **非対称なのは意図的**で、CI 側はランナーから叩くので
+      # コンテナ内のツールに依存させたくない。
+      #
+      # バケットの有無はどちらも見ない。それは下の minio-init が担保する。
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  # バケットを作って公開読み取りにする使い捨てコンテナ。
+  #
+  # **ローカルだけの妥協点。** 本番はバケットを公開せず、CloudFront の
+  # OAC 経由に限定する (ADR 0007 決定 4)。ここで anonymous download を
+  # 許しているのは、手元に CDN を立てないため。
+  # アプリが返す URL をブラウザでそのまま開けるようにしておく。
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    # mb は既に存在するとエラーになるので --ignore-existing を付ける。
+    # 付けないと 2 回目の up でこのコンテナが失敗し、
+    # depends_on の service_completed_successfully が満たされなくなる。
+    # **ログのバケットは公開しない。** 画像と違ってブラウザから直接
+    # 読ませるものではなく、中身は request_id や IP を含む
+    # (ADR 0010 の 4-5)。anonymous set download を掛けるのは
+    # bbs-images だけにする。
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/bbs-images &&
+      mc anonymous set download local/bbs-images &&
+      mc mb --ignore-existing local/bbs-logs
+      "
+
+  # 問い合わせメールの受け口 (docs/adr/0008-contact-and-mail.md)。
+  #
+  # **本物のメールは 1 通も外へ出ない。** Mailpit は受け取ったメールを
+  # 自分の中に溜めてブラウザで見せるだけで、どこへも転送しない。
+  # 手元で「実際に届いた内容」を目で確認できるようにするために置く ——
+  # ヘッダにユーザー入力が混ざっていないこと (決定 3) は、
+  # 最終的に届いたものを見るのがいちばん確実になる。
+  #
+  # 本番の理想構成は Amazon SES。差分は接続先と資格情報だけで、
+  # アプリ側は MailSender の背後にあるので変わらない。
+  # ただし **SES の初期状態はサンドボックス**で、検証済みアドレス以外へは
+  # 送れない (解除申請が前提。ADR 0008 の「引き受けるコスト」)。
+  mailpit:
+    image: axllent/mailpit:v1.21.8
+    ports:
+      # 1025 が SMTP、8025 が受信箱の画面。
+      # **画面を開けているのが要点。** ここを見ないと、送信が成功したのか
+      # 「成功したことにしただけ」なのか区別がつかない。
+      - "1025:1025"
+      - "8025:8025"
+    environment:
+      # 保存先をメモリだけにする。**溜めたメールは再起動で消える。**
+      # 手元の確認用なので永続化する理由がなく、
+      # 個人データを含む本文をボリュームに残さない側に倒す。
+      MP_MAX_MESSAGES: "500"
+      # 認証なしで受ける (MAIL_SMTP_USERNAME を空にしてあるのと対)。
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    healthcheck:
+      # **/readyz を叩く。** wget があるイメージなので curl は要らない。
+      # go-api が depends_on: service_healthy で待てるようにしておく ——
+      # 待たないと、起動直後の送信だけが必ず失敗する
+      # (失敗してもリトライで届くが、毎回 1 回目が落ちるのは調査の邪魔になる)。
+      test: ["CMD", "wget", "-qO-", "http://localhost:8025/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  # ログを集約して S3 互換ストレージへ流す (docs/adr/0010-log-pipeline.md)。
+  #
+  # 本番は ECS の FireLens がサイドカーとして同じ fluent-bit を動かす。
+  # ローカルは compose の fluentd ログドライバで forward に載せるため、
+  # **設定ファイルは本番と同じものを使える** (差分はエンドポイントだけ)。
+  #
+  # 【ポートをホストに公開している理由】
+  # ログドライバで接続するのは go-api コンテナではなく **docker daemon**
+  # なので、compose ネットワーク内の名前 (fluent-bit:24224) を解決できない。
+  # ホスト側のポートを見せて localhost:24224 で繋ぐ必要がある。
+  fluent-bit:
+    # **-debug タグを使う。** 通常のタグは distroless で sh も curl も無く、
+    # compose の healthcheck (コンテナ内でコマンドを実行する) が
+    # 「health: starting のまま永久に固まる」形で成立しない。
+    # 本番は FireLens が aws-for-fluent-bit を動かすので、
+    # この選択はローカルにしか影響しない。
+    image: fluent/fluent-bit:3.2.10-debug
+    volumes:
+      - ./infra/fluent-bit:/fluent-bit/etc:ro
+    environment:
+      # **UTC を明示する。** S3 のキー (dt/hour) はコンテナの TZ で決まるため、
+      # ここが JST になると Athena の partition projection の範囲と
+      # レコード内の time (UTC 固定) が 9 時間ずれる。
+      TZ: UTC
+      FB_LOG_LEVEL: info
+      LOG_BUCKET: bbs-logs
+      AWS_REGION: ap-northeast-1
+      # 実 S3 では空にする。MinIO のときだけ指定する。
+      LOG_S3_ENDPOINT: http://minio:9000
+      # **本番の値 (50M) とは変えている。** 手元で 50MB 貯まるのは現実的でない。
+      LOG_TOTAL_FILE_SIZE: 1M
+      LOG_UPLOAD_TIMEOUT: *log-upload-timeout
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+    ports:
+      - "24224:24224"
+    depends_on:
+      # バケットが無いと PutObject が 404 で失敗し続ける。
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # HTTP_Server On で生える健全性エンドポイント。
+      # **プロセスの生存だけでは足りない** —— 設定を読めていなくても
+      # fluent-bit は起動直後に落ちるとは限らない。
+      test: ["CMD", "curl", "-sf", "http://localhost:2020/api/v1/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # S3 に着地したログを SQL で読む使い捨てコンテナ
+  # (ADR 0010「ローカルでの再現」)。
+  #
+  # profiles が付いているので通常の up では起動しない。
+  # 使うのは make logs-query / make logs-verify から。
+  #
+  #   docker compose run --rm logs-query -c "SELECT ..."
+  #   docker compose run --rm --entrypoint python logs-query /opt/logs/verify.py
+  logs-query:
+    build:
+      context: ./infra/duckdb
+    profiles:
+      - tools
+    environment:
+      LOG_BUCKET: bbs-logs
+      LOG_S3_ENDPOINT: http://minio:9000
+      AWS_REGION: ap-northeast-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      # 検査が「ログが出揃うのを待つ」間隔の元になる。
+      # 出す側と同じ値を見る (冒頭のアンカーを参照)。
+      LOG_UPLOAD_TIMEOUT: *log-upload-timeout
+    # **TIME_WAIT のソケットを新しい接続に使い回す。**
+    #
+    # DuckDB の httpfs は、読むファイル 1 つにつき TCP 接続を 1 本張り、
+    # 使い回さない。エフェメラルポートは 28,232 個 (32768-60999) しかないので、
+    # **ログのファイルがそれを超えると、クエリの途中でポートが枯れる** ——
+    # `IO Error: Could not establish connection` として見える。
+    #
+    # 実測: これが無いと 28,231 本目で `Cannot assign requested address`。
+    # 有効にすると 40,000 本でも頭打ちにならない (TIME_WAIT が 13,500 で飽和)。
+    #
+    # ログが溜まるほど壊れる形なので、ファイル数を減らす対策では先送りにしかならない。
+    # 詳しくは infra/duckdb/logs_source.py の「接続の話」。
+    sysctls:
+      net.ipv4.tcp_tw_reuse: "1"
+    volumes:
+      # 保存したクエリを流し込めるようにする。
+      - ./infra/athena/queries:/queries:ro
+      # **列の単一の情報源。** DuckDB 側はこれをそのまま
+      # スキーマとして read_json に渡す (infra/duckdb/logs_source.py)。
+      # 写経すると、DDL に足した列を片方だけ足し忘れる。
+      - ./infra/athena/table.sql:/athena/table.sql:ro
+    depends_on:
+      minio:
+        condition: service_healthy
+
   go-api:
     build:
       context: ./apps/go-api
       dockerfile: Dockerfile
+      target: dev
     ports:
       - "8080:8080"
     volumes:
       - ./apps/go-api:/app
+      # ホストの GOPATH と混ざらないよう、モジュールキャッシュはボリュームに逃がす
+      - go-mod-cache:/go/pkg/mod
     environment:
-      - ENV=development
+      # **BBS_ENV から取る。** ENV は POSIX sh / ksh が起動スクリプトの
+      # パスに使う名前で、export している開発者が存在しうる。
+      # ${ENV:-development} にすると、その環境では make up が
+      # **勝手に production 扱い**になり、SECURE_COOKIE も既定で true に
+      # 倒れて、素の http://localhost:3000 で
+      # **ブラウザが Cookie を黙って捨てる** (下の SECURE_COOKIE の注記どおり)。
+      #
+      # go-api が読むのは ENV のままなので、渡す側の名前だけ分けている。
+      ENV: ${BBS_ENV:-development}
+      # **ENV とは別に指定する** (ADR 0010「実装して分かったこと 1」)。
+      #
+      # ENV=development の既定はテキスト形式 (人間が読む用) だが、
+      # それを fluent-bit に流すと**パーサが 1 行も展開できない** ——
+      # logfmt は JSON ではないため、log キーが文字列のまま S3 に着地する。
+      # 手元でパイプラインを検証しても、本番と違う形を検証したことになる。
+      #
+      # ここを json にすると、手元のログも本番と同じ形になる。
+      # 読みにくさは `docker compose logs fluent-bit` で払う。
+      #
+      # **外から差し替えられるようにしてある。** make logs-verify の検査が
+      # 実際に効くかは、壊してみないと分からない:
+      #
+      #   LOG_FORMAT=text make logs-verify   → 落ちれば検査が効いている
+      #
+      # COMMENT_POST_MODE を差し替えて並行制御を実測するのと同じ考え方になる。
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      ADDR: ":8080"
+      DATABASE_URL: postgres://app:password@postgres:5432/bbs?sslmode=disable
+      # 接続プールの上限 (docs/adr/0009-scaling-strategy.md の「実測」)。
+      #
+      # **既定値をここに書かない。** config 側が既定を持つ。
+      # COMMENT_POST_MODE と同じで、両方に書くと二重管理になる。
+      #
+      # 外へ出しているのは、**スループットが接続数のどこで折り返すかを
+      # 実測するため** (make scale-probe)。VIEW_COUNT_FLUSH_SECONDS を
+      # 出しているのと同じ理由になる。
+      DB_MAX_CONNS: ${DB_MAX_CONNS:-}
+      DB_MIN_CONNS: ${DB_MIN_CONNS:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      # X-Forwarded-For を信じてよい送信元 (ADR 0009 / server.go の SetTrustedProxies)。
+      #
+      # **既定は空 (= 誰も信じない)。** 素の make up にはプロキシが居ないので、
+      # ClientIP は接続元アドレスそのもので正しい。
+      #
+      # エッジ (make up-https) を前に置くと話が逆転する。**全員が
+      # Caddy コンテナの IP になる** ため、問い合わせのレート制限
+      # (既定 5 件/時) が誰か 5 人で使い切られ、その 1 時間は全員 429 になる。
+      # main.go:110 の trusted_proxies_unset は本番でしか出ないので、
+      # 開発中は警告すら出ないまま壊れる。
+      #
+      # make https-verify がこの両側を実測する。
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      # Cookie に Secure 属性を付けるか (ADR 0005 の Cookie 属性)。
+      #
+      # **ENV とは別に指定する** —— LOG_FORMAT / COMMENT_POST_MODE と同じ理由。
+      # 「localhost は HTTP だから開発中は付けられない」は、エッジ
+      # (infra/caddy) を置いた時点で前提が変わった。https://localhost で
+      # 動かしているのに Secure が外れたままだと、**開発環境だけが本番と違う
+      # Cookie を配る**ことになり、Secure 起因の不具合が手元で再現しない。
+      #
+      # **既定値をここに書かない。** config 側 (parseSecureCookie) が
+      # 未設定を「ENV から決める」として扱う。両方に既定を書くと二重管理になる。
+      #
+      # make up-https は true を渡す。素の make up (http) で true にすると
+      # **ブラウザが Cookie を黙って捨てて、ログインだけが失敗する。**
+      SECURE_COOKIE: ${SECURE_COOKIE:-}
+      # コメント投稿の並行制御の方式 (docs/adr/0019-comment-concurrency.md 決定 2)。
+      # ssi / pessimistic / unique / naive。
+      #
+      # ここを外から差し替えられるようにしているのは、
+      # make concurrency-probe が同一バイナリのままモードを切り替えて
+      # 実測するため。naive は ENV=development でしか選べない。
+      #
+      # **既定値をここに書かない。** config 側 (parseCommentPostMode) が
+      # 未設定を unique として扱う。両方に既定を書くと二重管理になり、
+      # 実際に食い違った —— compose だけ ssi のままで、
+      # 本番既定であるはずの unique がスモークを一度も通っていなかった。
+      COMMENT_POST_MODE: ${COMMENT_POST_MODE:-}
+      # 閲覧数の反映方式 (docs/adr/0006-view-count-and-popularity.md)。
+      # buffered / sync。**sync は Phase 4 の比較専用**で、
+      # ENV=development でしか選べない (config が弾く)。
+      #
+      # COMMENT_POST_MODE と同じく、**既定値をここに書かない。**
+      # 両方に既定を書くと二重管理になり、実際に食い違った経緯がある。
+      VIEW_COUNT_MODE: ${VIEW_COUNT_MODE:-}
+      # フラッシュ間隔と重複抑制の窓。ベンチマークで振るために外へ出す。
+      VIEW_COUNT_FLUSH_SECONDS: ${VIEW_COUNT_FLUSH_SECONDS:-}
+      VIEW_COUNT_DEDUPE_SECONDS: ${VIEW_COUNT_DEDUPE_SECONDS:-}
+      # 認証 (Google OIDC)。
+      # 値はここに書かず、リポジトリ直下の .env から補間する (.gitignore 済み)。
+      # 未設定でも API は起動し、ログインの 2 経路だけが 503 になる。
+      # セッションの検証は設定に依らず動く (ADR 0005 決定 4)。
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      AUTH_REDIRECT_URL: ${AUTH_REDIRECT_URL:-http://localhost:8080/auth/google/callback}
+      AUTH_FRONTEND_URL: ${AUTH_FRONTEND_URL:-http://localhost:3000}
+      # 最初の管理者。値はここに書かず .env から補間する (ADR 0011 決定 1)
+      BOOTSTRAP_ADMIN_GOOGLE_SUB: ${BOOTSTRAP_ADMIN_GOOGLE_SUB:-}
+      # 画像のストレージ (ADR 0007)。
+      # 揃っていなければ画像の経路だけが 503 になる。
+      S3_BUCKET: bbs-images
+      S3_REGION: ap-northeast-1
+      # 実 S3 では空にする。MinIO のときだけ指定する。
+      S3_ENDPOINT: http://minio:9000
+      # MinIO は path-style が必要 (bucket.localhost は名前解決できない)。
+      S3_USE_PATH_STYLE: "true"
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      # **ブラウザから見える URL にする。** コンテナ内の名前 (minio:9000) を
+      # 入れると、API は動くのに <img src> が解決できない。
+      # API はこの値をそのまま絶対 URL として返す (ADR 0007 決定 5)。
+      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL:-http://localhost:9000/bbs-images}
+      # 問い合わせメール (ADR 0008)。
+      #
+      # **揃っていなければ送信ワーカーだけが登録されない。**
+      # 受付 (POST /contact) は動き続け、未送信として溜まる ——
+      # 画像やログインの「経路ごと 503」とは扱いが違う。
+      # 設定漏れで 503 にすると、その間の問い合わせが失われるため。
+      MAIL_SMTP_HOST: mailpit
+      MAIL_SMTP_PORT: "1025"
+      # **STARTTLS は付けない。** Mailpit は平文で受ける。
+      # 本番 (SES) では MAIL_SMTP_STARTTLS=true と資格情報が要る。
+      MAIL_SMTP_STARTTLS: "false"
+      # 差出人と運営の宛先は**こちら側の固定値**。利用者が入力したアドレスは
+      # ヘッダに入らない (決定 2・決定 3)。
+      #
+      # **no-reply@ にしない。** ログイン済みの問い合わせには
+      # 登録アドレス宛に控えが飛ぶので、差出人が返信不可だと
+      # 「自分の問い合わせではない」と気づいた人の返す先が無くなる。
+      MAIL_FROM: contact@bbs.example.com
+      MAIL_TO: ops@bbs.example.com
+      # 送信の間隔。**既定 (60 秒) より短くしてある** ——
+      # 手元で確認するときに 1 分待つのは長い。
+      # 本番の既定値を compose に書き写しているわけではない
+      # (COMMENT_POST_MODE のように既定を二重管理しないため、
+      #  ここは「手元だけ短くする」という別の意図で明示している)。
+      CONTACT_DISPATCH_INTERVAL_SECONDS: "10"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      # メールの受け口も先に立てる (ADR 0008)。
+      # **待たなくても壊れない** —— 送信は失敗してもリトライされる。
+      # それでも待つのは、起動直後の 1 回目だけが必ず失敗する状態が
+      # ログを読むときの雑音になるため。
+      mailpit:
+        condition: service_healthy
+      # ログの受け口を先に立てる。**これだけでは足りない** ——
+      # 接続するのは docker daemon なので、compose の依存関係とは別の層になる。
+      # 取りこぼしを許す設定 (fluentd-async) を下で併用している。
+      fluent-bit:
+        condition: service_healthy
+    # ログを fluent-bit へ転送する (ADR 0010 決定 1)。
+    #
+    # **これを入れると `docker compose logs go-api` は空になる。**
+    # stdout がログドライバに横取りされるため。アプリのログは
+    # `docker compose logs fluent-bit` (= CloudWatch の代役) で見る。
+    # make logs はこの差を吸収してある。
+    #
+    # 【fluentd-async が必須】
+    # 既定では、コンテナ起動時に fluentd へ接続できないと
+    # **コンテナの起動そのものが失敗する。** ログの受け口が落ちている
+    # だけで API が起動しないのは本末転倒なので、非同期接続にして
+    # 「繋がるまでは捨てる」側に倒す。ADR 0010 決定 5 の
+    # 「ログは at-most-once であり、欠落しうる」と同じ判断になる。
+    logging:
+      driver: fluentd
+      options:
+        fluentd-address: localhost:24224
+        fluentd-async: "true"
+        # 再接続の間隔と上限。上限に達しても捨てるだけで、API は動き続ける。
+        fluentd-retry-wait: "1s"
+        fluentd-max-retries: "30"
+        tag: go-api
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
 
   next-app:
     build:
       context: ./apps/next-app
       dockerfile: Dockerfile
+      # **dev ステージを明示する** (go-api と同じ)。
+      # Dockerfile に prod ステージを足したので、指定しないと
+      # 最終ステージ (本番ビルド) が使われ、ホットリロードが効かなくなる。
+      target: dev
     ports:
       - "3000:3000"
     volumes:
@@ -21,7 +556,88 @@ services:
       - /app/node_modules
       - /app/.next
     environment:
-      - NODE_ENV=development
-      - NEXT_PUBLIC_API_URL=http://go-api:8080
+      NODE_ENV: development
+      # Server Components はコンテナ内から叩くのでサービス名で解決する
+      API_URL: http://go-api:8080
+      # ブラウザから叩く経路はホスト側のポートを見る
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8080}
     depends_on:
-      - go-api
+      go-api:
+        condition: service_started
+
+  # ローカルの擬似 AWS における「エッジ」= TLS 終端 + パス振り分け。
+  # 本番構成 (docs/infrastructure.md) の CloudFront + ALB に相当する。
+  #
+  # profiles が付いているので通常の up では起動しない:
+  #
+  #   make up-https      https://localhost ごと起動する
+  #   make https-verify  プロキシ配下でしか通らない分岐を実測する
+  #
+  # **既存の経路を塞がない。** 8080 / 3000 の公開はそのままなので、
+  # make up での開発は今までどおり http のまま動く。
+  # 置き換えではなく、本番同型の経路を「もう 1 本」足している。
+  edge:
+    # **@latest にしない** (Makefile 冒頭のツール固定と同じ理由)。
+    # 2 系の最新は v2.11.4 (2026-08-24 確認)。
+    image: caddy:2.11.4-alpine
+    profiles:
+      - edge
+    ports:
+      # 80 は https へのリダイレクト専用 (Caddy が自動で張る)。
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-localhost}
+      # 既定は max-age=0 (= 記憶しない)。理由は Caddyfile に書いてある ——
+      # HSTS はポートを区別しないので、localhost に付けると
+      # http://localhost:3000 での開発まで巻き添えで止まる。
+      #
+      # **この行を消すと、Caddyfile 側の {$HSTS:max-age=0} が
+      # 既定にフォールバックして動くように見える** —— だが
+      # HSTS="..." を渡しても届かなくなり、逃がし道が黙って死ぬ。
+      HSTS: ${HSTS:-max-age=0}
+      # X-Forwarded-Proto の値。既定は https (エッジが必ず TLS 終端するため)。
+      #
+      # **既定値をここに書く必要がある。** Caddyfile 側にも {$XFP:https} と
+      # 書いてあるが、Caddy の環境変数の既定は「**未設定**なら既定値」であって、
+      # 空文字は空文字のまま採用される。ここを ${XFP:-} にすると
+      # 空の X-Forwarded-Proto が go-api に届き、selfOrigin() が
+      # http:// を組み立てて **全書き込みが 403 になる** (実測済み)。
+      #
+      # XFP=http にすると同じ壊れ方を意図的に起こせる。make https-verify が使う。
+      XFP: ${XFP:-https}
+    volumes:
+      - ./infra/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # **発行した CA と証明書を永続化する。** 消すと CA が変わるので、
+      # ブラウザに入れた信頼 (make trust-ca) をやり直すことになる。
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      go-api:
+        condition: service_started
+      next-app:
+        condition: service_started
+      minio:
+        condition: service_started
+    healthcheck:
+      # 自己署名なので --no-check-certificate が要る。
+      # ここで検証したいのは「エッジが応答するか」だけで、
+      # 証明書の中身は make https-verify が別に見る。
+      #
+      # **URL を localhost で決め打ちしない。** Caddyfile のサイトは
+      # {$SITE_ADDRESS:localhost} の 1 つだけなので、
+      # SITE_ADDRESS=bbs.localhost で立てると Host: localhost に
+      # 一致するサイトが無く 404 になり、**edge が永久に unhealthy** になる。
+      test:
+        - CMD-SHELL
+        - wget --no-check-certificate -qO- "https://$${SITE_ADDRESS:-localhost}/edge-healthz"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres-data:
+  go-mod-cache:
+  minio-data:
+  caddy-data:
+  caddy-config:

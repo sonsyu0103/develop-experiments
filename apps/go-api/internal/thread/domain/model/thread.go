@@ -1,19 +1,128 @@
+// Package model は掲示板スレッドのドメインモデルを定義します。
 package model
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+	"unicode/utf8"
 
-// Thread は掲示板の「スレッド」そのものを表す構造体です
+	"github.com/google/uuid"
+
+	"develop-experiments/apps/go-api/internal/apperr"
+)
+
+// TitleMaxLength はスレッドタイトルの最大文字数です。
+// DB 側の CHECK 制約 (threads_title_length) と必ず同じ値にしてください。
+// アプリ側でも検証するのは、DB 到達前に 400 を返して無駄な往復を避けるためです。
+const TitleMaxLength = 200
+
+// Thread は掲示板の「スレッド」を表すエンティティです。
 type Thread struct {
-	ID        int       // スレッドを一意に識別する背番号
-	Title     string    // スレッドのタイトル
-	CreatedAt time.Time // このスレッドが作られた日時
+	ID    int64
+	Title string
+	// AuthorID は投稿者の内部 ID です。**nil が匿名を意味します**
+	// (docs/adr/0005-authentication.md 決定 2)。
+	// 書き込み時に使う値で、API には出しません。
+	//
+	// **読み出し経路では埋まりません。** 一覧・詳細のクエリは author_id を
+	// 選ばず、代わりに JOIN 済みの Author を返すためです。
+	// 「匿名かどうか」の判定に読み出し側でこれを使わないでください
+	// (常に nil に見えます)。判定は Author が nil かどうかで行います。
+	AuthorID *int64
+	// Author は表示用の投稿者情報です。読み出し時に解決されます。
+	// 匿名投稿では nil になります。
+	Author *Author
+	// IconImageID はスレッドアイコンの画像 ID です。**nil が「なし」を意味します**。
+	// 書き込み時に使う値で、読み出し経路では埋まりません (AuthorID と同じ)。
+	IconImageID *uuid.UUID
+	// Icon は表示用のアイコンです。設定されていなければ nil になります。
+	//
+	// **image モジュールの型は使いません** (ADR 0004 / ADR 0014 の Author と同じ形)。
+	Icon      *Image
+	CreatedAt time.Time
+	// ViewCount は閲覧数です (docs/adr/0006-view-count-and-popularity.md)。
+	//
+	// **正確な値ではありません。** 計上はアプリのメモリ上で行い、
+	// 一定間隔でまとめて反映するため、最大でその間隔ぶん遅れます。
+	// プロセスが異常終了すればバッファ内の増分は消えます。
+	//
+	// 表示用の指標であり、課金や順位の確定には使いません。
+	//
+	// **書き込み経路では埋まりません。** 作成時は必ず 0 で、
+	// 加算はフラッシュだけが行います。
+	ViewCount int64
 }
 
-// NewThread は、新しいスレッドの「実体」を作って、その「住所」を返す関数です
-func NewThread(id int, title string) *Thread {
+// Image は表示用のスレッドアイコンです。
+//
+// **URL ではなくオブジェクトキーを持ちます。** URL の組み立ては
+// 環境ごとの設定を要するため、ドメインの外で行います
+// (docs/adr/0007-image-storage.md 決定 5)。
+type Image struct {
+	ID        uuid.UUID
+	ObjectKey string
+	Width     int
+	Height    int
+}
+
+// NewImage は永続化層が読み出した行からアイコンを組み立てます。
+// id がゼロ値なら nil を返します (LEFT JOIN が成立しなかった場合)。
+func NewImage(id uuid.UUID, objectKey string, width, height int) *Image {
+	if id == uuid.Nil {
+		return nil
+	}
+	return &Image{ID: id, ObjectKey: objectKey, Width: width, Height: height}
+}
+
+// Summary は一覧表示用に、スレッドとそのコメント数を組にした値です。
+type Summary struct {
+	Thread
+	CommentCount int64
+}
+
+// NewThread は永続化前の新しいスレッドを組み立てます。
+// ID と CreatedAt は DB が採番するため、ここでは設定しません。
+//
+// authorID が nil なら匿名投稿になります。匿名投稿を残すのは決定事項です
+// (docs/adr/0005-authentication.md 決定 2)。
+//
+// **アイコンは認証済みでなければ設定できません** (ADR 0007 の背景)。
+// 匿名の作成に iconImageId が付いていたら、無視ではなくエラーにします ——
+// 利用者からは「設定したのに消えた」としか見えないためです。
+func NewThread(title string, authorID *int64, iconImageID *uuid.UUID) (*Thread, error) {
+	title = strings.TrimSpace(title)
+
+	if title == "" {
+		return nil, fmt.Errorf("タイトルが空です: %w", apperr.ErrInvalidArgument)
+	}
+	// バイト数ではなく文字数で数える。DB 側の char_length() と揃えるため。
+	if n := utf8.RuneCountInString(title); n > TitleMaxLength {
+		return nil, fmt.Errorf(
+			"タイトルが長すぎます (%d 文字, 上限 %d 文字): %w",
+			n, TitleMaxLength, apperr.ErrInvalidArgument,
+		)
+	}
+
+	if iconImageID != nil && authorID == nil {
+		return nil, fmt.Errorf(
+			"アイコンを設定するにはログインが必要です: %w", apperr.ErrUnauthenticated)
+	}
+
+	return &Thread{Title: title, AuthorID: authorID, IconImageID: iconImageID}, nil
+}
+
+// Reconstruct は永続化層から読み出した値でスレッドを復元します。
+// 保存済みのデータが対象なので、検証は行いません。
+func Reconstruct(
+	id int64, title string, author *Author, icon *Image, createdAt time.Time, viewCount int64,
+) *Thread {
 	return &Thread{
 		ID:        id,
 		Title:     title,
-		CreatedAt: time.Now(), // 今この瞬間の時刻をセット
+		Author:    author,
+		Icon:      icon,
+		CreatedAt: createdAt,
+		ViewCount: viewCount,
 	}
 }

@@ -1,0 +1,438 @@
+-- name: ListCommentsByThreadID :many
+-- thread_id を等値で指定しているため、HASH パーティションの pruning が効き、
+-- 8 分割中 1 パーティションだけを走査する。
+--
+-- 【なぜスレッドの存在確認を同じクエリに含めないか】
+-- 「存在しないスレッド」と「コメント 0 件のスレッド」を 1 クエリで
+-- 区別するには、threads を駆動表にした LEFT JOIN LATERAL が必要になる。
+-- しかしその形ではコメント側の列が NULL になりうるのに対し、
+-- sqlc は LEFT JOIN の NULL 許容を推論できず int64 / string を生成する
+-- (実測: コメント 0 件のスレッドで comment_id と author_name が NULL 返却)。
+-- 結果として Scan が実行時に失敗する。
+--
+-- 往復 1 回を節約するために実行時エラーの危険を持ち込むのは割に合わないため、
+-- 存在確認は呼び出し側 (CommentInteractor) の別クエリに分けている。
+-- どちらも主キー / 部分インデックスで完結する軽いクエリである。
+--
+-- 【投稿者は LEFT JOIN で解決する (ADR 0014 の選択肢 A)】
+-- **LEFT であることが必須。** INNER にすると匿名コメントが消える。
+--
+-- ADR 0014 は「コメント一覧では選択肢 B (一括取得) が勝つ可能性がある」と
+-- 書いている。同じ人が連投すると、同じ投稿者の情報が最大 100 行ぶん
+-- 重複して転送されるため。初手は A で揃え、B (ListAuthorsByIDs) との
+-- 比較は Phase 4 のベンチマークで行う。
+WITH page AS (
+    SELECT id, thread_id, seq, author_name, body, created_at, author_id, image_id
+    FROM comments
+    WHERE thread_id = sqlc.arg('thread_id')
+      AND deleted_at IS NULL
+      AND (sqlc.narg('cursor_id')::bigint IS NULL OR id < sqlc.narg('cursor_id')::bigint)
+    ORDER BY id DESC
+    LIMIT sqlc.arg('page_size')
+)
+SELECT
+    p.id,
+    p.thread_id,
+    p.seq,
+    p.author_name,
+    p.body,
+    p.created_at,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at,
+    -- 添付画像も LEFT JOIN で解決する。
+    -- **LEFT であることが必須** (INNER にすると画像なしのコメントが消える)。
+    -- 参照は部分索引 comments_image_id_idx を使う。
+    i.id         AS image_id,
+    i.object_key AS image_object_key,
+    i.width      AS image_width,
+    i.height     AS image_height
+FROM page p
+LEFT JOIN users u ON u.id = p.author_id
+-- **実体が無い画像は結合しない** (レビュー指摘)。
+--   status = 'deleted'          モデレーターが消した。回収バッチが S3 から実体を消す
+--   object_reclaimed_at IS NOT NULL  回収済み。実体はもう無い
+-- どちらも URL を返すと、ブラウザには壊れた画像が出る。
+-- **条件は ON に置くこと。** WHERE に置くと LEFT が INNER に化けて、
+-- 画像なしの行 (大多数) が消える。
+--
+-- ADR 0016 問題 3 は「画像は削除されました」と「元から画像なし」を
+-- 区別するために行を残すと決めているが、**その区別を表す API の項目がまだ無い。**
+-- Phase 10 後半で削除の UI を入れるとき、ここを status の受け渡しに変える。
+LEFT JOIN images i ON i.id = p.image_id
+    AND i.status <> 'deleted' AND i.object_reclaimed_at IS NULL
+ORDER BY p.id DESC;
+
+-- name: ListMyComments :many
+-- 自分が書いたコメントの一覧 (GET /me/comments)。
+--
+-- 【このクエリは 8 区画すべてを走る。このリポジトリで唯一の形】
+-- comments は HASH(thread_id) の 8 分割で、**author_id には区画キーが
+-- 含まれない**。ListCommentsByThreadID が 1 区画で済むのに対し、
+-- こちらは pruning が効かず 8 区画すべてに索引スキャンが走る
+-- (ADR 0016 のインデックス設計)。
+--
+-- 【実測して、索引は足さないと決めた】 make query-probe の 5 番。
+-- 20 万コメント / 投稿数が最多の利用者 (1,600 件) の中央値:
+--
+--   自分のコメント 先頭ページ      1.52 ms / buffers 78 / 区画 8
+--   自分のコメント 深いページ      1.10 ms / buffers 57 / 区画 8
+--   スレッド内のコメント一覧 (比較) 0.16 ms / buffers  6 / 区画 1
+--
+-- **9.6 倍・バッファ 13 倍**の差があり、ADR 0016 の「桁で違う」は当たっていた。
+-- **が、絶対値 1.5 ms は一覧として問題にならない。**
+-- comments_author_id_desc_idx (000002 で外部キー用に作成済み) で足りる。
+--
+-- 深いページのほうが速いのは、カーソルで各区画の走査が短くなるため。
+-- 先頭ページは 8 区画それぞれから 20 件読んで併合し、20 件だけ残す。
+--
+-- 【実際に流して分かったこと 1: 効くのは実行時間だけではない】
+-- この文を実 DB で EXPLAIN すると、**計画時間が実行時間を上回る。**
+--
+--   このクエリ (8 区画)          計画 6.0 ms / 実行 1.44 ms
+--   ListCommentsByThreadID (1 区画) 計画 2.6 ms / 実行 0.20 ms
+--
+-- 区画を絞れないと**計画の段階でも 8 枚ぶんを見に行く** (計画時の
+-- バッファ読み取り 1,630)。3 回流しても値は動かないので、
+-- カタログのキャッシュ待ちではない。
+--
+-- **アプリ経路では問題にならない。** pgx が拡張問い合わせプロトコルで
+-- 文をキャッシュするため、計画は接続ごとに 1 回で済む。
+-- ただし「1.5 ms の一覧」という理解は実行時間だけの話であり、
+-- 計画を含めた初回は数 ms 高い。psql で測ると両方が乗る。
+--
+-- 【実際に流して分かったこと 2: threads の結合は全走査になる】
+-- 下の JOIN は「20 件に絞ってから」掛かるが、**planner は threads の
+-- 主キーを 20 回引かず、2,000 行を Seq Scan して Hash Join する**
+-- (buffers 25。全体 78 のうち約 3 分の 1)。
+--
+-- この規模では 20 回のランダムアクセスより連続読みのほうが安い、
+-- という判断で、**誤りではない。** ただしこの部分の costs は
+-- ページの件数ではなく **threads の行数に比例して増える。**
+-- スレッドが桁で増えたら、ここは nested loop + 主キーに変わるはずで、
+-- 変わらなければ結合のヒントか分割の見直しを考える。
+-- **次に測るならここになる。**
+--
+-- 【threads は「生きているものだけ」を LEFT JOIN する】
+-- **コメント自体は削除済みスレッドのものも返す。** 除外すると、自分の
+-- コメントが「消えた」のか「元から無い」のか本人に区別できなくなる。
+--
+-- **ただしタイトルは返さない (レビュー指摘)。**
+-- 初版は INNER JOIN で t.title をそのまま返していた。「伏せると自分が
+-- 何に書いたのか分からなくなる」という理由だったが、**モデレーションの
+-- 経路を見落としていた。**
+--
+-- タイトル自体が誹謗中傷や個人情報だったためにスレッドを消した場合、
+-- この API はそのタイトルを**書き込んだ全員のマイページに残し続ける。**
+-- GET /threads/{id} が 404 を返すので、**ここが削除後にタイトルを
+-- 読める唯一の経路**になってしまう。
+--
+-- 表示の都合より、消したものが消えることを優先する ——
+-- 画像を status = 'deleted' で結合しないのと同じ姿勢になる。
+-- 本人が失うのは「どのスレッドか」だけで、自分が書いた本文は残る。
+--
+-- **アプリ層ではなく SQL で落とすこと。** 上の層で捨てる形にすると、
+-- 別の呼び出し口が増えたときに漏れる経路が残る。
+--
+-- 【なぜ CASE ではなく ON の条件でやるか】
+-- `CASE WHEN t.deleted_at IS NULL THEN t.title END` でも同じ値になるが、
+-- **sqlc の型推論がそれを扱えない。**
+--
+--   CASE のまま      -> interface{} (型が付かない)
+--   ::text を付ける  -> string (**非 NULL。NULL が来ると Scan が実行時に落ちる**)
+--
+-- これはこのファイルの冒頭で警告している罠と同じもの。
+-- 一方 LEFT JOIN の列は *string と推論される (投稿者・画像と同じ)。
+-- **結合の条件で表現するほうが、型として安全な形になる。**
+--
+-- 削除の判定も同じ結合から採れるので、threads を 2 回引く必要もない
+-- (t.id IS NULL がそのまま「削除済み」を意味する)。
+-- thread_id は NOT NULL の外部キーで、スレッドは論理削除しかしない
+-- (行は消えない) ため、**結合が空振りする原因は削除以外に無い。**
+--
+-- 【JOIN は 20 件に絞ったあとに掛ける】
+-- 内側の CTE に混ぜると、絞り込む前の全行に対して結合が走る
+-- (一覧クエリと同じ)。
+--
+-- 【author_name / author は返さない】
+-- 投稿者は常に自分なので、行ごとに持たせる意味が無い。
+-- API 側も MyComment には author を置いていない。
+--
+-- 【author_id を表名で修飾しているのは sqlc の都合】
+-- 裸で書くと sqlc の生成が「ambiguous」で落ちる。
+-- 理由は threads.sql の ListMyThreadsWithCommentCount に書いた。
+-- **外すと make generate が落ちる。**
+WITH page AS (
+    SELECT id, thread_id, seq, body, created_at, image_id
+    FROM comments
+    WHERE comments.author_id = sqlc.arg('actor_id')
+      AND deleted_at IS NULL
+      AND (sqlc.narg('cursor_id')::bigint IS NULL OR id < sqlc.narg('cursor_id')::bigint)
+    ORDER BY id DESC
+    LIMIT sqlc.arg('page_size')
+)
+SELECT
+    p.id,
+    p.thread_id,
+    p.seq,
+    p.body,
+    p.created_at,
+    -- 生きているスレッドのタイトルだけ。削除済みでは NULL になる
+    -- (結合が空振りするため)。上記「タイトルは返さない」を参照。
+    t.title AS thread_title,
+    -- 結合が空振りした = 削除済み。IS NULL は NULL を返さないので非 NULL。
+    (t.id IS NULL)::boolean AS thread_deleted,
+    i.id         AS image_id,
+    i.object_key AS image_object_key,
+    i.width      AS image_width,
+    i.height     AS image_height
+FROM page p
+LEFT JOIN threads t ON t.id = p.thread_id AND t.deleted_at IS NULL
+-- 実体が無い画像は結合しない (ListCommentsByThreadID と同じ理由)。
+LEFT JOIN images i ON i.id = p.image_id
+    AND i.status <> 'deleted' AND i.object_reclaimed_at IS NULL
+ORDER BY p.id DESC;
+
+-- name: NextCommentSeq :one
+-- スレッド内の次のレス番号を求める。**Phase 2 の題材の中心** (ADR 0019 決定 1)。
+--
+-- この 1 文は comments_thread_id_seq_idx の逆順スキャン 1 回で終わる。
+-- 速いが、**速さは正しさと関係がない** —— 同時に実行した 2 つの
+-- トランザクションは、どちらも同じ値を読む。
+-- 読んだ値が有効であり続けることを保証するのは、呼び出し側の
+-- 分離レベル (SERIALIZABLE) か明示ロック (LockThreadForUpdate) になる。
+--
+-- deleted_at で絞らないのは、削除されたコメントの番号を再利用しないため
+-- (ADR 0019 決定 5)。再利用すると過去の >>5 が別の投稿を指すようになる。
+--
+-- ::int で明示的にキャストしているのは、COALESCE(MAX(...), 0) + 1 の
+-- 型推論が sqlc 側で interface{} に落ちるのを避けるため。
+SELECT (COALESCE(MAX(seq), 0) + 1)::int AS next_seq
+FROM comments
+WHERE thread_id = sqlc.arg('thread_id');
+
+-- name: CreateCommentWithSeq :one
+-- レス番号を呼び出し側が決めて挿入する。
+-- ssi / pessimistic / naive の 3 モードが共有する (ADR 0019 決定 2)。
+--
+-- **親スレッドの存在確認をこの文に含めていない。**
+-- 3 モードはいずれもトランザクションの中で、先に threads を読んでいる
+-- (SERIALIZABLE では述語ロック、悲観ロックでは FOR UPDATE)。
+-- ここで WHERE EXISTS を重ねると、
+--   - SERIALIZABLE では同じ読み取りを 2 回行うだけ
+--   - 「0 行が返る」原因が「スレッドが無い」と「採番が衝突した」の
+--     2 通りになり、呼び出し側でエラーを取り違える
+-- 存在確認をどこでやるかは、モードごとに呼び出し側が持つ。
+--
+-- 投稿者の解決は 1 往復に含める。RETURNING は挿入行しか返せないので
+-- CTE で包んで LEFT JOIN する (threads.sql の CreateThread と同じ理由)。
+WITH inserted AS (
+    INSERT INTO comments (thread_id, seq, author_name, body, author_id, image_id)
+    VALUES (
+        sqlc.arg('thread_id'),
+        sqlc.arg('seq'),
+        sqlc.arg('author_name'),
+        sqlc.arg('body'),
+        sqlc.narg('author_id'),
+        sqlc.narg('image_id')
+    )
+    RETURNING id, thread_id, seq, author_name, body, created_at, author_id, image_id
+), attached AS (
+    -- **画像を「添付済み」にするのは、投稿を作るのと同じ 1 文の中で行う** (000007)。
+    -- 分けると「コメントは作られたが添付の記録が無い」窓ができ、
+    -- そこに回収バッチが入ると参照中の画像の実体を消してしまう。
+    --
+    -- inserted を参照しているので、挿入が 0 行なら何も更新しない。
+    -- こちらは VALUES なので必ず 1 行入るが、下の CreateCommentAutoSeq と
+    -- 形を揃えておく (片方だけ別の書き方だと、直すときに見落とす)。
+    UPDATE images
+    SET attached_at = now()
+    WHERE id = (SELECT image_id FROM inserted)
+      AND attached_at IS NULL
+      -- **確保済みの画像は添付済みにしない** (レビュー指摘)。
+      -- EnsureOwned はロックを取らない読み取りなので、
+      -- 「確認したあと・書く前」に回収バッチが確保する窓がある。
+      -- この UPDATE は images の行ロックで待たされてから最新版を読むため、
+      -- ここに条件を置くと確保を追い越せない。
+      AND object_reclaimed_at IS NULL
+)
+SELECT
+    i.id,
+    i.thread_id,
+    i.seq,
+    i.author_name,
+    i.body,
+    i.created_at,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS image_id,
+    img.object_key AS image_object_key,
+    img.width      AS image_width,
+    img.height     AS image_height
+FROM inserted i
+LEFT JOIN users u ON u.id = i.author_id
+LEFT JOIN images img ON img.id = i.image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL;
+
+-- name: CreateCommentAutoSeq :one
+-- 採番と挿入を 1 文で行う。unique モード専用 (ADR 0019 決定 2)。
+--
+-- **1 文にしても競合は消えない。** 集約はスナップショットから計算されるため、
+-- 同時に走った 2 つの文は同じ MAX(seq) を読む。
+-- 違うのは「衝突したことが必ず一意制約違反 (23505) として返る」点であり、
+-- 呼び出し側がそれをリトライすることで正しさが保たれる。
+-- READ COMMITTED のまま 1 往復で済むので、実務ではこれが最も安い。
+--
+-- 【HAVING であって WHERE ではない】
+-- 親スレッドの生存確認を WHERE に置くと壊れる。
+-- WHERE は集約の**入力行**を絞るため、スレッドが削除済みでも
+-- 入力 0 行の集約が 1 行 (MAX = NULL) を返し、seq = 1 で挿入されてしまう。
+-- HAVING は集約後の 1 行を絞るので、意図どおり 0 行になる。
+-- 0 行のときは pgx.ErrNoRows として 404 に翻訳される。
+--
+-- 【23505 の制約名は子パーティションのもの】
+-- パーティション親に張った comments_thread_id_seq_idx への違反は、
+-- 実際には子の索引で検出されるため、SQLSTATE 23505 が返すのは
+-- **comments_p5_thread_id_seq_idx のような子の名前**になる (実測)。
+-- 親の名前だけで一致を見るとリトライ判定が永久に偽になり、
+-- unique モードが競合のたびに 409 を返すようになる。
+WITH inserted AS (
+    INSERT INTO comments (thread_id, seq, author_name, body, author_id, image_id)
+    SELECT
+        sqlc.arg('thread_id'),
+        COALESCE(MAX(c.seq), 0) + 1,
+        sqlc.arg('author_name'),
+        sqlc.arg('body'),
+        sqlc.narg('author_id'),
+        sqlc.narg('image_id')
+    FROM comments c
+    WHERE c.thread_id = sqlc.arg('thread_id')
+    HAVING EXISTS (
+        SELECT 1 FROM threads
+        WHERE id = sqlc.arg('thread_id') AND deleted_at IS NULL
+    )
+    RETURNING id, thread_id, seq, author_name, body, created_at, author_id, image_id
+), attached AS (
+    -- **画像を「添付済み」にするのは、投稿を作るのと同じ 1 文の中で行う** (000007)。
+    -- 分けると「コメントは作られたが添付の記録が無い」窓ができ、
+    -- そこに回収バッチが入ると参照中の画像の実体を消してしまう。
+    --
+    -- **inserted を参照しているので、挿入が 0 行なら何も更新しない。**
+    -- CreateCommentAutoSeq は親スレッドが消えていると 0 行になる ——
+    -- そこで画像を添付済みにすると、投稿されていないのに
+    -- 二度と回収されない孤児が残る。
+    UPDATE images
+    SET attached_at = now()
+    WHERE id = (SELECT image_id FROM inserted)
+      AND attached_at IS NULL
+      -- **確保済みの画像は添付済みにしない** (レビュー指摘)。
+      -- EnsureOwned はロックを取らない読み取りなので、
+      -- 「確認したあと・書く前」に回収バッチが確保する窓がある。
+      -- この UPDATE は images の行ロックで待たされてから最新版を読むため、
+      -- ここに条件を置くと確保を追い越せない。
+      AND object_reclaimed_at IS NULL
+)
+SELECT
+    i.id,
+    i.thread_id,
+    i.seq,
+    i.author_name,
+    i.body,
+    i.created_at,
+    u.public_id    AS author_public_id,
+    u.display_name AS author_display_name,
+    u.avatar_url   AS author_avatar_url,
+    u.deleted_at   AS author_deleted_at,
+    img.id         AS image_id,
+    img.object_key AS image_object_key,
+    img.width      AS image_width,
+    img.height     AS image_height
+FROM inserted i
+LEFT JOIN users u ON u.id = i.author_id
+LEFT JOIN images img ON img.id = i.image_id
+    AND img.status <> 'deleted' AND img.object_reclaimed_at IS NULL;
+
+-- name: SoftDeleteOwnComment :execrows
+-- 投稿者が自分のコメントを論理削除する (ADR 0005 の権限モデル / ADR 0003 未決 #7)。
+--
+-- 条件と、0 行だった理由を別に引く事情は
+-- threads.sql の SoftDeleteOwnThread と同じ。
+--
+-- 【thread_id が要る】
+-- **主キーが (thread_id, id) なので、先頭列が無いと 8 パーティション
+-- すべてを走査する。** 副次的に「他スレッドのコメント ID を渡しても
+-- 当たらない」が成立する。
+--
+-- 【レス番号は消さない】
+-- 行が残るので seq も残り、次の投稿は削除された番号の次から続く
+-- (ADR 0019 決定 5)。再利用すると過去の >>5 が別の投稿を指す。
+UPDATE comments
+SET deleted_at = now()
+WHERE thread_id = sqlc.arg('thread_id')
+  AND id = sqlc.arg('id')
+  AND author_id = sqlc.arg('actor_id')
+  AND deleted_at IS NULL;
+
+-- name: CommentOwnership :one
+-- 削除が 0 行だったときに、その理由を答える。用途は ThreadOwnership と同じ。
+-- **::boolean が要る。** 付けないと sqlc が型を推論できず、
+-- 生成される戻り値が interface{} になる (実測)。
+SELECT COALESCE(author_id = sqlc.arg('actor_id'), false)::boolean AS owned
+FROM comments
+WHERE thread_id = sqlc.arg('thread_id')
+  AND id = sqlc.arg('id')
+  AND deleted_at IS NULL;
+
+-- name: SoftDeleteComment :execrows
+-- **投稿者を見ない削除。** モデレーターの経路
+-- (POST /moderation/actions) がこれを使う ——
+-- 匿名投稿も消せる必要があるため (ADR 0011 決定 2)。
+--
+-- 本人による削除は SoftDeleteOwnComment のほう。
+-- ADR 0003 の未決 #7 は Phase 10 後半で解決済み。
+UPDATE comments
+SET deleted_at = now()
+WHERE thread_id = sqlc.arg('thread_id')
+  AND id = sqlc.arg('id')
+  AND deleted_at IS NULL;
+
+-- name: LockThreadForUpdate :one
+-- スレッド行に行ロックを取る。**pessimistic モードの起点** (ADR 0019 決定 2)。
+--
+-- 同じスレッドへの投稿をこの 1 行で直列化する。
+-- レス番号の採番はこのロックを取ったあとに行うため、
+-- 「読んだ MAX(seq) が他トランザクションに書き換えられる」ことが起きない。
+--
+-- 行が返らない場合は「スレッドが無い / 論理削除済み」であり、
+-- 存在確認をこの 1 文が兼ねている。
+--
+-- **ロックの対象が threads であって comments でないことが重要。**
+-- 採番は「まだ存在しない行」を巡る競合なので、コメント側の行ロックでは防げない
+-- (ロックできる行が無い)。親を掴んで範囲ごと直列化する必要がある。
+--
+-- SSI (SERIALIZABLE) を使うならこの明示ロックは不要だが、
+-- 悲観ロック版と楽観 (SSI) 版のスループット差を計測するために両方用意している。
+SELECT id
+FROM threads
+WHERE id = sqlc.arg('id')
+  AND deleted_at IS NULL
+FOR UPDATE;
+
+-- name: CommentExists :one
+-- コメントが存在し、論理削除されていないかを返す。
+--
+-- **通報の対象を確かめるために要る** (ADR 0011 決定 4)。
+-- 確かめずに積むと、存在しない ID の通報でキューを埋められる。
+--
+-- thread_id が要るのは主キーが (thread_id, id) だから ——
+-- 無いと 8 パーティションすべてを走査する。
+-- 通報のリクエストが threadId を受け取るのは、この検査のためでもある。
+SELECT EXISTS (
+    SELECT 1 FROM comments
+    WHERE thread_id = sqlc.arg('thread_id')
+      AND id = sqlc.arg('id')
+      AND deleted_at IS NULL
+);

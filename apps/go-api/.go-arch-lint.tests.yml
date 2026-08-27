@@ -1,0 +1,399 @@
+# テストコードへの緩和を含む版。.go-arch-lint.yml との差は deps だけ。
+#
+# 「テストファイルだけを対象にする」ことはできない
+# (excludeFiles は Go の正規表現 = RE2 で、否定先読みが無い) ため、
+# このファイルは本体コードにも適用される。本体には厳しい方
+# (.go-arch-lint.yml) も同時に適用されるので、実質「テストにだけ緩和が効く」
+# 形になる。depguard の 本体用 / 緩和用 の対と同じ構造。
+#
+# **片方だけを編集しないこと。** 本体用から許可を減らしても、
+# こちらに残っていればテストからは通ってしまう。
+# 設計の背景は docs/adr/0017-arch-lint-and-depguard.md
+version: 3
+workdir: .
+
+allow:
+  deepScan: false
+
+vendors:
+  gin:
+    in: github.com/gin-gonic/gin
+  pgx:
+    in: github.com/jackc/pgx/**
+  openapi:
+    in:
+      - github.com/getkin/kin-openapi/**
+      - github.com/oapi-codegen/**
+  errgroup:
+    in: golang.org/x/sync/**
+  uuid:
+    in: github.com/google/uuid
+  oidc:
+    in:
+      - github.com/coreos/go-oidc/**
+      - golang.org/x/oauth2
+      - golang.org/x/oauth2/**
+  aws-s3:
+    in:
+      - github.com/aws/aws-sdk-go-v2/**
+      # smithy-go は SDK が返すエラーの共通インターフェース。
+      # DeleteObject のエラーは *smithy.GenericAPIError になるため、
+      # 「対象が無い」の判定にこちらが要る (s3.go の isNotFound)
+      - github.com/aws/smithy-go
+  imaging:
+    in:
+      - golang.org/x/image/**
+      - github.com/HugoSmits86/nativewebp
+
+components:
+  main:
+    in: cmd/api
+
+  # 負荷生成 (Phase 4 / .github/scripts/scale-probe.py)。
+  # **本番バイナリには入らない。** Dockerfile の本番ターゲットは
+  # cmd/api だけをビルドする。標準ライブラリしか使わないので deps は書かない
+  # (プロジェクトのどの層にも依存しない = 依存の向きを壊しようがない)。
+  loadgen:
+    in: tools/loadgen
+
+  shared-apperr:
+    in: internal/apperr
+  shared-pagination:
+    in: internal/pagination
+  # 冪等キー (docs/adr/0015-idempotency.md)。
+  # HTTP 層でヘッダを読み、永続化層で記録するため、pagination と同じく横断する
+  shared-idempotency:
+    in: internal/idempotency
+  shared-config:
+    in: internal/config
+  # 構造化ログの共通フィールドと相関 ID (docs/adr/0010-log-pipeline.md 決定 4)。
+  # どの層からもログを出すため、下地として扱う
+  shared-logging:
+    in: internal/logging
+  # 定期処理 (docs/adr/0003-open-questions.md 未決 #9 の決定: API プロセス内)。
+  # **Job の中身は知らない。** 束ねて回すだけで、実処理は main が渡す
+  shared-scheduler:
+    in: internal/scheduler
+  # 閲覧数のバッファ (docs/adr/0006-view-count-and-popularity.md)。
+  # 本体用と同じく commonComponents には入れない ——
+  # 「ついでに閲覧数を足す」経路を作れる形にしないため。
+  viewcount:
+    in: internal/viewcount
+
+  thread-model:
+    in: internal/thread/domain/model
+  thread-repository:
+    in: internal/thread/domain/repository
+  thread-usecase:
+    in: internal/thread/usecase
+
+  comment-model:
+    in: internal/comment/domain/model
+  comment-repository:
+    in: internal/comment/domain/repository
+  comment-usecase:
+    in: internal/comment/usecase
+
+  image-model:
+    in: internal/image/domain/model
+  image-repository:
+    in: internal/image/domain/repository
+  image-usecase:
+    in: internal/image/usecase
+
+  user-model:
+    in: internal/user/domain/model
+  user-repository:
+    in: internal/user/domain/repository
+  user-usecase:
+    in: internal/user/usecase
+
+  # モデレーション (docs/adr/0011-moderation.md)。
+  # 通報とモデレーション記録は thread / comment / image のいずれにも属さない
+  # 横断的な関心事で、どれかに寄せると他の 2 つへの参照が要る
+  moderation-model:
+    in: internal/moderation/domain/model
+  moderation-repository:
+    in: internal/moderation/domain/repository
+  moderation-usecase:
+    in: internal/moderation/usecase
+
+  # 問い合わせ (docs/adr/0008-contact-and-mail.md)
+  contact-model:
+    in: internal/contact/domain/model
+  contact-repository:
+    in: internal/contact/domain/repository
+  contact-usecase:
+    in: internal/contact/usecase
+
+  httpapi:
+    in: internal/httpapi
+  httpapi-oapigen:
+    in: internal/httpapi/oapigen
+
+  postgres:
+    in: internal/infrastructure/postgres
+  oidc-provider:
+    in: internal/infrastructure/oidc
+  object-storage:
+    in: internal/infrastructure/objectstorage
+  # メール送信 (ADR 0008 決定 3)。SMTP を知ってよいのはここだけ
+  mail-sender:
+    in: internal/infrastructure/mail
+  postgres-sqlcgen:
+    in: internal/infrastructure/postgres/sqlcgen
+
+commonComponents:
+  - shared-apperr
+  - shared-pagination
+  - shared-idempotency
+  - shared-logging
+
+deps:
+  main:
+    anyProjectDeps: true
+    canUse:
+      - gin
+
+  # Author が投稿者の公開 ID (public_id) を持つため uuid を許可する。
+  # 内部 ID は運ばない (docs/adr/0014-author-resolution.md)
+  thread-model:
+    canUse:
+      - uuid
+  thread-repository:
+    mayDependOn:
+      - thread-model
+  thread-usecase:
+    canUse:
+      # N+1 比較実装 (interactor_nplus1.go) が errgroup を使う
+      - errgroup
+      # AuthorDTO が公開 ID を持つ。アイコンの ID も uuid
+      - uuid
+      # 緩和: Phase 4 のベンチマーク (nplus1_live_bench_test.go) が
+      # 接続プールを自前で組み立てる。**測定条件として MaxConns を
+      # 固定する必要がある**ため、postgres.NewPool 越しには作れない
+      # (あちらは config.Config の値を使う)
+      - pgx
+    mayDependOn:
+      - thread-model
+      - thread-repository
+      # 緩和: 実 DB を使う統合テストを usecase 層に置けるようにする。
+      # 直列化失敗 (SQLSTATE 40001) はフェイクでは再現できない (Phase 2)
+      - postgres
+
+  comment-model:
+    canUse:
+      - uuid
+  comment-repository:
+    mayDependOn:
+      - comment-model
+  comment-usecase:
+    canUse:
+      # AuthorDTO が公開 ID を持つ
+      - uuid
+    mayDependOn:
+      - comment-model
+      - comment-repository
+      # 緩和: 同上
+      - postgres
+
+  # user モジュール。public_id (UUID v7) の採番をドメイン側で行うため uuid を許可する
+  image-model:
+    canUse:
+      - uuid
+  image-repository:
+    canUse:
+      - uuid
+    mayDependOn:
+      - image-model
+  # 画像のユースケース。**再エンコードはここで行う** ——
+  # ドメインに置くと、ドメインが画像ライブラリを知ることになる。
+  # S3 SDK は入らない (保存先は ObjectStorage の背後)
+  image-usecase:
+    canUse:
+      - uuid
+      - imaging
+    mayDependOn:
+      - image-model
+      - image-repository
+
+  user-model:
+    canUse:
+      - uuid
+  user-repository:
+    canUse:
+      - uuid
+    mayDependOn:
+      - user-model
+  # 認証のユースケース。OIDC プロバイダはインターフェースの背後に置くので、
+  # ここから go-oidc / oauth2 は見えない (テストでフェイクに差し替えるため)
+  user-usecase:
+    canUse:
+      - uuid
+    mayDependOn:
+      - user-model
+      - user-repository
+
+  # モデレーション (docs/adr/0011-moderation.md)。
+  # **他モジュールのドメイン型を知らない。** 削除の口は
+  # 「int64 / uuid.UUID を受け取るインターフェース」として
+  # moderation 側で定義し、postgres が実装する。
+  # thread / comment / image を mayDependOn に足すと、
+  # 横断的な関心事として切り出した意味が無くなる
+  # **deps を宣言しない。** import するのは apperr (commonComponents) と
+  # 標準ライブラリだけで、許可すべきものが 1 つも無い。
+  # 空の mayDependOn は go-arch-lint がエラーにする
+  # 画像の ID が UUID なので uuid が要る。他は int64
+  moderation-repository:
+    canUse:
+      - uuid
+    mayDependOn:
+      - moderation-model
+  moderation-usecase:
+    canUse:
+      # 画像 ID の解釈 (uuid.Parse)。**正規化した表現を記録に書く**ため、
+      # 文字列のまま扱うわけにはいかない
+      - uuid
+    mayDependOn:
+      - moderation-model
+      - moderation-repository
+
+  # 問い合わせ (docs/adr/0008-contact-and-mail.md)。
+  # **user モジュールを知らない** —— 匿名でも問い合わせできるため、
+  # 投稿者は *int64 としてだけ運ぶ。
+  #
+  # **緩和していない。** 受付も送信もフェイクのリポジトリと
+  # フェイクの MailSender で検査できる (実際にメールを送るテストは書かない)。
+  contact-repository:
+    mayDependOn:
+      - contact-model
+  contact-usecase:
+    mayDependOn:
+      - contact-model
+      - contact-repository
+
+  # 外側のアダプタ。contact が定義した MailSender を実装する。
+  # **テストでもここだけが SMTP を知る。** ただしテストは
+  # メッセージの組み立て (buildMessage) だけを見るので、
+  # 実際に SMTP を話す相手は要らない
+  #
+  # 【contact-model をテストにだけ許している理由】
+  # 控えの宛先 (repository.AutoReply.To) が model.VerifiedEmail で、
+  # **入力されたアドレスをここへ渡せないこと**が決定 2 の防御そのもの
+  # (ADR 0008)。値を作れるのが contact-model なので、
+  # 控えの送信を検査するテストはこれを import せざるをえない。
+  #
+  # **本体コードは今も contact-model を知らない。** 受け取った値の
+  # String() を呼ぶだけで、型名を書く場所が 1 つも無い ——
+  # 本体用の .go-arch-lint.yml は緩和していないので、
+  # 知り始めた日にそちらが落ちる。
+  mail-sender:
+    mayDependOn:
+      - contact-repository
+      - contact-model
+      - shared-config
+
+  # 外側のアダプタ。usecase が定義した Provider を実装する
+  # テストでも SDK を知ってよいのはここだけ。
+  # 実 MinIO に対する検証をこのパッケージ内で行うため、
+  # 本体用と同じ許可のままにしてある (緩和しない)。
+  object-storage:
+    canUse:
+      - aws-s3
+    mayDependOn:
+      - image-repository
+      - shared-config
+
+  oidc-provider:
+    canUse:
+      - oidc
+    mayDependOn:
+      - user-usecase
+      - shared-config
+
+  httpapi:
+    canUse:
+      - gin
+      - openapi
+      # リクエスト ID の採番 (ADR 0010 の 4-1) と、
+      # フェイクの user-repository を組むために必要。
+      # 以前は後者だけの緩和で「本体用では許可しない」と書いていたが、
+      # 相関 ID の採番で本体側にも入ったため、いまは両方で許可している
+      - uuid
+    mayDependOn:
+      - thread-usecase
+      - comment-usecase
+      - user-usecase
+      - user-model
+      - image-usecase
+      # モデレーション。ハンドラは Actor を組み立て、操作の種類を解釈するため
+      # usecase だけでなく model も見る (ロールの判定は user-model 側)
+      - moderation-usecase
+      - moderation-model
+      # 問い合わせの受付 (ADR 0008)
+      - contact-usecase
+      - httpapi-oapigen
+      - shared-config
+      # 閲覧を数える (ADR 0006)。**ここは DB に触らない**
+      - viewcount
+      # 緩和: ハンドラのテストはフェイクのリポジトリを組むため
+      # ドメインの型を必要とする。ここを縛るとテストのために本番コードが歪む。
+      # 一方 postgres は許していない —— テストでも永続化層には触らせない
+      - thread-model
+      - thread-repository
+      - comment-model
+      - comment-repository
+      # 認証のテストも同じ理由でフェイクを組む。
+      # user-repository のインターフェースを満たす必要があり、
+      # その署名に uuid.UUID が出てくるため vendors も要る。
+      - user-repository
+      # 画像も同じ。アップロードのテストは ImageRepository と
+      # ObjectStorage のフェイクを組む。
+      # **本体用には足していない** —— ハンドラがドメインの型を持つと、
+      # 内部表現がそのまま JSON に出る経路ができる (実際に一度踏んで、
+      # 用途の検証を usecase 層へ移した)。
+      - image-model
+      - image-repository
+      # モデレーションも同じ。削除のテストは Repository のフェイクを組む。
+      # **本体用には足していない** —— ハンドラは usecase の DTO だけを見る
+      - moderation-repository
+      # 問い合わせも同じ。受付のテストは ContactRepository のフェイクを組む。
+      # **contact-model も要る** —— Save が受け取る Submission を
+      # フェイク側で検査するため
+      - contact-repository
+      - contact-model
+
+  postgres:
+    canUse:
+      - pgx
+      - uuid
+    mayDependOn:
+      - thread-model
+      - thread-repository
+      - comment-model
+      - comment-repository
+      - user-model
+      - user-repository
+      - image-model
+      - image-repository
+      # 削除の口と記録をまとめて実装する (ModerationRepository)。
+      # 削除と記録を同じトランザクションに収めるため、1 つの実体が
+      # 4 つのインターフェースを満たす
+      - moderation-model
+      - moderation-repository
+      # 問い合わせ。SKIP LOCKED の検査は実 DB でしかできないため、
+      # このパッケージ内に live テストを置く
+      - contact-model
+      - contact-repository
+      - postgres-sqlcgen
+      - shared-config
+
+  # 生成物。import は生成器が決めるので、必要なベンダだけ許可する
+  httpapi-oapigen:
+    canUse:
+      - gin
+      - openapi
+  postgres-sqlcgen:
+    canUse:
+      - pgx
+      - uuid

@@ -5,14 +5,56 @@ out/
 build/
 *.tsbuildinfo
 
+# Next が実行モードに応じて書き換えるため、コミットすると差分が延々と出る。
+#   next dev   → import "./.next/dev/types/routes.d.ts"
+#   next build → import "./.next/types/routes.d.ts"
+# Next 公式はコミットを推奨しているが、ここだけ外す。
+# next-env.d.ts と .next の両方が無い状態 (CI のクリーンチェックアウト相当) でも
+# `npx tsc --noEmit` が通ることを実測して確認済み。
+next-env.d.ts
+
+# Playwright の実行成果物 (レポート・trace・スクリーンショット)。
+# 落ちたときの調査には要るが、コミットするものではない。
+playwright-report/
+test-results/
+blob-report/
+
 # Go のバイナリやノイズを遮断
 bin/
 dist/
 /apps/go-api/docs/
+# カバレッジプロファイル
+*.out
 
 # OSが勝手に作る透明なファイル
 .DS_Store
-Thmubs.db
+Thumbs.db
 
-# 環境変数の秘密ファイル（もし今後作っても大丈夫なように）
+# 環境変数の秘密ファイル
+# .env.example はコミットする (雛形なので)
+.env
 .env*.local
+
+# Terraform (infra/terraform)
+#
+# **tfstate は秘密として扱う。** DB のパスワードを Terraform に
+# 生成させているので (random_password)、state に平文で入る。
+# backend を local にしている以上、ここで遮断するしかない
+# (docs/adr/0024-aws-deployment.md 決定 1)。
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# 実際の値を入れた tfvars。**雛形 (.example) はコミットする。**
+*.tfvars
+!*.tfvars.example
+
+# **.terraform.lock.hcl はコミットする** (無視しない)。
+# プロバイダのバージョンを固定するファイルで、
+# Makefile 冒頭でツールを固定しているのと同じ役割になる。
+
+# スクリーンショットの元にした一時ファイル。**画像そのものはコミットする**
+# (docs/images/*.png は README が参照している)。
+docs/images/*.tmp

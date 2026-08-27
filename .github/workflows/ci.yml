@@ -1,63 +1,638 @@
-name: Continuous Integration
+name: CI Pipeline
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, develop ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main, develop ]
+
+# 同じブランチに続けて push したとき、古い実行を打ち切る
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # **patch まで固定する。**
+  #
+  # 初版は '1.25' + check-latest だった。しかし check-latest が見るのは
+  # actions/go-versions の manifest であって go.dev ではない。
+  # **Go 側で脆弱性が公表されてから manifest に載るまでに時差があり**、
+  # その間 govulncheck (exit 3) だけが落ちて CI が赤くなる。
+  # 実際に 1.25.13 の公開当日、manifest は 1.25.12 のままだった。
+  #
+  # setup-go は manifest に無いバージョンを go.dev から取りにいくので、
+  # patch まで書けば公表と同時に上げられる。
+  # 他のツール (GOLANGCI_LINT_VERSION など) と同じ扱いになる ——
+  # 更新は「意図した変更」としてコミットに残す。
+  GO_VERSION: '1.25.13'
+  NODE_VERSION: '22'
+  # バージョンを固定する理由:
+  #   @latest だと、リンタ側のルール追加で CI が突然赤くなる。
+  #   更新は「意図した変更」としてコミットに残したい。
+  GOLANGCI_LINT_VERSION: v2.12.2
+  SQLC_VERSION: v1.31.1
+  OAPI_CODEGEN_VERSION: v2.8.0
+  GO_ARCH_LINT_VERSION: v1.17.0
+  # MinIO とそのクライアント。compose.yaml と同じタグに揃える
+  # (docs/adr/0007-image-storage.md)
+  MINIO_VERSION: RELEASE.2025-04-22T22-12-26Z
+  MC_VERSION: RELEASE.2025-04-16T18-13-26Z
+  # Terraform も同じ扱い。infra/terraform/versions.tf の
+  # required_version (~> 1.10) を満たす範囲で固定する。
+  TERRAFORM_VERSION: 1.15.8
 
 jobs:
-  # --------------------------------------------------------
-  # 1. Go バックエンドのテストジョブ
-  # --------------------------------------------------------
-  go-backend-test:
-    name: Go Backend Test (-race)
+  # --------------------------------------------------
+  # Terraform Checks
+  # --------------------------------------------------
+  #
+  # **AWS には触らない。** fmt と validate だけを見る。
+  # plan には認証が要るうえ、実行のたびに state を読むことになるので
+  # CI では回さない (docs/adr/0024-aws-deployment.md)。
+  #
+  # 落とせるのはこの範囲:
+  #   - 書式のブレ
+  #   - 参照の不整合 (存在しないリソースを参照している)
+  #   - 型の不一致、必須引数の欠落
+  #
+  # **落とせないもの**もはっきりさせておく ——
+  # IAM ポリシーが実際に足りるか、SG が本当に通るかは apply して
+  # make tf-verify を回すまで分からない。
+  terraform-ci:
+    name: Terraform Checks
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          # ラッパーを無効にする。有効だと標準出力に余計な装飾が入り、
+          # 失敗時のログが読みにくくなる。
+          terraform_wrapper: false
+
+      - name: Check formatting
+        run: terraform -chdir=infra/terraform fmt -check -recursive -diff
+
+      - name: Initialize (without backend)
+        # **backend を使わずに初期化する。**
+        # backend は local なので CI に state は無い。
+        # ここで見たいのはプロバイダの解決と構成の妥当性だけになる。
+        run: terraform -chdir=infra/terraform init -backend=false
+
+      - name: Validate
+        run: terraform -chdir=infra/terraform validate
+
+  # --------------------------------------------------
+  # Go Backend Checks
+  # --------------------------------------------------
+  go-ci:
+    name: Go Checks
+    runs-on: ubuntu-latest
+    # **上限が無いと、詰まったステップが 6 時間 (GitHub の既定) 走る。**
+    #
+    # 実測の最長は 3m17s。ただし**それはツールのキャッシュが当たった実行だけ**で、
+    # Install Go tools は直近 60 run すべて skipped —— **golangci-lint を
+    # ソースからビルドする経路は一度も測れていない** (レビュー指摘)。
+    # 鍵のバージョンを上げた日・7 日で失効した日に初めて通る。
+    # 測れていない経路を締め上げると、その日の PR が永続的に赤くなるので広く取る。
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ./apps/go-api
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
           cache-dependency-path: apps/go-api/go.sum
 
-      - name: Install dependencies
-        run: |
-          cd apps/go-api
-          go mod download
+      - name: Download Go modules
+        run: go mod download
 
-      - name: Run Race Hazard Test
+      - name: Verify go.mod is tidy
         run: |
-          cd apps/go-api
-          go test -v -race ./...
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum \
+            || (echo "go.mod / go.sum が最新ではありません。'go mod tidy' を実行してコミットしてください。"; exit 1)
 
-  # --------------------------------------------------------
-  # 2. Next.js フロントエンドのテストジョブ
-  # --------------------------------------------------------
-  next-frontend-test:
-    name: Next.js Frontend Type Check
+      # ツールはバージョンを固定しているので、ビルド済みのバイナリを
+      # そのまま再利用できる。キーに @latest のものを含めてはいけない
+      # (govulncheck は毎回入れ直す。下のステップを参照)
+      - name: Cache Go tools
+        id: cache-go-tools
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: gotools-${{ runner.os }}-${{ runner.arch }}-golangci${{ env.GOLANGCI_LINT_VERSION }}-archlint${{ env.GO_ARCH_LINT_VERSION }}
+
+      # Go のバージョンはキーに含めていない。ここで作るのは実行可能な
+      # バイナリであり、Go を上げても動くため。上げるたびに作り直すと
+      # キャッシュの意味が薄れる
+      - name: Install Go tools
+        if: steps.cache-go-tools.outputs.cache-hit != 'true'
+        run: |
+          export GOTOOLCHAIN=auto
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${{ env.GOLANGCI_LINT_VERSION }}
+          go install github.com/fe3dback/go-arch-lint@${{ env.GO_ARCH_LINT_VERSION }}
+
+      - name: Run golangci-lint
+        run: golangci-lint run ./...
+
+      # モジュール境界とレイヤの依存方向は golangci-lint ではなく
+      # go-arch-lint で検査する (許可リスト方式)。
+      # 経緯は docs/adr/0017-arch-lint-and-depguard.md
+      - name: Run go-arch-lint
+        run: |
+          go-arch-lint check
+          go-arch-lint check --arch-file .go-arch-lint.tests.yml
+
+      # 「落ちるはずのものが通る」状態を検出する。
+      # 設定を読んだだけでは検査の正しさを判断できないため、
+      # 意図的な違反を置いて実測する
+      - name: Verify architecture probes
+        # このジョブの既定は apps/go-api なので、明示的にリポジトリ直下へ戻す
+        working-directory: ${{ github.workspace }}
+        run: .github/scripts/arch-probe.sh
+
+      # ログの msg がイベント名になっているかを、ソースを見て検査する
+      # (docs/adr/0010-log-pipeline.md の 4-2)。
+      #
+      # **ログ基盤の検証で CI に載るのはここだけ。** パイプライン全体
+      # (fluent-bit → S3 → Athena) の検証は実環境が要り、CI では API を
+      # コンテナではなくランナー上で直接起動しているため、
+      # fluentd ログドライバの経路そのものを再現できない。
+      # 実測は手元の make logs-verify が担う (README の「ログ基盤」節)。
+      #
+      # 実行時の検査では、呼ばれなかった経路のログを見られない。
+      # こちらはソースを見るので、エラー経路のログも対象になる。
+      - name: Verify log event names
+        working-directory: ${{ github.workspace }}
+        run: .github/scripts/verify-log-events.py
+
+      # CHECK 制約と、それを守る検査の対応を見る。
+      #
+      # 値そのものは各ドメインの Go テストが突き合わせているが、
+      # **テストは自分の不在を検出できない。** 書き忘れた制約を
+      # 拾えるのはこちらだけになる (ADR 0003 #8)。
+      - name: Verify constraint checks
+        working-directory: ${{ github.workspace }}
+        run: .github/scripts/verify-constraint-checks.py
+
+      # **上の 2 つが「落とすべきものを落とす」かを実測する。**
+      #
+      # 検査は壊れても出力が変わらない —— 何も検出できない状態でも
+      # 「OK」と出て、このジョブは緑になる。実際に verify-log-events.py
+      # には「壊しても終了コード 0」の穴が 2 つ空いていた (2026-08-24)。
+      #
+      # arch-probe と同じ位置づけで、こちらはソースを読む静的検査を見る。
+      - name: Probe the checkers
+        working-directory: ${{ github.workspace }}
+        run: .github/scripts/checker-probe.py
+
+      - name: Run Vulnerability Check (govulncheck)
+        # 脆弱性データベースは新しいほうが良いので、ここだけは latest を使う。
+        # そのためキャッシュの対象にせず、毎回入れ直す。
+        # ~/go/bin がキャッシュから復元されていても、この go install が
+        # 上書きするので古いバイナリが残ることはない
+        run: |
+          export GOTOOLCHAIN=auto
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Run Go Tests with Race Detector
+        run: go test -v -race -cover ./...
+
+      # 手書きロジックのカバレッジが下限を割ったら落とす。
+      #
+      # 生成コード (oapigen / sqlcgen)、実 DB / 実 IdP に依存する
+      # infrastructure/、起動と結線だけの cmd/ は計測から外している。
+      # 全体で率を出すと、生成コードのために意味のないテストを書く圧力が生まれる。
+      # 対象と下限は Makefile の cover ターゲットを参照。
+      - name: Check test coverage of hand-written code
+        working-directory: .
+        run: make cover
+
+  # --------------------------------------------------
+  # Next.js Frontend Checks
+  # --------------------------------------------------
+  next-ci:
+    name: Next.js Checks
     runs-on: ubuntu-latest
-
+    # **このジョブが実際に 6 時間持っていかれた** (下の Playwright の節)。
+    # 正常時は 1m30s〜2m30s。詰まる先を apt から外したうえで、
+    # **ブラウザの取得にもステップ側の上限を置く** ——
+    # ジョブの枠だけだと、詰まったときに他のステップの余地まで食う。
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ./apps/next-app
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
           cache-dependency-path: apps/next-app/package-lock.json
 
       - name: Install dependencies
-        run: |
-          cd apps/next-app
-          npm ci
+        run: npm ci
 
-      - name: Run Type Compilation Test
+      - name: TypeScript Type Check
+        run: npx tsc --noEmit
+
+      # Next.js 16 で `next lint` は削除されたため、eslint を直接呼ぶ。
+      # 設定は apps/next-app/eslint.config.mjs (フラット設定)。
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      # 管理画面は**状態遷移の検査を型でもビルドでも代替できない**。
+      # レビューで出た指摘 6 件のうち 4 件がその領域だった
+      # (古い応答が新しい一覧に混ざる、削除の二重送信が通る、など)。
+      #
+      # **実バックエンドは使わない。** 応答は page.route で差し替えるので、
+      # Go API も Postgres も MinIO も要らず、このジョブに閉じる。
+      # 理由は apps/next-app/playwright.config.ts に書いてある。
+      - name: Resolve Playwright version
+        id: playwright
         run: |
-          cd apps/next-app
-          npm run test:types
+          version=$(node -p "require('@playwright/test/package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # ブラウザは 100 MB 近くある。**バージョンとブラウザ集合を鍵にする。**
+      #
+      # バージョンだけを鍵にすると、パッケージを据え置いたまま
+      # playwright.config.ts に firefox を足した日に**鍵が変わらない**。
+      # 下の取得が skip され、`Executable doesn't exist` で落ちる
+      # —— しかも 7 日の失効かパッケージ更新まで自力で直らない (レビュー指摘)。
+      #
+      # **restore と save を分けている。** 一体の actions/cache は
+      # ジョブの最後に保存するため、**この後の e2e が落ちるとブラウザを
+      # 取り直した分が捨てられる。** 取得できた時点で保存する。
+      - name: Restore Playwright browsers
+        id: playwright-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-${{ hashFiles('apps/next-app/playwright.config.ts') }}
+
+      # **--with-deps を付けない。** ぶれの原因は apt だと実測で確定した。
+      #
+      # 3 桁ぶれた実行 (69s / 503s / 21,580s) は**どれもキャッシュヒット**で、
+      # ヒット時にブラウザは取得されない —— つまりその時間はすべて
+      # --with-deps が走らせる apt にかかっていた。
+      #
+      # 決め手はこのログ (run 32216157115):
+      #
+      #   Ign: http://azure.archive.ubuntu.com/ubuntu noble InRelease   ← 到達不能
+      #   ...
+      #   04:34:12 Get:5 https://archive.ubuntu.com/ubuntu noble-security InRelease
+      #   （7 分 34 秒 無音）
+      #   04:41:46 ##[error]The action has timed out after 8 minutes.
+      #
+      # **apt-get update が黙って固まり、ブラウザの取得は一度も始まらなかった。**
+      # 上限を伸ばしても、詰まる先が同じなら意味が薄い。**apt を経路から外す。**
+      #
+      # ubuntu-latest のランナーには Chromium が要る共有ライブラリが入っている。
+      # **足りなければ npx playwright test がブラウザを起動できずに落ちる**ので、
+      # この判断は下の e2e がそのまま検査になる。
+      - name: Install Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        run: npx playwright install chromium
+
+      # **取得できた時点で保存する。** 一体の actions/cache はジョブの最後に
+      # 保存するため、この後の e2e が落ちると取得した分が捨てられる。
+      - name: Save Playwright browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.playwright.outputs.version }}-${{ hashFiles('apps/next-app/playwright.config.ts') }}
+
+      - name: Playwright (管理画面の状態遷移)
+        run: npx playwright test
+
+  # --------------------------------------------------
+  # 生成物のドリフト検出
+  # --------------------------------------------------
+  # 「OpenAPI スキーマを起点とした駆動開発」を名乗る以上、
+  # 生成物が古いまま気づかない状態は避けたい。
+  # ここで再生成して差分が出たら CI を落とす。
+  generated-ci:
+    name: Generated Code Drift Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: apps/go-api/go.sum
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/next-app/package-lock.json
+
+      # 生成器はバージョンを固定しているので、ビルド済みのバイナリを再利用する。
+      # このジョブの実作業 (再生成 + 差分検査) は合計 1 秒であり、
+      # キャッシュが無いと 90 秒かけてビルドしたツールで 1 秒の仕事をすることになる
+      - name: Cache code generators
+        id: cache-generators
+        uses: actions/cache@v4
+        with:
+          path: ~/go/bin
+          key: generators-${{ runner.os }}-${{ runner.arch }}-sqlc${{ env.SQLC_VERSION }}-oapi${{ env.OAPI_CODEGEN_VERSION }}
+
+      - name: Install code generators
+        if: steps.cache-generators.outputs.cache-hit != 'true'
+        run: |
+          export GOTOOLCHAIN=auto
+          go install github.com/sqlc-dev/sqlc/cmd/sqlc@${{ env.SQLC_VERSION }}
+          go install github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@${{ env.OAPI_CODEGEN_VERSION }}
+
+      - name: Install npm dependencies
+        working-directory: ./apps/next-app
+        run: npm ci
+
+      - name: Regenerate sqlc code
+        working-directory: ./apps/go-api
+        run: sqlc generate
+
+      - name: Regenerate Go server stubs from the spec
+        working-directory: ./apps/go-api
+        run: oapi-codegen -config oapi-codegen.yaml ../../api/openapi.yaml
+
+      - name: Regenerate TypeScript types
+        working-directory: ./apps/next-app
+        run: npm run gen:types
+
+      - name: Fail if generated files are stale
+        run: |
+          if ! git diff --exit-code -- \
+              apps/go-api/internal/httpapi/oapigen \
+              apps/go-api/internal/infrastructure/postgres/sqlcgen \
+              apps/next-app/schema.d.ts; then
+            echo ""
+            echo "::error::生成物が最新ではありません。'make generate' の結果をコミットしてください。"
+            exit 1
+          fi
+
+  # --------------------------------------------------
+  # マイグレーションの適用と巻き戻しの検証
+  # --------------------------------------------------
+  # up / down の両方を通すことで、down マイグレーションの書き忘れや
+  # 壊れた SQL を検出する。
+  migration-ci:
+    name: Migration Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: bbs
+          # **compose.yaml と同じロケールにする。**
+          # LC_CTYPE を C にすると pg_trgm が日本語からトライグラムを
+          # 作らなくなり、検索の索引が無言で無効になる (ADR 0012)。
+          # ここが compose と食い違うと、CI と手元で別の DB を検査することになる。
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C.UTF-8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d bbs"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # S3 互換ストレージ (docs/adr/0007-image-storage.md)。
+      #
+      # ADR 0003 未決 #14 で「スモークの依存サービスをどこまで CI で立てるか」を
+      # 保留にしていた。**立てる**ことにした —— DB とストレージという
+      # 2 システム間の整合 (pending 行と孤児オブジェクト) は、
+      # フェイクでは原理的に再現できない。
+      #
+      # 【services ではなく docker run を使う理由】
+      # **services にはコマンド引数を渡す口が無い。**
+      # minio の ENTRYPOINT は引数として `server /data` を要求するため、
+      # services で起動するとサブコマンド無しになり、usage を出して即終了する
+      # (実際に CI を 1 回落とした)。options は docker create のフラグなので
+      # --entrypoint は指定できても、その後ろの引数は渡せない。
+      #
+      # postgres は引数が要らないので services のままでよい。
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            "minio/minio:${MINIO_VERSION}" server /data
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://localhost:9000/minio/health/live && exit 0
+            sleep 2
+          done
+          echo "::error::MinIO が起動しませんでした"
+          docker logs minio
+          exit 1
+
+      # **compose の minio-init と同じことを CI でも行う。**
+      # anonymous download にするのは、配信 URL を HTTP GET で
+      # 検証するため (本番はバケットを公開せず CloudFront の OAC 経由。
+      # ADR 0007 決定 4)。
+      - name: Create the MinIO bucket
+        run: |
+          # **バージョンを固定する。** 素の .../linux-amd64/mc は常に最新版で、
+          # Makefile 冒頭の方針 (@latest にしない) に反する。
+          # mc は過去に mc policy set -> mc anonymous set の改名を実施しており、
+          # 同種の変更が入るとコード変更なしに CI が落ちる。
+          # compose の minio/mc と同じタグに揃えてある。
+          curl -sSfL "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.${MC_VERSION}" -o /tmp/mc
+          chmod +x /tmp/mc
+          /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin
+          /tmp/mc mb --ignore-existing local/bbs-images
+          /tmp/mc anonymous set download local/bbs-images
+
+      - name: Install golang-migrate
+        run: |
+          curl -sSfL https://github.com/golang-migrate/migrate/releases/download/v4.18.1/migrate.linux-amd64.tar.gz \
+            | tar xvz -C /tmp migrate
+          sudo mv /tmp/migrate /usr/local/bin/migrate
+          migrate -version
+
+      # **service コンテナは docker-entrypoint-initdb.d を実行しない。**
+      # compose ではボリュームに載せた db/init が初回起動時に走るが、
+      # services: にはその口が無い (minio を docker run にしたのと同じ制約)。
+      #
+      # **ファイルをそのまま流す。** ここに CREATE EXTENSION を書き写すと、
+      # 拡張を足したときに compose 側だけが更新されて CI がすり抜ける。
+      #
+      # **ファイル名も決め打ちにしない** (レビュー指摘)。
+      # entrypoint は db/init 配下の *.sql を全部流すので、
+      # 01-*.sql を足した日に同じドリフトが起きる。
+      - name: Create extensions (compose の db/init と同じ)
+        run: |
+          for f in apps/go-api/db/init/*.sql; do
+            echo "--- $f"
+            PGPASSWORD=password psql -h localhost -U app -d bbs -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      # **pg_trgm が日本語を索引できることを確かめる (ADR 0012)。**
+      #
+      # LC_CTYPE が C だと show_trgm('検証') が空配列になり、
+      # 検索用の GIN 索引は作られるのに 1 件も載らない。
+      # **CREATE INDEX は成功し、エラーもどこにも出ない** ため、
+      # ここで撃ち落とさないと実行計画を読むまで誰も気づけない。
+      - name: Verify pg_trgm can index Japanese
+        run: |
+          n=$(PGPASSWORD=password psql -h localhost -U app -d bbs -tAc \
+            "SELECT coalesce(array_length(show_trgm('検証'), 1), 0)")
+          echo "show_trgm('検証') の要素数: $n"
+          if [ "$n" -lt 1 ]; then
+            PGPASSWORD=password psql -h localhost -U app -d bbs \
+              -c "SELECT datcollate, datctype FROM pg_database WHERE datname = 'bbs'"
+            echo "::error::pg_trgm が日本語からトライグラムを作れていません。LC_CTYPE を確認してください (ADR 0012)"
+            exit 1
+          fi
+
+      - name: Apply migrations
+        run: |
+          migrate -path apps/go-api/db/migrations \
+            -database "postgres://app:password@localhost:5432/bbs?sslmode=disable" up
+
+      - name: Load seed data
+        run: |
+          PGPASSWORD=password psql -h localhost -U app -d bbs \
+            -v ON_ERROR_STOP=1 -f apps/go-api/db/seed/seed.sql
+
+      - name: Verify partition pruning is effective
+        run: bash .github/scripts/verify-partition-pruning.sh
+
+      # ユニットテストはフェイクのリポジトリで動くため、
+      # SQL が実際に意図どおり動くかは CI のこの段階でしか検証できない。
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: apps/go-api/go.sum
+
+      - name: Start API server
+        working-directory: ./apps/go-api
+        env:
+          DATABASE_URL: postgres://app:password@localhost:5432/bbs?sslmode=disable
+          ADDR: ":8080"
+          # **画像を有効にする。** 渡さないとスモークの画像の節が
+          # 丸ごとスキップされ、SMOKE_REQUIRE_FULL が失敗として数える
+          # (実際に 1 回落とした —— スキップ検出が意図どおり働いた形)。
+          #
+          # 公開 URL はランナーから見えるアドレスにする。
+          # スモークは配信 URL を実際に HTTP GET して中身を確かめるため、
+          # コンテナ内の名前では解決できない。
+          S3_BUCKET: bbs-images
+          S3_REGION: ap-northeast-1
+          S3_ENDPOINT: http://localhost:9000
+          S3_USE_PATH_STYLE: "true"
+          S3_ACCESS_KEY_ID: minioadmin
+          S3_SECRET_ACCESS_KEY: minioadmin
+          S3_PUBLIC_BASE_URL: http://localhost:9000/bbs-images
+        run: |
+          go build -o /tmp/api ./cmd/api
+          /tmp/api > /tmp/api.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf -o /dev/null http://localhost:8080/healthz && exit 0
+            sleep 1
+          done
+          echo "::error::API が起動しませんでした"
+          cat /tmp/api.log
+          exit 1
+
+      # **実 MinIO に対する検証** (docs/adr/0007-image-storage.md)。
+      #
+      # ユニットテストのフェイクでは、path-style の要否・
+      # Content-Type が保存されて配信時に返ること・存在しないキーの
+      # DELETE が成功すること、のいずれも確かめられない。
+      #
+      # S3_TEST_ENDPOINT が無ければテスト側がスキップする。
+      # **ここを消すと静かにスキップに戻る**ので、
+      # スモークの SMOKE_REQUIRE_FULL と同じ性質の穴になる。
+      - name: Verify object storage against the real MinIO
+        working-directory: ./apps/go-api
+        env:
+          # **この 2 つは対で置く。** ENDPOINT だけ消えると REQUIRE が
+          # 残って t.Fatal になり、静かなスキップにはならない (fail-closed)。
+          #
+          # CI 環境変数を既定にはできない。go test は Go Checks でも走り、
+          # そちらに MinIO は無いため (既定にして 1 回落とした)。
+          S3_TEST_REQUIRE: "1"
+          S3_TEST_ENDPOINT: http://localhost:9000
+          S3_TEST_BUCKET: bbs-images
+          S3_TEST_PUBLIC_BASE_URL: http://localhost:9000/bbs-images
+        run: go test -v -run 'TestS3Storage|TestNew_' ./internal/infrastructure/objectstorage/
+
+      # **実 DB に対する検証** (回収バッチの経路)。
+      #
+      # ここでしか実 DB を通らない。ユニットはフェイクで動き、
+      # スモークは HTTP 越しなので回収を叩く口が無く、
+      # 定期処理は 10 分間隔 + ばらつきなので CI の実行時間では発火しない。
+      #
+      # **この 2 つは対で置く。** URL だけ消えると REQUIRE が残って
+      # t.Fatal になり、静かなスキップにはならない (objectstorage と同じ形)。
+      #
+      # **対象パッケージを列挙している。** ここから漏れた検査は、
+      # 名前が _Live で終わっていても**どこでも走らない** ——
+      # 実際 thread/usecase の N+1 比較が長らくその状態だった
+      # (make check では手元に DB があるときだけ走り、CI では 1 度も走らなかった)。
+      - name: Verify the repositories against the real database
+        working-directory: ./apps/go-api
+        env:
+          DB_TEST_REQUIRE: "1"
+          DATABASE_TEST_URL: postgres://app:password@localhost:5432/bbs?sslmode=disable
+        # **-p 1 でパッケージを並列に走らせない。**
+        #
+        # go test は既定で GOMAXPROCS 個のテストバイナリを同時に走らせる。
+        # postgres 側の live 検査は同じ DB にスレッドを**コミットして**作り、
+        # Cleanup で消す。一方 thread/usecase の N+1 比較は 2 つの実装を
+        # **別々の瞬間に**投げて件数と ID 列の完全一致を求めるので、
+        # その間に挿入や削除が挟まると落ちる。
+        # 既定の並びは id の降順なので、**挿入も削除も必ず 1 ページ目の先頭に効く。**
+        run: |
+          go test -v -p 1 -run '_Live$' \
+            ./internal/infrastructure/postgres/ \
+            ./internal/thread/usecase/
+
+      - name: Run smoke test against the real database
+        env:
+          BASE_URL: http://localhost:8080
+          SQL_EXEC: psql -h localhost -U app -d bbs -X -q -c
+          PGPASSWORD: password
+        run: python3 .github/scripts/smoke-test.py
+
+      - name: Dump API log on failure
+        if: failure()
+        run: cat /tmp/api.log || true
+
+      - name: Roll back migrations
+        run: |
+          migrate -path apps/go-api/db/migrations \
+            -database "postgres://app:password@localhost:5432/bbs?sslmode=disable" down -all

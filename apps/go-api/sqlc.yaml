@@ -1,0 +1,52 @@
+version: "2"
+sql:
+  - engine: postgresql
+    # golang-migrate 形式の *.down.sql は sqlc が自動で無視する
+    schema: db/migrations
+    queries: db/query
+    gen:
+      go:
+        package: sqlcgen
+        out: internal/infrastructure/postgres/sqlcgen
+        sql_package: pgx/v5
+        # 生成物はドメイン層に露出させないので JSON タグは不要
+        emit_json_tags: false
+        # nil スライスではなく空スライスを返す (JSON で null にならない)
+        emit_empty_slices: true
+        # ユースケース層からモックできるよう Querier インターフェースを出す
+        emit_interface: true
+        emit_pointers_for_null_types: true
+        # HASH パーティションの子テーブル (comments_p0..p7) は
+        # クエリから直接参照しないので、構造体を生成しない
+        omit_unused_structs: true
+        overrides:
+          # pgtype.Timestamptz をドメイン層に漏らさず time.Time で受ける
+          - db_type: "timestamptz"
+            go_type: "time.Time"
+          # 既定では pgtype.UUID になる。バイト配列 + Valid フラグの構造体で、
+          # 文字列化にも比較にも一手かかるため google/uuid.UUID で受ける。
+          # 生成は Go 側で行う (PostgreSQL 17 に uuidv7() が無い。ADR 0003 未決 #11)
+          - db_type: "uuid"
+            go_type: "github.com/google/uuid.UUID"
+          - db_type: "timestamptz"
+            nullable: true
+            go_type:
+              type: "time.Time"
+              pointer: true
+          # **NULL 許容の uuid には別に上書きが要る。**
+          # 上の uuid 上書きは NOT NULL の列にしか効かず、
+          # NULL 許容の列は pgtype.UUID のまま生成される。
+          # 000006 で足した画像への参照 3 列 (comments.image_id /
+          # users.avatar_image_id / threads.icon_image_id) がこれに当たり、
+          # 気づかないと「pgtype を漏らさない」という上の意図が
+          # 列を足すたびに静かに破れていく。timestamptz と同じ形で塞ぐ。
+          - db_type: "uuid"
+            nullable: true
+            go_type:
+              # **import と type を分ける。** 非 NULL 側で使っている
+              # "github.com/google/uuid.UUID" という 1 文字列の書き方は、
+              # オブジェクト形式では型名そのものとして扱われて効かない
+              # (黙って pgtype.UUID のまま生成される)。
+              import: "github.com/google/uuid"
+              type: "UUID"
+              pointer: true

@@ -4,6 +4,650 @@
  */
 
 export interface paths {
+    "/auth/google": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Google へのログインを開始する
+         * @description Google の認可エンドポイントへリダイレクトします。
+         *
+         *     state / nonce / PKCE の code_verifier をサーバ側で生成し、
+         *     短命な Cookie に保存します。CSRF とトークン差し替えを防ぐため、
+         *     コールバックではこれらを必ず照合します。
+         */
+        get: operations["startGoogleLogin"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/google/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Google からのコールバックを受ける
+         * @description 認可コードをトークンへ交換し、ID トークンを検証してから
+         *     セッションを発行します。成功するとフロントエンドへリダイレクトし、
+         *     セッション ID を HttpOnly Cookie で返します。
+         *
+         *     退会済みの利用者が同じ Google アカウントで再ログインした場合は
+         *     401 になります。行を復活させるかは未決です
+         *     (docs/adr/0005-authentication.md)。
+         *
+         *     同意画面で拒否された場合、Google は code を付けずに
+         *     error だけを返します。この経路もフロントエンドへリダイレクトし、
+         *     API のエラー JSON をブラウザに直接見せません。
+         *
+         *     **認可フローの Cookie (state / nonce / code_verifier) の失効、
+         *     state の不一致、code の欠落も同じくリダイレクトします。**
+         *     ここに来るのは Google からのトップレベル遷移なので、
+         *     4xx の JSON を返すとブラウザにそれが直接表示されます。
+         *     フロントへは `login_error` で理由を伝えます
+         *     (`login_expired` / `state_mismatch` / `no_code`)。
+         *
+         *     401 が返るのは、認可コードの交換まで進んだあとの失敗
+         *     (退会済みの再ログインなど) だけです。
+         */
+        get: operations["googleLoginCallback"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * ログアウトする
+         * @description サーバ側のセッションを削除し、Cookie を破棄します。
+         *
+         *     セッションの実体を DB に持つため、ログアウトは即座に効きます。
+         *     ステートレスな JWT ではこれができません
+         *     (docs/adr/0005-authentication.md 決定 1)。
+         */
+        post: operations["logout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * ログイン中の利用者を取得する
+         * @description セッションが有効な場合にだけ 200 を返します。
+         *
+         *     内部 ID (`users.id`) は返しません。API が扱う識別子は `publicId` だけです
+         *     (docs/adr/0003-open-questions.md 未決 #11)。
+         */
+        get: operations["getMe"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/me/avatar": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * プロフィール画像を設定する
+         * @description `POST /images` で `kind=avatar` として上げた画像を、
+         *     自分のプロフィール画像にします。
+         *
+         *     **自分がアップロードした画像だけ**を指定できます。
+         *     他人の画像 ID を指定すると 404 になります (存在を隠すため)。
+         *
+         *     `imageId` を `null` にすると設定を外します。
+         *     外すと Google のプロフィール画像 (`users.avatar_url`) に戻ります
+         *     (docs/adr/0007-image-storage.md のスキーマ)。
+         */
+        put: operations["setMyAvatar"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/me/threads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 自分が立てたスレッドの一覧
+         * @description ログイン中の利用者が投稿者になっているスレッドを、新しい順に返します。
+         *
+         *     **匿名で立てたスレッドは含まれません。** 投稿時にログインしていなければ
+         *     `author_id` が入らないため、後から本人だと突き合わせる手段がありません
+         *     (docs/adr/0005-authentication.md 決定 2)。
+         *
+         *     削除済みのスレッドは含まれません。
+         *
+         *     `GET /threads` と同じ `Thread` を返すので、画面は一覧のカードを
+         *     そのまま使い回せます。
+         *
+         *     【性能】`threads_author_id_desc_idx` (000002 で外部キー用に作成済み) が
+         *     効きます。2,000 スレッドで先頭ページ
+         *     **1.16 ms / buffers 48 / 走査区画 8** (make query-probe の 5)。
+         *
+         *     **`commentCount` の集計が comments の 8 区画すべてを触ります。**
+         *     threads 自体は分割していませんが、コメント数の相関サブクエリが
+         *     comments を引くためです。
+         *
+         *     初版はここに「0.37 ms / buffers 18、区画の走査は起きない」と
+         *     書いていましたが、**プローブがこの API とは別の
+         *     (コメント数の集計を含まない) クエリを測っていた**ための誤りでした。
+         */
+        get: operations["listMyThreads"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/me/comments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 自分が書いたコメントの一覧
+         * @description ログイン中の利用者が投稿者になっているコメントを、新しい順に返します。
+         *
+         *     **匿名で書いたコメントは含まれません** (`/me/threads` と同じ理由)。
+         *     削除済みのコメントも含まれません。
+         *
+         *     `Comment` ではなく `MyComment` を返します。**投稿先のスレッドが分からないと
+         *     一覧として成立しない**ためで、スレッドのタイトルを同梱しています。
+         *     逆に `author` は常に自分なので持たせていません。
+         *
+         *     【性能】**この API は 8 区画すべてを走ります。**
+         *     comments は `thread_id` の HASH パーティションで、`author_id` に
+         *     区画キーが含まれないため、partition pruning が効きません
+         *     (docs/adr/0016-schema-and-indexes.md)。
+         *
+         *     20 万コメントでの実測 (make query-probe の 5、投稿数が最多の利用者):
+         *
+         *     | | 時間 | buffers | 走査区画 |
+         *     | --- | --- | --- | --- |
+         *     | 自分のコメント 先頭ページ | 1.52 ms | 78 | 8 |
+         *     | 自分のコメント 深いページ | 1.10 ms | 57 | 8 |
+         *     | スレッド内のコメント一覧 (比較) | 0.16 ms | 6 | 1 |
+         *
+         *     除外が効く側とは **9.6 倍・バッファ 13 倍**の差がありますが、
+         *     絶対値 1.5 ms は一覧として問題にならないため、
+         *     **追加の索引は貼っていません。**
+         */
+        get: operations["listMyComments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/images": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 画像をアップロードする
+         * @description 画像を受け取り、**再エンコードしてから**保存します
+         *     (docs/adr/0007-image-storage.md 決定 2)。
+         *
+         *     アップロードされたバイト列はそのまま保存されません。
+         *     デコードし、リサイズし、こちらの指定した形式でエンコードし直した
+         *     ものだけを保存します。これ 1 つで MIME 偽装・EXIF の位置情報・
+         *     SVG に埋めたスクリプト・ポリグロットがまとめて閉じます。
+         *
+         *     **ログインが必要です。** 匿名で任意のバイト列をストレージに置けると、
+         *     容量の消費と違法コンテンツの設置が追跡不能な形で可能になります。
+         *
+         *     **添付は別の操作です。** ここで得た `id` を
+         *     `POST /threads/{threadId}/comments` の `imageId` に渡してください。
+         *     アップロードした時点では、まだどこからも参照されていません。
+         *
+         *     入力: JPEG / PNG / WebP。**SVG は受け付けません** ——
+         *     ベクタ形式はスクリプトと外部参照を含められるため、
+         *     「画像」として扱うと XSS と SSRF の経路になります。
+         *
+         *     **`Idempotency-Key` は受け付けません。**
+         *     [ADR 0015](../docs/adr/0015-idempotency.md) 決定 2 は画像も対象に
+         *     挙げていますが、同 決定 3 が要求する「キーの確保と応答の記録を
+         *     主トランザクションに同居させる」が、**DB とストレージの
+         *     2 システムにまたがるアップロードでは満たせない**ためです。
+         *
+         *     二重アップロードで起きるのは「使われない画像が 1 枚増える」ことだけで、
+         *     コメントの二重投稿のような不可逆な結果にはなりません。
+         *     添付する側 (コメント投稿) の冪等キーは、`imageId` を指紋に含めています。
+         */
+        post: operations["uploadImage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/moderation/actions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * モデレーション操作を実行し、記録する
+         * @description 投稿や画像をモデレーターとして削除し、**その事実を DB に記録します**
+         *     (docs/adr/0011-moderation.md 決定 2・3・5)。
+         *
+         *     **moderator または admin だけが呼べます。** それ以外は 403 です。
+         *
+         *     ### 削除と記録は同じトランザクションで行われます
+         *
+         *     [ADR 0010](../docs/adr/0010-log-pipeline.md) が
+         *     「ログは at-most-once であり欠落しうる」と決めているため、
+         *     監査に使う記録をログの件数から数えることはできません。
+         *     `moderation_actions` テーブルが正になります。
+         *
+         *     ログにも出しますが、**正はテーブル側**です。
+         *
+         *     ### 削除はすべて論理削除です
+         *
+         *     行は残ります。モデレーションは判断を伴うので必ず誤操作が起き、
+         *     戻せない削除は運用できません。コメントの参照整合性も保たれます。
+         *
+         *     **匿名投稿 (`author_id IS NULL`) も削除できます。**
+         *     [ADR 0005](../docs/adr/0005-authentication.md) の
+         *     「匿名投稿は誰も削除できない」は ADR 0011 が上書きしています。
+         *
+         *     ### 画像はストレージからも消えます
+         *
+         *     `delete_image` は `images.status` を `'deleted'` にします。
+         *     論理削除だけでは S3 のオブジェクトが残り、
+         *     **URL を直接叩けば見え続ける**ためです。
+         *     実体は回収バッチが消します (ADR 0011 決定 5)。
+         *
+         *     **即時ではありません。** 回収バッチの周回間隔ぶん
+         *     (既定 10 分) の遅れがあります。
+         *     CloudFront のキャッシュはさらに残ります。
+         *
+         *     ### 同じ対象を 2 回削除すると 404 です
+         *
+         *     論理削除は `deleted_at IS NULL` を条件にしているため、
+         *     2 回目は 0 行になります。**記録も残りません** ——
+         *     実際には何も起きていないためです。
+         */
+        post: operations["createModerationAction"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/reports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 投稿を通報する
+         * @description スレッドまたはコメントをモデレーターのキューに積みます
+         *     (docs/adr/0011-moderation.md 決定 4)。
+         *
+         *     ### ログインが必要です
+         *
+         *     **投稿は匿名を許しますが、通報は許しません。** 非対称ですが、
+         *     投稿は表現、通報は他人への申し立てであり、後者には責任の所在が要ります。
+         *
+         *     匿名で受け付けると、**通報そのものが荒らしの手段**になります ——
+         *     無限に投げてキューを埋められます。
+         *
+         *     ### 同じ対象への 2 回目は 200 です
+         *
+         *     1 人が同じ対象を何度も通報して、キューの優先度を操作できないように
+         *     一意制約を張っています。2 回目は**エラーにせず、
+         *     最初の通報をそのまま返します** (`201` ではなく `200`)。
+         *
+         *     クライアントはどちらでも「通報しました」と表示して構いません。
+         *     区別したい場合はステータスコードを見てください。
+         *
+         *     **一度処理された通報も重複として扱われます。** 一意制約に
+         *     `status` を含めていないため、モデレーターが `resolved` /
+         *     `rejected` にしたあとでも、同じ利用者の同じ対象への通報は
+         *     200 で最初の通報 (処理済み) を返します ——
+         *     **キューには何も積まれません。**
+         *
+         *     再申し立てが必要かどうかを判断できるよう、応答の `status` を
+         *     見てください。`open` でなければ、その通報は既に処理済みです。
+         *
+         *     これは [ADR 0011](../docs/adr/0011-moderation.md) 決定 4 の
+         *     一意制約をそのまま採ったことによる制限で、
+         *     「同じ人が同じ対象を何度も積む」ことを防ぐ側を優先しています。
+         *
+         *     ### 通報が集まっても自動では消えません
+         *
+         *     「N 件で自動非表示」は実装が簡単で、しかも危険です ——
+         *     組織的に通報を集めれば正常な投稿を消せますし
+         *     (通報爆撃)、少数派の意見が構造的に消えやすくなります。
+         *
+         *     通報はキューに積むだけで、判断は必ず人間が行い、
+         *     その結果が `moderation_actions` に残ります。
+         */
+        post: operations["createReport"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/moderation/reports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 通報キューを取得する
+         * @description **moderator または admin だけが読めます** (ADR 0011 決定 1)。
+         *
+         *     既定では未処理 (`open`) のものだけを、**古い順**に返します。
+         *     古い順なのは、通報が滞留したときに最初に届いたものから
+         *     処理されるようにするためです。
+         *
+         *     ### 並び順は `id` 昇順です
+         *
+         *     `created_at` ではありません。**`created_at` は一意ではない**ので、
+         *     キーセットページネーションの境界に使うと、
+         *     同じ時刻の行が複数あるページ境界で取りこぼしと重複が起きます。
+         *     通報は荒らしへの対応という性質上、短時間に集中して届きます。
+         *
+         *     `id` は IDENTITY なので一意かつ単調増加で、
+         *     `created_at` の既定は `now()` です —— 順序は実質同じになります。
+         *
+         *     ### 通報数は返しません
+         *
+         *     同じ対象への通報が何件あるかは、**この一覧には含めません。**
+         *     件数を前面に出すと、閾値で判断する運用へ引き寄せられます
+         *     (決定 4 が明確に避けたもの)。
+         */
+        get: operations["listReports"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/moderation/reports/{reportId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 通報 ID */
+                reportId: number;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * 通報を処理済みにする
+         * @description **moderator または admin だけが呼べます。**
+         *
+         *     `resolved` は「対処した」、`rejected` は「対処不要と判断した」です。
+         *     どちらも `resolved_at` と `resolved_by` が入ります ——
+         *     **「誰が解決したか分からない解決済み通報」を作れないよう、
+         *     DB 側の CHECK 制約が両方を要求します。**
+         *
+         *     ### 削除はしません
+         *
+         *     この操作は通報の状態を変えるだけで、投稿には触れません。
+         *     削除するなら `POST /moderation/actions` を別に呼んでください。
+         *
+         *     分けているのは、**「通報を却下する」と「投稿を消す」が
+         *     別の判断**だからです。まとめると、キューを片付ける操作が
+         *     そのまま削除になり、誤操作が投稿に届きます。
+         *
+         *     ### `open` に戻すことはできません
+         *
+         *     処理済みの通報を未処理へ戻す経路は作っていません。
+         *     判断をやり直したい場合は、投稿に対する操作
+         *     (`moderation_actions`) の側で記録が残ります。
+         */
+        patch: operations["resolveReport"];
+        trace?: never;
+    };
+    "/users/{publicId}/role": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description 利用者の公開 ID (UUID v7)。
+                 *
+                 *     **内部 ID (`users.id`) は受け取りません。**
+                 *     API が扱う識別子は `publicId` だけです
+                 *     (docs/adr/0003-open-questions.md 未決 #11)。
+                 */
+                publicId: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * 利用者のロールを変更する
+         * @description **admin だけが呼べます** (ADR 0011 決定 1)。
+         *
+         *     3 段階に分けているのは、**投稿を消せる権限と、
+         *     権限を配れる権限を分離する**ためです。
+         *     モデレーターを増やしても、権限を配れる人間は増えません。
+         *
+         *     ### 変更は監査記録に残ります
+         *
+         *     `moderation_actions` に `change_role` として記録されます
+         *     (決定 1「変更は監査記録に残す」/ 決定 3)。
+         *     削除と同じテーブルで、`target_type` は `user` になります。
+         *
+         *     ### 自分のロールは変更できません
+         *
+         *     **最後の admin が自分を降格させると、誰もロールを配れなくなります。**
+         *     復旧には DB を直接触るか、`BOOTSTRAP_ADMIN_GOOGLE_SUB` を
+         *     設定し直して再ログインするしかありません。
+         *
+         *     他の admin を降格させることはできます。
+         *
+         *     ### ただし、最後の admin は降格させられません
+         *
+         *     **自分を触らせないだけでは足りません。** admin が 2 人いるとき、
+         *     互いを同時に降格させると両方が「自分ではない」を通り、
+         *     **admin が 0 人になります** (レビュー指摘)。
+         *
+         *     そのため、admin を降格させる変更では
+         *     **他に admin が残ることを同じトランザクションで確かめます。**
+         *     確認は admin の行をロックして行うので、
+         *     同時に走った 2 つの降格は直列化され、後から来たほうが 422 になります。
+         */
+        patch: operations["changeUserRole"];
+        trace?: never;
+    };
+    "/contact": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 問い合わせを送る
+         * @description 問い合わせを受け付けます (docs/adr/0008-contact-and-mail.md)。
+         *
+         *     ### `202` は「送信完了」ではありません
+         *
+         *     受理した時点で返します。**メールの送信はこのリクエストの中で
+         *     行いません。**
+         *
+         *     ```
+         *     POST /contact
+         *          ├─▶ contact_messages に INSERT (status = 'pending')
+         *          └─▶ 202 Accepted            ← ここで外部サービスを待たない
+         *          ⋮
+         *     ワーカー (一定間隔)
+         *          ├─▶ pending を取り出す (FOR UPDATE SKIP LOCKED)
+         *          ├─▶ メール送信
+         *          └─▶ status = 'sent' / 'failed'
+         *     ```
+         *
+         *     同期で送ると、**メールプロバイダの障害がそのまま問い合わせの喪失に
+         *     なります** —— 利用者には 500 が返り、書いた内容は失われます。
+         *     問い合わせフォームは「送れなかったことに気づけない」のが
+         *     最悪の失敗なので、保存を先に確定させます (決定 1)。
+         *
+         *     `200 OK` を返さないのは、それが「送信完了」を含意するためです。
+         *
+         *     ### ログインは不要です
+         *
+         *     「ログインできない」という問い合わせが来る以上、ログインを必須に
+         *     すると詰みます (決定 4)。ログイン済みの場合は投稿者を記録し、
+         *     フォームの初期値も埋まりますが、**API の動作は変わりません。**
+         *
+         *     ### 自動返信 (控え) はログイン済みのときだけ届きます
+         *
+         *     **入力されたアドレスへは、いかなる場合も送りません** (決定 2)。
+         *     検証されていないアドレスへ送ると、他人のアドレスを入力するだけで
+         *     **このシステムを踏み台にして任意のアドレスへメールを送れます**。
+         *
+         *     ログイン済みの場合だけ、**アカウントに登録されているアドレス**
+         *     (IdP が確認済み) へ控えを 1 通送ります。
+         *     これは `user_id` から引き直した値で、下の `email` とは無関係です。
+         *
+         *     控えの送信は **best-effort** です。失敗しても再送されず、
+         *     受付にも運営への通知にも影響しません。
+         *
+         *     ### スパム対策
+         *
+         *     | 対策 | 内容 |
+         *     | --- | --- |
+         *     | レート制限 | 同一 IP から一定時間あたりの件数を制限します (超過は `429`) |
+         *     | 長さ制限 | このスキーマの `maxLength` と DB の CHECK 制約が同じ値で縛ります |
+         *     | honeypot | `website` を空のまま送ってください (下記) |
+         *
+         *     CAPTCHA は入れていません。外部サービス依存とプライバシーの話が
+         *     別途発生し、この規模では honeypot + レート制限で足ります。
+         */
+        post: operations["createContact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/healthz": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Liveness プローブ
+         * @description プロセスが生きているかだけを返します。DB の状態は見ません。
+         *     ここで DB を見ると、DB の一時的な不調でコンテナが再起動ループに入ります。
+         */
+        get: operations["getHealthz"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/readyz": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Readiness プローブ
+         * @description DB への疎通を含め、リクエストを受けられる状態かを返します。
+         */
+        get: operations["getReadyz"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/threads": {
         parameters: {
             query?: never;
@@ -13,39 +657,151 @@ export interface paths {
         };
         /**
          * スレッド一覧の取得
-         * @description 並列処理でコメント数を集計したスレッド一覧を返します
+         * @description スレッドを新しい順に、コメント数つきで取得します。
+         *
+         *     コメント数は LEFT JOIN と COUNT(*) FILTER による単一クエリで集計しています。
+         *     スレッドごとに COUNT を投げる実装 (N+1) を goroutine で並列化しても
+         *     DB へのラウンドトリップ回数は減らないため、単一クエリのほうが有利です。
+         *
+         *     `q` を渡すと、タイトルの中間一致で絞り込みます。
+         *     **絞り込んでも並び順は新着順のまま**なので、`cursor` の使い方は変わりません
+         *     (docs/adr/0012-search.md 決定 3)。
+         *
+         *     `sort=popular` で閲覧数の多い順になります。
+         *     **カーソルは並び順ごとに意味が変わります** ——
+         *     `sort` を変えたら先頭から取り直してください。
+         *     混ぜて渡した場合は 400 になります
+         *     (docs/adr/0006-view-count-and-popularity.md)。
          */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
+        get: operations["listThreads"];
+        put?: never;
+        /** スレッドの作成 */
+        post: operations["createThread"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/threads/{threadId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
             };
-            requestBody?: never;
-            responses: {
-                /** @description 成功 */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            threads?: {
-                                /** @example 7 */
-                                commentCount?: number;
-                                /** @example 1 */
-                                id?: number;
-                                /** @example 並列処理を学ぶ部屋 */
-                                title?: string;
-                            }[];
-                        };
-                    };
-                };
-            };
+            cookie?: never;
         };
+        /** スレッドの取得 */
+        get: operations["getThread"];
         put?: never;
         post?: never;
+        /**
+         * 自分のスレッドを削除する
+         * @description **自分が立てたスレッドだけ**を削除できます
+         *     (docs/adr/0005-authentication.md の権限モデル)。
+         *     [ADR 0003](../docs/adr/0003-open-questions.md) の未決 #7
+         *     (コメント削除 API を公開するか) は、認証が入ったこの時点で解けます。
+         *
+         *     論理削除です。行は残り、コメントの参照整合性も保たれます。
+         *
+         *     ### 匿名で立てたスレッドは削除できません
+         *
+         *     `author_id` が NULL のスレッドは、**投稿者を特定する情報がない**ため
+         *     本人であることを示せません。ログイン後に「さっき匿名で書いたやつ」を
+         *     自分のものにする機能も作りません —— 許すと任意の匿名投稿を
+         *     誰でも自分のものだと主張できます
+         *     (docs/adr/0005-authentication.md 決定 2)。
+         *
+         *     荒らしへの対処はモデレーターが行います
+         *     (`POST /moderation/actions`。docs/adr/0011-moderation.md 決定 2)。
+         *
+         *     ### コメントは消えません
+         *
+         *     スレッドが論理削除されると一覧からも取得からも消えるため、
+         *     コメントを個別に消して回る必要がありません
+         *     (8 パーティションすべてに UPDATE を投げることにもなります)。
+         *
+         *     ### 添付画像もストレージに残ります
+         *
+         *     画像を消すのはモデレーションの操作です
+         *     (docs/adr/0011-moderation.md 決定 5)。
+         *     自分のスレッドを消しただけで実体まで消すと、
+         *     誤操作の巻き戻しができなくなります。
+         */
+        delete: operations["deleteThread"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/threads/{threadId}/comments/{commentId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+                /**
+                 * @description コメント ID。
+                 *
+                 *     **レス番号 (`seq`) ではありません。** `seq` はスレッド内の
+                 *     通し番号で、削除で欠番が出ます。API が受け取るのは
+                 *     `Comment.id` のほうです。
+                 */
+                commentId: components["parameters"]["CommentId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 自分のコメントを削除する
+         * @description **自分が書いたコメントだけ**を削除できます。
+         *     条件と理由はスレッドの削除と同じです。
+         *
+         *     ### レス番号は空きます
+         *
+         *     削除しても `seq` は再利用しません
+         *     (docs/adr/0019-comment-concurrency.md 決定 5)。
+         *     再利用すると、過去の `>>5` が別の投稿を指すようになります。
+         *
+         *     ### スレッド ID がパスに要る理由
+         *
+         *     `comments` は `thread_id` による HASH パーティションで、
+         *     主キーが `(thread_id, id)` です。**コメント ID だけでは
+         *     先頭列を絞れず、8 パーティションすべてを走査します。**
+         */
+        delete: operations["deleteComment"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/threads/{threadId}/comments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * コメント一覧の取得
+         * @description 指定スレッドのコメントを新しい順に取得します。
+         *
+         *     comments テーブルは thread_id による HASH パーティションなので、
+         *     thread_id を等値指定するこのクエリでは partition pruning が効き、
+         *     8 分割中 1 パーティションのみを走査します。
+         */
+        get: operations["listComments"];
+        put?: never;
+        /** コメントの投稿 */
+        post: operations["createComment"];
         delete?: never;
         options?: never;
         head?: never;
@@ -56,20 +812,1981 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        ThreadDTO: {
-            /** @example 7 */
-            commentCount?: number;
-            /** @example 1 */
-            id?: number;
-            /** @example 並列処理を学ぶ部屋 */
-            title?: string;
+        HealthStatus: {
+            /** @example ok */
+            status: string;
+            /**
+             * @description 異常時のみ設定されます
+             * @example database
+             */
+            reason?: string;
+        };
+        Thread: {
+            /**
+             * Format: int64
+             * @example 1
+             */
+            id: number;
+            /** @example Go の並列処理を学ぶ部屋 */
+            title: string;
+            /**
+             * Format: int64
+             * @description 論理削除されていないコメントの件数
+             * @example 7
+             */
+            commentCount: number;
+            /**
+             * Format: int64
+             * @description 閲覧数。
+             *
+             *     **正確な値ではありません** (docs/adr/0006-view-count-and-popularity.md)。
+             *
+             *     - **最新ではありません。** 計上はアプリのメモリ上で行い、
+             *       一定間隔でまとめて反映するため、最大でその間隔ぶん遅れます
+             *     - **欠落します。** プロセスが異常終了するとバッファ内の増分は消えます
+             *     - **同一利用者の連打は一定時間まとめられます。** インスタンスを
+             *       またいだ厳密性は保証しません
+             *
+             *     表示用の指標であり、課金や順位の確定には使えません。
+             * @example 1284
+             */
+            viewCount: number;
+            author: components["schemas"]["Author"];
+            /** @description スレッドアイコン。**設定されていなければ `null`** です。 */
+            icon: components["schemas"]["Image"] | null;
+            /**
+             * Format: date-time
+             * @example 2026-08-02T12:00:00Z
+             */
+            createdAt: string;
+        };
+        Comment: {
+            /**
+             * Format: int64
+             * @example 10
+             */
+            id: number;
+            /**
+             * Format: int64
+             * @example 1
+             */
+            threadId: number;
+            /**
+             * Format: int32
+             * @description スレッド内のレス番号 (`>>1` の 1)。スレッドごとに 1 から振られます。
+             *
+             *     **欠番が出ます。** 削除されたコメントの番号は再利用しません
+             *     (docs/adr/0019-comment-concurrency.md 決定 5)。
+             *     再利用すると、過去の `>>5` が別の投稿を指すようになるためです。
+             *
+             *     採番は「読んでから書く」処理なので、同時投稿で競合します。
+             *     この採番がこのリポジトリの主題である並行制御の題材になっています。
+             * @example 3
+             */
+            seq: number;
+            /**
+             * @description 匿名投稿の表示名。省略時は「名無しさん」になります。
+             *
+             *     **`author` があるときは、そちらを表示してください。**
+             *     ログイン中の投稿ではこの欄は既定値のまま保存されます
+             *     (表示名の変更を過去の投稿にも反映させるため。ADR 0014)。
+             * @example 名無しさん
+             */
+            authorName: string;
+            author: components["schemas"]["Author"];
+            /** @example ふぁ〜、眠いよ〜 */
+            body: string;
+            /**
+             * Format: date-time
+             * @example 2026-08-02T12:00:00Z
+             */
+            createdAt: string;
+            /**
+             * @description 添付された画像。**画像がなければ `null`** です。
+             *
+             *     モデレーターに削除された画像もここに現れます
+             *     (`url` は 404 になります)。行を残すのは
+             *     「画像は削除されました」と「元から画像なし」を区別するためです
+             *     (docs/adr/0016-schema-and-indexes.md 問題 3)。
+             */
+            image: components["schemas"]["Image"] | null;
+        };
+        ThreadList: {
+            threads: components["schemas"]["Thread"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        CommentList: {
+            comments: components["schemas"]["Comment"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        /**
+         * @description マイページに出す「自分のコメント」。
+         *
+         *     `Comment` と分けているのは、**必要な情報が逆向き**だからです。
+         *     スレッド内の一覧では投稿者が要りますがスレッドは自明で、
+         *     こちらでは投稿者が自明でスレッドが要ります。
+         *     `Comment` に `threadTitle` を足すと、スレッド内の一覧で
+         *     全行に同じタイトルが並ぶことになります。
+         */
+        MyComment: {
+            /**
+             * Format: int64
+             * @example 10
+             */
+            id: number;
+            /**
+             * Format: int64
+             * @description 投稿先のスレッド。`/threads/{threadId}` へのリンクに使います。
+             * @example 1
+             */
+            threadId: number;
+            /**
+             * @description 投稿先のスレッドのタイトル。
+             *
+             *     **削除されたスレッドでは `null` です。**
+             *
+             *     初版はここでタイトルをそのまま返していました
+             *     (「伏せると自分が何に書いたのか分からなくなる」ため)。
+             *     **モデレーションの経路を見落としていたので撤回しました** ——
+             *     タイトル自体が誹謗中傷や個人情報だったために消された場合、
+             *     この API がそれを書き込んだ全員のマイページに残し続けます。
+             *     `GET /threads/{threadId}` は 404 を返すので、
+             *     **ここが削除後にタイトルを読める唯一の経路**になっていました。
+             *
+             *     本人が失うのは「どのスレッドか」だけで、自分が書いた本文
+             *     (`body`) は残ります。
+             * @example Go の並列処理を学ぶ部屋
+             */
+            threadTitle: string | null;
+            /**
+             * @description 投稿先のスレッドが削除済みか。
+             *
+             *     **削除済みでもコメントは一覧から消しません。** 消すと、
+             *     自分の投稿が「消えた」のか「元から無い」のか本人に区別できません。
+             *     リンク先は 404 になるので、画面側でその旨を出してください。
+             *
+             *     **真のとき `threadTitle` は必ず `null`** です。
+             * @example false
+             */
+            threadDeleted: boolean;
+            /**
+             * Format: int32
+             * @description スレッド内のレス番号 (`Comment.seq` と同じ)
+             * @example 3
+             */
+            seq: number;
+            /** @example ふぁ〜、眠いよ〜 */
+            body: string;
+            /**
+             * Format: date-time
+             * @example 2026-08-02T12:00:00Z
+             */
+            createdAt: string;
+            /** @description 添付された画像。**画像がなければ `null`** です。 */
+            image: components["schemas"]["Image"] | null;
+        };
+        MyCommentList: {
+            comments: components["schemas"]["MyComment"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        /**
+         * @description 次ページ取得用の不透明トークン。これ以上ページがない場合は null。
+         *     `cursor` パラメータへそのまま渡してください。
+         * @example eyJ2IjoxLCJpZCI6NDJ9
+         */
+        NextCursor: string | null;
+        CreateThreadRequest: {
+            /**
+             * @description DB 側の CHECK 制約 threads_title_length と同じ上限です
+             * @example 新しいスレッド
+             */
+            title: string;
+            /**
+             * Format: uuid
+             * @description スレッドアイコンの画像 ID。`POST /images` で
+             *     `kind=thread_icon` として上げたものを渡します。
+             *
+             *     - **省略できます。** アイコンの無いスレッドが既定です
+             *     - **自分がアップロードした画像だけ**を指定できます
+             *       (他人の画像 ID は 404)
+             *     - **未ログインでは指定できません** (画像の投稿にログインが要るため)
+             * @example 018f2c00-0000-7000-8000-000000000001
+             */
+            iconImageId?: string;
+        };
+        /**
+         * @description 投稿者。**匿名投稿では `null` になります**
+         *     (docs/adr/0005-authentication.md 決定 2)。
+         *
+         *     内部 ID (`users.id`) は含めません。`Me` と同じ理由です。
+         *
+         *     退会した利用者の投稿は、投稿そのものは残したまま表示だけ差し替えます。
+         *     このとき `publicId` を返しません —— フロントが `withdrawn` の分岐を
+         *     落としても、退会した人のマイページへ辿れないようにするためです。
+         */
+        Author: {
+            /**
+             * Format: uuid
+             * @description 公開用の識別子 (UUID v7)。
+             *
+             *     **退会済みの場合はフィールドごと省略されます** (null ではありません)。
+             *     required に入れていないため、生成される型は省略可能になります
+             * @example 0192f0a0-0000-7000-8000-000000000001
+             */
+            publicId?: string;
+            /**
+             * @description 退会済みの場合は「退会したユーザー」に置き換わります
+             * @example ホシノ
+             */
+            displayName: string;
+            /**
+             * @description アバター画像の URL。
+             *
+             *     **未設定または退会済みの場合はフィールドごと省略されます**
+             *     (`Me.avatarUrl` と同じ挙動)。null が入って返ることはありません
+             * @example https://lh3.googleusercontent.com/a/xxxx
+             */
+            avatarUrl?: string | null;
+            /**
+             * @description 退会済みか
+             * @example false
+             */
+            withdrawn: boolean;
+        } | null;
+        /**
+         * @description 利用者の権限 (docs/adr/0011-moderation.md 決定 1)。
+         *
+         *     3 段階に分けているのは、**投稿を消せる権限と、
+         *     権限を配れる権限を分離する**ためです。
+         *     モデレーターを増やしても、権限を配れる人間は増えません。
+         *
+         *     | | user | moderator | admin |
+         *     | --- | --- | --- | --- |
+         *     | 自分の投稿の削除 | ✅ | ✅ | ✅ |
+         *     | 他人・匿名の投稿の削除 | ❌ | ✅ | ✅ |
+         *     | ロールの変更 | ❌ | ❌ | ✅ |
+         * @example user
+         * @enum {string}
+         */
+        Role: "user" | "moderator" | "admin";
+        /**
+         * @description ログイン中の利用者。
+         *
+         *     **内部 ID (`users.id`) は含めません。** マイページの URL が連番だと
+         *     全ユーザーを列挙できるため、API が扱う識別子は `publicId` だけです
+         *     (docs/adr/0003-open-questions.md 未決 #11)。
+         */
+        Me: {
+            /**
+             * Format: uuid
+             * @description 公開用の識別子 (UUID v7)
+             * @example 0192f0a0-0000-7000-8000-000000000001
+             */
+            publicId: string;
+            /** @example ホシノ */
+            displayName: string;
+            /**
+             * @description 本人にだけ返します。投稿一覧には含まれません
+             * @example hoshino@example.com
+             */
+            email: string;
+            /**
+             * @description **自分のロールだけ**返します。
+             *     フロントが管理用の導線を出し分けるために使います。
+             *
+             *     他人のロールは `Author` に含めません ——
+             *     誰がモデレーターかを一覧で晒す必要がないためです
+             */
+            role: components["schemas"]["Role"];
+            /**
+             * @description プロフィール画像の URL。
+             *
+             *     **アップロードした画像があればそちら**を返し、
+             *     無ければ Google のプロフィール画像を返します
+             *     (docs/adr/0007-image-storage.md のスキーマ)。
+             *     クライアントはこの 1 つだけを見れば済みます ——
+             *     どちらから来たかは表示の関心事ではありません。
+             * @example https://lh3.googleusercontent.com/a/xxxx
+             */
+            avatarUrl?: string | null;
+        };
+        CreateCommentRequest: {
+            /**
+             * @description 匿名投稿の表示名。省略時は「名無しさん」になります。
+             *
+             *     **ログイン中は無視されます。** 表示名は `users` 側から解決するため、
+             *     送っても保存されず、レスポンスの `authorName` は既定値のままになります
+             *     (表示名の変更を過去の投稿にも反映させるため。ADR 0014)。
+             *     エラーにはしません
+             * @example ホシノ
+             */
+            authorName?: string;
+            /** @example ふぁ〜、眠いよ〜 */
+            body: string;
+            /**
+             * Format: uuid
+             * @description 添付する画像の ID。`POST /images` で得たものを渡します。
+             *
+             *     - **省略できます。** 画像のない投稿が既定です
+             *     - **自分がアップロードした画像だけ**を添付できます。
+             *       他人の画像 ID を指定すると 404 になります
+             *       (存在を隠すため。ADR 0013)
+             *     - 1 件のコメントに 1 枚だけです。複数枚にすると中間テーブルが要り、
+             *       パーティション済みテーブルとの結合がもう 1 段増えます
+             *     - **未ログインでは指定できません** (画像の投稿にログインが要るため)
+             * @example 018f2c00-0000-7000-8000-000000000001
+             */
+            imageId?: string;
+        };
+        /**
+         * @description 画像の用途。**用途によって保存する形式が変わります**
+         *     (docs/adr/0007-image-storage.md 決定 6)。
+         *
+         *     コメント添付は写真が主なので JPEG、小さい正方形になる
+         *     プロフィール画像とスレッドアイコンは可逆の WebP で保存します。
+         * @example comment_attachment
+         * @enum {string}
+         */
+        ImageKind: "comment_attachment" | "avatar" | "thread_icon";
+        Image: {
+            /**
+             * Format: uuid
+             * @description 添付するときに指定する ID。
+             * @example 018f2c00-0000-7000-8000-000000000001
+             */
+            id: string;
+            /**
+             * Format: uri
+             * @description **絶対 URL を返します** (docs/adr/0007-image-storage.md 決定 5)。
+             *
+             *     オブジェクトキーだけを返すと、フロントが CDN のベース URL を
+             *     知る必要が出て、組み立てロジックが Server Component と
+             *     Client Component の 2 か所に散ります。
+             *     環境ごとの差 (ローカルの MinIO と本番の CloudFront) は
+             *     API が吸収します。
+             * @example https://cdn.example.com/images/018f2c00-0000-7000-8000-000000000001.jpg
+             */
+            url: string;
+            /**
+             * @description 保存された画像の幅 (再エンコード後)。
+             * @example 1600
+             */
+            width: number;
+            /**
+             * @description 保存された画像の高さ (再エンコード後)。
+             * @example 1200
+             */
+            height: number;
+        };
+        /**
+         * @description 通報の対象種別 (docs/adr/0011-moderation.md 決定 4)。
+         *
+         *     **画像は含めません。** 画像はコメント / スレッドに従属するので、
+         *     通報の単位にしません —— 画像だけを消す判断は
+         *     モデレーター側が `POST /moderation/actions` で行います。
+         * @example comment
+         * @enum {string}
+         */
+        ReportTargetType: "thread" | "comment";
+        /**
+         * @description 通報の理由。**自由記述ではなく固定の 4 値**です。
+         *     集計と絞り込みができる形にしておくためで、
+         *     補足は `note` に書きます。
+         * @example abuse
+         * @enum {string}
+         */
+        ReportReason: "spam" | "abuse" | "illegal" | "other";
+        /**
+         * @description 通報の状態。`open` が未処理です。
+         *
+         *     `resolved` は「対処した」、`rejected` は「対処不要と判断した」。
+         *     **どちらも通報の行は残ります** —— 誰が何を通報したかは記録として要ります。
+         * @example open
+         * @enum {string}
+         */
+        ReportStatus: "open" | "resolved" | "rejected";
+        CreateReportRequest: {
+            targetType: components["schemas"]["ReportTargetType"];
+            /**
+             * Format: int64
+             * @description 対象の ID。**`moderation_actions` と違って整数です** ——
+             *     対象が `threads` / `comments` に限られ、型が混ざらないためです。
+             * @example 10
+             */
+            targetId: number;
+            /**
+             * Format: int64
+             * @description **`targetType` が `comment` のときだけ必須**です。
+             *     スレッドの通報では指定できません (指定すると 400)。
+             *
+             *     `comments` は `thread_id` による HASH パーティションで、
+             *     主キーが `(thread_id, id)` です。**通報を受けた側が
+             *     対象を引けるようにするため、通報の時点で受け取ります。**
+             * @example 1
+             */
+            threadId?: number;
+            reason: components["schemas"]["ReportReason"];
+            /**
+             * @description 補足。任意です。
+             *
+             *     DB 側の CHECK 制約 `reports_note_length` と同じ上限です。
+             * @example 同じ文面を連投しています
+             */
+            note?: string;
+        };
+        Report: {
+            /**
+             * Format: int64
+             * @example 1
+             */
+            id: number;
+            targetType: components["schemas"]["ReportTargetType"];
+            /**
+             * Format: int64
+             * @example 10
+             */
+            targetId: number;
+            /**
+             * Format: int64
+             * @description **`targetType` が `comment` のときだけ現れます。**
+             *     スレッドの通報では省略されます (null ではありません)。
+             * @example 1
+             */
+            threadId?: number;
+            reason: components["schemas"]["ReportReason"];
+            /**
+             * @description 指定されなかった場合は `null` です。
+             * @example 同じ文面を連投しています
+             */
+            note: string | null;
+            status: components["schemas"]["ReportStatus"];
+            /**
+             * Format: date-time
+             * @example 2026-08-15T12:00:00Z
+             */
+            createdAt: string;
+            /**
+             * Format: date-time
+             * @description 未処理の場合は `null` です。
+             * @example 2026-08-15T13:00:00Z
+             */
+            resolvedAt: string | null;
+        };
+        ReportList: {
+            reports: components["schemas"]["Report"][];
+            nextCursor: components["schemas"]["NextCursor"];
+        };
+        /**
+         * @description モデレーション操作の種類 (docs/adr/0011-moderation.md 決定 3)。
+         *
+         *     **Go 側の定数と DB の CHECK 制約 `moderation_action_valid` と
+         *     同じ 4 値**です。記録として現れうるものをすべて並べています。
+         *
+         *     リクエストで受け付ける集合は狭く、`ModerationDeleteAction` が別にあります。
+         * @example delete_comment
+         * @enum {string}
+         */
+        ModerationActionType: "delete_thread" | "delete_comment" | "delete_image" | "change_role";
+        /**
+         * @description `POST /moderation/actions` が**受け付ける**操作。
+         *
+         *     `change_role` は含めません。**入力の形が違う** (新しいロールが要る) ため、
+         *     `PATCH /users/{publicId}/role` が専用に受けます。
+         *     記録先のテーブルは同じで、記録された `action` は
+         *     `ModerationActionType` のほうに現れます。
+         *
+         *     つまり定義の関係は
+         *     **「Go の定数 = DB の CHECK 制約 ⊃ このエンドポイントの入力」**
+         *     という非対称な形になります (`action_test.go` が検査します)。
+         * @example delete_comment
+         * @enum {string}
+         */
+        ModerationDeleteAction: "delete_thread" | "delete_comment" | "delete_image";
+        /**
+         * @description 操作の対象種別。**`action` から一意に決まります**
+         *     (`delete_thread` なら `thread`)。
+         *     リクエストでは受け取らず、レスポンスにだけ現れます ——
+         *     受け取ると `delete_thread` と `image` のように
+         *     食い違う組み合わせを表現できてしまいます。
+         * @example comment
+         * @enum {string}
+         */
+        ModerationTargetType: "thread" | "comment" | "image" | "user";
+        CreateModerationActionRequest: {
+            action: components["schemas"]["ModerationDeleteAction"];
+            /**
+             * @description 対象の ID。**型が混在するため文字列です**
+             *     (`threads` / `comments` は BIGINT、`images` は UUID)。
+             *     [ADR 0003](../docs/adr/0003-open-questions.md) の未決 #11 は
+             *     「用途ごとに使い分ける (統一しない)」決定になったため、
+             *     この混在は解消されません。
+             *
+             *     `delete_thread` / `delete_comment` では 10 進の整数、
+             *     `delete_image` では UUID を渡してください。
+             *     形式が合わなければ 400 です。
+             * @example 10
+             */
+            targetId: string;
+            /**
+             * Format: int64
+             * @description **`delete_comment` のときだけ必須**です。他の操作では無視されます。
+             *
+             *     `comments` は `thread_id` による HASH パーティションで、
+             *     主キーが `(thread_id, id)` です。**コメント ID だけでは
+             *     先頭列を絞れず、8 パーティションすべてを走査します。**
+             *     スレッド ID を一緒に受け取ることで partition pruning が効きます。
+             * @example 1
+             */
+            threadId?: number;
+            /**
+             * @description 削除の理由。**任意です**が、記録の価値はここに集まります。
+             *
+             *     DB 側は NULL 可です。省略すると `null` で記録されます。
+             * @example 誹謗中傷のため
+             */
+            reason?: string;
+        };
+        ModerationAction: {
+            /**
+             * Format: int64
+             * @example 1
+             */
+            id: number;
+            action: components["schemas"]["ModerationActionType"];
+            targetType: components["schemas"]["ModerationTargetType"];
+            /**
+             * @description 記録された対象の ID。**リクエストで送った値とは限りません。**
+             *
+             *     - `delete_thread` — スレッド ID (`"7"`)
+             *     - `delete_comment` — **`"{threadId}:{commentId}"`**
+             *       (`"1:10"`)。パーティションキーを含めます ——
+             *       コメント ID だけだと、この記録から対象を引くときに
+             *       8 パーティションすべてを走査することになります
+             *     - `delete_image` — 正規化した UUID (小文字・ハイフンあり)
+             * @example 1:10
+             */
+            targetId: string;
+            /**
+             * @description 指定されなかった場合は `null` です。
+             * @example 誹謗中傷のため
+             */
+            reason: string | null;
+            /**
+             * Format: date-time
+             * @example 2026-08-14T12:00:00Z
+             */
+            createdAt: string;
+        };
+        /**
+         * @description 問い合わせの入力 (docs/adr/0008-contact-and-mail.md)。
+         *
+         *     **`maxLength` は DB の CHECK 制約と同じ値です。**
+         *     `contact_name_length` / `contact_email_length` /
+         *     `contact_subject_length` / `contact_body_length` の 4 本が
+         *     最後の砦になります。3 か所 (仕様書・ドメイン・DB) が揃っていることは
+         *     `internal/contact/domain/model` のテストが実際にファイルを読んで検査します。
+         */
+        CreateContactRequest: {
+            /**
+             * @description 氏名。**検証はしていません** —— 本文中のテキストとして記録します
+             * @example 小鳥遊 ホシノ
+             */
+            name: string;
+            /**
+             * Format: email
+             * @description 連絡先として記録するアドレス。
+             *
+             *     **このアドレスへは何も送りません** (決定 2)。
+             *     検証されていないアドレスへ送ると、他人のアドレスを入力するだけで
+             *     このシステムを踏み台にできます。**ログイン済みでも同じです** ——
+             *     この欄は書き換えられるので、控えの宛先には使いません
+             *     (控えはアカウントに登録されているアドレスへ届きます)。
+             *
+             *     **メールヘッダにも入りません** (決定 3)。`Reply-To` に設定すると
+             *     改行の注入で任意のヘッダを足せるため、本文中のテキストとしてだけ
+             *     扱います。
+             *
+             *     上限の 254 は RFC 5321 のアドレス長の上限です。
+             * @example hoshino@example.com
+             */
+            email: string;
+            /**
+             * @description 件名。**メールの Subject には入りません** (決定 3)
+             * @example ログインできません
+             */
+            subject: string;
+            /**
+             * @description 本文
+             * @example Google でログインしようとすると画面が戻ってきてしまいます。
+             */
+            body: string;
+            /**
+             * @description **honeypot です。空のまま送ってください。**
+             *
+             *     **`maxLength` を置いていません。** 置くと、長い値を入れた要求が
+             *     検証ミドルウェアに `400 INVALID_ARGUMENT` で弾かれ、
+             *     **応答に `website` というフィールド名が載ります** ——
+             *     この設計が伏せようとしている情報を、名指しで返すことになります
+             *     (レビュー指摘)。要求全体の大きさは本文サイズの上限が抑えます。
+             *
+             *     画面上は非表示にしてあり、人間が埋めることはありません。
+             *     値が入っている要求は**破棄されます** —— DB にも書かれず、
+             *     メールも送られません。
+             *
+             *     それでも `202` を返すのは、`400` にすると
+             *     **「この項目が引き金だ」とボット側に教える**ためです。
+             *     成功と区別がつかないほうが、対策として長持ちします。
+             * @example
+             */
+            website?: string;
+        };
+        /**
+         * @description 受理の応答。**問い合わせの ID を返しません。**
+         *
+         *     内部 ID を外に出さない方針 (docs/adr/0003-open-questions.md 未決 #11)
+         *     に加えて、**honeypot に引っかかった要求と区別できなくなる**ためです ——
+         *     あちらは行を作らないので、返せる ID がありません。
+         *     片方だけ ID が付けば、それが判定結果の合図になります。
+         */
+        ContactAccepted: {
+            /**
+             * @description **常に `accepted` です。** 「送信済み」を表す値はありません ——
+             *     この時点で完了しているのは受理までだからです。
+             * @example accepted
+             * @enum {string}
+             */
+            status: "accepted";
+            /**
+             * Format: date-time
+             * @description 受理した時刻。サーバの時刻です
+             * @example 2026-08-17T12:00:00Z
+             */
+            receivedAt: string;
+        };
+        Error: {
+            error: {
+                /**
+                 * @description 機械可読なエラー種別。クライアントはこの値で分岐します。
+                 * @example NOT_FOUND
+                 * @enum {string}
+                 */
+                code: "INVALID_ARGUMENT" | "UNAUTHENTICATED" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" | "CONFLICT" | "PERMISSION_DENIED" | "PAYLOAD_TOO_LARGE" | "FAILED_PRECONDITION" | "RESOURCE_EXHAUSTED" | "UNAVAILABLE" | "INTERNAL";
+                /**
+                 * @description 人間向けの説明。文言は予告なく変わるため分岐に使わないでください。
+                 * @example 対象のリソースが見つかりません
+                 */
+                message: string;
+            };
         };
     };
-    responses: never;
-    parameters: never;
+    responses: {
+        /** @description リクエストが不正 */
+        BadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description 対象が存在しない */
+        NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description 未ログイン、またはセッションが無効 */
+        Unauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /**
+         * @description `code` は `PERMISSION_DENIED` です。
+         *
+         *     状態変更メソッド (POST / PUT / PATCH / DELETE) の `Origin` または
+         *     `Referer` が許可リストに無い、あるいはどちらも付いていない
+         *     (docs/adr/0013-http-defense.md 決定 1 の CSRF 対策)。
+         *
+         *     **ブラウザ以外のクライアントも `Origin` を送る必要があります。**
+         *     `SameSite=Lax` だけではサブドメインを取られた場合に防げないため、
+         *     サーバ側でも検証します。
+         */
+        Forbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /**
+         * @description `code` は `RESOURCE_EXHAUSTED` です
+         *     (docs/adr/0013-http-defense.md 決定 3)。
+         *
+         *     同一 IP からの問い合わせが一定時間あたりの上限を超えました
+         *     ([ADR 0008](../docs/adr/0008-contact-and-mail.md) 決定 4 のスパム対策)。
+         *
+         *     **`Retry-After` は付けません。** 窓は移動窓なので、正確な待ち時間を
+         *     出すには「窓の中で最も古い 1 件」を引く問い合わせが 1 本増えます。
+         *     弾かれた要求のために追加のクエリを打つのは、レート制限として
+         *     本末転倒になります。時間をおいて送り直してください。
+         */
+        TooManyRequests: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /**
+         * @description 認証プロバイダの設定が入っていないため、この経路は利用できません。
+         *     設定が無くても API 自体は起動します
+         *     (掲示板の閲覧と匿名投稿は認証に依存しないため)。
+         */
+        ServiceUnavailable: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description サーバ内部エラー */
+        InternalError: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+    };
+    parameters: {
+        /** @description スレッド ID */
+        ThreadId: number;
+        /**
+         * @description コメント ID。
+         *
+         *     **レス番号 (`seq`) ではありません。** `seq` はスレッド内の
+         *     通し番号で、削除で欠番が出ます。API が受け取るのは
+         *     `Comment.id` のほうです。
+         */
+        CommentId: number;
+        /**
+         * @description 二重送信を防ぐためのキー。クライアントが投稿ごとに 1 つ生成します
+         *     (UUID v4 など、推測されない値)。
+         *
+         *     タイムアウト後の再送・回線の切り替え・複数タブ・送信直後のリロードで
+         *     **同じ投稿が 2 件できる**のを防ぎます。送信中のボタン無効化では
+         *     「タイムアウトしたが実は成功していた」を原理的に防げません
+         *     (docs/adr/0015-idempotency.md 決定 1)。
+         *
+         *     - **省略できます。** 省略した場合は冪等性なしで処理します
+         *       (必須にすると既存クライアントが即座に壊れるため)
+         *     - **同じキーで再送すると、前回の結果がそのまま返ります**
+         *       (処理は 1 回しか行われません)
+         *     - **同じキーで別の内容を送ると 422 になります。**
+         *       黙って前回の結果を返すと、クライアントのバグが見えなくなるため
+         *     - **未ログインでは無視されます。** 匿名にはキーの名前空間を分ける
+         *       手段がなく、IP で分けると NAT の背後で他人と衝突します
+         *       (同 決定 4)。この非対称は仕様として明記しています
+         *     - 記録は **24 時間**で削除されます。それ以降の再送は新規投稿になります
+         * @example 6f0c2a1e-6e6a-4e2f-9c4a-2f0f7f2d5c11
+         */
+        IdempotencyKey: string;
+        /**
+         * @description 次ページの取得位置を表す不透明トークン。
+         *     直前のレスポンスの `nextCursor` をそのまま渡します。
+         *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
+         *
+         *     中身はサーバ側の実装詳細なので、
+         *     **クライアントは解釈も生成も改変もしないでください。**
+         *     並び順を追加してもこの型は変わりません
+         *     (docs/adr/0018-opaque-cursor.md)。
+         */
+        Cursor: string;
+        /**
+         * @description 取得件数。省略時は 20。
+         *     上限を設けないと、1 リクエストで全件走査させられてしまいます。
+         */
+        Size: number;
+        /**
+         * @description 並び順。
+         *
+         *     - `new` (既定): 新着順 (id の降順)
+         *     - `popular`: 閲覧数の多い順 (docs/adr/0006-view-count-and-popularity.md)
+         *
+         *     **`q` との同時指定はできません** (400)。
+         *     検索結果の並び順は新着順に固定してあり
+         *     (docs/adr/0012-search.md 決定 3)、人気順を重ねると
+         *     `title ILIKE` の GIN 索引と `(view_count, id)` の索引の
+         *     どちらか一方しか使えません。どちらが有利かは検索語の珍しさで
+         *     変わるため、**測ってから決めます** (Phase 4)。
+         *
+         *     黙って新着順に落とさないのは、「人気順で並べたつもりの新着順」を
+         *     返すと、利用者にもこちらにも間違いが見えないためです。
+         */
+        Sort: "new" | "popular";
+        /**
+         * @description スレッドのタイトルに対する検索語 (中間一致)。
+         *
+         *     - **対象はタイトルだけです。** コメント本文は検索できません
+         *       (docs/adr/0012-search.md 決定 2)。
+         *       コメントは 5 年で 1.8 億行規模になる見積もりで、
+         *       そこに GIN 索引を張ると索引が本体に匹敵する大きさになります
+         *     - **並び順は新着順のまま**で、関連度順ではありません (同 決定 3)。
+         *       関連度順にするとカーソルがスコアになり、
+         *       埋め込む値の意味が検索語ごとに変わります
+         *     - **`%` と `_` はワイルドカードになりません。** サーバ側で
+         *       エスケープするため、`100%` はその文字列として検索されます
+         *     - **大文字と小文字は区別しません**
+         *     - **前後の空白は取り除きます。空白だけの検索語は「指定なし」と同じ**
+         *       扱いになり、絞り込みのない一覧を返します (400 にはしません)。
+         *       検索欄を空のまま送信したフォームが 400 になるのを避けるためで、
+         *       `cursor` に空文字を許しているのと同じ理由です
+         *
+         *     検索語が 1〜2 文字だと索引の選択性が落ちます
+         *     (`pg_trgm` は 3 文字単位のトライグラムに分解するため)。
+         *     最低文字数の制限は設けていません —— 実測してから決めます
+         *     (docs/adr/0012-search.md の罠)。
+         * @example PostgreSQL
+         */
+        SearchQuery: string;
+    };
     requestBodies: never;
     headers: never;
     pathItems: never;
 }
 export type $defs = Record<string, never>;
-export type operations = Record<string, never>;
+export interface operations {
+    startGoogleLogin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Google の認可エンドポイントへリダイレクト */
+            302: {
+                headers: {
+                    /** @description accounts.google.com の認可 URL */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    googleLoginCallback: {
+        parameters: {
+            query: {
+                /**
+                 * @description 開始時に発行した state。Cookie の値と照合します。
+                 *     拒否された場合も Google はこれを返すため、必須にしています
+                 */
+                state: string;
+                /**
+                 * @description Google が発行した認可コード。
+                 *     **同意画面で拒否されたときは付きません** (代わりに error が付きます)。
+                 *     必須にすると、拒否した利用者に検証エラーの JSON が直接見えてしまいます
+                 */
+                code?: string;
+                /**
+                 * @description 拒否や設定不備のときに Google が返すエラー識別子
+                 *     (access_denied など)
+                 */
+                error?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description フロントエンドへリダイレクト */
+            302: {
+                headers: {
+                    Location?: string;
+                    /** @description セッション ID (HttpOnly) */
+                    "Set-Cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+            503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    logout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description ログアウトした */
+            204: {
+                headers: {
+                    /** @description 空値・有効期限切れの Cookie */
+                    "Set-Cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getMe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    setMyAvatar: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * Format: uuid
+                     * @description 設定する画像の ID。`null` で解除します。
+                     */
+                    imageId: string | null;
+                };
+            };
+        };
+        responses: {
+            /** @description 設定した */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /**
+             * @description 指定された画像が存在しないか、自分のものではありません。
+             *     **403 ではなく 404 を返します** —— 403 だと
+             *     「その ID の画像が存在すること」自体が漏れます
+             *     (docs/adr/0013-http-defense.md)。
+             */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listMyThreads: {
+        parameters: {
+            query?: {
+                /**
+                 * @description 次ページの取得位置を表す不透明トークン。
+                 *     直前のレスポンスの `nextCursor` をそのまま渡します。
+                 *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
+                 *
+                 *     中身はサーバ側の実装詳細なので、
+                 *     **クライアントは解釈も生成も改変もしないでください。**
+                 *     並び順を追加してもこの型は変わりません
+                 *     (docs/adr/0018-opaque-cursor.md)。
+                 */
+                cursor?: components["parameters"]["Cursor"];
+                /**
+                 * @description 取得件数。省略時は 20。
+                 *     上限を設けないと、1 リクエストで全件走査させられてしまいます。
+                 */
+                size?: components["parameters"]["Size"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ThreadList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listMyComments: {
+        parameters: {
+            query?: {
+                /**
+                 * @description 次ページの取得位置を表す不透明トークン。
+                 *     直前のレスポンスの `nextCursor` をそのまま渡します。
+                 *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
+                 *
+                 *     中身はサーバ側の実装詳細なので、
+                 *     **クライアントは解釈も生成も改変もしないでください。**
+                 *     並び順を追加してもこの型は変わりません
+                 *     (docs/adr/0018-opaque-cursor.md)。
+                 */
+                cursor?: components["parameters"]["Cursor"];
+                /**
+                 * @description 取得件数。省略時は 20。
+                 *     上限を設けないと、1 リクエストで全件走査させられてしまいます。
+                 */
+                size?: components["parameters"]["Size"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MyCommentList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    uploadImage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "multipart/form-data": {
+                    /**
+                     * Format: binary
+                     * @description 画像本体。5 MiB まで。
+                     *
+                     *     デコード後の画素数にも上限があります (2500 万画素)。
+                     *     **サイズの上限だけでは decompression bomb を防げない**ため、
+                     *     全体を展開する前にヘッダから寸法を読んで判定します。
+                     */
+                    file: string;
+                    kind: components["schemas"]["ImageKind"];
+                };
+            };
+        };
+        responses: {
+            /** @description アップロード成功 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Image"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /**
+             * @description サイズまたは画素数の上限を超えました。
+             *     縮小すれば通ります (docs/adr/0007-image-storage.md 決定 2)。
+             */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+            /**
+             * @description ストレージの設定が入っていないため、この経路だけが使えません。
+             *     掲示板の閲覧・投稿・ログインは影響を受けません。
+             */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    createModerationAction: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateModerationActionRequest"];
+            };
+        };
+        responses: {
+            /** @description 削除し、記録した */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModerationAction"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。原因は 2 つあります。
+             *
+             *     - **ロールが `moderator` / `admin` ではない**
+             *       (docs/adr/0011-moderation.md 決定 1)
+             *     - 状態変更メソッドの `Origin` / `Referer` が許可リストに無い
+             *       (docs/adr/0013-http-defense.md 決定 1)
+             *
+             *     **ロールの検査は対象を探す前に行います。** 逆にすると、
+             *     権限の無い利用者が 403 と 404 の差で
+             *     「その ID の対象が存在すること」を確かめられます。
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description 対象が存在しないか、既に削除されています。 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createReport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateReportRequest"];
+            };
+        };
+        responses: {
+            /**
+             * @description **既に通報済みです。** 最初の通報をそのまま返します。
+             *     エラーではありません。
+             */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Report"];
+                };
+            };
+            /** @description 通報した */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Report"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /**
+             * @description 通報の対象が存在しないか、既に削除されています。
+             *
+             *     **存在を確かめてから積みます。** 確かめないと、
+             *     存在しない ID の通報でキューを埋められます。
+             */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listReports: {
+        parameters: {
+            query?: {
+                /**
+                 * @description 次ページの取得位置を表す不透明トークン。
+                 *     直前のレスポンスの `nextCursor` をそのまま渡します。
+                 *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
+                 *
+                 *     中身はサーバ側の実装詳細なので、
+                 *     **クライアントは解釈も生成も改変もしないでください。**
+                 *     並び順を追加してもこの型は変わりません
+                 *     (docs/adr/0018-opaque-cursor.md)。
+                 */
+                cursor?: components["parameters"]["Cursor"];
+                /**
+                 * @description 取得件数。省略時は 20。
+                 *     上限を設けないと、1 リクエストで全件走査させられてしまいます。
+                 */
+                size?: components["parameters"]["Size"];
+                /**
+                 * @description 絞り込む状態。省略時は `open` だけを返します。
+                 *
+                 *     **部分索引 `reports_open_idx` が効くのは `open` のときだけ**です。
+                 *     解決済みを引く場合は全体の走査になります (件数が増え続けるため、
+                 *     調査用と割り切ってください)。
+                 */
+                status?: components["schemas"]["ReportStatus"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReportList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。
+             *     ロールが `moderator` / `admin` ではありません。
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    resolveReport: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description 通報 ID */
+                reportId: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /**
+                     * @description `open` は指定できません。未処理へ戻す経路は作っていません。
+                     * @enum {string}
+                     */
+                    status: "resolved" | "rejected";
+                };
+            };
+        };
+        responses: {
+            /** @description 処理済みにした */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Report"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。
+             *     ロールが `moderator` / `admin` ではありません。
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description 通報が存在しないか、**既に処理済み**です。 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    changeUserRole: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /**
+                 * @description 利用者の公開 ID (UUID v7)。
+                 *
+                 *     **内部 ID (`users.id`) は受け取りません。**
+                 *     API が扱う識別子は `publicId` だけです
+                 *     (docs/adr/0003-open-questions.md 未決 #11)。
+                 */
+                publicId: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    role: components["schemas"]["Role"];
+                    /** @description 変更の理由。任意ですが、記録の価値はここに集まります。 */
+                    reason?: string;
+                };
+            };
+        };
+        responses: {
+            /**
+             * @description 変更した。記録された操作を返します。
+             *
+             *     **`targetId` は対象の `publicId`** です。
+             *     `moderation_actions` テーブルには内部 ID (`users.id`) を
+             *     書いていますが (監査記録から `users` を辿るため)、
+             *     **API が内部 ID を出さない方針**に従って詰め替えます
+             *     (docs/adr/0003-open-questions.md 未決 #11)。
+             *
+             *     返ってきた `targetId` はそのまま他の API へ渡せます。
+             */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModerationAction"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。原因は 3 つあります。
+             *
+             *     - **ロールが `admin` ではない**
+             *     - **自分自身を対象にした**
+             *     - 状態変更メソッドの `Origin` / `Referer` が許可リストに無い
+             *
+             *     **ロールの検査は対象を探す前に行います。**
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description 利用者が存在しないか、退会しています。 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description `code` は `FAILED_PRECONDITION` です。
+             *
+             *     **最後の admin を降格させようとしました。**
+             *     誰もロールを配れない状態にはできません。
+             *
+             *     先に別の利用者を admin にしてから降格させてください
+             *     —— 再試行しても解決しません。
+             */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createContact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateContactRequest"];
+            };
+        };
+        responses: {
+            /**
+             * @description **受理しました。送信完了ではありません。**
+             *
+             *     honeypot に引っかかった要求も、区別できないよう
+             *     同じ応答を返します (`CreateContactRequest.website` の説明を参照)。
+             */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContactAccepted"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            429: components["responses"]["TooManyRequests"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    getHealthz: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 正常 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HealthStatus"];
+                };
+            };
+        };
+    };
+    getReadyz: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description リクエスト受付可能 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HealthStatus"];
+                };
+            };
+            /** @description 依存先が利用できない */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HealthStatus"];
+                };
+            };
+        };
+    };
+    listThreads: {
+        parameters: {
+            query?: {
+                /**
+                 * @description 次ページの取得位置を表す不透明トークン。
+                 *     直前のレスポンスの `nextCursor` をそのまま渡します。
+                 *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
+                 *
+                 *     中身はサーバ側の実装詳細なので、
+                 *     **クライアントは解釈も生成も改変もしないでください。**
+                 *     並び順を追加してもこの型は変わりません
+                 *     (docs/adr/0018-opaque-cursor.md)。
+                 */
+                cursor?: components["parameters"]["Cursor"];
+                /**
+                 * @description 取得件数。省略時は 20。
+                 *     上限を設けないと、1 リクエストで全件走査させられてしまいます。
+                 */
+                size?: components["parameters"]["Size"];
+                /**
+                 * @description スレッドのタイトルに対する検索語 (中間一致)。
+                 *
+                 *     - **対象はタイトルだけです。** コメント本文は検索できません
+                 *       (docs/adr/0012-search.md 決定 2)。
+                 *       コメントは 5 年で 1.8 億行規模になる見積もりで、
+                 *       そこに GIN 索引を張ると索引が本体に匹敵する大きさになります
+                 *     - **並び順は新着順のまま**で、関連度順ではありません (同 決定 3)。
+                 *       関連度順にするとカーソルがスコアになり、
+                 *       埋め込む値の意味が検索語ごとに変わります
+                 *     - **`%` と `_` はワイルドカードになりません。** サーバ側で
+                 *       エスケープするため、`100%` はその文字列として検索されます
+                 *     - **大文字と小文字は区別しません**
+                 *     - **前後の空白は取り除きます。空白だけの検索語は「指定なし」と同じ**
+                 *       扱いになり、絞り込みのない一覧を返します (400 にはしません)。
+                 *       検索欄を空のまま送信したフォームが 400 になるのを避けるためで、
+                 *       `cursor` に空文字を許しているのと同じ理由です
+                 *
+                 *     検索語が 1〜2 文字だと索引の選択性が落ちます
+                 *     (`pg_trgm` は 3 文字単位のトライグラムに分解するため)。
+                 *     最低文字数の制限は設けていません —— 実測してから決めます
+                 *     (docs/adr/0012-search.md の罠)。
+                 * @example PostgreSQL
+                 */
+                q?: components["parameters"]["SearchQuery"];
+                /**
+                 * @description 並び順。
+                 *
+                 *     - `new` (既定): 新着順 (id の降順)
+                 *     - `popular`: 閲覧数の多い順 (docs/adr/0006-view-count-and-popularity.md)
+                 *
+                 *     **`q` との同時指定はできません** (400)。
+                 *     検索結果の並び順は新着順に固定してあり
+                 *     (docs/adr/0012-search.md 決定 3)、人気順を重ねると
+                 *     `title ILIKE` の GIN 索引と `(view_count, id)` の索引の
+                 *     どちらか一方しか使えません。どちらが有利かは検索語の珍しさで
+                 *     変わるため、**測ってから決めます** (Phase 4)。
+                 *
+                 *     黙って新着順に落とさないのは、「人気順で並べたつもりの新着順」を
+                 *     返すと、利用者にもこちらにも間違いが見えないためです。
+                 */
+                sort?: components["parameters"]["Sort"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ThreadList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createThread: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateThreadRequest"];
+            };
+        };
+        responses: {
+            /** @description 作成成功 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Thread"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /**
+             * @description アイコンを指定したが未ログインです。
+             *     **画像の投稿にはログインが要ります**
+             *     (docs/adr/0007-image-storage.md の背景)。
+             */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            403: components["responses"]["Forbidden"];
+            /**
+             * @description 指定されたアイコンが存在しないか、自分のものではありません。
+             *     **403 ではなく 404** です —— 403 だと
+             *     「その ID の画像が存在すること」自体が漏れます。
+             */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+            /**
+             * @description ストレージの設定が入っていないため、アイコンを指定できません。
+             *     アイコンなしのスレッド作成は影響を受けません。
+             */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getThread: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Thread"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deleteThread: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 削除した。本文はありません */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。原因は 3 つあります。
+             *
+             *     - **他人のスレッド**
+             *     - **匿名で立てられたスレッド** (`author_id` が NULL)
+             *     - 状態変更メソッドの `Origin` / `Referer` が許可リストに無い
+             *       (docs/adr/0013-http-defense.md 決定 1)
+             *
+             *     **ここでは 404 に隠しません。** スレッドは誰でも
+             *     `GET /threads/{threadId}` で読めるので、存在は公開情報です。
+             *     隠す意味が無いうえ、404 にすると自分の投稿が消せないときに
+             *     「消えたのか、権限が無いのか」を利用者が区別できません。
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description スレッドが存在しないか、既に削除されています。 */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    deleteComment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+                /**
+                 * @description コメント ID。
+                 *
+                 *     **レス番号 (`seq`) ではありません。** `seq` はスレッド内の
+                 *     通し番号で、削除で欠番が出ます。API が受け取るのは
+                 *     `Comment.id` のほうです。
+                 */
+                commentId: components["parameters"]["CommentId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 削除した。本文はありません */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /**
+             * @description `code` は `PERMISSION_DENIED` です。
+             *     他人のコメント、匿名のコメント、または `Origin` の検証失敗です
+             *     (スレッドの削除と同じ)。
+             */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description コメントが存在しないか、既に削除されています。
+             *
+             *     **指定したスレッドに属さないコメント ID も 404 です。**
+             *     パーティションキーで絞るため、他スレッドの行には当たりません。
+             */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+    listComments: {
+        parameters: {
+            query?: {
+                /**
+                 * @description 次ページの取得位置を表す不透明トークン。
+                 *     直前のレスポンスの `nextCursor` をそのまま渡します。
+                 *     省略した場合と空文字を渡した場合は、どちらも先頭ページになります。
+                 *
+                 *     中身はサーバ側の実装詳細なので、
+                 *     **クライアントは解釈も生成も改変もしないでください。**
+                 *     並び順を追加してもこの型は変わりません
+                 *     (docs/adr/0018-opaque-cursor.md)。
+                 */
+                cursor?: components["parameters"]["Cursor"];
+                /**
+                 * @description 取得件数。省略時は 20。
+                 *     上限を設けないと、1 リクエストで全件走査させられてしまいます。
+                 */
+                size?: components["parameters"]["Size"];
+            };
+            header?: never;
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description 成功 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommentList"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalError"];
+        };
+    };
+    createComment: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description 二重送信を防ぐためのキー。クライアントが投稿ごとに 1 つ生成します
+                 *     (UUID v4 など、推測されない値)。
+                 *
+                 *     タイムアウト後の再送・回線の切り替え・複数タブ・送信直後のリロードで
+                 *     **同じ投稿が 2 件できる**のを防ぎます。送信中のボタン無効化では
+                 *     「タイムアウトしたが実は成功していた」を原理的に防げません
+                 *     (docs/adr/0015-idempotency.md 決定 1)。
+                 *
+                 *     - **省略できます。** 省略した場合は冪等性なしで処理します
+                 *       (必須にすると既存クライアントが即座に壊れるため)
+                 *     - **同じキーで再送すると、前回の結果がそのまま返ります**
+                 *       (処理は 1 回しか行われません)
+                 *     - **同じキーで別の内容を送ると 422 になります。**
+                 *       黙って前回の結果を返すと、クライアントのバグが見えなくなるため
+                 *     - **未ログインでは無視されます。** 匿名にはキーの名前空間を分ける
+                 *       手段がなく、IP で分けると NAT の背後で他人と衝突します
+                 *       (同 決定 4)。この非対称は仕様として明記しています
+                 *     - 記録は **24 時間**で削除されます。それ以降の再送は新規投稿になります
+                 * @example 6f0c2a1e-6e6a-4e2f-9c4a-2f0f7f2d5c11
+                 */
+                "Idempotency-Key"?: components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                /** @description スレッド ID */
+                threadId: components["parameters"]["ThreadId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateCommentRequest"];
+            };
+        };
+        responses: {
+            /** @description 投稿成功 */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Comment"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            /** @description 親スレッドが存在しない */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description 同時更新が競合しました。再試行可能です。
+             *     SERIALIZABLE 分離レベルでの直列化失敗 (SQLSTATE 40001) や
+             *     デッドロック (40P01) がここに対応します。
+             *
+             *     同じ `Idempotency-Key` の処理がまだ完了していない場合も
+             *     ここに入ります (docs/adr/0015-idempotency.md)。
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description **同じ `Idempotency-Key` で、前回と違う内容が送られました。**
+             *
+             *     前回の結果を黙って返すと、クライアントのバグが見えなくなります。
+             *     キーを作り直して送り直してください
+             *     (docs/adr/0015-idempotency.md)。
+             */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["InternalError"];
+        };
+    };
+}

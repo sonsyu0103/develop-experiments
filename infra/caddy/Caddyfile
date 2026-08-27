@@ -1,0 +1,125 @@
+# ローカルの擬似 AWS における「エッジ」。
+# 本番構成 (docs/infrastructure.md) の CloudFront + ALB に相当する。
+#
+# ── なぜ置くのか ────────────────────────────────────────────
+#
+# **「手元でも https で見たい」が目的ではない。**
+# プロキシの背後でしか通らない分岐を、実際に通すことが目的になる。
+#
+# go-api には以下が実装済みだが、compose が全部 http だったため
+# **どれも 1 度も実行されていなかった**:
+#
+#   internal/httpapi/auth.go:166        SecureCookie (Cookie の Secure 属性)
+#   internal/httpapi/middleware.go:236  X-Forwarded-Proto によるスキーム判定
+#   internal/httpapi/server.go:722      TRUSTED_PROXIES (ClientIP をどう決めるか)
+#   cmd/api/main.go:110                 trusted_proxies_unset の警告
+#
+# この 4 つは連動して壊れる。下の reverse_proxy が X-Forwarded-Proto を
+# 落とすと、selfOrigin() が "http://localhost" を組み立て、
+# Origin ヘッダ ("https://localhost") と一致しなくなり、
+# csrfGuard が **すべての書き込みを 403 にする**。
+#
+# **ただし逃げ道はある。** isAllowedOrigin は許可リストを先に見るので、
+# CORS_ALLOWED_ORIGINS に自分のオリジンを明示していれば selfOrigin まで
+# 到達せずに通る。「同一オリジンなら設定する理由がない」という当初の読みは
+# 誤りで、**XFP 落ちの保険になる** (ADR 0023 の 3 で訂正)。
+# make up-https と AWS の両方で明示してあるのはこのため ——
+# **ここを外すと保険が消える。**
+#
+# make https-verify がこの因果を実測する (go-api を直接叩き、
+# 許可リストに無いホスト名で selfOrigin だけを頼りにさせる)。
+#
+# あわせて ADR 0013 決定 2 (セキュリティヘッダ、未実装のまま残っていた) を
+# ここで満たす。ADR は「フロント側の応答に付ける」と書いているが、
+# エッジで付ければ go-api と next-app の両方に漏れなく乗る。
+
+{
+	# **ACME を使わない。** Caddy 内蔵の CA がローカル用の証明書を発行する。
+	# 外部通信が起きないので、ネットワークの無い環境でも起動する。
+	#
+	# CA のルート証明書はコンテナ内の
+	#   /data/caddy/pki/authorities/local/root.crt
+	# にある。ブラウザや curl に信頼させるには make trust-ca。
+	local_certs
+
+	# admin API は既定で 127.0.0.1:2019 (コンテナの外には出ない)。
+	# Phase 4 の Blue/Green で upstream を差し替えるのに使うので off にしない。
+}
+
+# **既定を localhost にする。** bbs.localhost のような .localhost の
+# サブドメインはブラウザなら 127.0.0.1 に解決するが、macOS の curl や
+# Go の net パッケージは解決しないことがあり、
+# 「ブラウザでは見えるのに検査スクリプトだけ落ちる」が起きる。
+#
+# 本番同型のホスト名で試したいときは /etc/hosts に足したうえで:
+#   SITE_ADDRESS=bbs.localhost make up-https
+{$SITE_ADDRESS:localhost} {
+	log {
+		output stdout
+		format json
+	}
+
+	# ADR 0013 決定 2。**エッジで付けるので下流の実装は要らない。**
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Frame-Options "DENY"
+
+		# **HSTS の既定は max-age=0 (= 記憶しない)。**
+		#
+		# ADR 0013 決定 2 が「ローカルは HTTP なので、付けると
+		# ブラウザに記憶されて開発が壊れる」と書いているとおり。
+		# さらに悪いことに、**HSTS はホスト単位でポートを区別しない。**
+		# localhost に max-age を付けると http://localhost:3000 も
+		# http://localhost:8080 も以後すべて https へ強制され、
+		# エッジを使わない既存の開発まで巻き添えで止まる。
+		#
+		# max-age=0 は「記憶するな / 記憶済みなら忘れろ」の意味なので、
+		# 誤って有効にしたあとの復旧もこの既定で効く。
+		#
+		# 本番同型の値を確かめるときだけ外から差し替える:
+		#   HSTS="max-age=31536000; includeSubDomains" make up-https
+		Strict-Transport-Security "{$HSTS:max-age=0}"
+
+		# 素性を隠す。
+		-Server
+	}
+
+	# CSP は入れない。ADR 0013 決定 2 が
+	# 「まず Report-Only で導入し、違反を観測してから強制へ」と
+	# 決めているため、観測の受け口 (ADR 0010 のログ基盤) を用意してから。
+
+	# エッジ自身の生存確認 (ALB のヘルスチェックに相当)。
+	# 下流が落ちていても応答するので、切り分けの起点になる。
+	handle /edge-healthz {
+		respond "ok" 200
+	}
+
+	# /api/* -> go-api。**プレフィックスを剥がす。**
+	#
+	# ALB はパスを書き換えられないが、CloudFront は Origin Path で剥がせる。
+	# 本番構成では CloudFront が /api/* を ALB へ流すので、
+	# ここは CloudFront 側の振る舞いに合わせている。
+	handle_path /api/* {
+		reverse_proxy go-api:8080 {
+			# **X-Forwarded-Proto を明示的に書く。**
+			#
+			# Caddy は既定でも付ける ({scheme} 相当) が、明示しておくと
+			# 「落としたら何が壊れるか」を環境変数ひとつで実測できる:
+			#   XFP=http make up-https   -> 全書き込みが 403 になるはず
+			header_up X-Forwarded-Proto {$XFP:https}
+		}
+	}
+
+	# /images/* -> MinIO (本番の S3 + OAC に相当)。
+	# 画像を API に通さず直接返す経路が、単一オリジンでも成立するかを見る。
+	handle_path /images/* {
+		rewrite * /bbs-images{uri}
+		reverse_proxy minio:9000
+	}
+
+	# それ以外はフロントへ。
+	handle {
+		reverse_proxy next-app:3000
+	}
+}

@@ -1,0 +1,660 @@
+/*
+ * 画面の見た目をここに集約する。
+ *
+ * 【なぜインラインスタイルをやめたか】
+ * `app/lib/ui.ts` は CSSProperties のオブジェクトを配って回っていた。
+ * 画面が 3 枚のうちは依存を増やさない判断として妥当だったが、
+ * Phase 3 で画面が 8 枚になり、**インラインスタイルでは書けないもの**が
+ * そのまま欠落として残っていた。
+ *
+ *   - `:focus-visible` —— **キーボード操作でいまどこにいるか分からない。**
+ *     ブラウザ既定のフォーカスリングは、`outline` を上書きしていなくても
+ *     暗い背景に暗い輪郭が乗るため実質見えていなかった
+ *   - `:hover` / `:disabled` —— 押せるもの・押せないものが見分けられない
+ *   - メディアクエリ —— 幅の狭い画面で `padding: 2rem` が固定
+ *   - `prefers-reduced-motion` —— 前庭障害への配慮を宣言できない
+ *
+ * どれも「型が通り、ビルドも通り、それでも使えない」領域になる。
+ * ADR 0020 がフロントの検査について言ったことと同じ形をしている。
+ *
+ * 依存は増やしていない (Tailwind も CSS-in-JS も入れていない)。
+ * Next.js が標準で持つグローバル CSS だけを使う。
+ *
+ * 【配色を変えた理由 —— 前の組み合わせは読めなかった】
+ * 旧: 文字 #00f / 背景 #000 は**コントラスト比 2.44:1**。
+ * WCAG 2.2 の AA (本文 4.5:1) に届いていない。純青は輝度が低く、
+ * 「暗い背景に暗い文字」になる。世界観は保ったまま、青の明度だけ上げた。
+ *
+ * 比は sRGB の相対輝度から算出した実測値で、下の各行に併記する。
+ */
+
+/* --------------------------------------------------------------------------
+ * トークン
+ * ----------------------------------------------------------------------- */
+
+:root {
+  /*
+   * **ダーク固定。** ライトテーマを用意していないので、
+   * ブラウザに「この配色でいく」と宣言する。
+   * これが無いと、フォームコントロール (select の矢印、スクロールバー、
+   * オートフィルの黄色い背景) だけが明るいまま残る。
+   */
+  color-scheme: dark;
+
+  --bg: #05070c;
+  --surface: #0b1018;
+  --surface-raised: #121a26;
+
+  --fg: #dbe6f6; /* 対 --bg 15.9:1 */
+  --dim: #93a6c4; /* 対 --bg  8.1:1 */
+  --accent: #7fb0ff; /* 対 --bg  9.2:1 */
+  --danger: #ff8f8f; /* 対 --bg  9.2:1 */
+  --warn: #ffc46b; /* 対 --bg 13.0:1 */
+  --ok: #7ee0b0; /* 対 --bg 12.4:1 */
+
+  /*
+   * 罫線は色そのものではなく accent の透過で作る。
+   * 面の重なりが増えても、線だけが浮かないようにするため。
+   */
+  --line: color-mix(in srgb, var(--accent) 28%, transparent);
+  --line-strong: color-mix(in srgb, var(--accent) 55%, transparent);
+
+  --radius: 2px;
+  --gap: 1rem;
+
+  /* 本文の最大幅。**行が長すぎると読み返す位置を見失う。** */
+  --measure: 46rem;
+  --page-width: 60rem;
+
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  /*
+   * 日本語の可読性は行間で決まる。1.7 は本文向けで、
+   * 見出しは下で個別に詰める。
+   */
+  line-height: 1.7;
+}
+
+/* --------------------------------------------------------------------------
+ * 基本
+ * ----------------------------------------------------------------------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  /* ページ内リンクで飛んだ先が見出しの真上に来ないようにする。 */
+  scroll-padding-top: 2rem;
+}
+
+body {
+  margin: 0;
+  background-color: var(--bg);
+  color: var(--fg);
+  /*
+   * **等幅のままにする。** このリポジトリの見た目 (端末風) はここで決まる。
+   * ただし日本語は等幅指定が効かず既定のゴシックに落ちるので、
+   * 実際に等幅なのは英数字だけになる —— それで意図した見え方になる。
+   */
+  font-family: inherit;
+  /* iOS Safari で横向きにしたときの自動拡大を止める。 */
+  text-size-adjust: 100%;
+}
+
+/*
+ * **長い英数字の連続で横スクロールを出さない。**
+ * 掲示板は URL がそのまま貼られる。カーソル文字列も同様に長い。
+ */
+body,
+p,
+li,
+td,
+th,
+dd {
+  overflow-wrap: anywhere;
+}
+
+h1,
+h2,
+h3 {
+  line-height: 1.35;
+  font-weight: 700;
+}
+
+h1 {
+  font-size: 1.5rem;
+  margin: 0 0 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--line-strong);
+}
+
+h2 {
+  font-size: 1.2rem;
+  margin: 2rem 0 0.75rem;
+}
+
+h3 {
+  font-size: 1.05rem;
+  margin: 1.5rem 0 0.5rem;
+}
+
+a {
+  color: var(--accent);
+  /*
+   * **下線を残す。** 色だけで区別すると、色覚特性によっては
+   * リンクと本文が同じに見える (WCAG 1.4.1)。
+   */
+  text-underline-offset: 0.2em;
+}
+
+a:hover {
+  color: var(--fg);
+}
+
+/*
+ * **フォーカスの輪郭。ここがこのファイルを書いた一番の理由になる。**
+ *
+ * `:focus-visible` を使うので、マウスで押したときには出ず、
+ * キーボード操作のときだけ出る。`outline-offset` を付けているのは
+ * 罫線と重なって見分けが付かなくなるのを避けるため。
+ */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius);
+}
+
+/*
+ * **見えないが読み上げには残す。** 表示から消すだけの `display: none` は
+ * スクリーンリーダーからも消えるので、代わりにこれを使う。
+ */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/*
+ * 本文へ飛ぶリンク。**Tab の 1 打鍵目にだけ現れる。**
+ * ヘッダのナビを毎回読み飛ばさせないため (WCAG 2.4.1)。
+ */
+.skip-link {
+  position: absolute;
+  left: 0.5rem;
+  top: -3rem;
+  z-index: 10;
+  padding: 0.5rem 0.75rem;
+  background-color: var(--surface-raised);
+  border: 1px solid var(--line-strong);
+  transition: top 0.15s ease;
+}
+
+.skip-link:focus {
+  top: 0.5rem;
+}
+
+/* --------------------------------------------------------------------------
+ * 骨組み
+ * ----------------------------------------------------------------------- */
+
+.shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.site-header {
+  border-bottom: 1px solid var(--line);
+  background-color: var(--surface);
+}
+
+.site-header__inner,
+.page,
+.site-footer__inner {
+  width: 100%;
+  max-width: var(--page-width);
+  margin: 0 auto;
+  padding: 1rem 1.25rem;
+}
+
+.page {
+  flex: 1;
+  padding-top: 1.5rem;
+  padding-bottom: 3rem;
+}
+
+.site-title {
+  font-size: 1rem;
+  margin: 0;
+  letter-spacing: 0.08em;
+}
+
+.site-title a {
+  color: var(--fg);
+  text-decoration: none;
+}
+
+.site-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  margin-top: 0.5rem;
+  font-size: 0.9rem;
+}
+
+/*
+ * いま開いている画面。**色だけでなく下線でも示す。**
+ * `aria-current="page"` は読み上げ側の表現で、見た目はこちらが持つ。
+ */
+.site-nav a[aria-current='page'] {
+  color: var(--fg);
+  border-bottom: 2px solid var(--accent);
+}
+
+.site-footer {
+  border-top: 1px solid var(--line);
+  color: var(--dim);
+  font-size: 0.85rem;
+}
+
+/* --------------------------------------------------------------------------
+ * 面と間隔
+ * ----------------------------------------------------------------------- */
+
+.card {
+  background-color: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 1rem;
+  margin: var(--gap) 0;
+}
+
+/* 縦に積むときの間隔をここで一括で持つ (各所の margin 指定をやめるため)。 */
+.stack > * + * {
+  margin-top: 0.75rem;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* 操作の並び。**入力欄との間を空ける** —— 詰まっていると誤って押す。 */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+
+/*
+ * 押すと面が開く操作 (通報) は、開いたあと行を占有させる。
+ * flex の子のままだと、中身の幅に潰れて入力欄が読めなくなる。
+ */
+.actions > .card,
+.actions > .alert {
+  flex: 1 1 100%;
+}
+
+.muted {
+  color: var(--dim);
+}
+
+.measure {
+  max-width: var(--measure);
+}
+
+.meta {
+  color: var(--dim);
+  font-size: 0.85rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  margin: 0;
+}
+
+.badge {
+  display: inline-block;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: 0 0.4rem;
+  font-size: 0.8rem;
+  color: var(--dim);
+}
+
+/* --------------------------------------------------------------------------
+ * 報せ
+ *
+ * **色だけで種類を伝えない** (WCAG 1.4.1)。文言と役割属性を併せる。
+ * 失敗は `role="alert"`、待ちは `aria-live="polite"` を付けて使う。
+ * ----------------------------------------------------------------------- */
+
+.alert {
+  border: 1px solid var(--line-strong);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  margin: var(--gap) 0;
+  background-color: var(--surface);
+}
+
+.alert--error {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.alert--warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.alert--ok {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.alert p {
+  margin: 0;
+}
+
+.alert p + p {
+  margin-top: 0.5rem;
+}
+
+/* --------------------------------------------------------------------------
+ * 操作子
+ * ----------------------------------------------------------------------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  /*
+   * **指で押せる高さを確保する** (2.5rem = 40px)。
+   * 文字の高さだけで作ると、幅の狭い画面で押し損ねる。
+   */
+  min-height: 2.5rem;
+  padding: 0.4rem 0.9rem;
+  background-color: transparent;
+  color: var(--accent);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  font: inherit;
+  font-size: 0.95rem;
+  cursor: pointer;
+  text-decoration: none;
+  transition:
+    background-color 0.12s ease,
+    color 0.12s ease;
+}
+
+.btn:hover:not(:disabled) {
+  background-color: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--fg);
+}
+
+.btn:disabled {
+  /*
+   * **透明度だけで無効を示さない。** 0.5 まで落とすと文字が読めなくなり、
+   * 「なぜ押せないか」を書いた文言まで読めなくなる。
+   * 色を dim に落とし、カーソルの形でも伝える。
+   */
+  color: var(--dim);
+  border-color: var(--line);
+  cursor: not-allowed;
+}
+
+/* 取り消せない操作。**論理削除なので DB からは戻せるが、戻す画面は無い** (ADR 0011)。 */
+.btn--danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 60%, transparent);
+}
+
+.btn--danger:hover:not(:disabled) {
+  background-color: color-mix(in srgb, var(--danger) 16%, transparent);
+  color: var(--fg);
+}
+
+.btn--primary {
+  border-color: var(--accent);
+  background-color: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.btn--quiet {
+  border-color: transparent;
+  padding-inline: 0.4rem;
+  min-height: 2rem;
+  font-size: 0.85rem;
+}
+
+.btn--quiet:hover:not(:disabled) {
+  border-color: var(--line);
+}
+
+/*
+ * いま選ばれている切り替え (並び順など)。
+ * **値は `page` に揃える** —— ヘッダのナビと同じ意味 (ページ遷移) になる。
+ */
+.btn[aria-current='page'] {
+  background-color: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+}
+
+/* --------------------------------------------------------------------------
+ * 入力
+ * ----------------------------------------------------------------------- */
+
+.field {
+  display: block;
+  margin: 1rem 0 0;
+}
+
+.field__label {
+  display: block;
+  margin-bottom: 0.3rem;
+  color: var(--dim);
+  font-size: 0.9rem;
+}
+
+/* 任意項目・補足。**必須の印だけを付けると、印の無い項目の扱いが曖昧になる。** */
+.field__hint {
+  display: block;
+  margin-top: 0.3rem;
+  color: var(--dim);
+  font-size: 0.8rem;
+}
+
+.input,
+.textarea,
+.select {
+  display: block;
+  width: 100%;
+  max-width: var(--measure);
+  min-height: 2.5rem;
+  padding: 0.45rem 0.6rem;
+  background-color: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  font: inherit;
+  /*
+   * **16px を下回らせない。** iOS Safari は 16px 未満の入力欄に
+   * 焦点が当たると画面を勝手に拡大し、そのまま戻らない。
+   */
+  font-size: 1rem;
+}
+
+.textarea {
+  min-height: 8rem;
+  line-height: 1.7;
+  resize: vertical;
+}
+
+.input::placeholder,
+.textarea::placeholder {
+  color: color-mix(in srgb, var(--dim) 70%, transparent);
+}
+
+/* 文字数の残り。上限に近づいたら色を変える (クラスを足し替えて使う)。 */
+.counter {
+  font-size: 0.8rem;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.counter--near {
+  color: var(--warn);
+}
+
+.counter--over {
+  color: var(--danger);
+}
+
+/* --------------------------------------------------------------------------
+ * 一覧と投稿
+ * ----------------------------------------------------------------------- */
+
+.list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+/*
+ * スレッドの行。**カード全体を押せるようにはしない** ——
+ * 中に別のリンクや操作を置けなくなるうえ、
+ * 「どこを押したか」で挙動が変わる作りは説明できない。
+ */
+.thread {
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+
+.thread__title {
+  font-size: 1.05rem;
+  margin: 0 0 0.35rem;
+}
+
+.thread__icon,
+.avatar {
+  flex: none;
+  width: 3rem;
+  height: 3rem;
+  object-fit: cover;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background-color: var(--surface-raised);
+}
+
+.avatar--lg {
+  width: 4.5rem;
+  height: 4.5rem;
+}
+
+/* 投稿者名の横に添える小さいもの。**行の高さを押し広げない大きさ。** */
+.avatar--sm {
+  width: 1.5rem;
+  height: 1.5rem;
+}
+
+/* 見出しと、その場の操作 (更新など) を横に並べる。 */
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+
+.section-head h2 {
+  margin-bottom: 0;
+}
+
+.comment {
+  border-top: 1px solid var(--line);
+  padding: 1rem 0;
+}
+
+.comment:first-child {
+  border-top: none;
+}
+
+.comment__seq {
+  color: var(--accent);
+  font-weight: 700;
+  margin-right: 0.5rem;
+}
+
+/*
+ * 本文。**改行をそのまま出す。**
+ * 掲示板の投稿は改行で意味を作るので、潰すと読めなくなる。
+ * `pre-wrap` にしているのは、長い行は折り返したいため。
+ */
+.body-text {
+  white-space: pre-wrap;
+  margin: 0.5rem 0 0;
+  max-width: var(--measure);
+}
+
+/*
+ * 添付画像。**縦横比を保ったまま縮める。**
+ * `width`/`height` は API が返す実寸を属性で入れておく ——
+ * 読み込み前に場所が確保され、後から本文が飛ばない (CLS)。
+ */
+.attachment {
+  display: block;
+  max-width: min(100%, 28rem);
+  height: auto;
+  margin-top: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+/* --------------------------------------------------------------------------
+ * 画面幅
+ * ----------------------------------------------------------------------- */
+
+@media (max-width: 40rem) {
+  .site-header__inner,
+  .page,
+  .site-footer__inner {
+    padding-inline: 0.9rem;
+  }
+
+  h1 {
+    font-size: 1.25rem;
+  }
+
+  .thread__icon {
+    width: 2.5rem;
+    height: 2.5rem;
+  }
+}
+
+/*
+ * **動きを止める。** 前庭障害のある利用者には、
+ * わずかな移動でも症状が出る (WCAG 2.3.3)。
+ * ここで使っている動きは skip-link とボタンの色だけだが、宣言しておく。
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

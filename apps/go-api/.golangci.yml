@@ -1,0 +1,80 @@
+version: "2"
+
+linters:
+  # standard = errcheck, govet, ineffassign, staticcheck, unused
+  default: standard
+  enable:
+    # HTTP レスポンスボディの閉じ忘れ (接続リーク) を検出する
+    - bodyclose
+    # errors.Is / errors.As を使わない型アサーションや == 比較を検出する。
+    # apperr の番兵エラーを errors.Is で判定する設計なので、これは必須
+    - errorlint
+    # エラーを受け取っておきながら nil を返している箇所を検出する
+    - nilerr
+    # context を渡すべき箇所で渡していない HTTP/SQL 呼び出しを検出する
+    - noctx
+    # 典型的なセキュリティ問題 (弱い乱数、パーミッション、SQL 組み立てなど)
+    - gosec
+    # database/sql の Rows.Err() 確認漏れ
+    - rowserrcheck
+    # Rows / Stmt の閉じ忘れ
+    - sqlclosecheck
+    # 不要な型変換
+    - unconvert
+    # 代入したのに使われていない値
+    - wastedassign
+    # コメントや文字列のスペルミス
+    - misspell
+    # 命名規則、エクスポート識別子のコメント有無など
+    - revive
+
+  # モジュール境界・レイヤの依存方向・ライブラリの流出は depguard ではなく
+  # go-arch-lint (.go-arch-lint.yml / .go-arch-lint.tests.yml) で検査する。
+  # depguard のルールは files の glob に一致したファイルにだけ効くため、
+  # 新しく足したモジュールがどのルールにも一致せず無検査で通ってしまう。
+  # 実測でその穴を確認したうえで移行した。
+  # 経緯は docs/adr/0017-arch-lint-and-depguard.md
+
+  settings:
+    errcheck:
+      # 型アサーションの失敗も検査する
+      check-type-assertions: true
+    govet:
+      enable:
+        # 構造体のフィールド並びによるメモリパディングは
+        # 可読性を優先したいので有効にしない (fieldalignment は入れない)
+        - shadow
+    revive:
+      rules:
+        - name: exported
+          # エクスポートされた識別子にはコメントを求める
+          severity: warning
+        - name: unexported-return
+        - name: error-return
+        - name: error-naming
+        - name: context-as-argument
+
+  exclusions:
+    # sqlc の生成コードは "Code generated ... DO NOT EDIT." を持つので
+    # 既定の generated 除外規則で対象外になる
+    generated: lax
+    rules:
+      # テストでは以下を許容する
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+      # 生成コードは対象外
+      - path: internal/infrastructure/postgres/sqlcgen/
+        linters:
+          - revive
+          - errorlint
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - develop-experiments/apps/go-api
