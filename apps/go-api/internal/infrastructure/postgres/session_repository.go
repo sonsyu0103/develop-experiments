@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"develop-experiments/apps/go-api/internal/infrastructure/postgres/sqlcgen"
@@ -16,13 +17,15 @@ import (
 // SessionRepository は repository.SessionRepository の PostgreSQL 実装です。
 type SessionRepository struct {
 	q *sqlcgen.Queries
+	// pool はトランザクションを開始するために持ちます (SetAvatarImage)。
+	pool *pgxpool.Pool
 }
 
 var _ repository.SessionRepository = (*SessionRepository)(nil)
 
 // NewSessionRepository は接続プールからリポジトリを生成します。
 func NewSessionRepository(pool *pgxpool.Pool) *SessionRepository {
-	return &SessionRepository{q: sqlcgen.New(pool)}
+	return &SessionRepository{q: sqlcgen.New(pool), pool: pool}
 }
 
 // Create はセッションを保存します。
@@ -123,15 +126,57 @@ func clampMaxRows(maxRows int32) int32 {
 // SetAvatarImage はプロフィール画像を設定します。
 //
 // **所有者の確認はユースケース層が済ませています** (repository.go の doc を参照)。
+//
+// 【利用者の行ロックを先に取る】(DB レビュー)
+// 同じ利用者への付け替えが同時に走ると、SetUserAvatarImage の previous が
+// 両方とも同じ旧画像を読み、片方が付けた画像を外し損ねます
+// (attached_at が入ったまま参照されず、永久に回収されない)。
+// 先に LockUserForAvatarChange で行ロックを取り、**READ COMMITTED の
+// 次の文のスナップショットを相手のコミット後にする**ことで防ぎます。
+// SQL 側の説明は users.sql にあります。
+//
+// 画像のキーを引き直す文も同じトランザクションに入れます。
+// 外に出すと、付け替えた直後に回収バッチが行を消した場合に
+// 「設定は成功したのに 404」という応答になります。
 func (r *SessionRepository) SetAvatarImage(
 	ctx context.Context, userID int64, imageID *uuid.UUID,
 ) (*model.SessionOwner, error) {
-	row, err := r.q.SetUserAvatarImage(ctx, sqlcgen.SetUserAvatarImageParams{
-		ID:            userID,
-		AvatarImageID: imageID,
+	const op = "SessionRepository.SetAvatarImage"
+
+	var (
+		row       sqlcgen.User
+		objectKey *string
+	)
+	err := runInTx(ctx, op, r.pool, pgx.ReadCommitted, func(_ pgx.Tx, q *sqlcgen.Queries) error {
+		// 退会済みならここで 0 行になり、404 に翻訳されます。
+		if _, err := q.LockUserForAvatarChange(ctx, userID); err != nil {
+			return translateError(op, err)
+		}
+
+		// 画像が使えない状態 (回収の確保済みなど) なら 0 行になり、404 に翻訳されます。
+		var err error
+		row, err = q.SetUserAvatarImage(ctx, sqlcgen.SetUserAvatarImageParams{
+			ID:            userID,
+			AvatarImageID: imageID,
+		})
+		if err != nil {
+			return translateError(op, err)
+		}
+
+		// **設定した画像のキーを引き直す。** UPDATE の RETURNING は
+		// images を結合できないため、URL の組み立てに要るキーが手に入らない。
+		// 解除 (nil) のときは引かない。
+		if imageID != nil {
+			img, findErr := q.GetImageByID(ctx, *imageID)
+			if findErr != nil {
+				return translateError(op, findErr)
+			}
+			objectKey = &img.ObjectKey
+		}
+		return nil
 	})
 	if err != nil {
-		return nil, translateError("SessionRepository.SetAvatarImage", err)
+		return nil, err
 	}
 
 	role, err := model.ParseRole(row.Role)
@@ -141,24 +186,13 @@ func (r *SessionRepository) SetAvatarImage(
 		role = model.RoleUser
 	}
 
-	owner := &model.SessionOwner{
-		ID:          row.ID,
-		PublicID:    row.PublicID,
-		Email:       row.Email,
-		DisplayName: row.DisplayName,
-		AvatarURL:   row.AvatarUrl,
-		Role:        role,
-	}
-
-	// **設定した画像のキーを引き直す。** UPDATE の RETURNING は
-	// images を結合できないため、URL の組み立てに要るキーが手に入らない。
-	// 解除 (nil) のときは引かない。
-	if imageID != nil {
-		img, findErr := r.q.GetImageByID(ctx, *imageID)
-		if findErr != nil {
-			return nil, translateError("SessionRepository.SetAvatarImage", findErr)
-		}
-		owner.AvatarObjectKey = &img.ObjectKey
-	}
-	return owner, nil
+	return &model.SessionOwner{
+		ID:              row.ID,
+		PublicID:        row.PublicID,
+		Email:           row.Email,
+		DisplayName:     row.DisplayName,
+		AvatarURL:       row.AvatarUrl,
+		Role:            role,
+		AvatarObjectKey: objectKey,
+	}, nil
 }
