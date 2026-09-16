@@ -153,8 +153,12 @@ services:
   #
   # 本番は S3 + CloudFront を想定しており、アプリ側は S3 互換の
   # インターフェースだけを見る。エンドポイントの差し替えで両方に対応できる。
+  #
+  # **イメージは quay.io から取る。** Docker Hub の minio/minio と minio/mc は
+  # 2026-09 に取得できなくなった。同じタグ・同じダイジェストが quay.io にある
+  # (詳細は .github/workflows/ci.yml の Start MinIO)。
   minio:
-    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -190,7 +194,7 @@ services:
   # 許しているのは、手元に CDN を立てないため。
   # アプリが返す URL をブラウザでそのまま開けるようにしておく。
   minio-init:
-    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
     depends_on:
       minio:
         condition: service_healthy

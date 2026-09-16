@@ -441,13 +441,20 @@ jobs:
       # --entrypoint は指定できても、その後ろの引数は渡せない。
       #
       # postgres は引数が要らないので services のままでよい。
+      #
+      # 【Docker Hub ではなく quay.io から取る】
+      # 2026-09 に Docker Hub の minio/minio と minio/mc が取得できなくなった
+      # (`pull access denied ... repository does not exist`)。
+      # quay.io には同じタグが残っており、**ダイジェストも Docker Hub から
+      # 取得済みのものと一致する** (minio: sha256:a1ea29fa…、mc: sha256:aead63c7…)。
+      # 中身は同じイメージで、取得元だけが変わる。compose.yaml も同じ。
       - name: Start MinIO
         run: |
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            "minio/minio:${MINIO_VERSION}" server /data
+            "quay.io/minio/minio:${MINIO_VERSION}" server /data
           for i in $(seq 1 30); do
             curl -sf -o /dev/null http://localhost:9000/minio/health/live && exit 0
             sleep 2
@@ -467,11 +474,21 @@ jobs:
           # mc は過去に mc policy set -> mc anonymous set の改名を実施しており、
           # 同種の変更が入るとコード変更なしに CI が落ちる。
           # compose の minio/mc と同じタグに揃えてある。
-          curl -sSfL "https://dl.min.io/client/mc/release/linux-amd64/archive/mc.${MC_VERSION}" -o /tmp/mc
-          chmod +x /tmp/mc
-          /tmp/mc alias set local http://localhost:9000 minioadmin minioadmin
-          /tmp/mc mb --ignore-existing local/bbs-images
-          /tmp/mc anonymous set download local/bbs-images
+          #
+          # 【バイナリではなくイメージを使う】
+          # 以前は dl.min.io の archive からバイナリを落としていたが、
+          # 2026-09 に **410 Gone** になった (上の Docker Hub と同時期)。
+          # compose と同じ quay.io/minio/mc のイメージを --network host で動かす。
+          # 接続先は MC_HOST_local で渡す —— alias set は設定をコンテナ内に
+          # 書くので、使い捨てのコンテナでは次のコマンドに残らない
+          # (Makefile の MC と同じ形)。
+          mc() {
+            docker run --rm --network host \
+              -e MC_HOST_local=http://minioadmin:minioadmin@localhost:9000 \
+              "quay.io/minio/mc:${MC_VERSION}" "$@"
+          }
+          mc mb --ignore-existing local/bbs-images
+          mc anonymous set download local/bbs-images
 
       - name: Install golang-migrate
         run: |
