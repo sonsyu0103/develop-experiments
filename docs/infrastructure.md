@@ -43,7 +43,8 @@ CloudFront (TLS 終端)             Caddy (ローカル CA で TLS 終端)
 | 要素 | 状態 |
 | --- | --- |
 | CloudFront / ALB / ECS Fargate / RDS / S3 (画像) | **Terraform で実装済み** |
-| Secrets Manager / CloudWatch (ログ・アラーム) | **実装済み** |
+| Secrets Manager / CloudWatch Logs | **実装済み** |
+| CloudWatch アラーム | **一部**。障害と課金は見ているが、下の「アラームを鳴らすもの」の 4 指標は未実装 ([一覧](#アラームを鳴らすもの-cloudwatch-metrics)) |
 | WAF / Route 53 / 独自ドメイン + ACM | 図のまま (コストの判断。ADR 0024 決定 4) |
 | NAT Gateway / プライベートサブネットへの ECS 配置 | 図のまま (同 決定 3) |
 | FireLens → S3 → Athena のログ基盤 | 図のまま (同「やらないこと」) |
@@ -265,14 +266,38 @@ ECS のタスク定義から直接参照させ、環境変数に平文で置か�
 
 #### アラームを鳴らすもの (CloudWatch Metrics)
 
-| 指標 | なぜ見るか |
-| --- | --- |
-| 直列化失敗 (40001) の発生率とリトライ回数 | Phase 2 の中心。[ADR 0006](adr/0006-view-count-and-popularity.md) の問題 2 が起きていないかの確認も兼ねる |
-| 閲覧数フラッシュの遅延とロスト件数 | [ADR 0006](adr/0006-view-count-and-popularity.md) |
-| `contact_messages` の最古 `pending` の経過時間 | [ADR 0008](adr/0008-contact-and-mail.md)。ワーカー停止の検知 |
-| `images` の `pending` 残存数 | [ADR 0007](adr/0007-image-storage.md)。回収バッチの動作確認 |
+設計で挙げた指標と、実装の状況 (2026-09-17 時点)。
+**「実装」は Terraform に書いてあるという意味で、下の 3 本 (\*) は apply して鳴ることまでは確かめていない。**
+
+| 指標 | なぜ見るか | 実装 |
+| --- | --- | --- |
+| 直列化失敗 (40001) の発生率とリトライ回数 | Phase 2 の中心。[ADR 0006](adr/0006-view-count-and-popularity.md) の問題 2 が起きていないかの確認も兼ねる | **未実装**。リトライを使い切った失敗だけは `serialization_retry_exhausted` (ERROR) として下の ERROR アラームに掛かる。発生率は掛からない |
+| 閲覧数フラッシュの遅延とロスト件数 | [ADR 0006](adr/0006-view-count-and-popularity.md) | **未実装**。失敗は `view_count_sync_failed` (WARN) で、アラームに掛からない |
+| `contact_messages` の最古 `pending` の経過時間 | [ADR 0008](adr/0008-contact-and-mail.md)。ワーカー停止の検知 | **未実装**。`contact_pending_age` をログに出しているだけ。**ワーカーごと止まるとこのログも出なくなる**ので、メトリクスにしても「出ていないこと」を見る必要がある (ADR 0008 の 9 / 24) |
+| `images` の `pending` 残存数 | [ADR 0007](adr/0007-image-storage.md)。回収バッチの動作確認 | **未実装**。回収の失敗だけは `image_reclaim_*_failed` (ERROR) として ERROR アラームに掛かる |
 
 下 3 つは**非同期処理が静かに止まったことに気づくため**の指標になる。
+いまの構成では、**失敗して ERROR を出せば気づけるが、静かに止まると気づけない。**
+立てて壊す環境では非同期処理が長時間動かないため、ここは後回しにしている。
+
+実装済みのアラーム (`infra/terraform/monitoring.tf`):
+
+| アラーム | 見ているもの | 捕まえる状態 |
+| --- | --- | --- |
+| `alb-5xx` | `HTTPCode_ELB_5XX_Count` (ALB 自身の 5xx) | ターゲットが居ない・応答しない |
+| `target-5xx` \* | `HTTPCode_Target_5XX_Count` (アプリが返した 5xx) | アプリは生きているが 5xx を返し続けている |
+| `api-error-log` \* | CloudWatch Logs のメトリクスフィルタ `{ $.level = "ERROR" }` | go-api が ERROR を出した ([ADR 0010](adr/0010-log-pipeline.md) の 4-3)。HTTP に出ない失敗もここで拾う |
+| `api-no-healthy-target` | `HealthyHostCount` | go-api の健全なタスクが 0 |
+| `rds-cpu` | `CPUUtilization` | DB の CPU が張り付いている |
+| 予算 (Budgets) | 実績 80% / 予測 100% | 消し忘れ |
+
+\* は 2026-09-17 に追加した分 (メトリクスフィルタを含めて 3 リソース)。
+それ以前は、**アプリが返す 500 と ERROR ログを見るアラームが 1 本も無かった。**
+`alb-5xx` の名前から「5xx は見ている」と読めるが、ALB のこの指標はターゲットが返した 5xx を含まない。
+
+**見ていないもの**: next-app のエラーログ (構造化されていない)、CloudFront の 5xx、
+RDS のストレージ残量と接続数、外形監視。ヘルスチェックは GET なので、
+**書き込みだけが全滅する状態は本番では検知できない** ([ADR 0023](adr/0023-local-edge-and-https.md) の 2。手元の `make https-verify` だけが捕まえる)。
 同期処理と違い、止まってもリクエストは成功し続けるので、
 専用の指標がないと発覚しない。
 

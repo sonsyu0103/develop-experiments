@@ -95,6 +95,83 @@ resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
   treat_missing_data = "notBreaching"
 }
 
+# **アプリ自身が 5xx を返している。**
+#
+# 上の alb_5xx が見る HTTPCode_ELB_5XX_Count は **ALB が自分で作った 5xx だけ**で、
+# ターゲット (go-api / next-app) が返した 5xx は含まない (CloudWatch の
+# メトリクス定義)。そのため「アプリは生きているが 500 を返し続けている」状態
+# —— DB が詰まって全リクエストが 500 になる、など —— を、どのアラームも
+# 見ていなかった (運用監視の点検で見つけた穴)。
+#
+# ロードバランサ単位で見るので、go-api と next-app のどちらが返しても鳴る。
+# go-api の 500 は下の api_error_log も同時に鳴らす (requestLogger が 500 以上を
+# ERROR にしている) ので、**片方だけ鳴ったら next-app 側**と切り分けられる。
+resource "aws_cloudwatch_metric_alarm" "target_5xx" {
+  alarm_name          = "${local.name}-target-5xx"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  threshold           = 5
+  period              = 300
+  statistic           = "Sum"
+
+  namespace   = "AWS/ApplicationELB"
+  metric_name = "HTTPCode_Target_5XX_Count"
+
+  dimensions = {
+    LoadBalancer = aws_lb.main.arn_suffix
+  }
+
+  alarm_description  = "アプリ (go-api / next-app) が 5xx を返している"
+  alarm_actions      = [aws_sns_topic.alarms.arn]
+  treat_missing_data = "notBreaching"
+}
+
+# **go-api が ERROR を出した。**
+#
+# ADR 0010 の 4-3 は「ERROR = 人が対応する必要がある」と定め、
+# 「CloudWatch のアラームはこのレベルを起点に組む」と決めていた。
+# **その起点が実装されていなかった。** リトライ上限に達した直列化失敗、
+# メール送信の断念、画像の回収失敗など、HTTP の応答に出ない失敗は
+# ここでしか拾えない。
+#
+# パターンはログの形に依存する: 本番は LOG_FORMAT=json (ecs.tf) で、
+# slog の JSON ハンドラがトップレベルに "level":"ERROR" を出す。
+# **形が変わるとフィルタは 0 件のまま黙る**ので、
+# internal/logging の TestNewHandler_ErrorLevelMatchesMetricFilter が形を固定している。
+#
+# JSON として読めない行 (起動時のパニックの出力など) はフィルタの対象外になる。
+resource "aws_cloudwatch_log_metric_filter" "api_error" {
+  name           = "${local.name}-api-error"
+  log_group_name = aws_cloudwatch_log_group.api.name
+  pattern        = "{ $.level = \"ERROR\" }"
+
+  metric_transformation {
+    name      = "ErrorLogCount"
+    namespace = "${local.name}/go-api"
+    value     = "1"
+  }
+}
+
+# **1 件でも鳴らす。** ERROR は「人が対応するもの」だけに付けてある
+# (付け方の点検は infra/athena/queries/errors.sql)。
+# 平常時に出るものが混ざっているなら、閾値ではなくレベルの付け方を直す。
+resource "aws_cloudwatch_metric_alarm" "api_error_log" {
+  alarm_name          = "${local.name}-api-error-log"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  threshold           = 1
+  period              = 300
+  statistic           = "Sum"
+
+  namespace   = aws_cloudwatch_log_metric_filter.api_error.metric_transformation[0].namespace
+  metric_name = aws_cloudwatch_log_metric_filter.api_error.metric_transformation[0].name
+
+  alarm_description = "go-api が ERROR を出した (人が対応する必要がある。ADR 0010 の 4-3)"
+  alarm_actions     = [aws_sns_topic.alarms.arn]
+  # ERROR が 1 件も無い期間はデータポイント自体が無い。それは正常。
+  treat_missing_data = "notBreaching"
+}
+
 # **健全なターゲットが 0 になった。**
 # Spot の中断や、ヘルスチェック失敗による入れ替えが続いている状態。
 resource "aws_cloudwatch_metric_alarm" "api_unhealthy" {

@@ -522,22 +522,27 @@ VPC CIDR だけを信頼すると、右端のエッジ IP がそのまま `Clien
 タグ検索に残るのが `INACTIVE` の墓標だけであることを確認した。
 実績コストは約 $0.07 (稼働 1 時間)。
 
-### 作られるリソースは 71 件 (2026-08-30 に内訳を確定)
+### 作られるリソースは 74 件 (2026-08-30 に内訳を確定、2026-09-17 に 71 → 74)
 
-**`.tf` を `grep` しても 65 件しか出ない。** `count` と `for_each` で
+**`.tf` を `grep` しても 68 件しか出ない。** `count` と `for_each` で
 展開される分が数えられないため。内訳を残しておく。
 
 | | 件数 |
 | --- | --- |
-| `resource` ブロック (静的) | 65 |
-| うち固定 (展開なし) | 56 |
+| `resource` ブロック (静的) | 68 |
+| うち固定 (展開なし) | 59 |
 | ECR: `for_each = local.ecr_repositories` (api / web / migrate) × 2 ブロック | **6** |
 | network: `count = var.az_count` (既定 2) × 4 ブロック | **8** |
 | IAM: GitHub OIDC プロバイダ (三項で 1 か 0 のどちらか) | **1** |
 | monitoring: SNS 購読 (`var.alarm_email` 既定 `""` なので 0) | **0** |
-| **合計** | **71** |
+| **合計** | **74** |
 
-56 + 6 + 8 + 1 + 0 = 71。**`alarm_email` を設定して apply すると 72 になる。**
+59 + 6 + 8 + 1 + 0 = 74。**`alarm_email` を設定して apply すると 75 になる。**
+
+> **2026-09-17 に監視を 3 リソース足した** (`monitoring.tf`: `target_5xx` / `api_error` のメトリクスフィルタ / `api_error_log`)。
+> アプリが返した 5xx と ERROR ログを見るアラームが無かったため
+> ([インフラ構成](../infrastructure.md) の「アラームを鳴らすもの」)。
+> **apply → verify → destroy を一周したのは 71 件の時点**で、この 3 件は `terraform validate` までしか通していない。
 
 > **なぜ数え直したか**: 実測で語る流儀で来ているのに、この数字だけ
 > 出典が `apply` 時の記憶しか無かった。リポジトリを見た人が `grep` すると
@@ -552,6 +557,9 @@ VPC CIDR だけを信頼すると、右端のエッジ IP がそのまま `Clien
   次に立てたら、まず `gh workflow run deploy.yml` を通すこと
 - **Google OIDC を設定していない。** `tf-verify` の Cookie 検査が SKIP のまま
 - **予算アラートのメールが届くか。** SNS の購読確認を押していない
+- **2026-09-17 に足した監視 3 件が実際に鳴るか。** `terraform validate` まで。
+  メトリクスフィルタのパターンがログに一致することは、ログの形をテスト
+  (`TestNewHandler_ErrorLevelMatchesMetricFilter`) で固定しただけで、AWS 上では確かめていない
 
 ## やり残し
 

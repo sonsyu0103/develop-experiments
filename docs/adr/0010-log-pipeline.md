@@ -202,6 +202,12 @@ Athena はスキーマオンリードなので、フィールドが揺れると�
 CloudWatch のアラームはこのレベルを起点に組む
 ([インフラ構成](../infrastructure.md) の「ログとメトリクスの分担」)。
 
+> **この起点は 2026-09-17 まで実装されていなかった。** Terraform に
+> ERROR を数えるメトリクスフィルタが無く、ERROR を出しても誰にも届かなかった。
+> `monitoring.tf` の `api_error` / `api_error_log` で実装した
+> (パターン `{ $.level = "ERROR" }`。ログの形は
+> `TestNewHandler_ErrorLevelMatchesMetricFilter` が固定している)。
+
 したがって、**人が対応しなくてよいものを ERROR にしない**ことが重要になる。
 
 #### 特に: リトライして成功した直列化失敗は ERROR ではない
