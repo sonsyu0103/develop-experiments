@@ -223,6 +223,30 @@ type Querier interface {
 	// **comments_p5_thread_id_seq_idx のような子の名前**になる (実測)。
 	// 親の名前だけで一致を見るとリトライ判定が永久に偽になり、
 	// unique モードが競合のたびに 409 を返すようになる。
+	//
+	// 【画像が添付できる状態かを、この文の中で確かめる】(DB レビュー)
+	// EnsureOwned はロックを取らない読み取りなので、「確認したあと・書く前」に
+	// 回収バッチが画像を確保 (object_reclaimed_at を書く) する窓がある。
+	// 以前は attached の UPDATE にだけ条件を置いていたが、**それでは足りなかった。**
+	// 添付済みの記録が付かないだけで、**コメントは回収済みの画像を参照したまま
+	// 作られる。** 回収バッチの DeleteImage はその参照で外部キー違反になり、
+	// 画像の行が宙に浮く。利用者からは、添付した画像が黙って消えて見える。
+	//
+	// そこで image CTE で行ロックを取り、条件を満たさなければ挿入を 0 行にする。
+	// 回収バッチが先に確保していれば、ロックを待ったあと最新の行で WHERE を
+	// 評価し直すので、確保を追い越せない。0 行は pgx.ErrNoRows として 404 になる
+	// (EnsureOwned も使えない画像を 404 で返すので、応答は揃う)。
+	//
+	// 確かめるのは status と object_reclaimed_at だけ。owner_id と kind は
+	// 作成後に変わらない列なので、EnsureOwned の確認がそのまま有効であり続ける。
+	//
+	// **ロックは FOR NO KEY UPDATE。FOR SHARE にしてはいけない。**
+	// 共有ロック同士は両立するので、同じ画像を付けた二重送信が 2 本とも
+	// 共有ロックを取り、attached の UPDATE でロックを格上げするときに
+	// 互いを待ってデッドロックする (実測: deadlock detected)。
+	// FOR NO KEY UPDATE なら 2 本目は 1 本目の終了を待つだけになる。
+	// 外部キーの確認 (FOR KEY SHARE) とは衝突しないので、
+	// 同じ画像を参照する他の行の挿入は妨げない。
 	CreateCommentAutoSeq(ctx context.Context, arg CreateCommentAutoSeqParams) (CreateCommentAutoSeqRow, error)
 	// レス番号を呼び出し側が決めて挿入する。
 	// ssi / pessimistic / naive の 3 モードが共有する (ADR 0019 決定 2)。
@@ -235,6 +259,12 @@ type Querier interface {
 	//   - 「0 行が返る」原因が「スレッドが無い」と「採番が衝突した」の
 	//     2 通りになり、呼び出し側でエラーを取り違える
 	// 存在確認をどこでやるかは、モードごとに呼び出し側が持つ。
+	//
+	// **画像が添付できる状態かは、この文の中で確かめる** (DB レビュー)。
+	// 理由とロック強度は下の CreateCommentAutoSeq に書いた。
+	// 使えない画像なら 0 行になり、insertWithSeq が pgx.ErrNoRows を 404 に翻訳する。
+	// スレッドの存在確認と違って、呼び出し側が先に済ませる手段が無い
+	// (確認と書き込みの間の窓を閉じるのが目的なので)。
 	//
 	// 投稿者の解決は 1 往復に含める。RETURNING は挿入行しか返せないので
 	// CTE で包んで LEFT JOIN する (threads.sql の CreateThread と同じ理由)。
@@ -350,6 +380,10 @@ type Querier interface {
 	// 呼び出し側で組み立てる手もあるが、一覧・詳細と組み立て方が 2 通りになる。
 	//
 	// author_id は NULL 許容。NULL が匿名を意味する (ADR 0005 決定 2)。
+	//
+	// 【アイコンが使える状態かを、この文の中で確かめる】(DB レビュー)
+	// 理由とロック強度は comments.sql の CreateCommentAutoSeq と同じ。
+	// 使えないアイコンなら 0 行になり、pgx.ErrNoRows が 404 に翻訳される。
 	CreateThread(ctx context.Context, arg CreateThreadParams) (CreateThreadRow, error)
 	// 保持期間を過ぎたキーの削除。定期処理から呼ぶ
 	// (ADR 0003 未決 #9: どのプロセスで動かすかは未決。現時点で未配線)。
@@ -537,8 +571,21 @@ type Querier interface {
 	//
 	// **UPDATE ... FROM の行処理順は保証されない。** 実行計画次第で、
 	// 入力配列の順序どおりにロックを取るとは限らない。
-	// そのため、先に FOR UPDATE の CTE で **ORDER BY id のロックだけを取る。**
-	// FOR UPDATE を含む CTE は inline されず、UPDATE 本体より先に評価される。
+	// そのため、先にロック句つきの CTE で **ORDER BY id のロックだけを取る。**
+	// ロック句を含む CTE は inline されず、UPDATE 本体より先に評価される。
+	//
+	// 【FOR UPDATE ではなく FOR NO KEY UPDATE】(DB レビュー)
+	// **FOR UPDATE は FOR KEY SHARE と衝突する。** コメントの INSERT は
+	// 外部キーの確認で親スレッドの行に FOR KEY SHARE を取るので、
+	// FOR UPDATE にすると反映とコメント投稿が互いを待つ。
+	// id 昇順にロックを取っていく途中で遅い投稿トランザクションに当たると、
+	// **それまでにロックした無関係なスレッドへの投稿がすべて待たされる**
+	// (実測: 4 秒かかる投稿が 1 本あるだけで、別スレッドへの投稿が 2,947 ms)。
+	//
+	// view_count は一意索引に含まれないので、UPDATE 本体が取るのも
+	// FOR NO KEY UPDATE になる。CTE だけ強くする理由は無い。
+	// FOR NO KEY UPDATE 同士は衝突するので、デッドロックを避ける目的は変わらない
+	// (同じ条件で 7.9 ms)。
 	//
 	// 【存在しない行は黙って無視される】
 	// 閲覧された後に削除されたスレッドは JOIN で落ちる。
@@ -998,6 +1045,19 @@ type Querier interface {
 	// SSI (SERIALIZABLE) を使うならこの明示ロックは不要だが、
 	// 悲観ロック版と楽観 (SSI) 版のスループット差を計測するために両方用意している。
 	LockThreadForUpdate(ctx context.Context, id int64) (int64, error)
+	// プロフィール画像を付け替える前に、利用者の行をロックする (DB レビュー)。
+	//
+	// **SetUserAvatarImage と同じトランザクションで、その直前に呼ぶ。**
+	// 理由は SetUserAvatarImage の【LockUserForAvatarChange のあとに…】を参照。
+	//
+	// 条件は SetUserAvatarImage の主文と揃える。退会済みなら 0 行になり、
+	// pgx.ErrNoRows が 404 に翻訳される (以前は SetUserAvatarImage の 0 行が同じ役目)。
+	//
+	// **FOR UPDATE ではなく FOR NO KEY UPDATE** (threads.sql の
+	// IncrementThreadViewCounts と同じ理由)。FOR UPDATE は、その利用者が
+	// 投稿するときの外部キーの確認 (FOR KEY SHARE) と衝突する。
+	// 付け替え同士を直列にするには FOR NO KEY UPDATE 同士の衝突で足りる。
+	LockUserForAvatarChange(ctx context.Context, id int64) (int64, error)
 	// 送信できた行を確定する。
 	//
 	// **status = 'pending' を条件に含める。** 含めないと、リース切れで
@@ -1239,6 +1299,31 @@ type Querier interface {
 	// **列は表名で修飾する。** この 1 文には users と images の 2 つが登場し、
 	// どちらにも id 列がある。修飾しないと sqlc の解析が
 	// "column reference \"id\" is ambiguous" で止まる (実測)。
+	//
+	// 【LockUserForAvatarChange のあとに、同じトランザクションで呼ぶ】(DB レビュー)
+	// previous はこの文のスナップショットで旧画像を読む。同じ利用者への
+	// 付け替えが 2 本同時に走ると、どちらも同じ旧画像 X を読み、
+	// 2 本目は 1 本目が付けた画像 A を外さない —— **A は attached_at が入ったまま
+	// どこからも参照されず、永久に回収されない** (実測で 3 回とも再現)。
+	// 先に users の行ロックを取っておけば、READ COMMITTED ではこの文の
+	// スナップショットが相手のコミット後に取られるので、previous が最新の値を読む。
+	// **READ COMMITTED で呼ぶ前提。** SERIALIZABLE / REPEATABLE READ では
+	// スナップショットがトランザクションで固定されるため、相手が更新した行の
+	// ロックは待ったあと直列化失敗 (40001) になる (正しさは保たれるが、
+	// リトライの経路をこの操作は持っていない)。
+	//
+	// **previous に FOR UPDATE を付ける形では直らない。** 主文 (UPDATE users) が
+	// 先に行を更新し、参照されていない detached / attached はそのあとで実行される。
+	// そこで評価される previous の FOR UPDATE は「同じ文が更新した行」を
+	// 読み飛ばして 0 行になり、**競合が無くても**画像の付け外しが丸ごと空振りする
+	// (実測)。ロックは文を分けて先に取る。
+	//
+	// 【画像が使える状態かを、この文の中で確かめる】(DB レビュー)
+	// 理由とロック強度は comments.sql の CreateCommentAutoSeq と同じ。
+	// 使えない画像なら主文が 0 行になり、pgx.ErrNoRows が 404 に翻訳される。
+	// **detached にも同じ条件を置く。** 参照されていない CTE は主文が 0 行でも
+	// 実行されるので、置かないと「設定は失敗したのに旧画像だけ外れる」。
+	// トランザクションの中ならロールバックで戻るが、文だけで閉じておく。
 	SetUserAvatarImage(ctx context.Context, arg SetUserAvatarImageParams) (User, error)
 	// **投稿者を見ない削除。** モデレーターの経路
 	// (POST /moderation/actions) がこれを使う ——
