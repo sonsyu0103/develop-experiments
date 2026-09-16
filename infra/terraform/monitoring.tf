@@ -104,8 +104,13 @@ resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
 # 見ていなかった (運用監視の点検で見つけた穴)。
 #
 # ロードバランサ単位で見るので、go-api と next-app のどちらが返しても鳴る。
-# go-api の 500 は下の api_error_log も同時に鳴らす (requestLogger が 500 以上を
-# ERROR にしている) ので、**片方だけ鳴ったら next-app 側**と切り分けられる。
+#
+# 【切り分けは一方向だけ】
+# go-api の 5xx は必ず下の api_error_log も鳴らす (requestLogger が 500 以上を
+# ERROR にしている)。したがって **target_5xx だけが鳴ったら next-app 側**と言える。
+# **逆は言えない。** 閾値が違う (こちらは 5 分で 5 件超、api_error_log は 1 件以上) ので、
+# go-api が 500 を数回返しただけ、あるいは HTTP に出ない ERROR
+# (scheduler_job_failed など) でも、api_error_log だけが鳴る (レビュー指摘)。
 resource "aws_cloudwatch_metric_alarm" "target_5xx" {
   alarm_name          = "${local.name}-target-5xx"
   comparison_operator = "GreaterThanThreshold"
