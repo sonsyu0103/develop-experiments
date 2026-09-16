@@ -225,36 +225,45 @@ WHERE thread_id = sqlc.arg('thread_id');
 --     2 通りになり、呼び出し側でエラーを取り違える
 -- 存在確認をどこでやるかは、モードごとに呼び出し側が持つ。
 --
+-- **画像が添付できる状態かは、この文の中で確かめる** (DB レビュー)。
+-- 理由とロック強度は下の CreateCommentAutoSeq に書いた。
+-- 使えない画像なら 0 行になり、insertWithSeq が pgx.ErrNoRows を 404 に翻訳する。
+-- スレッドの存在確認と違って、呼び出し側が先に済ませる手段が無い
+-- (確認と書き込みの間の窓を閉じるのが目的なので)。
+--
 -- 投稿者の解決は 1 往復に含める。RETURNING は挿入行しか返せないので
 -- CTE で包んで LEFT JOIN する (threads.sql の CreateThread と同じ理由)。
-WITH inserted AS (
+WITH image AS (
+    SELECT images.id
+    FROM images
+    WHERE images.id = sqlc.narg('image_id')
+      AND images.status = 'committed'
+      AND images.object_reclaimed_at IS NULL
+    FOR NO KEY UPDATE
+), inserted AS (
     INSERT INTO comments (thread_id, seq, author_name, body, author_id, image_id)
-    VALUES (
+    SELECT
         sqlc.arg('thread_id'),
         sqlc.arg('seq'),
         sqlc.arg('author_name'),
         sqlc.arg('body'),
         sqlc.narg('author_id'),
         sqlc.narg('image_id')
-    )
+    WHERE sqlc.narg('image_id')::uuid IS NULL OR EXISTS (SELECT 1 FROM image)
     RETURNING id, thread_id, seq, author_name, body, created_at, author_id, image_id
 ), attached AS (
     -- **画像を「添付済み」にするのは、投稿を作るのと同じ 1 文の中で行う** (000007)。
     -- 分けると「コメントは作られたが添付の記録が無い」窓ができ、
     -- そこに回収バッチが入ると参照中の画像の実体を消してしまう。
     --
-    -- inserted を参照しているので、挿入が 0 行なら何も更新しない。
-    -- こちらは VALUES なので必ず 1 行入るが、下の CreateCommentAutoSeq と
-    -- 形を揃えておく (片方だけ別の書き方だと、直すときに見落とす)。
+    -- inserted を参照しているので、挿入が 0 行なら何も更新しない
+    -- (画像が使えないときは 0 行になる)。
     UPDATE images
     SET attached_at = now()
     WHERE id = (SELECT image_id FROM inserted)
       AND attached_at IS NULL
-      -- **確保済みの画像は添付済みにしない** (レビュー指摘)。
-      -- EnsureOwned はロックを取らない読み取りなので、
-      -- 「確認したあと・書く前」に回収バッチが確保する窓がある。
-      -- この UPDATE は images の行ロックで待たされてから最新版を読むため、
-      -- ここに条件を置くと確保を追い越せない。
+      -- 確保済みでないことは image CTE がロックを取って確かめている。
+      -- ここの条件はその確認と同じ内容で、単独では確保を防げない。
       AND object_reclaimed_at IS NULL
 )
 SELECT
@@ -299,7 +308,38 @@ LEFT JOIN images img ON img.id = i.image_id
 -- **comments_p5_thread_id_seq_idx のような子の名前**になる (実測)。
 -- 親の名前だけで一致を見るとリトライ判定が永久に偽になり、
 -- unique モードが競合のたびに 409 を返すようになる。
-WITH inserted AS (
+--
+-- 【画像が添付できる状態かを、この文の中で確かめる】(DB レビュー)
+-- EnsureOwned はロックを取らない読み取りなので、「確認したあと・書く前」に
+-- 回収バッチが画像を確保 (object_reclaimed_at を書く) する窓がある。
+-- 以前は attached の UPDATE にだけ条件を置いていたが、**それでは足りなかった。**
+-- 添付済みの記録が付かないだけで、**コメントは回収済みの画像を参照したまま
+-- 作られる。** 回収バッチの DeleteImage はその参照で外部キー違反になり、
+-- 画像の行が宙に浮く。利用者からは、添付した画像が黙って消えて見える。
+--
+-- そこで image CTE で行ロックを取り、条件を満たさなければ挿入を 0 行にする。
+-- 回収バッチが先に確保していれば、ロックを待ったあと最新の行で WHERE を
+-- 評価し直すので、確保を追い越せない。0 行は pgx.ErrNoRows として 404 になる
+-- (EnsureOwned も使えない画像を 404 で返すので、応答は揃う)。
+--
+-- 確かめるのは status と object_reclaimed_at だけ。owner_id と kind は
+-- 作成後に変わらない列なので、EnsureOwned の確認がそのまま有効であり続ける。
+--
+-- **ロックは FOR NO KEY UPDATE。FOR SHARE にしてはいけない。**
+-- 共有ロック同士は両立するので、同じ画像を付けた二重送信が 2 本とも
+-- 共有ロックを取り、attached の UPDATE でロックを格上げするときに
+-- 互いを待ってデッドロックする (実測: deadlock detected)。
+-- FOR NO KEY UPDATE なら 2 本目は 1 本目の終了を待つだけになる。
+-- 外部キーの確認 (FOR KEY SHARE) とは衝突しないので、
+-- 同じ画像を参照する他の行の挿入は妨げない。
+WITH image AS (
+    SELECT images.id
+    FROM images
+    WHERE images.id = sqlc.narg('image_id')
+      AND images.status = 'committed'
+      AND images.object_reclaimed_at IS NULL
+    FOR NO KEY UPDATE
+), inserted AS (
     INSERT INTO comments (thread_id, seq, author_name, body, author_id, image_id)
     SELECT
         sqlc.arg('thread_id'),
@@ -314,6 +354,7 @@ WITH inserted AS (
         SELECT 1 FROM threads
         WHERE id = sqlc.arg('thread_id') AND deleted_at IS NULL
     )
+       AND (sqlc.narg('image_id')::uuid IS NULL OR EXISTS (SELECT 1 FROM image))
     RETURNING id, thread_id, seq, author_name, body, created_at, author_id, image_id
 ), attached AS (
     -- **画像を「添付済み」にするのは、投稿を作るのと同じ 1 文の中で行う** (000007)。
@@ -328,11 +369,8 @@ WITH inserted AS (
     SET attached_at = now()
     WHERE id = (SELECT image_id FROM inserted)
       AND attached_at IS NULL
-      -- **確保済みの画像は添付済みにしない** (レビュー指摘)。
-      -- EnsureOwned はロックを取らない読み取りなので、
-      -- 「確認したあと・書く前」に回収バッチが確保する窓がある。
-      -- この UPDATE は images の行ロックで待たされてから最新版を読むため、
-      -- ここに条件を置くと確保を追い越せない。
+      -- 確保済みでないことは image CTE がロックを取って確かめている。
+      -- ここの条件はその確認と同じ内容で、単独では確保を防げない (上の説明)。
       AND object_reclaimed_at IS NULL
 )
 SELECT

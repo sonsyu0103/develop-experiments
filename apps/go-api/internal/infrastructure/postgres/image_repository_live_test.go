@@ -2,14 +2,17 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"develop-experiments/apps/go-api/internal/apperr"
 	"develop-experiments/apps/go-api/internal/image/domain/model"
 	"develop-experiments/apps/go-api/internal/image/domain/repository"
 	"develop-experiments/apps/go-api/internal/infrastructure/postgres/sqlcgen"
@@ -725,12 +728,46 @@ func TestGetThread_SkipsReclaimedIcon_Live(t *testing.T) {
 	}
 }
 
-// **確保済みの画像は添付済みにしないこと** (レビュー指摘)。
+// ---------------------------------------------------------------------------
+// 回収の確保済みの画像を添付させないこと (DB レビュー)
+// ---------------------------------------------------------------------------
 //
 // EnsureOwned はロックを取らない読み取りなので、「確認したあと・書く前」に
-// 回収バッチが確保する窓があります。添付の UPDATE は images の行ロックで
-// 待たされてから最新版を読むため、ここに条件を置くと追い越されません。
-func TestSetAvatarImage_DoesNotAttachReclaimed_Live(t *testing.T) {
+// 回収バッチが画像を確保する窓があります。
+//
+// **以前は「添付済みにしない」だけを確かめていました。** それでは足りず、
+// 投稿やアバターは回収済みの画像を参照したまま作られ、回収バッチの
+// DeleteImage が外部キー違反で止まっていました (実測で再現)。
+// 添付する文が画像の行をロックして条件を確かめ、**書き込みごと 0 行に
+// する**ことを、ここで押さえます。
+//
+// 窓そのもの (確認と書き込みの間に確保が挟まる) はここでは作りません。
+// 確保済みの画像を直接渡せば、文の中の確認だけが頼りになるためです。
+
+// markReclaimed は回収バッチの確保と同じ状態にします。
+func markReclaimed(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) {
+	t.Helper()
+
+	if _, err := pool.Exec(t.Context(),
+		`UPDATE images SET object_reclaimed_at = now() WHERE id = $1`, id); err != nil {
+		t.Fatalf("確保できませんでした: %v", err)
+	}
+}
+
+// assertReclaimCanFinish は、回収バッチが行ごと消せる (= どこからも参照されていない) ことを確かめます。
+func assertReclaimCanFinish(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) {
+	t.Helper()
+
+	if attachedAt(t, pool, id) != nil {
+		t.Error("確保済みの画像が添付済みになった")
+	}
+	if err := NewImageRepository(pool).Delete(t.Context(), id); err != nil {
+		t.Errorf("回収バッチが行を消せない (どこかが参照したまま): %v", err)
+	}
+}
+
+// **確保済みの画像はプロフィール画像に設定できず、元の画像が残ること。**
+func TestSetAvatarImage_RejectsReclaimed_Live(t *testing.T) {
 	pool := liveDB(t)
 	const ownerID = int64(900316)
 	seedOwner(t, pool, ownerID)
@@ -738,17 +775,248 @@ func TestSetAvatarImage_DoesNotAttachReclaimed_Live(t *testing.T) {
 	ctx := t.Context()
 	sessions := NewSessionRepository(pool)
 
+	current := insertImageOf(t, pool, ownerID, "avatar", model.StatusCommitted, 2*time.Hour)
+	if _, err := sessions.SetAvatarImage(ctx, ownerID, &current); err != nil {
+		t.Fatalf("前提の設定に失敗した: %v", err)
+	}
+
 	id := insertImageOf(t, pool, ownerID, "avatar", model.StatusCommitted, 2*time.Hour)
-	if _, err := pool.Exec(ctx,
-		`UPDATE images SET object_reclaimed_at = now() WHERE id = $1`, id); err != nil {
-		t.Fatalf("確保できませんでした: %v", err)
+	markReclaimed(t, pool, id)
+
+	_, err := sessions.SetAvatarImage(ctx, ownerID, &id)
+	if !errors.Is(err, apperr.ErrNotFound) {
+		t.Fatalf("確保済みの画像を設定できてしまった (err=%v, want ErrNotFound)", err)
 	}
 
-	if _, err := sessions.SetAvatarImage(ctx, ownerID, &id); err != nil {
-		t.Fatalf("設定に失敗した: %v", err)
+	var avatar *uuid.UUID
+	if err := pool.QueryRow(ctx,
+		`SELECT avatar_image_id FROM users WHERE id = $1`, ownerID).Scan(&avatar); err != nil {
+		t.Fatalf("利用者を読めませんでした: %v", err)
+	}
+	if avatar == nil || *avatar != current {
+		t.Errorf("元のプロフィール画像が変わった (got=%v want=%v)", avatar, current)
+	}
+	if attachedAt(t, pool, current) == nil {
+		t.Error("設定に失敗したのに元の画像の添付が外れた")
+	}
+	assertReclaimCanFinish(t, pool, id)
+}
+
+// **文だけで呼んでも、設定に失敗したときに元の画像が外れないこと。**
+//
+// detached は参照されていない CTE なので、主文が 0 行でも実行されます。
+// 画像の条件を置き忘れると「設定は失敗したのに元の画像だけ外れる」形になります。
+//
+// **SessionRepository 経由では検出できません。** トランザクションの中で
+// 0 行がエラーになり、ロールバックで元に戻るためです
+// (条件を外す変異を入れても上の検査は通りました)。文を直接叩いて押さえます。
+func TestSetUserAvatarImage_KeepsPreviousWhenRejected_Live(t *testing.T) {
+	pool := liveDB(t)
+	const ownerID = int64(900324)
+	seedOwner(t, pool, ownerID)
+
+	ctx := t.Context()
+	q := sqlcgen.New(pool)
+
+	current := insertImageOf(t, pool, ownerID, "avatar", model.StatusCommitted, 2*time.Hour)
+	if _, err := NewSessionRepository(pool).SetAvatarImage(ctx, ownerID, &current); err != nil {
+		t.Fatalf("前提の設定に失敗した: %v", err)
 	}
 
-	if at := attachedAt(t, pool, id); at != nil {
-		t.Errorf("確保済みの画像が添付済みになった (attached_at=%v)", at)
+	id := insertImageOf(t, pool, ownerID, "avatar", model.StatusCommitted, 2*time.Hour)
+	markReclaimed(t, pool, id)
+
+	_, err := q.SetUserAvatarImage(ctx, sqlcgen.SetUserAvatarImageParams{
+		ID: ownerID, AvatarImageID: &id,
+	})
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("確保済みの画像を設定できてしまった (err=%v, want pgx.ErrNoRows)", err)
 	}
+	if attachedAt(t, pool, current) == nil {
+		t.Error("設定に失敗したのに元の画像の添付が外れた (detached に画像の条件が無い)")
+	}
+}
+
+// **確保済みの画像はコメントに添付できないこと** (unique モードの 1 文)。
+func TestCreateCommentAutoSeq_RejectsReclaimedImage_Live(t *testing.T) {
+	pool := liveDB(t)
+	const ownerID = int64(900320)
+	seedOwner(t, pool, ownerID)
+
+	ctx := t.Context()
+	threadID := seedThread(t, pool, nil)
+	id := insertImage(t, pool, ownerID, model.StatusCommitted, 2*time.Hour)
+	markReclaimed(t, pool, id)
+
+	author := ownerID
+	_, err := sqlcgen.New(pool).CreateCommentAutoSeq(ctx, sqlcgen.CreateCommentAutoSeqParams{
+		ThreadID:   threadID,
+		AuthorName: "名無しさん",
+		Body:       "確保済みの画像を添付する",
+		AuthorID:   &author,
+		ImageID:    &id,
+	})
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("確保済みの画像を添付できてしまった (err=%v, want pgx.ErrNoRows)", err)
+	}
+	assertReclaimCanFinish(t, pool, id)
+}
+
+// **採番を呼び出し側が持つ 3 モードの文でも同じこと。**
+func TestCreateCommentWithSeq_RejectsReclaimedImage_Live(t *testing.T) {
+	pool := liveDB(t)
+	const ownerID = int64(900321)
+	seedOwner(t, pool, ownerID)
+
+	ctx := t.Context()
+	threadID := seedThread(t, pool, nil)
+	id := insertImage(t, pool, ownerID, model.StatusCommitted, 2*time.Hour)
+	markReclaimed(t, pool, id)
+
+	author := ownerID
+	_, err := sqlcgen.New(pool).CreateCommentWithSeq(ctx, sqlcgen.CreateCommentWithSeqParams{
+		ThreadID:   threadID,
+		Seq:        1,
+		AuthorName: "名無しさん",
+		Body:       "確保済みの画像を添付する",
+		AuthorID:   &author,
+		ImageID:    &id,
+	})
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("確保済みの画像を添付できてしまった (err=%v, want pgx.ErrNoRows)", err)
+	}
+	assertReclaimCanFinish(t, pool, id)
+
+	// 画像が無ければ同じ文で普通に投稿できること (条件の置き場所の確認)。
+	if _, err := sqlcgen.New(pool).CreateCommentWithSeq(ctx, sqlcgen.CreateCommentWithSeqParams{
+		ThreadID:   threadID,
+		Seq:        1,
+		AuthorName: "名無しさん",
+		Body:       "画像なし",
+	}); err != nil {
+		t.Errorf("画像なしの投稿が失敗した: %v", err)
+	}
+}
+
+// **確保済みの画像はスレッドのアイコンにできないこと。**
+func TestCreateThread_RejectsReclaimedIcon_Live(t *testing.T) {
+	pool := liveDB(t)
+	const ownerID = int64(900322)
+	seedOwner(t, pool, ownerID)
+
+	ctx := t.Context()
+	id := insertImageOf(t, pool, ownerID, "thread_icon", model.StatusCommitted, 2*time.Hour)
+	markReclaimed(t, pool, id)
+
+	author := ownerID
+	row, err := sqlcgen.New(pool).CreateThread(ctx, sqlcgen.CreateThreadParams{
+		Title:       "確保済みのアイコン",
+		AuthorID:    &author,
+		IconImageID: &id,
+	})
+	if err == nil {
+		t.Cleanup(func() {
+			_, _ = pool.Exec(context.Background(), `DELETE FROM threads WHERE id = $1`, row.ID)
+		})
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("確保済みのアイコンでスレッドを作れてしまった (err=%v, want pgx.ErrNoRows)", err)
+	}
+	assertReclaimCanFinish(t, pool, id)
+}
+
+// ---------------------------------------------------------------------------
+// プロフィール画像の同時付け替え (DB レビュー)
+// ---------------------------------------------------------------------------
+
+// **同じ利用者への付け替えが重なっても、負けた側の画像が外れること。**
+//
+// SetUserAvatarImage の previous はその文のスナップショットで旧画像を読みます。
+// 行ロックを先に取らないと、2 本目は 1 本目が付けた画像を知らないまま
+// 元の画像を外し、**1 本目の画像は attached_at が入ったまま参照されず、
+// 永久に回収されません** (実測で 3 回とも再現)。
+//
+// 1 本目をコミット前で止め、2 本目が行ロックで待たされたのを
+// pg_stat_activity で確かめてからコミットします。sleep で順序を作ると
+// 環境の速さ次第で順序が入れ替わり、何も検査しない回が混ざります。
+func TestSetAvatarImage_ConcurrentChangeDetachesLoser_Live(t *testing.T) {
+	pool := liveDB(t)
+	const ownerID = int64(900323)
+	seedOwner(t, pool, ownerID)
+
+	ctx := t.Context()
+	sessions := NewSessionRepository(pool)
+
+	original := insertImageOf(t, pool, ownerID, "avatar", model.StatusCommitted, 2*time.Hour)
+	first := insertImageOf(t, pool, ownerID, "avatar", model.StatusCommitted, 2*time.Hour)
+	second := insertImageOf(t, pool, ownerID, "avatar", model.StatusCommitted, 2*time.Hour)
+	if _, err := sessions.SetAvatarImage(ctx, ownerID, &original); err != nil {
+		t.Fatalf("前提の設定に失敗した: %v", err)
+	}
+
+	// 1 本目: SessionRepository.SetAvatarImage と同じ手順を、コミットの手前で止める。
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("トランザクションを開始できませんでした: %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	q := sqlcgen.New(tx)
+	if _, err := q.LockUserForAvatarChange(ctx, ownerID); err != nil {
+		t.Fatalf("1 本目のロックに失敗した: %v", err)
+	}
+	if _, err := q.SetUserAvatarImage(ctx, sqlcgen.SetUserAvatarImageParams{
+		ID: ownerID, AvatarImageID: &first,
+	}); err != nil {
+		t.Fatalf("1 本目の付け替えに失敗した: %v", err)
+	}
+
+	// 2 本目: 行ロックで待たされる。
+	done := make(chan error, 1)
+	go func() {
+		_, setErr := sessions.SetAvatarImage(ctx, ownerID, &second)
+		done <- setErr
+	}()
+	waitForAvatarLockWait(t, pool)
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("1 本目をコミットできませんでした: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("2 本目の付け替えに失敗した: %v", err)
+	}
+
+	if attachedAt(t, pool, first) != nil {
+		t.Error("1 本目の画像が添付済みのまま残った (どこからも参照されず、永久に回収されない)")
+	}
+	if attachedAt(t, pool, second) == nil {
+		t.Error("2 本目の画像が添付済みになっていない")
+	}
+	if attachedAt(t, pool, original) != nil {
+		t.Error("元の画像の添付が外れていない")
+	}
+}
+
+// waitForAvatarLockWait は、プロフィール画像の付け替えが行ロックで待たされるまで待ちます。
+func waitForAvatarLockWait(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting bool
+		if err := pool.QueryRow(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_stat_activity
+				WHERE datname = current_database()
+				  AND pid <> pg_backend_pid()
+				  AND wait_event_type = 'Lock'
+				  AND query LIKE '%Avatar%'
+			)`).Scan(&waiting); err != nil {
+			t.Fatalf("待ち状態を読めませんでした: %v", err)
+		}
+		if waiting {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("2 本目が行ロックで待たされなかった (ロックを先に取っていない)")
 }

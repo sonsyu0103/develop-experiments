@@ -234,6 +234,33 @@ func (q *Queries) LockAdminsAndCount(ctx context.Context) (int64, error) {
 	return admins, err
 }
 
+const lockUserForAvatarChange = `-- name: LockUserForAvatarChange :one
+SELECT users.id
+FROM users
+WHERE users.id = $1
+  AND users.deleted_at IS NULL
+FOR NO KEY UPDATE
+`
+
+// プロフィール画像を付け替える前に、利用者の行をロックする (DB レビュー)。
+//
+// **SetUserAvatarImage と同じトランザクションで、その直前に呼ぶ。**
+// 理由は SetUserAvatarImage の【LockUserForAvatarChange のあとに…】を参照。
+//
+// 条件は SetUserAvatarImage の主文と揃える。退会済みなら 0 行になり、
+// pgx.ErrNoRows が 404 に翻訳される (以前は SetUserAvatarImage の 0 行が同じ役目)。
+//
+// **FOR UPDATE ではなく FOR NO KEY UPDATE** (threads.sql の
+// IncrementThreadViewCounts と同じ理由)。FOR UPDATE は、その利用者が
+// 投稿するときの外部キーの確認 (FOR KEY SHARE) と衝突する。
+// 付け替え同士を直列にするには FOR NO KEY UPDATE 同士の衝突で足りる。
+func (q *Queries) LockUserForAvatarChange(ctx context.Context, id int64) (int64, error) {
+	row := q.db.QueryRow(ctx, lockUserForAvatarChange, id)
+	var id_2 int64
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
 const promoteToAdmin = `-- name: PromoteToAdmin :one
 UPDATE users
 SET role = 'admin', updated_at = now()
@@ -277,7 +304,14 @@ func (q *Queries) PromoteToAdmin(ctx context.Context, googleSub string) (User, e
 }
 
 const setUserAvatarImage = `-- name: SetUserAvatarImage :one
-WITH previous AS (
+WITH image AS (
+    SELECT images.id
+    FROM images
+    WHERE images.id = $1
+      AND images.status = 'committed'
+      AND images.object_reclaimed_at IS NULL
+    FOR NO KEY UPDATE
+), previous AS (
     SELECT users.avatar_image_id AS image_id
     FROM users
     WHERE users.id = $2
@@ -290,16 +324,14 @@ WITH previous AS (
     SET attached_at = NULL
     WHERE images.id = (SELECT previous.image_id FROM previous)
       AND images.id IS DISTINCT FROM $1
+      AND ($1::uuid IS NULL OR EXISTS (SELECT 1 FROM image))
 ), attached AS (
     UPDATE images
     SET attached_at = now()
     WHERE images.id = $1
       AND images.attached_at IS NULL
-      -- **確保済みの画像は添付済みにしない** (レビュー指摘)。
-      -- EnsureOwned はロックを取らない読み取りなので、
-      -- 「確認したあと・書く前」に回収バッチが確保する窓がある。
-      -- この UPDATE は images の行ロックで待たされてから最新版を読むため、
-      -- ここに条件を置くと確保を追い越せない。
+      -- 確保済みでないことは image CTE がロックを取って確かめている。
+      -- ここの条件はその確認と同じ内容で、単独では確保を防げない。
       AND images.object_reclaimed_at IS NULL
       AND EXISTS (SELECT 1 FROM previous)
 )
@@ -308,6 +340,7 @@ SET avatar_image_id = $1,
     updated_at = now()
 WHERE users.id = $2
   AND users.deleted_at IS NULL
+  AND ($1::uuid IS NULL OR EXISTS (SELECT 1 FROM image))
 RETURNING users.id, users.public_id, users.google_sub, users.email, users.display_name, users.avatar_url, users.created_at, users.updated_at, users.deleted_at, users.role, users.avatar_image_id
 `
 
@@ -337,6 +370,31 @@ type SetUserAvatarImageParams struct {
 // **列は表名で修飾する。** この 1 文には users と images の 2 つが登場し、
 // どちらにも id 列がある。修飾しないと sqlc の解析が
 // "column reference \"id\" is ambiguous" で止まる (実測)。
+//
+// 【LockUserForAvatarChange のあとに、同じトランザクションで呼ぶ】(DB レビュー)
+// previous はこの文のスナップショットで旧画像を読む。同じ利用者への
+// 付け替えが 2 本同時に走ると、どちらも同じ旧画像 X を読み、
+// 2 本目は 1 本目が付けた画像 A を外さない —— **A は attached_at が入ったまま
+// どこからも参照されず、永久に回収されない** (実測で 3 回とも再現)。
+// 先に users の行ロックを取っておけば、READ COMMITTED ではこの文の
+// スナップショットが相手のコミット後に取られるので、previous が最新の値を読む。
+// **READ COMMITTED で呼ぶ前提。** SERIALIZABLE / REPEATABLE READ では
+// スナップショットがトランザクションで固定されるため、相手が更新した行の
+// ロックは待ったあと直列化失敗 (40001) になる (正しさは保たれるが、
+// リトライの経路をこの操作は持っていない)。
+//
+// **previous に FOR UPDATE を付ける形では直らない。** 主文 (UPDATE users) が
+// 先に行を更新し、参照されていない detached / attached はそのあとで実行される。
+// そこで評価される previous の FOR UPDATE は「同じ文が更新した行」を
+// 読み飛ばして 0 行になり、**競合が無くても**画像の付け外しが丸ごと空振りする
+// (実測)。ロックは文を分けて先に取る。
+//
+// 【画像が使える状態かを、この文の中で確かめる】(DB レビュー)
+// 理由とロック強度は comments.sql の CreateCommentAutoSeq と同じ。
+// 使えない画像なら主文が 0 行になり、pgx.ErrNoRows が 404 に翻訳される。
+// **detached にも同じ条件を置く。** 参照されていない CTE は主文が 0 行でも
+// 実行されるので、置かないと「設定は失敗したのに旧画像だけ外れる」。
+// トランザクションの中ならロールバックで戻るが、文だけで閉じておく。
 func (q *Queries) SetUserAvatarImage(ctx context.Context, arg SetUserAvatarImageParams) (User, error) {
 	row := q.db.QueryRow(ctx, setUserAvatarImage, arg.AvatarImageID, arg.ID)
 	var i User

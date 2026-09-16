@@ -205,8 +205,21 @@ ORDER BY p.view_count DESC, p.id DESC;
 --
 -- **UPDATE ... FROM の行処理順は保証されない。** 実行計画次第で、
 -- 入力配列の順序どおりにロックを取るとは限らない。
--- そのため、先に FOR UPDATE の CTE で **ORDER BY id のロックだけを取る。**
--- FOR UPDATE を含む CTE は inline されず、UPDATE 本体より先に評価される。
+-- そのため、先にロック句つきの CTE で **ORDER BY id のロックだけを取る。**
+-- ロック句を含む CTE は inline されず、UPDATE 本体より先に評価される。
+--
+-- 【FOR UPDATE ではなく FOR NO KEY UPDATE】(DB レビュー)
+-- **FOR UPDATE は FOR KEY SHARE と衝突する。** コメントの INSERT は
+-- 外部キーの確認で親スレッドの行に FOR KEY SHARE を取るので、
+-- FOR UPDATE にすると反映とコメント投稿が互いを待つ。
+-- id 昇順にロックを取っていく途中で遅い投稿トランザクションに当たると、
+-- **それまでにロックした無関係なスレッドへの投稿がすべて待たされる**
+-- (実測: 4 秒かかる投稿が 1 本あるだけで、別スレッドへの投稿が 2,947 ms)。
+--
+-- view_count は一意索引に含まれないので、UPDATE 本体が取るのも
+-- FOR NO KEY UPDATE になる。CTE だけ強くする理由は無い。
+-- FOR NO KEY UPDATE 同士は衝突するので、デッドロックを避ける目的は変わらない
+-- (同じ条件で 7.9 ms)。
 --
 -- 【存在しない行は黙って無視される】
 -- 閲覧された後に削除されたスレッドは JOIN で落ちる。
@@ -229,7 +242,7 @@ WITH input AS (
     FROM threads t
     JOIN input i ON i.id = t.id
     ORDER BY t.id
-    FOR UPDATE OF t
+    FOR NO KEY UPDATE OF t
 )
 UPDATE threads t
 SET view_count = t.view_count + i.increment
@@ -455,9 +468,21 @@ WHERE t.id = sqlc.arg('id')
 -- 呼び出し側で組み立てる手もあるが、一覧・詳細と組み立て方が 2 通りになる。
 --
 -- author_id は NULL 許容。NULL が匿名を意味する (ADR 0005 決定 2)。
-WITH inserted AS (
+--
+-- 【アイコンが使える状態かを、この文の中で確かめる】(DB レビュー)
+-- 理由とロック強度は comments.sql の CreateCommentAutoSeq と同じ。
+-- 使えないアイコンなら 0 行になり、pgx.ErrNoRows が 404 に翻訳される。
+WITH icon AS (
+    SELECT images.id
+    FROM images
+    WHERE images.id = sqlc.narg('icon_image_id')
+      AND images.status = 'committed'
+      AND images.object_reclaimed_at IS NULL
+    FOR NO KEY UPDATE
+), inserted AS (
     INSERT INTO threads (title, author_id, icon_image_id)
-    VALUES (sqlc.arg('title'), sqlc.narg('author_id'), sqlc.narg('icon_image_id'))
+    SELECT sqlc.arg('title'), sqlc.narg('author_id'), sqlc.narg('icon_image_id')
+    WHERE sqlc.narg('icon_image_id')::uuid IS NULL OR EXISTS (SELECT 1 FROM icon)
     RETURNING id, title, created_at, view_count, author_id, icon_image_id
 ), attached AS (
     -- アイコンを「添付済み」にする (000007)。理由は comments.sql と同じ。
@@ -466,11 +491,8 @@ WITH inserted AS (
     SET attached_at = now()
     WHERE id = (SELECT icon_image_id FROM inserted)
       AND attached_at IS NULL
-      -- **確保済みの画像は添付済みにしない** (レビュー指摘)。
-      -- EnsureOwned はロックを取らない読み取りなので、
-      -- 「確認したあと・書く前」に回収バッチが確保する窓がある。
-      -- この UPDATE は images の行ロックで待たされてから最新版を読むため、
-      -- ここに条件を置くと確保を追い越せない。
+      -- 確保済みでないことは icon CTE がロックを取って確かめている。
+      -- ここの条件はその確認と同じ内容で、単独では確保を防げない。
       AND object_reclaimed_at IS NULL
 )
 SELECT
