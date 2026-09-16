@@ -129,6 +129,37 @@ func TestNewHandler_CommonFields(t *testing.T) {
 	}
 }
 
+// **ERROR はトップレベルの "level":"ERROR" として出ること。**
+//
+// 本番の ERROR アラームは、CloudWatch Logs のメトリクスフィルタ
+// `{ $.level = "ERROR" }` で数えている (infra/terraform/monitoring.tf)。
+// **フィルタはログの形を知っているだけで、形が変わってもエラーにならない。**
+// キー名を変える・値を "error" や "ERR" にする・入れ子にする、のどれでも
+// 一致が 0 件になり、**アラームは鳴らないまま緑を示し続ける。**
+//
+// WithGroup を通しても level が入れ子にならないことも押さえる
+// (グループは属性だけを包み、組み込みのキーは包まない)。
+func TestNewHandler_ErrorLevelMatchesMetricFilter(t *testing.T) {
+	t.Parallel()
+
+	for name, log := range map[string]func(*slog.Logger){
+		"そのまま":         func(l *slog.Logger) { l.ErrorContext(context.Background(), "unhandled_error") },
+		"WithGroup の中": func(l *slog.Logger) { l.WithGroup("job").ErrorContext(context.Background(), "scheduler_job_failed") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var buf bytes.Buffer
+			log(slog.New(NewHandler(&buf, Options{JSON: true})))
+
+			got := decode(t, &buf)
+			if got["level"] != "ERROR" {
+				t.Errorf(`level = %#v, want "ERROR" (メトリクスフィルタ { $.level = "ERROR" } が一致しなくなる)`, got["level"])
+			}
+		})
+	}
+}
+
 // **未ログインでは user_id を出さない。**
 //
 // 0 を出すと「利用者 0 番」と区別できなくなる。
