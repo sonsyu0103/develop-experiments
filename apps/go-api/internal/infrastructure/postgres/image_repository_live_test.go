@@ -936,8 +936,8 @@ func TestCreateThread_RejectsReclaimedIcon_Live(t *testing.T) {
 // 元の画像を外し、**1 本目の画像は attached_at が入ったまま参照されず、
 // 永久に回収されません** (実測で 3 回とも再現)。
 //
-// 1 本目をコミット前で止め、2 本目が行ロックで待たされたのを
-// pg_stat_activity で確かめてからコミットします。sleep で順序を作ると
+// 1 本目をコミット前で止め、2 本目が 1 本目に待たされたのを
+// pg_blocking_pids で確かめてからコミットします。sleep で順序を作ると
 // 環境の速さ次第で順序が入れ替わり、何も検査しない回が混ざります。
 func TestSetAvatarImage_ConcurrentChangeDetachesLoser_Live(t *testing.T) {
 	pool := liveDB(t)
@@ -970,13 +970,13 @@ func TestSetAvatarImage_ConcurrentChangeDetachesLoser_Live(t *testing.T) {
 		t.Fatalf("1 本目の付け替えに失敗した: %v", err)
 	}
 
-	// 2 本目: 行ロックで待たされる。
+	// 2 本目: 1 本目の行ロックで待たされる。
 	done := make(chan error, 1)
 	go func() {
 		_, setErr := sessions.SetAvatarImage(ctx, ownerID, &second)
 		done <- setErr
 	}()
-	waitForAvatarLockWait(t, pool)
+	waitForBlockedBy(t, pool, tx.Conn().PgConn().PID())
 
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("1 本目をコミットできませんでした: %v", err)
@@ -996,27 +996,29 @@ func TestSetAvatarImage_ConcurrentChangeDetachesLoser_Live(t *testing.T) {
 	}
 }
 
-// waitForAvatarLockWait は、プロフィール画像の付け替えが行ロックで待たされるまで待ちます。
-func waitForAvatarLockWait(t *testing.T, pool *pgxpool.Pool) {
+// waitForBlockedBy は、指定したバックエンドにロックで待たされているセッションが現れるまで待ちます。
+//
+// **クエリの文字列では絞りません** (レビュー指摘)。`query LIKE '%Avatar%'` の形だと、
+// 同じ DB で無関係なセッションが似た名前の文を待たせたときに誤って抜けます。
+// pg_blocking_pids は「誰に待たされているか」を返すので、1 本目のトランザクションに
+// 待たされているものだけを拾えます。
+func waitForBlockedBy(t *testing.T, pool *pgxpool.Pool, blockerPID uint32) {
 	t.Helper()
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		var waiting bool
+		var blocked bool
 		if err := pool.QueryRow(t.Context(), `
 			SELECT EXISTS (
 				SELECT 1 FROM pg_stat_activity
-				WHERE datname = current_database()
-				  AND pid <> pg_backend_pid()
-				  AND wait_event_type = 'Lock'
-				  AND query LIKE '%Avatar%'
-			)`).Scan(&waiting); err != nil {
+				WHERE $1::int = ANY(pg_blocking_pids(pid))
+			)`, int32(blockerPID)).Scan(&blocked); err != nil {
 			t.Fatalf("待ち状態を読めませんでした: %v", err)
 		}
-		if waiting {
+		if blocked {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("2 本目が行ロックで待たされなかった (ロックを先に取っていない)")
+	t.Fatal("2 本目が 1 本目に待たされなかった (付け替えの前に行ロックを取っていない)")
 }
