@@ -61,6 +61,39 @@ data "aws_iam_policy_document" "images_bucket" {
       values   = [aws_cloudfront_distribution.main.arn]
     }
   }
+
+  # **存在しないキーを 404 にするために要る。**
+  #
+  # S3 は `s3:ListBucket` を持たない主体には、**オブジェクトが無いときも
+  # 403 AccessDenied を返す** (「無い」ことを教えないため)。
+  # GetObject だけを与えた状態だと、消えた画像も壊れたリンクも
+  # すべて 403 になり、**OAC が壊れているときと区別が付かない。**
+  #
+  # 2026-09-26 に `make tf-verify` の 6 番がこれで落ちた。検査は
+  # 404 を期待していたが、**ポリシーに ListBucket が無いので原理的に返らない。**
+  # 検査側の期待値ではなくポリシーを直す —— 404 が返るようになれば
+  # 「認可が成立している」ことの証明になり、検査が意味を持つ。
+  #
+  # **リソースはバケット本体** (`/*` を付けない)。ListBucket は
+  # バケットに対する操作なので、`arn/*` に書いても効かない。
+  statement {
+    sid    = "AllowCloudFrontListBucketForNotFound"
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["cloudfront.amazonaws.com"]
+    }
+
+    actions   = ["s3:ListBucket"]
+    resources = [aws_s3_bucket.images.arn]
+
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceArn"
+      values   = [aws_cloudfront_distribution.main.arn]
+    }
+  }
 }
 
 resource "aws_s3_bucket_policy" "images" {
