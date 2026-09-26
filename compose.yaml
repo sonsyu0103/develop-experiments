@@ -154,26 +154,51 @@ services:
   # 本番は S3 + CloudFront を想定しており、アプリ側は S3 互換の
   # インターフェースだけを見る。エンドポイントの差し替えで両方に対応できる。
   #
-  # **イメージは quay.io から取る。** Docker Hub の minio/minio と minio/mc は
-  # 2026-09 に取得できなくなった。同じタグ・同じダイジェストが quay.io にある
-  # (詳細は .github/workflows/ci.yml の Start MinIO)。
+  # **イメージは bitnamilegacy から取る (2026-09-26)。**
+  #
+  # 取得元はこれで 3 回目になる:
+  #   Docker Hub `minio/minio`  -> 2026-09 に pull access denied
+  #   quay.io `minio/minio`     -> 2026-09-26 に unauthorized (API も 401)
+  #   `bitnamilegacy/minio`     <- いまここ
+  #
+  # **MinIO の公開イメージは、どのレジストリからも引けなくなった。**
+  # 実測 (2026-09-26): quay.io / Docker Hub / ghcr.io / public.ecr.aws /
+  # `bitnami/minio` のいずれも失敗。引けたのは `bitnamilegacy` だけ。
+  #
+  # **これも恒久ではない。** 起動ログに Bitnami 自身の告知が出る ——
+  # 「2025-08-28 以降、無償で残るのは一部だけ。Bitnami Legacy に
+  # 退避してあるが、それも for some time」。**また閉じる前提で扱う**
+  # (docs/adr/0024-aws-deployment.md の 17)。
+  #
+  # 【bitnami 版との差】
+  #   - `server /data` の引数が要らない (entrypoint が組み立てる)
+  #   - データは /bitnami/minio/data。非 root (UID 1001) で動く
+  #   - **管理画面が無い。** MinIO 自体が Web UI を落としたため
+  #     (起動ログに `API:` しか出ず、`Console:` が無い)。
+  #     MINIO_CONSOLE_PORT_NUMBER を渡しても復活しない ——
+  #     中身を見るときは下の minio-init 経由で mc を使う
+  #     (Makefile の $(MC) がその形)
+  #   - mc は同梱されている (/opt/bitnami/minio-client/bin)
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
-    command: server /data --console-address ":9001"
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      # 9000 が S3 API、9001 が管理画面。
-      # 管理画面を開けているのは、アップロードされた実体を目で確認するため。
+      # 9000 が S3 API。**管理画面のポートは開けない** (上記のとおり無い)。
       - "9000:9000"
-      - "9001:9001"
     volumes:
-      - minio-data:/data
+      # **マウント先が /data から変わった。** bitnami はデータを
+      # /bitnami/minio/data に置く。既存の環境では
+      # **`make clean` でボリュームを作り直すこと** ——
+      # 古い minio-data を新しいパスに載せると、root 所有のままなので
+      # 非 root の minio が書けない。
+      - minio-data:/bitnami/minio/data
     healthcheck:
       # mc ready はクラスタが要求を受けられる状態かを見る。
       # **HTTP の /minio/health/live とは別物** (あちらはプロセスの生存だけ)。
-      # ここで mc を使えるのは、minio イメージが mc を同梱しているため。
+      # ここで mc を使えるのは、minio イメージが mc を同梱しているため
+      # (bitnami 版も同梱。/opt/bitnami/minio-client/bin/mc)。
       #
       # CI は同じイメージを services ではなく docker run で起動しており、
       # 待ち合わせは curl で /minio/health/live を叩いている。
@@ -194,7 +219,9 @@ services:
   # 許しているのは、手元に CDN を立てないため。
   # アプリが返す URL をブラウザでそのまま開けるようにしておく。
   minio-init:
-    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    # **取得元は minio と揃える** (上のコメントを参照)。
+    # entrypoint を上書きするので bitnami のラッパーは通らない。
+    image: bitnamilegacy/minio-client:2025.7.21-debian-12-r3
     depends_on:
       minio:
         condition: service_healthy

@@ -229,7 +229,7 @@ tf-apply: ## AWS に環境を作る (**課金が発生する**)
 	# RDS の作成に 5〜10 分かかる。全体で 15 分ほど見ておく。
 	# **非対話にしたぶん、誤操作の余地が増えた。**
 	# terraform の確認プロンプトが無くなったので、打ち間違いや
-	# タブ補完のミスが 74 リソースを無確認で作りうる。
+	# タブ補完のミスが 75 リソースを無確認で作りうる。
 	# destroy より apply 側のほうが危ない (RDS 込みで途中中断もしにくい)。
 	# 明示的な合図を要求する。
 	@if [ "$(CONFIRM)" != "1" ]; then \
@@ -278,7 +278,26 @@ tf-destroy: ## AWS の環境を消す (**消し忘れると課金され続ける
 	#
 	# SITE_ADDRESS から導出するのも同じ理由で誤り (あれはローカルの
 	# エッジのホスト名で、AWS の Project タグとは無関係)。
-	@echo "  aws resourcegroupstaggingapi get-resources --tag-filters Key=Project,Values=$(PROJECT) --query 'length(ResourceTagMappingList)'"
+	#
+	# **タグ検索の件数を出さない (2026-09-26 に実測して差し替え)。**
+	# destroy を完走させた直後でもタグ検索は 19 件返す ——
+	# 中身は ECS の INACTIVE な墓標と、**既に存在しない Security Group
+	# ルールの ARN 8 件** (タグ索引の遅れ)。件数を出すと、
+	# 消えているのに「19 件残っている」と誤読する。
+	# 逆方向の誤読 (0 件で安心する) は上のコメントのとおり。
+	#
+	# **課金するものを、それぞれの API に直接聞く。** 件数ではなく
+	# 「何が残っているか」が出る。NAT Gateway は作らない構成 (決定 3) なので
+	# 並べない —— 常に 0 件の検査は「消えた証拠」にならない。
+	@echo "  aws rds describe-db-instances       --query 'DBInstances[].DBInstanceIdentifier'"
+	@echo "  aws elbv2 describe-load-balancers   --query 'LoadBalancers[].LoadBalancerName'"
+	@echo "  aws cloudfront list-distributions   --query 'DistributionList.Items[].DomainName'"
+	@echo "  aws ec2 describe-vpcs --filter Name=isDefault,Values=false --query 'Vpcs[].VpcId'"
+	@echo "  aws secretsmanager list-secrets     --query 'SecretList[].Name'"
+	@echo "  aws ecr describe-repositories       --query 'repositories[].repositoryName'"
+	@echo
+	@echo "  # ECS は削除後も INACTIVE で引けるので、件数ではなく状態を見る:"
+	@echo "  aws ecs describe-clusters --clusters $(PROJECT) --query 'clusters[].status'   # INACTIVE なら消えている"
 
 
 .PHONY: tf-push

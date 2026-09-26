@@ -6,9 +6,15 @@
 # 更新は「意図した変更」としてコミットに残す。
 
 terraform {
-  # 1.10 以降を要求する。**S3 backend のロックが DynamoDB 無しで効く**
-  # バージョンで、backend を移すときに作るものが 1 つ減る (下の backend の節)。
-  required_version = "~> 1.10"
+  # 1.11 以降を要求する。理由は 2 つ:
+  #
+  #   1.10  **S3 backend のロックが DynamoDB 無しで効く。**
+  #         backend を移すときに作るものが 1 つ減る (下の backend の節)
+  #   1.11  **write-only 属性 (`*_wo`) が使える。**
+  #         secrets.tf が `secret_string_wo` を使っている。
+  #         1.10 で apply すると「Unsupported argument」で落ちるので、
+  #         下限を 1.10 のままにしておくと**通る構成が嘘になる**
+  required_version = "~> 1.11"
 
   required_providers {
     aws = {
