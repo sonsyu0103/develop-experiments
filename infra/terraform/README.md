@@ -42,12 +42,33 @@ make tf-destroy
 (`monitoring.tf`)、通知が届く頃には使ってしまっている。
 `terraform destroy` が完走したことを確認する。
 
-消えたかどうかは、タグで確認できる:
+**タグ検索では確認できない。** destroy を完走させた直後でも 19 件返る
+(2026-09-26 に実測)。中身は ECS の `INACTIVE` な墓標と、
+**すでに存在しない Security Group ルールの ARN 8 件** ——
+`describe-security-group-rules` に当てると
+`InvalidSecurityGroupRuleId.NotFound` で、タグ索引が遅れているだけ。
+**件数を見ると「消えていない」と誤読する。**
+
+課金するものを、それぞれの API に直接聞く:
 
 ```bash
-aws resourcegroupstaggingapi get-resources \
-  --tag-filters Key=Project,Values=bbs --query 'ResourceTagMappingList[].ResourceARN'
+aws rds describe-db-instances       --query 'DBInstances[].DBInstanceIdentifier'
+aws elbv2 describe-load-balancers   --query 'LoadBalancers[].LoadBalancerName'
+aws cloudfront list-distributions   --query 'DistributionList.Items[].DomainName'
+aws ec2 describe-vpcs --filter Name=isDefault,Values=false --query 'Vpcs[].VpcId'
+aws secretsmanager list-secrets     --query 'SecretList[].Name'
+aws ecr describe-repositories       --query 'repositories[].repositoryName'
 ```
+
+ECS は削除後も `INACTIVE` として引けるので、件数ではなく**状態**を見る
+(`list-clusters` は削除済みを返さないので 0 件が正しい姿):
+
+```bash
+aws ecs describe-clusters --clusters bbs --query 'clusters[].status'   # INACTIVE なら消えている
+```
+
+NAT Gateway は作らない構成なので並べていない ——
+常に 0 件の検査は「消えた証拠」にならない。
 
 ## 更新する
 

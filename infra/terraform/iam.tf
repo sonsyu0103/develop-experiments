@@ -33,16 +33,23 @@ resource "aws_iam_role_policy_attachment" "ecs_execution" {
 # **Secrets Manager の読み取りは実行ロール側に要る。**
 # タスク定義の `secrets` で環境変数へ注入するのは ECS エージェントの仕事なので、
 # アプリ側 (タスクロール) に権限があっても起動に失敗する。
+#
+# **資源は列挙する。** `bbs/*` のようなワイルドカードにすると、
+# 後で足した無関係な secret まで実行ロールが読めるようになる。
 data "aws_iam_policy_document" "ecs_execution_secrets" {
   statement {
-    effect    = "Allow"
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = [aws_secretsmanager_secret.db.arn]
+    effect  = "Allow"
+    actions = ["secretsmanager:GetSecretValue"]
+    resources = concat(
+      [aws_secretsmanager_secret.db.arn],
+      # 認証が無効なら secret が存在しないので、空になる (secrets.tf)。
+      aws_secretsmanager_secret.google_oauth[*].arn,
+    )
   }
 }
 
 resource "aws_iam_role_policy" "ecs_execution_secrets" {
-  name   = "read-db-secret"
+  name   = "read-secrets"
   role   = aws_iam_role.ecs_execution.id
   policy = data.aws_iam_policy_document.ecs_execution_secrets.json
 }
