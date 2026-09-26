@@ -151,16 +151,28 @@ resource "aws_ecs_task_definition" "api" {
       { name = "S3_PUBLIC_BASE_URL", value = local.public_url },
 
       # 認証は任意 (未設定ならログインの 2 経路だけが 503。ADR 0005)。
+      #
+      # **ID はここ、SECRET は下の secrets。**
+      # クライアント ID は秘密でない (認可のリダイレクト URL に載って
+      # ブラウザまで出る)。シークレットのほうは secrets.tf 参照。
       { name = "GOOGLE_CLIENT_ID", value = var.google_client_id },
-      { name = "GOOGLE_CLIENT_SECRET", value = var.google_client_secret },
     ]
 
-    # **DATABASE_URL は Secrets Manager から注入する。**
-    # environment に書くと、タスク定義を読める人全員に見える。
-    secrets = [{
-      name      = "DATABASE_URL"
-      valueFrom = "${aws_secretsmanager_secret.db.arn}:url::"
-    }]
+    # **秘密は Secrets Manager から注入する。**
+    # environment に書くと、タスク定義を読める人全員に見える
+    # (`ecs:DescribeTaskDefinition` の応答に平文で出る)。
+    secrets = concat(
+      [{
+        name      = "DATABASE_URL"
+        valueFrom = "${aws_secretsmanager_secret.db.arn}:url::"
+      }],
+      # 認証が無効なら secret を作らないので、注入もしない (secrets.tf)。
+      # 環境変数が無い状態は空文字と同じ扱いになる (config.go の os.Getenv)。
+      local.google_oauth_enabled ? [{
+        name      = "GOOGLE_CLIENT_SECRET"
+        valueFrom = "${aws_secretsmanager_secret.google_oauth[0].arn}:client_secret::"
+      }] : [],
+    )
 
     logConfiguration = {
       logDriver = "awslogs"
