@@ -92,6 +92,22 @@ variable "google_client_secret" {
   type        = string
   default     = ""
   sensitive   = true
+
+  # **片方だけ設定された状態を弾く。**
+  #
+  # AuthConfig.Enabled() は ID と SECRET の両方を要求する
+  # (apps/go-api/internal/config/config.go:474)。片方だけ入れても
+  # **ログインは有効にならず、503 のまま**になる。
+  #
+  # しかも tfvars で変数名を打ち間違えた場合、Terraform は
+  # 「Value for undeclared variable」の**警告 1 行**で通してしまう ——
+  # apply は成功し、secret も注入も作られず、原因は警告に埋もれる。
+  #
+  # 「両方 or 両方空」だけを許せば、その静かな失敗が消える。
+  validation {
+    condition     = (var.google_client_secret == "") == (var.google_client_id == "")
+    error_message = "google_client_id と google_client_secret は、両方設定するか両方空にしてください (片方だけではログインが有効になりません)。"
+  }
 }
 
 variable "alarm_email" {

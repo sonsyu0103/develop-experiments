@@ -163,9 +163,20 @@ case "$s3_base" in
 		bad "S3_PUBLIC_BASE_URL が公開 URL と違う (got $s3_base, want $BASE)" ;;
 esac
 
-# 経路そのものの到達性も見る。存在しないキーは 403 ではなく 404 が返る
-# (バケットポリシーが arn/* に GetObject を与えているため)。
-# **403 は OAC かポリシーが効いていない合図**になる。
+# 経路そのものの到達性も見る。存在しないキーには 404 を期待する。
+#
+# **404 が返るのは s3.tf の ListBucket 文があるからで、GetObject では
+# 足りない。** S3 は ListBucket を持たない主体には、キーが無いときも
+# 403 AccessDenied を返す (不存在を教えないため)。
+# 初版のコメントは「arn/* に GetObject を与えているため 404」と
+# 書いていたが理屈が逆で、**この検査は 2026-09-26 まで一度も
+# 通ったことがなかった** (ADR 0024 の 16)。
+#
+# **s3.tf の ListBucket 文はこの検査を支えている (load-bearing)。**
+# 消すと 403 に戻ってここが落ちる —— そのとき期待値を 403 に
+# 緩めてはいけない。**403 は OAC が壊れているときにも返る**ので、
+# 緩めると診断力がゼロになる。404 が返ること自体が
+# 「認可が成立している」証明になっている。
 probe_key="images/00000000-0000-0000-0000-000000000000.webp"
 img_code="$(status "$BASE/$probe_key")"
 case "$img_code" in
@@ -173,6 +184,43 @@ case "$img_code" in
 	403) bad  "存在しないキーが 403 —— OAC かバケットポリシーが効いていない" ;;
 	*)   bad  "S3 オリジンの応答が想定外 (status=$img_code)" ;;
 esac
+
+echo
+echo "=== 7. 秘密がタスク定義に平文で入っていないか (ADR 0024 決定 7) ==="
+
+# **塞いだ穴に検査を付ける。**
+#
+# GOOGLE_CLIENT_SECRET が environment に平文で入っていた
+# (ecs:DescribeTaskDefinition があれば読める)。直したが、
+# **同じ間違いはいつでも再発できる** —— environment に 1 行足すほうが
+# secrets + IAM を足すより楽なので、楽なほうに倒れる。
+#
+# 手で「SECRET を含む項目 0 件」を数えるのは、MAIL_SMTP_PASSWORD の
+# ような名前を取り逃す。**名前の規則で機械的に見る。**
+#
+# ここで見るのは名前だけで、値は読まない (読めば検査のログに秘密が乗る)。
+secretish='(SECRET|PASSWORD|TOKEN|CREDENTIAL|PRIVATE_KEY|ACCESS_KEY)'
+cluster="$(tf output -raw ecs_cluster_name)"
+
+for family in "$cluster-go-api" "$cluster-next-app" "$cluster-migrate"; do
+	names="$(aws ecs describe-task-definition \
+		--region "$region" \
+		--task-definition "$family" \
+		--query 'taskDefinition.containerDefinitions[].environment[].name' \
+		--output text 2>/dev/null || echo "__READ_FAILED__")"
+
+	case "$names" in
+		__READ_FAILED__)
+			bad "$family のタスク定義を読めない" ;;
+		*)
+			hits="$(printf '%s\n' $names | grep -E "$secretish" || true)"
+			if [ -n "$hits" ]; then
+				bad "$family の environment に秘密らしい名前がある: $(printf '%s ' $hits)"
+			else
+				pass "$family の environment に秘密らしい名前は無い"
+			fi ;;
+	esac
+done
 
 echo
 echo "=== 後片付け ==="
