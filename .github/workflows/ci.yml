@@ -35,8 +35,11 @@ env:
   GO_ARCH_LINT_VERSION: v1.17.0
   # MinIO とそのクライアント。compose.yaml と同じタグに揃える
   # (docs/adr/0007-image-storage.md)
-  MINIO_VERSION: RELEASE.2025-04-22T22-12-26Z
-  MC_VERSION: RELEASE.2025-04-16T18-13-26Z
+  # **取得元は bitnamilegacy (2026-09-26 に 3 回目の移転)。**
+  # MinIO の公開イメージがどのレジストリからも引けなくなった。
+  # 詳細と「また閉じる前提」は compose.yaml の minio を参照。
+  MINIO_VERSION: 2025.7.23-debian-12-r5
+  MC_VERSION: 2025.7.21-debian-12-r3
   # Terraform も同じ扱い。infra/terraform/versions.tf の
   # required_version (~> 1.11) を満たす範囲で固定する。
   # **下限は 1.11。** secrets.tf が write-only 属性 (secret_string_wo) を
@@ -445,19 +448,24 @@ jobs:
       #
       # postgres は引数が要らないので services のままでよい。
       #
-      # 【Docker Hub ではなく quay.io から取る】
-      # 2026-09 に Docker Hub の minio/minio と minio/mc が取得できなくなった
-      # (`pull access denied ... repository does not exist`)。
-      # quay.io には同じタグが残っており、**ダイジェストも Docker Hub から
-      # 取得済みのものと一致する** (minio: sha256:a1ea29fa…、mc: sha256:aead63c7…)。
-      # 中身は同じイメージで、取得元だけが変わる。compose.yaml も同じ。
+      # 【取得元は bitnamilegacy】
+      # 2026-09 に Docker Hub が閉じ、quay.io に移した。
+      # **その quay.io も 2026-09-26 に閉じた** (`unauthorized`、API も 401)。
+      # ghcr.io / public.ecr.aws / bitnami/minio も全滅で、
+      # 引けたのは bitnamilegacy だけ。compose.yaml に経緯を残してある。
+      #
+      # **bitnami 版は `server /data` を要らない。** entrypoint が
+      # コマンドを組み立てるため、引数なしで起動する。
+      # つまり上の「services にはコマンド引数を渡す口が無い」という
+      # 制約は**もう当てはまらない**が、docker run のままにする ——
+      # 失敗時に `docker logs minio` を出す形をそのまま使いたい。
       - name: Start MinIO
         run: |
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            "quay.io/minio/minio:${MINIO_VERSION}" server /data
+            "bitnamilegacy/minio:${MINIO_VERSION}"
           for i in $(seq 1 30); do
             curl -sf -o /dev/null http://localhost:9000/minio/health/live && exit 0
             sleep 2
@@ -481,14 +489,18 @@ jobs:
           # 【バイナリではなくイメージを使う】
           # 以前は dl.min.io の archive からバイナリを落としていたが、
           # 2026-09 に **410 Gone** になった (上の Docker Hub と同時期)。
-          # compose と同じ quay.io/minio/mc のイメージを --network host で動かす。
+          # compose と同じ bitnamilegacy/minio-client を --network host で動かす。
+          #
+          # **`mc` を第 1 引数として渡す。** bitnami の entrypoint は
+          # 受け取った引数をそのまま exec するため、`mb` だけを渡すと
+          # `exec: mb: not found` で落ちる (実測)。
           # 接続先は MC_HOST_local で渡す —— alias set は設定をコンテナ内に
           # 書くので、使い捨てのコンテナでは次のコマンドに残らない
           # (Makefile の MC と同じ形)。
           mc() {
             docker run --rm --network host \
               -e MC_HOST_local=http://minioadmin:minioadmin@localhost:9000 \
-              "quay.io/minio/mc:${MC_VERSION}" "$@"
+              "bitnamilegacy/minio-client:${MC_VERSION}" mc "$@"
           }
           mc mb --ignore-existing local/bbs-images
           mc anonymous set download local/bbs-images
