@@ -124,6 +124,130 @@ push のたびに走らせると存在しないクラスタに向かって失敗
 **この構成では釣り合わない**という判断になる。
 利用者が付いた日に CodeDeploy へ移す。
 
+## 決定 7: 秘密は Secrets Manager 経由で渡す —— state に残すかは値ごとに分ける (2026-09-26 追記)
+
+ECS のタスク定義は `ecs:DescribeTaskDefinition` があれば読める。
+`environment` に入れた値はその応答に**平文で出る**ので、
+秘密は `secrets` (`valueFrom`) で渡し、実行ロールに
+Secrets Manager の読み取りを与える。
+
+**当初 `DATABASE_URL` だけがこの形になっていて、
+`GOOGLE_CLIENT_SECRET` は `environment` に平文で残っていた。**
+「environment に書くと読める人全員に見える」というコメントの
+3 行上にその行があった —— 意図は書けていて、適用漏れだけがあった形になる。
+
+値ごとの置き場:
+
+| 値 | 置き場 | 理由 |
+| --- | --- | --- |
+| `DATABASE_URL` | Secrets Manager (`bbs/db`) | 秘密 |
+| `GOOGLE_CLIENT_SECRET` | Secrets Manager (`bbs/google-oauth`) | 秘密 |
+| `GOOGLE_CLIENT_ID` | `environment` | **秘密ではない。** 認可のリダイレクト URL に載ってブラウザまで出る |
+
+IAM は**実行ロール側**に要る。`secrets` を環境変数へ展開するのは
+ECS エージェントの仕事なので、タスクロール (アプリ自身) に付けても
+起動に失敗する。資源はワイルドカードにせず ARN を列挙する ——
+`bbs/*` にすると、後で足した無関係な secret まで読めるようになる。
+
+### 認証が無効なら secret ごと作らない
+
+認証は任意 ([ADR 0005](0005-authentication.md))。`google_client_secret` が
+空なら `count = 0` で secret を作らず、`secrets` への注入も行わない。
+
+空文字のまま作ろうとしても Secrets Manager が受け付けない
+(`SecretString` は 1 文字以上)。またアプリ側は `os.Getenv` で読むので
+(`internal/config/config.go`)、**「環境変数が無い」と「空文字」は同じ挙動**に
+なる —— `AuthConfig.Enabled()` が false を返し、ログインの 2 経路だけが 503。
+`environment` から外しても、無効時の振る舞いは変わらない。
+
+### `secret_string_wo` は google だけに使う。db には使わない
+
+Terraform 1.11 の write-only 属性 (`*_wo`) を使うと、値が
+**state にも plan ファイルにも残らない。** provider に apply 時だけ渡される。
+
+代償がある。**値が state に無いので、Terraform は中身の変化を検知できない。**
+更新は `secret_string_wo_version` を人が上げたときだけ起きる。
+
+この代償を払えるかは、**secret の中身が何に依存しているか**で決まる:
+
+| secret | 中身の出どころ | `_wo` | 理由 |
+| --- | --- | --- | --- |
+| `bbs/google-oauth` | `var.google_client_secret` 1 個 | **使う** | 他リソースに依存しない。ローテーション時に番号を上げるのは自然な操作 |
+| `bbs/db` | `aws_db_instance.main` の `address` / `endpoint` | **使わない** | 追跡されないと、**RDS が置き換わっても secret が古いホストを指したまま**になる |
+
+db 側のパスワードを state から消すなら、`_wo` ではなく
+`manage_master_user_password = true` (AWS 側が secret を持つ) のほうが筋が通る。
+`random_password` を `ephemeral` にする手も plan までは通ったが、
+**生成した値を誰も保持しなくなる**ため、RDS の置き換えと secret の更新が
+ずれたときに突き合わせる先が無くなる。採らない。
+
+**`_wo` を使うと Terraform の下限が上がる。** `versions.tf` の
+`required_version` を `~> 1.10` から `~> 1.11` に上げた。1.10 で apply すると
+`Unsupported argument` で落ちるので、下限を据え置くと**通る構成が嘘になる。**
+
+### `_wo` を実機で確かめた (2026-09-26)
+
+ダミー値 (`google_client_id` は空のまま = ログインは無効) で apply し、
+**plan では原理的に出ない部分**を実測した。
+
+**1. 値は Secrets Manager に入り、state には残らない。**
+
+`aws secretsmanager get-secret-value --secret-id bbs/google-oauth` が
+`{"client_secret":"..."}` を返す一方、`terraform.tfstate` 内の
+その文字列の出現数は **0**。同じ state の中で並べると差がはっきり出る:
+
+| state 内の `secret_string` | |
+| --- | --- |
+| `secret_version.db` (素の `secret_string`) | **298 文字が平文で存在** |
+| `secret_version.google_oauth` (`_wo`) | **null** |
+| `random_password.result` (参考) | 32 文字が平文で存在 |
+
+**2. `secrets` の 2 件目として注入される。**
+`describe-task-definition` の実物で `DATABASE_URL` と
+`GOOGLE_CLIENT_SECRET` の 2 件、`environment` 側に
+`SECRET` を含む項目は 0 件。実行ロールのポリシーも ARN 2 本に増えていた。
+
+**3. `wo_version` を上げ忘れると、plan が `No changes` を返す。**
+
+ここがいちばん危ない。tfvars の値を書き換え、`wo_version` を 1 のまま
+plan したところ:
+
+```
+No changes. Your infrastructure matches the configuration.
+```
+
+**「apply は成功するのに値が変わらない」よりさらに悪い。**
+差分が 0 件なので、**apply する機会すら来ない。**
+値が state に無いので比較対象が無く、Terraform には原理的に見えない。
+
+`wo_version` を 2 に上げて apply すると更新され、Secrets Manager 側に
+`AWSPREVIOUS` / `AWSCURRENT` の 2 版が並ぶことも確認した。
+
+> **運用上の含み**: ローテーションを「tfvars を書き換えて apply」だけで
+> 済ませると、**静かに失敗する。** 番号を上げる操作が手順から抜けたときに
+> 気づく仕掛けが無い —— `wo_version` を値のハッシュから導出する
+> (`secret_string_wo_version = parseint(substr(sha256(var.google_client_secret), 0, 8), 16)`)
+> といった形にすれば自動で動くが、**まだ入れていない** (やり残し)。
+
+### plan ファイルには秘密が入る —— `_wo` でも消えない
+
+`terraform plan -out` が書くファイルは zip で、中身は
+`tfconfig` / `tfplan` / `tfstate` / `tfstate-prev`。`_wo` にした値は
+`tfstate` 側には入らないが、**`-var` で渡した値は `tfplan` に平文で残る**
+(zip を展開して `tfplan` エントリに当てて確認した)。
+変数そのものの性質で、`_wo` とは関係がない。
+
+`make tf-apply` は plan を `$(HOME)/claude-artifacts/bbs-apply.tfplan` に
+固めてから適用する (対話で止まらないようにするため)。
+**成功すれば最後の `rm -f` で消える** (`tf-destroy` も同じ形)。
+
+**危ないのは失敗したときで、`rm` の手前で make が止まるので残る。**
+apply が途中で落ちるのは「作れたところまでは state に残る」場面
+(下の 10) と重なるため、**いちばん取り乱しているときに、
+秘密を含むファイルが成果物ディレクトリに置き去りになる。**
+いまは `google_client_secret` を tfvars に入れていないので実害は無いが、
+設定した日からは効いてくる (やり残しに追加)。
+
 ## コスト
 
 東京リージョン、常時起動した場合の概算:
@@ -482,6 +606,52 @@ VPC CIDR だけを信頼すると、右端のエッジ IP がそのまま `Clien
 **教訓は「実測した結論にも射程がある」ということになる。**
 手元の 1 段構成で得た答えは、2 段構成では成り立たなかった。
 
+### 16. 検査 6 番は、書いてから一度も実行されていなかった (2026-09-26)
+
+`make tf-verify` の「存在しないキーは 404」を見る検査が **NG** で落ちた。
+だが**インフラではなく検査側が間違っていた。**
+
+S3 は `s3:ListBucket` を持たない主体に対して、
+**オブジェクトが存在しないときも 403 `AccessDenied` を返す**
+(「無い」ことを教えないため)。バケットポリシーは `s3:GetObject` だけを
+与えていて、`ListBucket` はリポジトリのどこにも無かった ——
+つまり **404 は原理的に返らない。** 実測の応答もそれだった:
+
+```
+HTTP/2 403      server: AmazonS3
+<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>
+```
+
+検査のコメントは「バケットポリシーが `arn/*` に GetObject を
+与えているため 404 が返る」と書いてあったが、**理屈が逆**になる。
+404 を返させるには `ListBucket` が要る。
+
+**なぜ今まで気づかなかったか:**
+
+| | 日付 |
+| --- | --- |
+| `apply` → `verify` → `destroy` を一周した | 2026-08-25 |
+| この検査を追加した (`7e88be2`) | **2026-08-26** |
+
+**一周した翌日に足されている。** レビュー指摘への対応として
+「検査を厚くする」変更を入れたが、その検査自体は AWS に当てていない。
+上の「まだ確かめていないこと」に書いてあった監視 3 件と同じ形の穴で、
+**検査を足す変更は、足した検査が未検証になる**という構造がある
+([ADR 0022](0022-probing-the-checkers.md) の主題そのもの)。
+
+**対処はポリシー側を直した。** 検査の期待値を 403 に合わせる手もあったが、
+**403 は「OAC が壊れているとき」にも返る**ので、それでは何も証明しない。
+`ListBucket` を (ディストリビューション条件付きで) 与えると:
+
+- 存在しないキーが **404** になる —— 消えた画像と設定ミスが区別できる
+- 404 が返ること自体が「**認可が成立している**」証明になり、検査が意味を持つ
+
+リソースはバケット本体に書く (`arn/*` ではない)。ListBucket は
+バケットに対する操作なので、`/*` を付けると効かない。
+
+**教訓: 検査が落ちたとき、まず疑うのは検査のほう。**
+今回は「インフラが壊れている」ではなく「検査が一度も動いていなかった」だった。
+
 ## 本番ならこうする
 
 **この構成はポートフォリオ用であり、本番構成ではない。**
@@ -498,6 +668,7 @@ VPC CIDR だけを信頼すると、右端のエッジ IP がそのまま `Clien
 | ログ | CloudWatch (7 日) | FireLens → S3 → Athena ([ADR 0010](0010-log-pipeline.md)) |
 | デプロイ | ローリング | Blue/Green (CodeDeploy) |
 | tfstate | local | S3 backend (`use_lockfile`) |
+| DB のパスワード | `random_password` (state に平文) | `manage_master_user_password` + 自動ローテーション (決定 7) |
 | WAF | 無し | あり ([インフラ構成](../infrastructure.md) の図) |
 
 ## 実機で確かめたこと (2026-08-25)
@@ -522,22 +693,64 @@ VPC CIDR だけを信頼すると、右端のエッジ IP がそのまま `Clien
 タグ検索に残るのが `INACTIVE` の墓標だけであることを確認した。
 実績コストは約 $0.07 (稼働 1 時間)。
 
-### 作られるリソースは 74 件 (2026-08-30 に内訳を確定、2026-09-17 に 71 → 74)
+> **2026-09-26 の一周で分かったこと: タグ検索は 0 件にならない。**
+> `get-resources --tag-filters Key=Project,Values=bbs` が **19 件**返した。
+> 内訳は ECS の `INACTIVE` な墓標 (クラスタ・サービス・タスク定義 7 版) と、
+> **すでに存在しない Security Group ルールの ARN 8 件** ——
+> `describe-security-group-rules` に当てると
+> `InvalidSecurityGroupRuleId.NotFound` で、タグ索引側が遅れているだけだった。
+>
+> つまり **「タグ検索が 0 件なら消えている」という読み方は成立しない。**
+> 件数ではなく**状態**を見る必要がある:
+>
+> - ECS: `describe-clusters` の `status` が `INACTIVE` か
+>   (`list-clusters` は削除済みを返さないので 0 件が正しい姿)
+> - 課金するもの: `describe-db-instances` / `describe-load-balancers` /
+>   `describe-nat-gateways` / `list-distributions` /
+>   `describe-vpcs --filter isDefault=false` / `list-secrets` を直接引く
+>
+> `destroy` 後に 78 リソースすべてが消え、上記がいずれも 0 件になることを
+> 確認した (`Apply complete! Resources: 0 added, 0 changed, 78 destroyed.`
+> —— destroy plan を適用する形なので、出力は "Destroy complete" ではなく
+> **"Apply complete"** になる。`grep` で確認するときに引っかかる)。
 
-**`.tf` を `grep` しても 68 件しか出ない。** `count` と `for_each` で
+### 作られるリソースは 75 件 (2026-08-30 に内訳を確定、2026-09-17 に 71 → 74、2026-09-26 に 74 → 75 を訂正)
+
+**`.tf` を `grep` しても 70 件しか出ない。** `count` と `for_each` で
 展開される分が数えられないため。内訳を残しておく。
 
 | | 件数 |
 | --- | --- |
-| `resource` ブロック (静的) | 68 |
-| うち固定 (展開なし) | 59 |
+| `resource` ブロック (静的) | 70 |
+| うち固定 (展開なし) | 60 |
 | ECR: `for_each = local.ecr_repositories` (api / web / migrate) × 2 ブロック | **6** |
 | network: `count = var.az_count` (既定 2) × 4 ブロック | **8** |
 | IAM: GitHub OIDC プロバイダ (三項で 1 か 0 のどちらか) | **1** |
 | monitoring: SNS 購読 (`var.alarm_email` 既定 `""` なので 0) | **0** |
-| **合計** | **74** |
+| secrets: google の secret + version (`google_client_secret` 既定 `""` なので 0) | **0** |
+| **合計** | **75** |
 
-59 + 6 + 8 + 1 + 0 = 74。**`alarm_email` を設定して apply すると 75 になる。**
+60 + 6 + 8 + 1 + 0 + 0 = 75。**`alarm_email` を設定して apply すると 76、
+さらに `google_client_secret` も設定すると 78 になる。**
+
+> **2026-09-26 に 74 → 75 を訂正した。** 決定 7 の作業中に
+> `terraform plan` を実測したら 76 件 (`alarm_email` 設定済み) で、
+> この表から出る 75 と **1 件合わなかった。**
+>
+> 原因はこの表の算数で、**構成は 2026-09-17 から変わっていない**
+> (`git log -- infra/terraform` で確認)。展開されるブロックは
+> ECR 2 + network 4 + OIDC 1 + SNS 1 = **8 ブロック**なので、
+> 固定は 68 − 8 = **60**。ここが 59 になっていた。
+>
+> つまり **2026-09-17 の「71 → 74」も、正しくは「72 → 75」だった。**
+> 内訳を書いておいたおかげで、実測とぶつけた時点で場所が特定できた。
+>
+> **同日 apply して裏を取った**: `Apply complete! Resources: 76 added`
+> (`alarm_email` 設定済み・`google_client_secret` 未設定)。
+> 表から出る 75 + SNS 購読 1 = 76 で一致する。
+>
+> 静的ブロックが 68 → 70 になっているのは、決定 7 で `secrets.tf` に
+> 2 ブロック足したため。どちらも `count` 付きで、既定では 0 件に畳まれる。
 
 > **2026-09-17 に監視を 3 リソース足した** (`monitoring.tf`: `target_5xx` / `api_error` のメトリクスフィルタ / `api_error_log`)。
 > アプリが返した 5xx と ERROR ログを見るアラームが無かったため
@@ -560,6 +773,22 @@ VPC CIDR だけを信頼すると、右端のエッジ IP がそのまま `Clien
 - **2026-09-17 に足した監視 3 件が実際に鳴るか。** `terraform validate` まで。
   メトリクスフィルタのパターンがログに一致することは、ログの形をテスト
   (`TestNewHandler_ErrorLevelMatchesMetricFilter`) で固定しただけで、AWS 上では確かめていない
+- **決定 7 のうち、google 側 (`secret_string_wo`) を apply していない。**
+
+  `container_definitions` は **plan では unknown** になる ——
+  新しい secret の ARN が apply 後にしか決まらないため、Terraform が
+  丸ごと「known after apply」に倒す。IAM のポリシー JSON も同じ。
+  そこで 2026-09-26 に apply し、`describe-task-definition` で実物を見た:
+
+  | 見たもの | 結果 |
+  | --- | --- |
+  | `environment` に秘密が残っていないか | **残っていない。** `GOOGLE_CLIENT_ID` だけ (値は空) |
+  | `secrets` の注入 | `DATABASE_URL` → `bbs/db:url::` |
+  | 実行ロールのポリシー | `read-secrets` が `bbs/db` の ARN 1 本だけを許可 |
+
+  続けて `google_client_secret` にダミーを入れて apply し、
+  `count = 1` 側も通した。**結果は下の「`_wo` を実機で確かめた」を参照** ——
+  未検証だった 3 点はすべて潰れている
 
 ## やり残し
 
@@ -569,6 +798,24 @@ VPC CIDR だけを信頼すると、右端のエッジ IP がそのまま `Clien
   **手元の compose と同じ形に揃う。** 追加料金もかからない
 - **`make tf-verify` を CI に組み込む。** いまは手で回している
 - **Google OIDC の設定。** `tf-verify` の Cookie 検査が SKIP のままになっている
+- **`secret_string_wo_version` を手で上げる形をやめる。** 上げ忘れると
+  plan が `No changes` を返し、**静かに失敗する** (決定 7 で実測)。
+  値のハッシュから導出すれば自動で動く:
+  `parseint(substr(sha256(var.google_client_secret), 0, 8), 16)`。
+  ただし**番号が単調増加しない**組み合わせがありうるので、
+  provider がそれを許すかを先に確かめる
+- **`make tf-verify` の検査自体を一度も AWS に当てずに増やさない (16)。**
+  検査を足す変更は、足した検査が未検証のまま残る。
+  CI に組み込むか、検査を足した日に apply して当てる運用にする
+- **plan ファイルの後始末を失敗経路にも付ける (決定 7 の最後)。**
+  `make tf-apply` / `tf-destroy` は成功時に `rm -f` するが、
+  **apply が落ちると `rm` に到達せず、秘密を含む plan が残る。**
+  `trap` なり `|| (rm -f ...; false)` なりで、失敗しても消えるようにする
+- **db secret の `manage_master_user_password` 化。** 決定 7 のとおり
+  `_wo` では解けない。state から DB のパスワードを消すなら、
+  AWS 側に secret を持たせる形になる。ただし secret 名が AWS 任せになるため、
+  `recovery_window_in_days = 0` で回している「立てて壊す」運用と
+  ぶつからないかを先に確かめる必要がある
 
 ## やらないこと
 
