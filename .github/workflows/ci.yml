@@ -38,7 +38,10 @@ env:
   MINIO_VERSION: RELEASE.2025-04-22T22-12-26Z
   MC_VERSION: RELEASE.2025-04-16T18-13-26Z
   # Terraform も同じ扱い。infra/terraform/versions.tf の
-  # required_version (~> 1.10) を満たす範囲で固定する。
+  # required_version (~> 1.11) を満たす範囲で固定する。
+  # **下限は 1.11。** secrets.tf が write-only 属性 (secret_string_wo) を
+  # 使っており、1.10 では Unsupported argument で落ちる。
+  # ここを 1.10 系に下げると、validate の段階で失敗する。
   TERRAFORM_VERSION: 1.15.8
 
 jobs:
