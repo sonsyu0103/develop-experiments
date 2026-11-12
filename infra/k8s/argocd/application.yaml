@@ -11,6 +11,11 @@ metadata:
   namespace: argocd
   # Application を消したら、配ったリソースも消す。
   # これが無いと、Application を消してもクラスタに掲示板が残り続ける。
+  #
+  # apply すると Kubernetes v1.37 が「prefer a domain-qualified finalizer name
+  # including a path (/)」と警告するが、**名前は Argo CD の公式どおりにする。**
+  # Argo CD が認める「/ 付き」は .../background だけで、それは削除の方式
+  # (前景 → 背景) を変えてしまう。警告のために挙動を変えない。
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
