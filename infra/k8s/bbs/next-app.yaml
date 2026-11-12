@@ -1,0 +1,60 @@
+# next-app。Dockerfile の prod ステージ (standalone) を動かす。
+#
+# ブラウザからの API は同一オリジンの /api (ビルド時の NEXT_PUBLIC_API_URL の既定)、
+# Server Components からはクラスタ内の go-api を直接叩く (API_URL)。
+apiVersion: v1
+kind: Service
+metadata:
+  name: next-app
+spec:
+  selector:
+    app.kubernetes.io/name: next-app
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: next-app
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: next-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: next-app
+    spec:
+      containers:
+        - name: next-app
+          image: bbs/next-app:local
+          imagePullPolicy: Never
+          env:
+            - name: API_URL
+              value: http://go-api:8080
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            # **UID を数字で書く** (go-api.yaml と同じ理由)。Dockerfile の
+            # USER nextjs は名前なので、kubelet が root でないと確かめられない。
+            # 1001 は Dockerfile の adduser -u 1001。
+            runAsUser: 1001
+            capabilities:
+              drop: ["ALL"]

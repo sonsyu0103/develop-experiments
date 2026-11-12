@@ -1,0 +1,74 @@
+# 掲示板アプリ一式 (ADR 0026)。Argo CD はこのディレクトリを見て、
+# クラスタをここに書かれたとおりに揃える (argocd/application.yaml)。
+#
+# 手元で中身を見る:  make k8s-render
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: bbs
+
+resources:
+  - namespace.yaml
+  - secret.yaml
+  - postgres.yaml
+  - migrate.yaml
+  - minio.yaml
+  - mailpit.yaml
+  - go-api.yaml
+  - next-app.yaml
+  - edge.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: bbs
+    includeSelectors: false
+
+# **設定ファイルはリポジトリの正本をそのまま読む (コピーしない)。**
+#
+# マイグレーション・拡張の初期化・Caddyfile は compose と同じファイルを使う。
+# このディレクトリの外を読むので、kustomize の既定 (LoadRestrictionsRootOnly)
+# では build が落ちる。Argo CD 側も argocd-cm の kustomize.buildOptions で
+# 同じ制限を外している (argocd/argocd-cm.yaml)。
+#
+# 名前にハッシュが付くので、中身が変わると参照する Pod / Job も作り直される
+# —— 「ConfigMap だけ更新されて Pod は古い設定のまま」が起きない。
+configMapGenerator:
+  - name: edge-caddyfile
+    files:
+      - Caddyfile=../../caddy/Caddyfile
+  - name: db-init
+    files:
+      - ../../../apps/go-api/db/init/00-extensions.sql
+  # **一覧は手で並べている** (kustomize は glob を受け付けない)。
+  # マイグレーションを足したらここにも足す。忘れると k8s だけ古いスキーマで
+  # 動くので、make k8s-lint がディレクトリと突き合わせて落とす。
+  - name: migrations
+    files:
+      - ../../../apps/go-api/db/migrations/000001_init_schema.down.sql
+      - ../../../apps/go-api/db/migrations/000001_init_schema.up.sql
+      - ../../../apps/go-api/db/migrations/000002_add_users_and_sessions.down.sql
+      - ../../../apps/go-api/db/migrations/000002_add_users_and_sessions.up.sql
+      - ../../../apps/go-api/db/migrations/000003_add_user_role.down.sql
+      - ../../../apps/go-api/db/migrations/000003_add_user_role.up.sql
+      - ../../../apps/go-api/db/migrations/000004_add_comment_seq.down.sql
+      - ../../../apps/go-api/db/migrations/000004_add_comment_seq.up.sql
+      - ../../../apps/go-api/db/migrations/000005_add_idempotency_keys.down.sql
+      - ../../../apps/go-api/db/migrations/000005_add_idempotency_keys.up.sql
+      - ../../../apps/go-api/db/migrations/000006_add_images.down.sql
+      - ../../../apps/go-api/db/migrations/000006_add_images.up.sql
+      - ../../../apps/go-api/db/migrations/000007_add_image_attached_at.down.sql
+      - ../../../apps/go-api/db/migrations/000007_add_image_attached_at.up.sql
+      - ../../../apps/go-api/db/migrations/000008_add_moderation.down.sql
+      - ../../../apps/go-api/db/migrations/000008_add_moderation.up.sql
+      - ../../../apps/go-api/db/migrations/000009_fix_reports_queue.down.sql
+      - ../../../apps/go-api/db/migrations/000009_fix_reports_queue.up.sql
+      - ../../../apps/go-api/db/migrations/000010_add_thread_title_trgm_index.down.sql
+      - ../../../apps/go-api/db/migrations/000010_add_thread_title_trgm_index.up.sql
+      - ../../../apps/go-api/db/migrations/000011_add_thread_view_count.down.sql
+      - ../../../apps/go-api/db/migrations/000011_add_thread_view_count.up.sql
+      - ../../../apps/go-api/db/migrations/000012_add_contact_messages.down.sql
+      - ../../../apps/go-api/db/migrations/000012_add_contact_messages.up.sql
+      - ../../../apps/go-api/db/migrations/000013_fix_image_delete_pending.down.sql
+      - ../../../apps/go-api/db/migrations/000013_fix_image_delete_pending.up.sql
+      - ../../../apps/go-api/db/migrations/000014_drop_threads_updated_at.down.sql
+      - ../../../apps/go-api/db/migrations/000014_drop_threads_updated_at.up.sql

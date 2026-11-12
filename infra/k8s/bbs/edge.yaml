@@ -1,0 +1,68 @@
+# エッジ (Caddy)。**compose の up-https と同じ Caddyfile をそのまま読む**
+# (kustomization.yaml の configMapGenerator)。振り分けは同じ:
+#   /api/*    → go-api (プレフィックスを剥がす)
+#   /images/* → minio の bbs-images
+#   それ以外  → next-app
+#
+# **TLS は終端しない (http)。** SITE_ADDRESS を :80 にすると Caddy は
+# 自動 HTTPS をやめる。XFP も http にして、go-api の selfOrigin が
+# http://localhost:8088 を組み立てるようにする。
+# HTTPS の分岐は compose 側の make https-verify が実測している (ADR 0023)。
+apiVersion: v1
+kind: Service
+metadata:
+  name: edge
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: edge
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      # kind-cluster.yaml の extraPortMappings でホストの 127.0.0.1:8088 に出る。
+      nodePort: 30080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: edge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: edge
+    spec:
+      containers:
+        - name: caddy
+          image: caddy:2.11.4-alpine
+          env:
+            - name: SITE_ADDRESS
+              value: ":80"
+            - name: XFP
+              value: http
+          ports:
+            - name: http
+              containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /edge-healthz
+              port: http
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          volumeMounts:
+            - name: caddyfile
+              mountPath: /etc/caddy
+              readOnly: true
+      volumes:
+        - name: caddyfile
+          configMap:
+            name: edge-caddyfile

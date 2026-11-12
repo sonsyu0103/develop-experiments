@@ -178,6 +178,162 @@ https-verify: ## エッジ配下でしか通らない分岐を実測する (XFP 
 	@$(HTTPS_ENV) bash .github/scripts/https-probe.sh
 
 # ---------------------------------------------------------------------------
+# Kubernetes (kind) + GitOps (Argo CD) —— 手元で立てて壊す
+# ---------------------------------------------------------------------------
+#
+# 掲示板を kind 上で動かし、Argo CD に Git (infra/k8s/bbs) どおりに揃えさせる
+# (docs/adr/0026-kubernetes-and-gitops.md)。**課金は無い。** 全部この PC の中。
+#
+# **kubectl には必ず --context kind-bbs を付ける。** 素の kubectl は
+# 「いま選ばれているクラスタ」に向かうので、別のクラスタを触っていた日に
+# k8s-down 相当の操作が他所へ飛ぶ。
+
+# ツールはリポジトリの bin/ に版を固定して入れる (bin/ は .gitignore 済み)。
+#   - kind とノードイメージは組で作られている。ノードイメージは kind-cluster.yaml で固定
+#   - kubectl はクラスタとの版差 ±1 までが保証範囲。手元の古い kubectl を使わせない
+#   - ARGOCD_VERSION は infra/k8s/argocd/kustomization.yaml の URL と揃える
+#     (k8s-lint が突き合わせる)
+KIND_VERSION    := v0.33.0
+KUBECTL_VERSION := v1.37.0
+ARGOCD_VERSION  := v3.5.6
+
+K8S_BIN     := $(CURDIR)/bin
+KIND        := $(K8S_BIN)/kind
+K8S_CLUSTER := bbs
+KUBECTL     := $(K8S_BIN)/kubectl --context kind-$(K8S_CLUSTER)
+K8S_DIR     := infra/k8s
+# マイグレーションと Caddyfile をリポジトリの正本から読むため、
+# ディレクトリの外を読む許可が要る (Argo CD 側は argocd-cm で同じ指定)。
+KUSTOMIZE   := $(KUBECTL) kustomize --load-restrictor LoadRestrictionsNone
+
+# Argo CD が見る枝。既定は application.yaml に書いた main。
+# 作業ブランチを試すとき: make k8s-up K8S_REVISION=feat/xxx (push 済みであること)
+K8S_REVISION ?=
+
+$(KIND):
+	@mkdir -p $(K8S_BIN)
+	GOBIN=$(K8S_BIN) go install sigs.k8s.io/kind@$(KIND_VERSION)
+
+$(K8S_BIN)/kubectl:
+	@mkdir -p $(K8S_BIN)
+	curl -fsSL -o $@ https://dl.k8s.io/release/$(KUBECTL_VERSION)/bin/$$(go env GOOS)/$$(go env GOARCH)/kubectl
+	chmod +x $@
+
+.PHONY: k8s-tools
+k8s-tools: $(KIND) $(K8S_BIN)/kubectl ## kind と kubectl を固定の版で bin/ に入れる
+	@$(KIND) version
+	@$(K8S_BIN)/kubectl version --client | head -1
+
+.PHONY: k8s-render
+k8s-render: k8s-tools ## Argo CD が適用するマニフェストを手元で組み立てて表示する
+	@$(KUSTOMIZE) $(K8S_DIR)/bbs
+
+.PHONY: k8s-lint
+k8s-lint: k8s-tools ## k8s のマニフェストが組み立てられ、正本と食い違っていないか検査する
+	# **マイグレーションの一覧はディレクトリと一致していなければならない。**
+	# kustomize は glob を受けないので一覧を手で並べている。足し忘れると
+	# k8s だけ古いスキーマで動き、エラーはどこにも出ない (go-api が
+	# 無い列を引いた瞬間に初めて落ちる)。
+	@want=$$(ls $(GO_API_DIR)/db/migrations | sort); \
+	got=$$(sed -n 's#^ *- \.\./\.\./\.\./apps/go-api/db/migrations/##p' $(K8S_DIR)/bbs/kustomization.yaml | sort); \
+	if [ "$$want" != "$$got" ]; then \
+		echo "NG: infra/k8s/bbs/kustomization.yaml のマイグレーション一覧がディレクトリと違う"; \
+		for f in $$want; do echo "$$got" | grep -qx "$$f" || echo "  足りない: $$f"; done; \
+		for f in $$got; do echo "$$want" | grep -qx "$$f" || echo "  余分:     $$f"; done; \
+		exit 1; \
+	fi
+	@grep -q "argo-cd/$(ARGOCD_VERSION)/manifests/install.yaml" $(K8S_DIR)/argocd/kustomization.yaml || { \
+		echo "NG: ARGOCD_VERSION ($(ARGOCD_VERSION)) と argocd/kustomization.yaml の URL が違う"; exit 1; }
+	@$(KUSTOMIZE) $(K8S_DIR)/bbs > /dev/null
+	@$(KUSTOMIZE) $(K8S_DIR)/argocd > /dev/null
+	@echo "OK: k8s のマニフェストは組み立てられ、正本と一致している"
+
+.PHONY: k8s-cluster
+k8s-cluster: k8s-tools ## kind のクラスタを作る (既にあれば何もしない)
+	@if $(KIND) get clusters 2>/dev/null | grep -qx $(K8S_CLUSTER); then \
+		echo "クラスタ $(K8S_CLUSTER) は既にある"; \
+	else \
+		$(KIND) create cluster --config $(K8S_DIR)/kind-cluster.yaml --wait 120s; \
+	fi
+
+.PHONY: k8s-images
+k8s-images: k8s-cluster ## go-api / next-app の本番イメージをビルドして kind に読み込む
+	# **レジストリを経由しない。** kind のノードへ直接読み込むので、
+	# マニフェストは imagePullPolicy: Never で :local を指す。
+	# 読み込んだだけでは動いている Pod は入れ替わらない —— 作り直す。
+	docker build --target prod -t bbs/go-api:local $(GO_API_DIR)
+	docker build --target prod -t bbs/next-app:local $(NEXT_DIR)
+	$(KIND) load docker-image --name $(K8S_CLUSTER) bbs/go-api:local bbs/next-app:local
+	# **他所のイメージ (postgres / minio など) もホストから読み込む。**
+	# kind のノードはホストの Docker のキャッシュを共有しない。放っておくと
+	# ノードが Docker Hub から引き直し、初回は postgres だけで 10 分を超えた。
+	# 一覧はマニフェストから引く (ここに二重に書かない)。
+	@for img in $$($(KUSTOMIZE) $(K8S_DIR)/bbs | sed -n 's/^ *image: *//p' | grep -v '^bbs/' | sort -u); do \
+		docker image inspect $$img >/dev/null 2>&1 || docker pull -q $$img; \
+		$(KIND) load docker-image --name $(K8S_CLUSTER) $$img; \
+	done
+	@if $(KUBECTL) get namespace bbs >/dev/null 2>&1; then \
+		$(KUBECTL) -n bbs rollout restart deployment/go-api deployment/next-app; \
+	fi
+
+.PHONY: k8s-argocd
+k8s-argocd: k8s-cluster ## Argo CD をクラスタに入れる (版は ARGOCD_VERSION)
+	# **server-side apply にする。** Argo CD の CRD は大きく、client-side apply だと
+	# last-applied-configuration 注釈が上限 (256KiB) を超えて落ちる。
+	$(KUSTOMIZE) $(K8S_DIR)/argocd | $(KUBECTL) apply --server-side --force-conflicts -f - > /dev/null
+	$(KUBECTL) -n argocd rollout status deployment/argocd-server --timeout=300s
+	$(KUBECTL) -n argocd rollout status deployment/argocd-repo-server --timeout=300s
+	$(KUBECTL) -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
+	# argocd-cm を変えても、読み込み済みのプロセスには効かない設定がある
+	# (kustomize.buildOptions は repo-server が持つ)。2 回目以降の実行で
+	# 設定だけ変えた場合に備えて作り直す。
+	$(KUBECTL) -n argocd rollout restart deployment/argocd-repo-server statefulset/argocd-application-controller
+	$(KUBECTL) -n argocd rollout status deployment/argocd-repo-server --timeout=300s
+
+.PHONY: k8s-app
+k8s-app: ## Argo CD に掲示板の Application を登録し、揃うまで待つ
+	# **CRD と同じ apply に入れない。** Application の CRD が登録される前に
+	# Application を送ると「no matches for kind」で落ちる。
+	$(KUBECTL) apply -f $(K8S_DIR)/argocd/application.yaml
+	@if [ -n "$(K8S_REVISION)" ]; then \
+		echo "見る枝を $(K8S_REVISION) に上書きする (Git の application.yaml は main のまま)"; \
+		$(KUBECTL) -n argocd patch application bbs --type merge \
+			-p '{"spec":{"source":{"targetRevision":"$(K8S_REVISION)"}}}'; \
+	fi
+	$(KUBECTL) -n argocd wait application/bbs --for=jsonpath='{.status.sync.status}'=Synced --timeout=600s
+	$(KUBECTL) -n argocd wait application/bbs --for=jsonpath='{.status.health.status}'=Healthy --timeout=600s
+
+.PHONY: k8s-up
+k8s-up: k8s-lint k8s-cluster k8s-images k8s-argocd k8s-app ## kind + Argo CD で掲示板を立てる (http://localhost:8088)
+	@echo
+	@echo "  http://localhost:8088   掲示板 (エッジ経由)"
+	@echo "  http://localhost:8089   Argo CD (admin / make k8s-argocd-password)"
+
+.PHONY: k8s-apply-local
+k8s-apply-local: k8s-lint k8s-cluster k8s-images ## Argo CD を通さず、手元のマニフェストを直接入れる (push 前の確認用)
+	# **Argo CD が居るクラスタでは使わない。** selfHeal が Git の状態へ戻すので、
+	# 手元の変更は数十秒で消える (それ自体が ADR 0026 で確かめたい動き)。
+	@if $(KUBECTL) -n argocd get application bbs >/dev/null 2>&1; then \
+		echo "NG: Application bbs が居る。手元の変更は Argo CD に戻される"; exit 1; \
+	fi
+	$(KUSTOMIZE) $(K8S_DIR)/bbs | $(KUBECTL) apply -f -
+	$(KUBECTL) -n bbs wait job/migrate --for=condition=Complete --timeout=300s
+	$(KUBECTL) -n bbs rollout status deployment/go-api --timeout=300s
+	$(KUBECTL) -n bbs rollout status deployment/next-app --timeout=300s
+
+.PHONY: k8s-verify
+k8s-verify: ## kind 上の掲示板と、Argo CD の selfHeal を実測する (クラスタを一時的に崩す)
+	@KUBECTL="$(KUBECTL)" bash .github/scripts/k8s-probe.sh
+
+.PHONY: k8s-argocd-password
+k8s-argocd-password: ## Argo CD の admin の初期パスワードを表示する
+	@$(KUBECTL) -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo
+
+.PHONY: k8s-down
+k8s-down: ## kind のクラスタを丸ごと消す (データも消える)
+	$(KIND) delete cluster --name $(K8S_CLUSTER)
+
+# ---------------------------------------------------------------------------
 # AWS (Terraform) —— 必要な日だけ立てる
 # ---------------------------------------------------------------------------
 #
@@ -915,7 +1071,7 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 		fi
 
 .PHONY: check
-check: lint test cover verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test cover verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe k8s-lint e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
 # **test-live は smoke の後ろに置く。** 前に置くと、スタックが落ちている

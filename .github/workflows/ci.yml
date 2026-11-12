@@ -92,6 +92,33 @@ jobs:
         run: terraform -chdir=infra/terraform validate
 
   # --------------------------------------------------
+  # Kubernetes Manifest Checks
+  # --------------------------------------------------
+  #
+  # **クラスタは立てない。** マニフェストが組み立てられることと、
+  # 正本 (マイグレーションのディレクトリ・Argo CD の版) と食い違って
+  # いないことだけを見る (docs/adr/0026-kubernetes-and-gitops.md)。
+  #
+  # 落とせないもの: Pod が実際に起動するか、Argo CD が同期できるか。
+  # それは手元の make k8s-up → make k8s-verify でしか分からない。
+  k8s-ci:
+    name: Kubernetes Manifest Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        # kind を go install するため (版は Makefile の KIND_VERSION)
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Lint manifests
+        run: make k8s-lint
+
+  # --------------------------------------------------
   # Go Backend Checks
   # --------------------------------------------------
   go-ci:

@@ -1,0 +1,38 @@
+# 掲示板を Git の infra/k8s/bbs に揃え続ける Application (ADR 0026)。
+#
+# **見る枝は main。** develop に入っただけでは反映されず、main に入って
+# 初めてクラスタが変わる —— 「何が出ているか」は main を読めば分かる。
+# 作業ブランチを試すときは、Git を書き換えずに上書きする:
+#   make k8s-up K8S_REVISION=feat/xxx
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: bbs
+  namespace: argocd
+  # Application を消したら、配ったリソースも消す。
+  # これが無いと、Application を消してもクラスタに掲示板が残り続ける。
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/sonsyu0103/develop-experiments.git
+    targetRevision: main
+    path: infra/k8s/bbs
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: bbs
+  syncPolicy:
+    automated:
+      # Git から消したものはクラスタからも消す。
+      prune: true
+      # **クラスタを手で変えても Git に戻す。** これを外すと「Git と違う」と
+      # 表示されるだけで、kubectl scale や edit がそのまま残る。
+      selfHeal: true
+    retry:
+      # 初回はイメージの読み込みや postgres の起動を待つので、何度かやり直させる。
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 2m
