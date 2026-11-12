@@ -57,6 +57,13 @@ spec:
             # エッジ (Caddy の Pod) は Pod の CIDR から来る (kind-cluster.yaml)。
             - name: TRUSTED_PROXIES
               value: 10.244.0.0/16
+            # **Cookie の Secure を外す。** このエッジは TLS を終端しない (http)。
+            # Secure 付きの Cookie を http://localhost で受けるかはブラウザ次第で、
+            # 受けないブラウザではログインだけが黙って失敗する (レビュー指摘)。
+            # Secure を付ける分岐は compose 側の make https-verify が実測している
+            # (ADR 0023 決定 3 で SECURE_COOKIE を ENV から独立させたのはこのため)。
+            - name: SECURE_COOKIE
+              value: "false"
             - name: AUTH_REDIRECT_URL
               value: http://localhost:8088/api/auth/google/callback
             - name: AUTH_FRONTEND_URL
@@ -106,6 +113,13 @@ spec:
           resources:
             requests: { cpu: 100m, memory: 64Mi }
             limits: { memory: 256Mi }
+          volumeMounts:
+            # **ルートを読み取り専用にするなら /tmp は書けるようにする。**
+            # 画像のアップロードは 1 MiB を超えた分を一時ファイルに書く
+            # (images.go の multipartMemoryLimit。上限は 5 MiB)。/tmp が書けないと、
+            # 2〜5 MiB の画像だけが k8s でだけ失敗する (レビュー指摘)。
+            - name: tmp
+              mountPath: /tmp
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -118,3 +132,8 @@ spec:
             runAsGroup: 65532
             capabilities:
               drop: ["ALL"]
+      volumes:
+        - name: tmp
+          emptyDir:
+            # アップロードの上限 (5 MiB) × 同時数に余裕を持たせる。
+            sizeLimit: 64Mi

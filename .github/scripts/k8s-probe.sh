@@ -25,7 +25,10 @@ pass() { printf '  \033[32mOK\033[0m    %s\n' "$1"; }
 bad()  { printf '  \033[31mNG\033[0m    %s\n' "$1"; fail=$((fail + 1)); }
 k()    { $KUBECTL "$@"; }
 status() { curl -s --max-time 10 -o /dev/null -w '%{http_code}' "$@" || true; }
-psql_q() { k -n "$NS" exec -i statefulset/postgres -- psql -U app -d bbs -tAc "$1" | tr -d '[:space:]'; }
+# **取得の失敗でスクリプトを止めない。** set -e の下で $(...) の中が落ちると、
+# NG / SKIP のまとめを出さずに生のエラーで抜けてしまう (レビュー指摘)。
+# 失敗は空文字として返し、判定の側で NG にする。
+psql_q() { { k -n "$NS" exec -i statefulset/postgres -- psql -U app -d bbs -tAc "$1" 2>/dev/null || true; } | tr -d '[:space:]'; }
 
 # **起動途中を検査結果と取り違えない。** エッジは自分で /edge-healthz を返すので、
 # go-api や next-app が上がる前でも 200 になる。3 つとも揃うまで待つ。
@@ -99,12 +102,19 @@ else
 	echo
 	echo "=== 3. Argo CD が Git の指すコミットに揃えているか ==="
 
-	app_json() { k -n argocd get application bbs -o "jsonpath=$1"; }
+	app_json() { k -n argocd get application bbs -o "jsonpath=$1" 2>/dev/null || true; }
 	rev="$(app_json '{.spec.source.targetRevision}')"
 	sync="$(app_json '{.status.sync.status}')"
 	health="$(app_json '{.status.health.status}')"
 	deployed="$(app_json '{.status.sync.revision}')"
-	remote="$(git ls-remote "$(app_json '{.spec.source.repoURL}')" "refs/heads/$rev" | cut -f1)"
+	# 枝・タグ・コミット SHA のどれで指していても先頭のコミットを引く
+	# (refs/heads だけを見ると、タグや SHA を指したときに正しく同期していても NG になる)。
+	if [[ "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+		remote="$rev"
+	else
+		remote="$({ git ls-remote "$(app_json '{.spec.source.repoURL}')" \
+			"refs/heads/$rev" "refs/tags/$rev^{}" "refs/tags/$rev" 2>/dev/null || true; } | head -1 | cut -f1)"
+	fi
 
 	[ "$sync" = "Synced" ] && pass "Synced (Git とクラスタに差が無い)" || bad "Synced でない (got $sync)"
 	[ "$health" = "Healthy" ] && pass "Healthy" || bad "Healthy でない (got $health)"

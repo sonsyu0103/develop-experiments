@@ -1,7 +1,11 @@
 # 掲示板を Git の infra/k8s/bbs に揃え続ける Application (ADR 0026)。
 #
-# **見る枝は main。** develop に入っただけでは反映されず、main に入って
-# 初めてクラスタが変わる —— 「何が出ているか」は main を読めば分かる。
+# **見る枝は develop。** PR がマージされた枝にクラスタが追従する。
+#
+# 初版は main にしていた (「何が出ているか」を main で読めるように)。
+# だが main への反映はリリースの PR を待つので、マージ直後の
+# make k8s-up は「main に infra/k8s が無い」で同期できずに止まる (レビュー指摘)。
+# このクラスタは手元の開発用で、本番 (main → ECS) とは別の役割になる。
 # 作業ブランチを試すときは、Git を書き換えずに上書きする:
 #   make k8s-up K8S_REVISION=feat/xxx
 apiVersion: argoproj.io/v1alpha1
@@ -22,7 +26,7 @@ spec:
   project: default
   source:
     repoURL: https://github.com/sonsyu0103/develop-experiments.git
-    targetRevision: main
+    targetRevision: develop
     path: infra/k8s/bbs
   destination:
     server: https://kubernetes.default.svc

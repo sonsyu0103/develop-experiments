@@ -108,13 +108,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Go
-        # kind を go install するため (版は Makefile の KIND_VERSION)
-        uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: false
-
+      # kubectl (Makefile の KUBECTL_VERSION) だけを落として使う。kind は要らない。
+      # Go も要らない —— 初版は k8s-lint が kind まで go install していた (レビュー指摘)。
       - name: Lint manifests
         run: make k8s-lint
 

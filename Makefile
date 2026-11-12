@@ -197,39 +197,48 @@ KIND_VERSION    := v0.33.0
 KUBECTL_VERSION := v1.37.0
 ARGOCD_VERSION  := v3.5.6
 
+# **ファイル名に版を入れる。** bin/kind のような版なしの名前だと、
+# KIND_VERSION を上げても「ファイルはもうある」と見なされて入れ直されず、
+# 古い版のまま動き続ける (レビュー指摘)。版ごとに別のファイルにしておけば、
+# 上げた瞬間に新しい版が入る。
 K8S_BIN     := $(CURDIR)/bin
-KIND        := $(K8S_BIN)/kind
+KIND        := $(K8S_BIN)/kind-$(KIND_VERSION)
+KUBECTL_BIN := $(K8S_BIN)/kubectl-$(KUBECTL_VERSION)
 K8S_CLUSTER := bbs
-KUBECTL     := $(K8S_BIN)/kubectl --context kind-$(K8S_CLUSTER)
+KUBECTL     := $(KUBECTL_BIN) --context kind-$(K8S_CLUSTER)
 K8S_DIR     := infra/k8s
 # マイグレーションと Caddyfile をリポジトリの正本から読むため、
 # ディレクトリの外を読む許可が要る (Argo CD 側は argocd-cm で同じ指定)。
 KUSTOMIZE   := $(KUBECTL) kustomize --load-restrictor LoadRestrictionsNone
 
-# Argo CD が見る枝。既定は application.yaml に書いた main。
+# Argo CD が見る枝。既定は application.yaml に書いた develop。
 # 作業ブランチを試すとき: make k8s-up K8S_REVISION=feat/xxx (push 済みであること)
 K8S_REVISION ?=
 
 $(KIND):
 	@mkdir -p $(K8S_BIN)
-	GOBIN=$(K8S_BIN) go install sigs.k8s.io/kind@$(KIND_VERSION)
+	@tmp=$$(mktemp -d) && GOBIN=$$tmp go install sigs.k8s.io/kind@$(KIND_VERSION) && mv $$tmp/kind $@ && rmdir $$tmp
 
-$(K8S_BIN)/kubectl:
+# **Go に頼らずに OS とアーキテクチャを決める。** k8s-lint は kubectl だけで済むので、
+# CI のジョブに Go を入れなくて済むようにする。
+$(KUBECTL_BIN):
 	@mkdir -p $(K8S_BIN)
-	curl -fsSL -o $@ https://dl.k8s.io/release/$(KUBECTL_VERSION)/bin/$$(go env GOOS)/$$(go env GOARCH)/kubectl
-	chmod +x $@
+	@os=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	arch=$$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/'); \
+	curl -fsSL -o $@.tmp https://dl.k8s.io/release/$(KUBECTL_VERSION)/bin/$$os/$$arch/kubectl && \
+	chmod +x $@.tmp && mv $@.tmp $@
 
 .PHONY: k8s-tools
-k8s-tools: $(KIND) $(K8S_BIN)/kubectl ## kind と kubectl を固定の版で bin/ に入れる
+k8s-tools: $(KIND) $(KUBECTL_BIN) ## kind と kubectl を固定の版で bin/ に入れる
 	@$(KIND) version
-	@$(K8S_BIN)/kubectl version --client | head -1
+	@$(KUBECTL_BIN) version --client | head -1
 
 .PHONY: k8s-render
-k8s-render: k8s-tools ## Argo CD が適用するマニフェストを手元で組み立てて表示する
+k8s-render: $(KUBECTL_BIN) ## Argo CD が適用するマニフェストを手元で組み立てて表示する
 	@$(KUSTOMIZE) $(K8S_DIR)/bbs
 
 .PHONY: k8s-lint
-k8s-lint: k8s-tools ## k8s のマニフェストが組み立てられ、正本と食い違っていないか検査する
+k8s-lint: $(KUBECTL_BIN) ## k8s のマニフェストが組み立てられ、正本と食い違っていないか検査する
 	# **マイグレーションの一覧はディレクトリと一致していなければならない。**
 	# kustomize は glob を受けないので一覧を手で並べている。足し忘れると
 	# k8s だけ古いスキーマで動き、エラーはどこにも出ない (go-api が
@@ -249,7 +258,7 @@ k8s-lint: k8s-tools ## k8s のマニフェストが組み立てられ、正本�
 	@echo "OK: k8s のマニフェストは組み立てられ、正本と一致している"
 
 .PHONY: k8s-cluster
-k8s-cluster: k8s-tools ## kind のクラスタを作る (既にあれば何もしない)
+k8s-cluster: $(KIND) $(KUBECTL_BIN) ## kind のクラスタを作る (既にあれば何もしない)
 	@if $(KIND) get clusters 2>/dev/null | grep -qx $(K8S_CLUSTER); then \
 		echo "クラスタ $(K8S_CLUSTER) は既にある"; \
 	else \
@@ -289,48 +298,57 @@ k8s-argocd: k8s-cluster ## Argo CD をクラスタに入れる (版は ARGOCD_VE
 	# 設定だけ変えた場合に備えて作り直す。
 	$(KUBECTL) -n argocd rollout restart deployment/argocd-repo-server statefulset/argocd-application-controller
 	$(KUBECTL) -n argocd rollout status deployment/argocd-repo-server --timeout=300s
+	$(KUBECTL) -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
 
+# **依存関係で順序を書く** (k8s-up の前提の並び順に頼らない)。
+# 並び順に頼ると make -j で k8s-app が Argo CD より先に走り、
+# CRD が無くて「no matches for kind」で落ちる (レビュー指摘)。
+# 代わりに k8s-app を単独で叩くと Argo CD の apply も走る (冪等なので壊れない)。
 .PHONY: k8s-app
-k8s-app: ## Argo CD に掲示板の Application を登録し、揃うまで待つ
+k8s-app: k8s-argocd k8s-images ## Argo CD に掲示板の Application を登録し、その枝の先頭に揃うまで待つ
 	# **CRD と同じ apply に入れない。** Application の CRD が登録される前に
 	# Application を送ると「no matches for kind」で落ちる。
 	$(KUBECTL) apply -f $(K8S_DIR)/argocd/application.yaml
 	@if [ -n "$(K8S_REVISION)" ]; then \
-		echo "見る枝を $(K8S_REVISION) に上書きする (Git の application.yaml は main のまま)"; \
+		echo "見る枝を $(K8S_REVISION) に上書きする (Git の application.yaml は書き換えない)"; \
 		$(KUBECTL) -n argocd patch application bbs --type merge \
 			-p '{"spec":{"source":{"targetRevision":"$(K8S_REVISION)"}}}'; \
 	fi
-	$(KUBECTL) -n argocd wait application/bbs --for=jsonpath='{.status.sync.status}'=Synced --timeout=600s
-	$(KUBECTL) -n argocd wait application/bbs --for=jsonpath='{.status.health.status}'=Healthy --timeout=600s
+	@KUBECTL="$(KUBECTL)" bash .github/scripts/k8s-sync-wait.sh
 
 .PHONY: k8s-up
-k8s-up: k8s-lint k8s-cluster k8s-images k8s-argocd k8s-app ## kind + Argo CD で掲示板を立てる (http://localhost:8088)
+k8s-up: k8s-lint k8s-app ## kind + Argo CD で掲示板を立てる (http://localhost:8088)
 	@echo
 	@echo "  http://localhost:8088   掲示板 (エッジ経由)"
 	@echo "  http://localhost:8089   Argo CD (admin / make k8s-argocd-password)"
 
 .PHONY: k8s-apply-local
-k8s-apply-local: k8s-lint k8s-cluster k8s-images ## Argo CD を通さず、手元のマニフェストを直接入れる (push 前の確認用)
+k8s-apply-local: k8s-lint k8s-images ## Argo CD を通さず、手元のマニフェストを直接入れる (push 前の確認用)
 	# **Argo CD が居るクラスタでは使わない。** selfHeal が Git の状態へ戻すので、
 	# 手元の変更は数十秒で消える (それ自体が ADR 0026 で確かめたい動き)。
 	@if $(KUBECTL) -n argocd get application bbs >/dev/null 2>&1; then \
 		echo "NG: Application bbs が居る。手元の変更は Argo CD に戻される"; exit 1; \
 	fi
+	# **初期化の Job は消してから入れ直す。** Argo CD を通さないと Job はただの
+	# リソースになり、spec.template を変えられない。マイグレーションを足すと
+	# ConfigMap 名のハッシュが変わり、apply が「field is immutable」で落ちる
+	# (Argo CD 側は Sync フックで同じ問題を避けている。ADR 0026 決定 6)。
+	$(KUBECTL) -n bbs delete job migrate minio-init --ignore-not-found --wait=true
 	$(KUSTOMIZE) $(K8S_DIR)/bbs | $(KUBECTL) apply -f -
-	$(KUBECTL) -n bbs wait job/migrate --for=condition=Complete --timeout=300s
+	$(KUBECTL) -n bbs wait job/migrate job/minio-init --for=condition=Complete --timeout=300s
 	$(KUBECTL) -n bbs rollout status deployment/go-api --timeout=300s
 	$(KUBECTL) -n bbs rollout status deployment/next-app --timeout=300s
 
 .PHONY: k8s-verify
-k8s-verify: ## kind 上の掲示板と、Argo CD の selfHeal を実測する (クラスタを一時的に崩す)
+k8s-verify: $(KUBECTL_BIN) ## kind 上の掲示板と、Argo CD の selfHeal を実測する (クラスタを一時的に崩す)
 	@KUBECTL="$(KUBECTL)" bash .github/scripts/k8s-probe.sh
 
 .PHONY: k8s-argocd-password
-k8s-argocd-password: ## Argo CD の admin の初期パスワードを表示する
+k8s-argocd-password: $(KUBECTL_BIN) ## Argo CD の admin の初期パスワードを表示する
 	@$(KUBECTL) -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo
 
 .PHONY: k8s-down
-k8s-down: ## kind のクラスタを丸ごと消す (データも消える)
+k8s-down: $(KIND) ## kind のクラスタを丸ごと消す (データも消える)
 	$(KIND) delete cluster --name $(K8S_CLUSTER)
 
 # ---------------------------------------------------------------------------

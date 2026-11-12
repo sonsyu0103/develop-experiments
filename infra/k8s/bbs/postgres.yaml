@@ -65,8 +65,18 @@ spec:
             - name: postgres
               containerPort: 5432
           readinessProbe:
+            # **TCP (127.0.0.1) で確かめる。Unix ソケットでは確かめない。**
+            # postgres イメージは初期化中、TCP を閉じた一時サーバを
+            # ソケットだけで立てる。ソケット越しだと初期化中でも通ってしまい、
+            # 波 0 が早すぎる Healthy になる (レビュー指摘)。
+            # init スクリプトをわざと 20 秒止めて測ったら、ソケット越しの
+            # pg_isready && SELECT 1 は初期化中ずっと ok、TCP は終わるまで ng だった。
+            # ユーザー名は Secret から (ここに app と書くと Secret とずれうる)。
             exec:
-              command: ["pg_isready", "-U", "app", "-d", "bbs"]
+              command:
+                - sh
+                - -c
+                - pg_isready -q -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"
             periodSeconds: 5
           resources:
             requests: { cpu: 100m, memory: 256Mi }
