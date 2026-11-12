@@ -3,7 +3,9 @@
 - ステータス: **採用 (実装済み・手元で実測済み)**。
   `infra/k8s` / `make k8s-up` / `make k8s-verify` (2026-11-13)。
   **Argo CD が作業ブランチ (`feat/k8s-gitops`) から同期し、`make k8s-verify` が
-  全項目通った。** `main` から同期したことはまだ無い (下の「まだ確かめていないこと」)
+  全項目通った。** 既定の枝 (`develop`) から同期したことはまだ無い
+  (下の「まだ確かめていないこと」)。PR #70 のレビューで 10 件の指摘を受けて直した
+  (「レビューで見つかったこと」)
 - 日付: 2026-11-13
 
 ## 背景
@@ -103,7 +105,9 @@ Argo CD / Flux の経験を求める記述が多く、ポートフォリオと�
 | kubectl | v1.37.0 | `Makefile` (`KUBECTL_VERSION`) |
 | Argo CD | v3.5.6 | `Makefile` (`ARGOCD_VERSION`) と `argocd/kustomization.yaml` の URL |
 
-kind と kubectl はリポジトリの `bin/` (gitignore 済み) に入れる。
+kind と kubectl はリポジトリの `bin/` (gitignore 済み) に、**ファイル名に版を入れて**
+(`bin/kind-v0.33.0` / `bin/kubectl-v1.37.0`) 置く。版なしの名前だと、
+`KIND_VERSION` を上げても「もうある」と見なされて入れ直されない (レビューで見つかったこと 5)。
 **手元にあった kubectl は v1.25 で、v1.37 のクラスタとは保証範囲 (±1) の外**だった。
 各自の PC に入っている版に任せると、人によって挙動が変わる。
 
@@ -124,9 +128,16 @@ Argo CD の版は 2 か所に書くことになるので、`make k8s-lint` が�
 - **automated + prune + selfHeal。** Git から消したものはクラスタから消え、
   手でクラスタを変えても Git の状態へ戻る。selfHeal を外すと
   「OutOfSync と表示するだけで戻さない」ことを実測した (実機で確かめたこと)
-- **見る枝は `main`。** develop に入っただけではクラスタは変わらない。
+- **見る枝は `develop`。** PR がマージされた枝にクラスタが追従する。
   作業ブランチを試すときは `make k8s-up K8S_REVISION=feat/xxx` で、
   **Git を書き換えずに**上書きする
+
+  **初版は `main` にしていた**(「何が出ているか」を main で読めるように)。
+  だが main への反映はリリースの PR (develop → main) を待つので、
+  この PR をマージした直後の `make k8s-up` は「main に `infra/k8s` が無い」で
+  同期できず、600 秒待ってタイムアウトする (レビューで見つかったこと 2)。
+  このクラスタは手元の開発用で、本番 (main → ECS) とは役割が違う。
+  main を見る理由は「本番相当」の位置づけから来ていたが、それは ECS が担っている
 - **Argo CD 自身は Argo CD に同期させない** (`make k8s-argocd` で kubectl apply する)。
   Argo CD が自分の設定を同期して壊れたら、直す手段も一緒に壊れる。
   App of Apps で Argo CD 自身まで載せるのは、複数クラスタを持ってから考える
@@ -344,16 +355,89 @@ XFP が無くても scheme は http のままで、しかも Origin は CORS の
 - **Docker Desktop が起動しておらず、kind も入っていなかった。** 決定 1 の
   `bin/` への版固定は、ここから入れたもの
 
+## レビューで見つかったこと (PR #70、2026-11-13)
+
+レビューの指摘 10 件をすべて直した。**直す前に、再現できるものは再現した。**
+
+### 1. 読み取り専用のルートでは、1 MiB を超える画像を上げられない
+
+go-api は `readOnlyRootFilesystem: true` にしていた。画像のアップロードは
+1 MiB を超えた分を `/tmp` に一時ファイルとして書く (`images.go` の
+`multipartMemoryLimit`。上限は 5 MiB)。**compose と ECS はルートを読み取り
+専用にしていないので、k8s でだけ壊れる。**
+
+DB にテスト用のセッションを直接作り、3 MiB の PNG を上げて再現した:
+
+```
+直す前: 400 {"message":"... open /tmp/multipart-1586701104: read-only file system"}
+直した後: 201、エッジ経由で取り出して 200 (WebP 722KB)
+```
+
+`/tmp` に emptyDir (上限 64Mi) を足して直した。最初の検査は画像を上げていなかったので、
+**全項目 OK の裏でこれが壊れていた。**
+
+### 2. 既定の枝 `main` には、マニフェストが無い
+
+決定 2 を参照。既定を `develop` に替え、さらに `make k8s-app` は
+**その枝にマニフェストがあるかを最初に確かめる**ようにした。
+main を指させると、600 秒のタイムアウトではなく 1 秒で
+「main (90c07db) に infra/k8s/bbs が無い」と落ちる。
+
+### 3. 枝を替えた直後の「Synced」は、前の枝の Synced
+
+`make k8s-app` は Synced と Healthy を待っていた。枝を替えた直後は
+Argo CD がまだ新しい枝を見ておらず、**前の枝のまま Synced / Healthy でいる**ので、
+待ちは即座に通り、クラスタが前の枝のままなのに成功を報告する。
+
+**同期したコミットが枝の先頭と一致し、かつ Synced / Healthy** の 3 つが
+揃うまで待つようにした (`.github/scripts/k8s-sync-wait.sh`)。
+新しいコミットを push した直後に流すと、そのコミットに揃うまで待ってから通った。
+
+### 4. postgres の readiness は、ソケット越しだと初期化中も通る
+
+compose の healthcheck は「`pg_isready` だけだと初期化中も通るので
+`SELECT 1` を足す」と書いている。k8s 側はそれすら無かった (指摘)。
+
+**だが compose のやり方でも防げていなかった。** init スクリプトを
+わざと 20 秒止めて、2 秒ごとに測った:
+
+| 経過 | ソケット越しの `pg_isready && SELECT 1` | TCP 越しの `pg_isready -h 127.0.0.1` |
+| --- | --- | --- |
+| 2〜18 秒 (初期化中) | ok | ng |
+| 20 秒〜 (初期化完了) | ok | ok |
+
+postgres イメージは初期化中、**TCP を閉じた一時サーバをソケットだけで**立てる。
+ソケット越しの確認は、何を足しても初期化中に通る。k8s 側は TCP で確かめるようにした。
+
+**compose の healthcheck は直していない** (この PR の外)。いまは db-init / migrate の
+待ち合わせが別にあるので実害は出ていないが、コメントの主張は事実と違う。
+
+### 5. その他
+
+| 指摘 | 直し方 |
+| --- | --- |
+| Argo CD なしの `k8s-apply-local` では、初期化の Job が `field is immutable` で落ちる (マイグレーションを足すと ConfigMap 名が変わるため) | 入れ直す前に Job を消す。`db/init` の中身を変えて 2 回流し、2 回目も通ることを確かめた |
+| ツールのファイル名に版が無く、版を上げても入れ直されない | ファイル名に版を入れた (決定 1) |
+| `k8s-up` が前提の並び順に頼っていて、`make -j` だと CRD より先に Application が走る | 依存関係で書いた (`k8s-app` は `k8s-argocd` と `k8s-images` に依存)。`k8s-down` なども各ツールに依存させた |
+| `k8s-lint` が kind まで go install していた (kubectl だけで足りる) | kubectl だけに依存させ、OS とアーキテクチャは `uname` で決める。CI の `k8s-ci` から Go のセットアップを外した |
+| 検査が取得の失敗で途中終了する。枝の名前しか扱えない | 取得の失敗は空として NG に落とし、まとめまで出す。タグと SHA も比べられるようにした |
+| `SECURE_COOKIE` が既定の true のまま、http のエッジで配っている | false を明示した。Secure の分岐は compose の `make https-verify` が測っている ([ADR 0023](0023-local-edge-and-https.md) 決定 3) |
+
 ## 実機で確かめたこと (2026-11-13)
 
 `make k8s-verify` (`.github/scripts/k8s-probe.sh`) の結果。
 Argo CD が `feat/k8s-gitops` から同期した状態で、全項目が通った。
 
-**最後に、クラスタを消してゼロから一発で通した。** `make k8s-down` →
+**クラスタを消してゼロから一発で通した。** `make k8s-down` →
 `make k8s-up K8S_REVISION=feat/k8s-gitops` が **191 秒で exit 0**
 (イメージのビルドはキャッシュあり)、続く `make k8s-verify` も全項目 OK、
 全 Pod の再起動は 0 回だった。それまでは手順を分けて叩いて確かめていたので、
 **ひとつながりの `make k8s-up` はこれが初回**になる。
+
+**レビューの指摘を直したあとも、もう一度ゼロから通した** (88f80e3):
+`make k8s-up` が 185 秒で exit 0 (同期の待ちは 26 秒)、`make k8s-verify` 全項目 OK、
+再起動 0 回。3 MiB の画像のアップロードも 201。その前に Argo CD なしの
+`make k8s-apply-local` を、`db/init` の中身を変えて 2 回流し、2 回とも通った。
 
 | 見たこと | 結果 |
 | --- | --- |
@@ -362,9 +446,11 @@ Argo CD が `feat/k8s-gitops` から同期した状態で、全項目が通っ�
 | マイグレーション | version 14 (ディレクトリの up 14 本と一致)、dirty=f |
 | pg_trgm が日本語を索引できるか ([ADR 0012](0012-search.md)) | `show_trgm('検証')` が 3 個 (LC_CTYPE=C.UTF-8 が効いている) |
 | Argo CD | Synced / Healthy、同期したコミットがブランチの先頭と一致 |
-| go-api を 0 台に縮める | 2 秒で 1 台に戻った (2 回とも) |
-| Service (mailpit) を消す | 6 秒 / 2 秒で作り直された |
+| go-api を 0 台に縮める | 2 秒で 1 台に戻った (3 回とも) |
+| Service (mailpit) を消す | 6 秒 / 2 秒 / 3 秒で作り直された |
 | Git の変更 (next-app に livenessProbe を足して push) | 揺らぎあり 123 秒 / 揺らぎ 0 で 51 秒で同期 |
+| 3 MiB の画像のアップロード (DB に直接作ったセッションで) | 201。エッジ経由の取り出しも 200 |
+| マニフェストの無い枝 (`main`) を指させる | 1 秒で NG (以前は 600 秒のタイムアウト) |
 
 **検査の効きも確かめた** ([ADR 0022](0022-probing-the-checkers.md) と同じ考え方):
 
@@ -376,16 +462,12 @@ Argo CD が `feat/k8s-gitops` から同期した状態で、全項目が通っ�
 
 ## まだ確かめていないこと
 
-- **`main` から同期したことが無い。** `main` にはまだ `infra/k8s` が無い。
+- **既定の枝 (`develop`) から同期したことが無い。** `develop` にはまだ `infra/k8s` が無い。
   マージ後に `make k8s-up` (K8S_REVISION なし) を通すまでは、
   application.yaml の既定のまま動くかは未確認
-- **CI の `k8s-ci` ジョブが GitHub 上で走っていない。** CI の起動条件は
-  main / develop への push と PR なので、作業ブランチの push では走らない。
-  手元では `make k8s-lint` が通っている。初回は PR で見る
-- **画像のアップロード。** `/images/*` の経路は確かめたが、go-api から MinIO への
-  書き込み (PUT) は通していない。ログインが要るため (Google OIDC 未設定)
-- **Cookie の `Secure` を http://localhost で受けられるか。** 主要なブラウザは
-  localhost を安全な文脈として扱うので付くはずだが、ログインを通していないので未確認
+- **Google のログインを通していない** (OIDC 未設定)。アップロードは DB に
+  直接作ったセッションで確かめたので、ログインの往復 (リダイレクトと Cookie の発行) は
+  k8s 上では一度も通っていない
 - **PVC の永続性。** postgres の Pod を消して作り直しても、データが残るかは見ていない
 - **同期時間は 1 回ずつしか測っていない。**
 

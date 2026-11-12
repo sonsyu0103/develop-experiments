@@ -956,7 +956,7 @@ DB の中で待たれると全員が一緒に遅くなる。
 | Phase 11 | スレッド検索 (`pg_trgm`) | **完了** |
 | Phase 12 | ローカルのエッジ (TLS 終端) と、プロキシ配下の実測 | **完了** ([ADR 0023](docs/adr/0023-local-edge-and-https.md)) |
 | Phase 13 | AWS の IaC (Terraform) と CD | **完了** (apply → verify → destroy を実機で一周。CD の実行のみ未検証) ([ADR 0024](docs/adr/0024-aws-deployment.md)) |
-| Phase 14 | Kubernetes (kind) と GitOps (Argo CD) | **完了** (作業ブランチから同期し `k8s-verify` が全項目通過。`main` からの同期は未確認) ([ADR 0026](docs/adr/0026-kubernetes-and-gitops.md)) |
+| Phase 14 | Kubernetes (kind) と GitOps (Argo CD) | **完了** (作業ブランチから同期し `k8s-verify` が全項目通過。既定の枝 `develop` からの同期は未確認) ([ADR 0026](docs/adr/0026-kubernetes-and-gitops.md)) |
 
 ### 着手順
 
