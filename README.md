@@ -249,6 +249,28 @@ CloudFront ←→ ALB を HTTP にすると ALB が `X-Forwarded-Proto` を
 残る未検証は CD (GitHub Actions からのデプロイ) で、
 ADR 0024 の「まだ確かめていないこと」に挙げてある。
 
+## Kubernetes (kind) と GitOps (Argo CD)
+
+```bash
+make k8s-up       # kind を作り、イメージを読み込み、Argo CD を入れて同期を待つ
+make k8s-verify   # 疎通と、手で崩しても Git の状態へ戻るか (selfHeal) を実測する
+make k8s-down     # クラスタを丸ごと消す
+```
+
+- 掲示板: http://localhost:8088 (エッジ経由。compose の up-https と同じ `Caddyfile`)
+- Argo CD: http://localhost:8089 (admin / `make k8s-argocd-password`)
+- **課金なし。** 全部この PC の中で動く。AWS の経路は ECS のまま
+
+Argo CD は Git の `infra/k8s/bbs` を見て、クラスタをそのとおりに揃え続ける。
+`kubectl scale` で go-api を 0 台にしても 2 秒で 1 台に戻り、
+Service を消しても 6 秒で作り直される —— `make k8s-verify` がこれを毎回実際に崩して確かめる。
+selfHeal を切ると戻らないことも確かめてある。
+
+マイグレーションと `Caddyfile` は compose と同じファイルを読む (コピーしない)。
+イメージの中身は Git に載らない (手元でビルドして kind に読み込む) ので、
+**GitOps と呼べるのはマニフェストまで。** 理由とつまずきの記録は
+[ADR 0026](docs/adr/0026-kubernetes-and-gitops.md)。
+
 ## 開発
 
 ```bash
@@ -934,6 +956,7 @@ DB の中で待たれると全員が一緒に遅くなる。
 | Phase 11 | スレッド検索 (`pg_trgm`) | **完了** |
 | Phase 12 | ローカルのエッジ (TLS 終端) と、プロキシ配下の実測 | **完了** ([ADR 0023](docs/adr/0023-local-edge-and-https.md)) |
 | Phase 13 | AWS の IaC (Terraform) と CD | **完了** (apply → verify → destroy を実機で一周。CD の実行のみ未検証) ([ADR 0024](docs/adr/0024-aws-deployment.md)) |
+| Phase 14 | Kubernetes (kind) と GitOps (Argo CD) | **完了** (作業ブランチから同期し `k8s-verify` が全項目通過。`main` からの同期は未確認) ([ADR 0026](docs/adr/0026-kubernetes-and-gitops.md)) |
 
 ### 着手順
 
@@ -1090,6 +1113,7 @@ api/openapi.yaml を書く
 | [ADR 0023](docs/adr/0023-local-edge-and-https.md) | ローカルにエッジを置き、「本番ならこう動く」を実測に変える |
 | [ADR 0024](docs/adr/0024-aws-deployment.md) | AWS へのデプロイ —— 「消せること」を構成の要件にする |
 | [ADR 0025](docs/adr/0025-language-and-framework.md) | 言語とフレームワークの選択と、その使い方 (Gin は薄く使う) |
+| [ADR 0026](docs/adr/0026-kubernetes-and-gitops.md) | 掲示板を kind 上で動かし、Argo CD に Git どおり揃えさせる —— AWS の経路は ECS のまま |
 | [インフラ構成](docs/infrastructure.md) | AWS の理想構成 (Terraform で出すのはこの一部) |
 
 [ADR 0015](docs/adr/0015-idempotency.md) と

@@ -978,3 +978,7 @@ docker: Error response from daemon:
 - **WAF。** 月 $5 + リクエスト課金。利用者が居ない環境で払う理由がない
 - **マルチ環境 (dev / stg / prod)。** 1 つで足りる。
   必要になったら workspace か tfvars で分ける
+- **EKS への移行** (2026-11-13 追記)。Kubernetes と GitOps (Argo CD) は
+  手元の kind で扱うことにした ([ADR 0026](0026-kubernetes-and-gitops.md))。
+  コントロールプレーンだけで月 $73 かかり、決定 1 の「1 日 $1.3」と両立しない。
+  AWS の経路は ECS のまま
