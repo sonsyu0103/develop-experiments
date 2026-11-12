@@ -46,6 +46,15 @@ spec:
               port: http
             periodSeconds: 10
             timeoutSeconds: 5
+          # **生存は TCP で見る。** / は Server Component が go-api を叩くので、
+          # HTTP で見ると go-api の不調で next-app まで再起動ループに入る
+          # (go-api の /healthz が DB を見ないのと同じ理由)。
+          # 見たいのは「Node のプロセスが受け付けをやめていないか」だけ。
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits: { memory: 512Mi }
