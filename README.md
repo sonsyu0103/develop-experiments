@@ -271,6 +271,24 @@ selfHeal を切ると戻らないことも確かめてある。
 **GitOps と呼べるのはマニフェストまで。** 理由とつまずきの記録は
 [ADR 0026](docs/adr/0026-kubernetes-and-gitops.md)。
 
+## ゴールデンパス (`make new-service`)
+
+```bash
+make new-service NAME=billing-api MODULE=github.com/acme/billing-api   # ../billing-api に生成
+make verify-golden-path   # ひな形から生成して、CI と同じ検査を通るか確かめて捨てる
+make golden-path-kind     # 生成から kind 上で Ready になるまでの秒数を測る
+```
+
+**他チーム向けのひな形**で、生成したサービスはこのリポジトリにはコミットしない
+(掲示板はモジュラモノリスのまま。[ADR 0004](docs/adr/0004-modular-monolith.md))。
+OpenAPI からの生成・CI・distroless の Dockerfile・k8s のマニフェストが最初から入っていて、
+非 root・読み取り専用のルート・プローブの分け方など、[ADR 0026](docs/adr/0026-kubernetes-and-gitops.md)
+で踏んだ穴は既定値として塞いである。
+
+ひな形 (`templates/go-service`) は**テンプレート言語で書かず、それ自体が動くサービス**にしてある。
+使われない間に腐るので、CI が毎回生成して検査する —— 作った初日に、依存の脆弱性 4 件をこれで見つけた。
+理由と、検査の穴をわざと壊して見つけた記録は [ADR 0027](docs/adr/0027-golden-path.md)。
+
 ## 開発
 
 ```bash
@@ -957,6 +975,7 @@ DB の中で待たれると全員が一緒に遅くなる。
 | Phase 12 | ローカルのエッジ (TLS 終端) と、プロキシ配下の実測 | **完了** ([ADR 0023](docs/adr/0023-local-edge-and-https.md)) |
 | Phase 13 | AWS の IaC (Terraform) と CD | **完了** (apply → verify → destroy を実機で一周。CD の実行のみ未検証) ([ADR 0024](docs/adr/0024-aws-deployment.md)) |
 | Phase 14 | Kubernetes (kind) と GitOps (Argo CD) | **完了** (作業ブランチと既定の枝 `develop` の両方から同期し、`k8s-verify` が全項目通過) ([ADR 0026](docs/adr/0026-kubernetes-and-gitops.md)) |
+| Phase 15 | ゴールデンパス (`make new-service`) | **完了** (生成から kind で Ready まで 35 秒。CI のジョブは未実行) ([ADR 0027](docs/adr/0027-golden-path.md)) |
 
 ### 着手順
 
@@ -1114,6 +1133,7 @@ api/openapi.yaml を書く
 | [ADR 0024](docs/adr/0024-aws-deployment.md) | AWS へのデプロイ —— 「消せること」を構成の要件にする |
 | [ADR 0025](docs/adr/0025-language-and-framework.md) | 言語とフレームワークの選択と、その使い方 (Gin は薄く使う) |
 | [ADR 0026](docs/adr/0026-kubernetes-and-gitops.md) | 掲示板を kind 上で動かし、Argo CD に Git どおり揃えさせる —— AWS の経路は ECS のまま |
+| [ADR 0027](docs/adr/0027-golden-path.md) | ゴールデンパスは他チーム向けのひな形として置き、掲示板は分割しない —— CI で毎回生成して捨てる |
 | [インフラ構成](docs/infrastructure.md) | AWS の理想構成 (Terraform で出すのはこの一部) |
 
 [ADR 0015](docs/adr/0015-idempotency.md) と

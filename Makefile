@@ -679,6 +679,98 @@ openapi: ## openapi.yaml から Go スタブと TypeScript 型を生成する
 generate: sqlc openapi ## 生成物をすべて作り直す
 
 # ---------------------------------------------------------------------------
+# ゴールデンパス (docs/adr/0027-golden-path.md)
+# ---------------------------------------------------------------------------
+# templates/go-service は**他チーム向けのひな形**で、生成したサービスは
+# このリポジトリにはコミットしない (掲示板はモジュラモノリスのまま。ADR 0004)。
+#
+# ひな形は使われない間に腐る。だから「生成して、検査して、捨てる」を
+# CI で毎回回す (verify-golden-path)。
+# ---------------------------------------------------------------------------
+
+GOLDEN_TEMPLATE     := templates/go-service
+GOLDEN_TOOL         := tools/new-service
+GOVULNCHECK_VERSION := v1.9.0
+# 手元の golangci-lint が古い Go 製だと、Go 1.26 のコードを読めずに落ちる。
+# そのときは Go 1.26 で入れ直したものを渡す (make verify-golden-path GOLANGCI_LINT=...)。
+GOLANGCI_LINT       ?= golangci-lint
+
+.PHONY: new-service
+new-service: ## ひな形から Go サービスを作る (NAME=必須 MODULE=example.com/NAME OUT=../NAME)
+	@test -n "$(NAME)" || { echo "NAME を指定する (例: make new-service NAME=billing-api MODULE=github.com/acme/billing-api)"; exit 1; }
+	@cd $(GOLDEN_TOOL) && go run . -name "$(NAME)" -module "$(MODULE)" \
+		-template "$(CURDIR)/$(GOLDEN_TEMPLATE)" -out "$(abspath $(or $(OUT),../$(NAME)))"
+
+.PHONY: verify-golden-path
+verify-golden-path: ## ひな形から生成したサービスが CI と同じ検査を通るか確かめる (Docker が要る)
+	# **ひな形そのものではなく、生成した結果を検査する。** 置き換え漏れや、
+	# ひな形の中でだけ通る相対パスは、生成してみないと見つからない。
+	#
+	# **golangci-lint のキャッシュは使い捨てにする。** 共有のキャッシュだと、前回の
+	# (もう消えた) 一時ディレクトリのパスつきで結果が返り、生成コードの除外が
+	# ファイルを開けずに効かなくなる。1 回目は通り、2 回目から落ちる (実測)。
+	#
+	# **ジェネレータのテストは -count=1 でキャッシュを切る。** テストが読むひな形は
+	# tools/new-service モジュールの外にあり、go test はモジュール外のファイルの
+	# 変化をキャッシュの鍵に入れない。ひな形を壊しても「ok (cached)」が返る (実測)。
+	cd $(GOLDEN_TOOL) && go vet ./... && go test -race -count=1 ./...
+	@set -eu; \
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	svc="$$tmp/smoke-svc"; \
+	(cd $(GOLDEN_TOOL) && go run . -name smoke-svc -module github.com/acme/smoke-svc \
+		-template "$(CURDIR)/$(GOLDEN_TEMPLATE)" -out "$$svc") > /dev/null; \
+	cd "$$svc"; \
+	echo "== go.mod / go.sum が tidy か"; \
+	cp go.mod "$$tmp/go.mod.before"; cp go.sum "$$tmp/go.sum.before"; \
+	go mod tidy; \
+	diff -u "$$tmp/go.mod.before" go.mod && diff -u "$$tmp/go.sum.before" go.sum \
+		|| { echo "NG: ひな形の go.mod / go.sum が tidy ではない"; exit 1; }; \
+	echo "== 生成物が仕様書と一致するか"; make --no-print-directory verify-generated > /dev/null; \
+	echo "== lint"; go vet ./...; \
+	GOLANGCI_LINT_CACHE="$$tmp/lint-cache" $(GOLANGCI_LINT) run ./...; \
+	echo "== test"; go test -race ./... > /dev/null; \
+	echo "== govulncheck"; go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./... > /dev/null \
+		|| { echo "NG: 既知の脆弱性がある (go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./... で詳細)"; exit 1; }; \
+	echo "== k8s のマニフェスト"; \
+	out=$$($(KUBECTL_BIN) kustomize deploy/k8s); \
+	if echo "$$out" | grep -q go-service; then echo "NG: マニフェストに go-service が残っている"; exit 1; fi; \
+	for kind in Namespace Service Deployment; do \
+		echo "$$out" | grep -q "^kind: $$kind$$" || { echo "NG: $$kind が無い"; exit 1; }; \
+	done; \
+	echo "== 本番用イメージ"; docker build -q --target prod -t smoke-svc:verify . > /dev/null; \
+	docker image rm smoke-svc:verify > /dev/null; \
+	echo "OK: ひな形から生成したサービスは CI と同じ検査を通る"
+verify-golden-path: $(KUBECTL_BIN)
+
+# ゴールデンパスの効果を測る: 「作り始めてから Pod が Ready になるまで」の秒数。
+# 掲示板のクラスタ (bbs) とは別の、素の kind クラスタを使う。
+GOLDEN_CLUSTER := golden-path
+
+.PHONY: golden-path-kind
+golden-path-kind: $(KIND) $(KUBECTL_BIN) ## ひな形から作ったサービスを kind に載せ、Ready までの秒数を測る
+	@set -eu; \
+	if ! $(KIND) get clusters 2>/dev/null | grep -qx $(GOLDEN_CLUSTER); then \
+		echo "== kind のクラスタ $(GOLDEN_CLUSTER) を作る (計測には含めない)"; \
+		$(KIND) create cluster --name $(GOLDEN_CLUSTER) --wait 120s; \
+	fi; \
+	kubectl="$(KUBECTL_BIN) --context kind-$(GOLDEN_CLUSTER)"; \
+	$$kubectl delete namespace hello-svc --ignore-not-found --wait=true > /dev/null; \
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"; kill $${pf:-0} 2>/dev/null || true' EXIT; \
+	start=$$(date +%s); \
+	(cd $(GOLDEN_TOOL) && go run . -name hello-svc -module github.com/acme/hello-svc \
+		-template "$(CURDIR)/$(GOLDEN_TEMPLATE)" -out "$$tmp/hello-svc") > /dev/null; \
+	make --no-print-directory -C "$$tmp/hello-svc" kind-deploy \
+		CLUSTER=$(GOLDEN_CLUSTER) KIND=$(KIND) KUBECTL="$$kubectl"; \
+	end=$$(date +%s); \
+	$$kubectl -n hello-svc port-forward svc/hello-svc 18080:8080 > /dev/null 2>&1 & pf=$$!; \
+	for i in $$(seq 1 20); do curl -fsS "http://localhost:18080/hello?name=golden" 2>/dev/null && break; sleep 0.5; done; echo; \
+	echo "OK: 生成から Ready まで $$((end - start)) 秒 (イメージのビルドを含む)"
+
+.PHONY: golden-path-kind-down
+golden-path-kind-down: $(KIND) ## golden-path-kind のクラスタを消す
+	$(KIND) delete cluster --name $(GOLDEN_CLUSTER)
+
+# ---------------------------------------------------------------------------
 # 検証
 # ---------------------------------------------------------------------------
 
@@ -1064,6 +1156,11 @@ tools: ## 開発ツール (sqlc / golangci-lint / go-arch-lint) をインスト�
 .PHONY: verify-tidy
 .PHONY: verify-go-version
 verify-go-version: ## CI・Dockerfile・go.mod の Go の版が揃っているか検査する
+	# **ひな形とジェネレータも同じ版に揃える** (ADR 0027)。ひな形は使われない間に
+	# 取り残され、生成した日から古い Go で動くサービスができる。
+	#
+	# (下のシェルの中に # でコメントを書かないこと。行末の \ で 1 行につながるので、
+	#  そこから後ろの検査が丸ごとコメントになり、黙って通る。実際に一度そうなった)
 	# **3 か所に書いてある Go の版がずれていないかを見る。**
 	# 2026-11 までは CI が 1.25.13、Dockerfile が浮動タグの 1.26 で、
 	# 脆弱性の修正が 1.26 系にしか出なくなって初めてずれに気づいた。
@@ -1076,7 +1173,14 @@ verify-go-version: ## CI・Dockerfile・go.mod の Go の版が揃っている�
 		echo "NG: Go の版が揃っていない (ci.yml=$$ci / Dockerfile=$$docker / go.mod toolchain=$$mod)"; \
 		exit 1; \
 	fi; \
-	echo "OK: Go の版は $$ci で揃っている"
+	tci=$$(sed -n "s/^  GO_VERSION: '\(.*\)'/\1/p" $(GOLDEN_TEMPLATE)/.github/workflows/ci.yml); \
+	tdocker=$$(sed -n 's/^FROM golang:\([0-9.]*\)-alpine.*/\1/p' $(GOLDEN_TEMPLATE)/Dockerfile); \
+	tmod=$$(sed -n 's/^toolchain go//p' $(GOLDEN_TEMPLATE)/go.mod); \
+	gmod=$$(sed -n 's/^toolchain go//p' $(GOLDEN_TOOL)/go.mod); \
+	for v in "ひな形の ci.yml=$$tci" "ひな形の Dockerfile=$$tdocker" "ひな形の go.mod=$$tmod" "$(GOLDEN_TOOL)/go.mod=$$gmod"; do \
+		[ "$${v##*=}" = "$$ci" ] || { echo "NG: Go の版が $$ci ではない: $$v"; exit 1; }; \
+	done; \
+	echo "OK: Go の版は $$ci で揃っている (ひな形とジェネレータを含む)"
 
 .PHONY: verify-pg-healthcheck
 verify-pg-healthcheck: ## postgres の healthcheck が compose と CI で同じか検査する
@@ -1116,7 +1220,7 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 		fi
 
 .PHONY: check
-check: lint test cover verify-go-version verify-pg-healthcheck verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe k8s-lint e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test cover verify-go-version verify-pg-healthcheck verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe k8s-lint verify-golden-path e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
 # **test-live は smoke の後ろに置く。** 前に置くと、スタックが落ちている

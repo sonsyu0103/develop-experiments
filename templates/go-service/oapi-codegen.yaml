@@ -1,0 +1,14 @@
+# api/openapi.yaml から Go のサーバスタブと型を生成する設定。
+#
+# 生成物 (internal/httpapi/oapigen) は編集しない。仕様書を直して `make generate`。
+# oapi-codegen の版は go.mod の tool ディレクティブで固定している
+# (`go tool oapi-codegen`)。各自のマシンに入れる必要はない。
+package: oapigen
+output: internal/httpapi/oapigen/oapigen.gen.go
+
+generate:
+  # gin 用の ServerInterface と RegisterHandlers
+  gin-server: true
+  models: true
+  # 仕様書をバイナリに埋め込む。リクエスト検証のミドルウェアが使う。
+  embedded-spec: true
