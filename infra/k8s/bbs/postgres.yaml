@@ -1,0 +1,99 @@
+# PostgreSQL。compose.yaml の postgres と同じ初期化引数で立てる。
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  # **headless にしない。** headless だと Ready な Pod が居ない間は名前が
+  # 引けず、go-api が「no such host」で落ちる —— 名前の書き間違いと
+  # 区別がつかない。ClusterIP なら名前は常に引け、失敗は接続拒否として出る。
+  # (Pod ごとの DNS 名は使わないので、StatefulSet 側も困らない)
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  annotations:
+    # 同期の順序: 秘密 (-1) → DB とストレージ (0) → 初期化 Job (1) → アプリ (2)。
+    # Argo CD は前の波が Healthy になるまで次へ進まない。
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          args:
+            # compose.yaml の postgres と同じ。log_statement=all だけ外す
+            # (N+1 を目視するための開発用で、ここでは読む人がいない)。
+            - -c
+            - shared_preload_libraries=pg_stat_statements,auto_explain
+            - -c
+            - auto_explain.log_min_duration=100ms
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: bbs-credentials, key: POSTGRES_USER }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: bbs-credentials, key: POSTGRES_PASSWORD }
+            - name: POSTGRES_DB
+              value: bbs
+            # 照合順序と文字種を分ける理由は compose.yaml を参照
+            # (LC_CTYPE=C だと pg_trgm が日本語を索引できない。ADR 0012)。
+            - name: POSTGRES_INITDB_ARGS
+              value: --encoding=UTF8 --lc-collate=C --lc-ctype=C.UTF-8
+            # **ボリュームの直下ではなく 1 段下に置く。** 直下に lost+found
+            # などが居るストレージだと、initdb が「空でない」と言って止まる。
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            # **TCP (127.0.0.1) で確かめる。Unix ソケットでは確かめない。**
+            # postgres イメージは初期化中、TCP を閉じた一時サーバを
+            # ソケットだけで立てる。ソケット越しだと初期化中でも通ってしまい、
+            # 波 0 が早すぎる Healthy になる (レビュー指摘)。
+            # init スクリプトをわざと 20 秒止めて測ったら、ソケット越しの
+            # pg_isready && SELECT 1 は初期化中ずっと ok、TCP は終わるまで ng だった。
+            #
+            # **pg_isready ではなく psql で確かめる。** pg_isready は存在しない DB を
+            # 指しても 0 を返す (実測)。psql ならロールと DB が無ければ落ちる。
+            # 127.0.0.1 は pg_hba で trust なのでパスワードは要らない。
+            # compose の healthcheck も同じ形 (PR #72)。
+            # ユーザー名は Secret から (ここに app と書くと Secret とずれうる)。
+            exec:
+              command:
+                - sh
+                - -c
+                - psql -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc 'SELECT 1'
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

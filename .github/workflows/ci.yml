@@ -98,6 +98,28 @@ jobs:
         run: terraform -chdir=infra/terraform validate
 
   # --------------------------------------------------
+  # Kubernetes Manifest Checks
+  # --------------------------------------------------
+  #
+  # **クラスタは立てない。** マニフェストが組み立てられることと、
+  # 正本 (マイグレーションのディレクトリ・Argo CD の版) と食い違って
+  # いないことだけを見る (docs/adr/0026-kubernetes-and-gitops.md)。
+  #
+  # 落とせないもの: Pod が実際に起動するか、Argo CD が同期できるか。
+  # それは手元の make k8s-up → make k8s-verify でしか分からない。
+  k8s-ci:
+    name: Kubernetes Manifest Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # kubectl (Makefile の KUBECTL_VERSION) だけを落として使う。kind は要らない。
+      # Go も要らない —— 初版は k8s-lint が kind まで go install していた (レビュー指摘)。
+      - name: Lint manifests
+        run: make k8s-lint
+
+  # --------------------------------------------------
   # Go Backend Checks
   # --------------------------------------------------
   go-ci:
@@ -524,8 +546,21 @@ jobs:
               -e MC_HOST_local=http://minioadmin:minioadmin@localhost:9000 \
               "bitnamilegacy/minio-client:${MC_VERSION}" mc "$@"
           }
-          mc mb --ignore-existing local/bbs-images
-          mc anonymous set download local/bbs-images
+          # **通るまでやり直す** (どれも冪等)。bitnami の MinIO は起動時に
+          # 初期設定用の MinIO を立てて止め、本番を立て直すので、上の health/live は
+          # 初期設定用のサーバで通ってしまう。続く mc が入れ替えのすき間に当たると
+          # 「Connection closed by foreign host」で落ちる (2026-11-13 に PR #70 で実際に落ちた。
+          # 手元の実測: 0.7 秒で 200、5.5 秒でいったん無応答、その後に本番)。
+          for i in $(seq 1 30); do
+            if mc mb --ignore-existing local/bbs-images &&
+              mc anonymous set download local/bbs-images; then
+              exit 0
+            fi
+            echo "MinIO の準備を待っています ($i)"; sleep 2
+          done
+          echo "::error::MinIO のバケットを作れませんでした"
+          docker logs minio
+          exit 1
 
       - name: Install golang-migrate
         run: |
