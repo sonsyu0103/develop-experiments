@@ -12,7 +12,7 @@
 # 待ち合わせで当てにいかず、やり直しで吸収する。
 #
 # このファイルは ConfigMap (job-scripts) として Job に渡す。Job の中に直接書くと、
-# 書き換えても Argo CD が同期し直さない (ADR 0026「レビューで見つかったこと 6」)。
+# 書き換えても Argo CD が同期し直さない (ADR 0026「レビューと CI で見つかったこと 6」)。
 for i in $(seq 1 60); do
 	if mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1 &&
 		mc mb --ignore-existing local/bbs-images &&

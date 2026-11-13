@@ -39,10 +39,30 @@ echo "$rev (${sha:0:7}) に揃うのを待っています (最大 ${TIMEOUT} 秒
 # 定期の確認 (60 秒間隔) を待たずに、すぐ見に行かせる。
 $KUBECTL -n argocd annotate application bbs argocd.argoproj.io/refresh=normal --overwrite >/dev/null
 
+# **同期の操作が終わっていることも待つ。** Argo CD は普通のリソースを当てた時点で
+# Synced と表示し、Sync フック (migrate / minio-init) の完了を待たない。
+# 0.5 秒刻みで測ると、push から 5 秒で「新しいコミット・Synced・Healthy」に
+# なったが、操作は 14 秒まで Running だった (フックを流している最中)。
+# 3 つだけを見る初版は、その間に「揃った」と言っていた。
+#
+# 操作が無いとき (マニフェストが変わらないコミットでは同期が走らない) は
+# phase が前回のもののまま残るので、Running でなければ良しとする。
 for i in $(seq 1 "$TIMEOUT"); do
 	state="$(app '{.status.sync.revision} {.status.sync.status} {.status.health.status}')"
-	if [ "$state" = "$sha Synced Healthy" ]; then
-		echo "揃った: ${sha:0:7} Synced / Healthy (${i} 秒)"
+	phase="$(app '{.status.operationState.phase}')"
+	op_rev="$(app '{.status.operationState.syncResult.revision}')"
+	case "$phase" in
+	Failed | Error)
+		if [ "$op_rev" = "$sha" ]; then
+			echo "NG: ${sha:0:7} の同期が $phase で終わった" >&2
+			app '{.status.operationState.message}' >&2
+			echo >&2
+			exit 1
+		fi
+		;;
+	esac
+	if [ "$state" = "$sha Synced Healthy" ] && [ "$phase" != Running ] && [ "$phase" != Terminating ]; then
+		echo "揃った: ${sha:0:7} Synced / Healthy、同期の操作は ${phase:-なし} (${i} 秒)"
 		exit 0
 	fi
 	sleep 1

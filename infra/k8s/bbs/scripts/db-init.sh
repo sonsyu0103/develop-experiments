@@ -10,7 +10,7 @@
 # ON_ERROR_STOP=1 が無いと、途中で失敗しても psql が 0 で終わる。
 #
 # このファイルは ConfigMap (job-scripts) として Job に渡す。Job の中に直接書くと、
-# 書き換えても Argo CD が同期し直さない (ADR 0026「レビューで見つかったこと 6」)。
+# 書き換えても Argo CD が同期し直さない (ADR 0026「レビューと CI で見つかったこと 6」)。
 set -e
 until pg_isready -q; do
 	echo "postgres を待っています"
