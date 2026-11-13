@@ -495,8 +495,12 @@ CI のステップも k8s の minio-init も、**手順をまるごと通るま�
 「MinIO が居ないうちにループを始め、途中で MinIO を起動する」形で通した
 (1 回目が失敗し、2 回目で成功して終わった)。
 
-**compose の minio-init にも同じ穴がある** (`mc ready` は初期設定用のサーバで通り、
-minio-init には再起動の設定が無い)。この PR の外なので別の PR で直す。
+**compose では再現しなかった。** compose は待ち合わせに `/minio/health/live` ではなく
+`mc ready local` を使っている。新しいボリュームから 5 回立てて minio-init は 5 回とも成功し、
+`mc ready` が最初に ok を返したのは初期設定用のサーバが止まった直後 (停止 5.19 秒 → ok 5.20 秒)
+だった。`mc ready` は本番のサーバを待っているように見える。この節の初版は「compose にも
+同じ穴がある」と書いていたが、**確かめる前に書いた推測で、実測と合わなかったので消した。**
+k8s の readinessProbe (`/minio/health/ready`) は HTTP なので、CI と同じ側に入る。
 
 ## 実機で確かめたこと (2026-11-13)
 
