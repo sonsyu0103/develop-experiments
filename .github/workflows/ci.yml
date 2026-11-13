@@ -538,8 +538,21 @@ jobs:
               -e MC_HOST_local=http://minioadmin:minioadmin@localhost:9000 \
               "bitnamilegacy/minio-client:${MC_VERSION}" mc "$@"
           }
-          mc mb --ignore-existing local/bbs-images
-          mc anonymous set download local/bbs-images
+          # **通るまでやり直す** (どれも冪等)。bitnami の MinIO は起動時に
+          # 初期設定用の MinIO を立てて止め、本番を立て直すので、上の health/live は
+          # 初期設定用のサーバで通ってしまう。続く mc が入れ替えのすき間に当たると
+          # 「Connection closed by foreign host」で落ちる (2026-11-13 に PR #70 で実際に落ちた。
+          # 手元の実測: 0.7 秒で 200、5.5 秒でいったん無応答、その後に本番)。
+          for i in $(seq 1 30); do
+            if mc mb --ignore-existing local/bbs-images &&
+              mc anonymous set download local/bbs-images; then
+              exit 0
+            fi
+            echo "MinIO の準備を待っています ($i)"; sleep 2
+          done
+          echo "::error::MinIO のバケットを作れませんでした"
+          docker logs minio
+          exit 1
 
       - name: Install golang-migrate
         run: |
