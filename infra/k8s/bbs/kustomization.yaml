@@ -39,6 +39,14 @@ configMapGenerator:
   - name: db-init
     files:
       - ../../../apps/go-api/db/init/00-extensions.sql
+  # **Job (Sync フック) のスクリプトはここに出す。Job の中に直接書かない。**
+  # Sync フックは Argo CD の差分比較に入らないので、Job の中身だけを変えても
+  # OutOfSync にならず、同期が走らず、古い Job のまま残る (実際に起きた)。
+  # ConfigMap なら中身が変わると名前のハッシュが変わり、同期とフックが走り直す。
+  - name: job-scripts
+    files:
+      - scripts/db-init.sh
+      - scripts/minio-init.sh
   # **一覧は手で並べている** (kustomize は glob を受け付けない)。
   # マイグレーションを足したらここにも足す。忘れると k8s だけ古いスキーマで
   # 動くので、make k8s-lint がディレクトリと突き合わせて落とす。
