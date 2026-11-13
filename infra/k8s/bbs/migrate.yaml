@@ -1,0 +1,76 @@
+# 拡張の初期化とマイグレーションを流して終わる Job。
+# compose.yaml の db-init → migrate の 2 段を、initContainer と本体に分けて 1 つにした。
+#
+# **Argo CD の Sync フックにしている。** 同期のたびに作り直して流す。
+#   - Job の spec.template は作成後に変えられない。普通のリソースとして置くと、
+#     マイグレーションを 1 本足しただけで (ConfigMap 名のハッシュが変わり)
+#     「field is immutable」で同期が止まる
+#   - migrate up は冪等なので、毎回流しても困らない
+#
+# Argo CD を通さずに kubectl apply -k で入れた場合は、ただの Job として 1 回走る。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: migrate
+  annotations:
+    argocd.argoproj.io/hook: Sync
+    # 次の同期の直前に前回の Job を消す。終わった直後に消す (HookSucceeded) と、
+    # 失敗したときに追えるのに、成功したときのログが読めなくなる。
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  # 待ち合わせは initContainer の中でやる。ここは純粋な失敗のやり直し。
+  backoffLimit: 3
+  # 待ちが永遠に続かないよう上限を置く (初回のイメージ取得を含めても足りる値)。
+  activeDeadlineSeconds: 900
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        # 手順は scripts/db-init.sh (ConfigMap job-scripts)。
+        - name: db-init
+          image: postgres:17-alpine
+          command: ["/bin/sh", "/scripts/db-init.sh"]
+          env:
+            - name: PGHOST
+              value: postgres
+            - name: PGDATABASE
+              value: bbs
+            - name: PGUSER
+              valueFrom:
+                secretKeyRef: { name: bbs-credentials, key: POSTGRES_USER }
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: { name: bbs-credentials, key: POSTGRES_PASSWORD }
+          volumeMounts:
+            - name: db-init
+              mountPath: /init
+              readOnly: true
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+      containers:
+        - name: migrate
+          image: migrate/migrate:v4.18.1
+          args:
+            - -path=/migrations
+            - -database=$(DATABASE_URL)
+            - up
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: bbs-credentials, key: DATABASE_URL }
+          volumeMounts:
+            - name: migrations
+              mountPath: /migrations
+              readOnly: true
+      volumes:
+        - name: db-init
+          configMap:
+            name: db-init
+        - name: scripts
+          configMap:
+            name: job-scripts
+        - name: migrations
+          configMap:
+            name: migrations

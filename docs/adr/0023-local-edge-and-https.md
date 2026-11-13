@@ -246,6 +246,10 @@ go-api (`go run` のコンパイル) と next-app (初回起動) が上がりき
   ボリュームを消すと信頼をやり直すことになる
 - **環境変数が 3 つ増えた** (`SECURE_COOKIE` / `TRUSTED_PROXIES` / `XFP`)。
   いずれも既定は従来の挙動と同じで、`make up` には影響しない
+- **`infra/caddy/Caddyfile` は kind 上のエッジも読む** (2026-11-13 追記、
+  [ADR 0026](0026-kubernetes-and-gitops.md) 決定 3)。コピーせず同じファイルを
+  ConfigMap にしているので、**ここを変えると k8s 側の振り分けも変わる。**
+  k8s 側は `SITE_ADDRESS=:80` / `XFP=http` で TLS を終端しない
 
 ## やらないこと
 
