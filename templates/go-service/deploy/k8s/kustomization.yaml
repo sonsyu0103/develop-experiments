@@ -1,0 +1,19 @@
+# このサービスを k8s に載せる一式。`kubectl apply -k deploy/k8s` で入る。
+#
+# **イメージのタグはここで差し替える。** CD (Argo CD など) からは
+# `kustomize edit set image go-service=<registry>/go-service:<sha>` で書き換える。
+# マニフェスト本体 (deployment.yaml) のタグを直接いじらない。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: go-service
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: go-service
+resources:
+  - namespace.yaml
+  - deployment.yaml
+  - service.yaml
+images:
+  - name: go-service
+    newTag: local

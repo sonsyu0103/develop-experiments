@@ -43,12 +43,21 @@
   - **どう終わっても元に戻す** (例外・Ctrl-C・SIGTERM のいずれでも)
 
 DB もネットワークも要らないので CI で回せる。
+
+【make のターゲットも対象にする】(2026-11-14、ADR 0027)
+
+    make verify-go-version         CI・go-api・ひな形・ジェネレータの Go の版
+    make verify-template-versions  ひな形の Makefile のツールの版
+
+シェルの途中に書いた # で後ろが丸ごとコメントになり、版をずらしても
+exit 0 で通ったことがある。それまでこの検査には変異が 1 件も無かった。
 """
 
 from __future__ import annotations
 
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
@@ -74,6 +83,24 @@ DUCKDB_VERIFY = "infra/duckdb/verify.py"
 CHECKER = f".github/scripts/{CONSTRAINTS}"
 CONTACT_MIGRATION = "apps/go-api/db/migrations/000012_add_contact_messages.up.sql"
 ROLE_MIGRATION_FILE = "apps/go-api/db/migrations/000003_add_user_role.up.sql"
+
+# ---- make verify-go-version -----------------------------------------------
+# **スクリプトではなく make のターゲットも検査する。** 先頭が "make " のものは
+# make -s <ターゲット> として走らせる。
+GO_VERSION_CHECK = "make verify-go-version"
+TEMPLATE_VERSIONS_CHECK = "make verify-template-versions"
+
+# **版を直書きしない。** 1.26.11 と書くと、Go を上げた日に置換対象が 0 件になる
+# (このスクリプトはそれを NG として知らせるが、毎回直すことになる)。
+GO_VERSION = re.search(r"^  GO_VERSION: '([0-9.]+)'$",
+                        (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"),
+                        re.M).group(1)
+FAKE_GO = "0.0.1"
+
+# ひな形の Makefile に書いたツールの版。こちらも直書きしない。
+_TPL_MAKEFILE = (ROOT / "templates/go-service/Makefile").read_text(encoding="utf-8")
+TPL_GOLANGCI = re.search(r"^GOLANGCI_LINT_VERSION := (\S+)$", _TPL_MAKEFILE, re.M).group(1)
+TPL_GOVULN = re.search(r"^GOVULNCHECK_VERSION   := (\S+)$", _TPL_MAKEFILE, re.M).group(1)
 
 # 共通で差し替えるログ行。**起動時に必ず 1 回出る行**なので、
 # 消えたときは置換が 0 件になり、このスクリプトが先に気づく。
@@ -185,6 +212,41 @@ PROBES = [
           '\t// assertSameSet(t, "DB の CHECK 制約", registered, valuesFromMigration(t))',
           "宣言と実物が食い違っている検査が",
           "コメントアウトした呼び出しからヘルパを引き込めないか"),
+
+    # ---- make verify-go-version -----------------------------------------
+    # **行末の \\ でつながったシェルの途中に # を書くと、そこから後ろが全部
+    # コメントになり、版をずらしても exit 0 で通る** (ADR 0027「検査の穴」3)。
+    # 7 か所それぞれを 1 つずつずらして、全部が落ちることを見る。
+    Probe("Q", GO_VERSION_CHECK, ".github/workflows/ci.yml",
+          f"  GO_VERSION: '{GO_VERSION}'", f"  GO_VERSION: '{FAKE_GO}'",
+          "Go の版が揃っていない", "CI の GO_VERSION"),
+    Probe("R", GO_VERSION_CHECK, "apps/go-api/Dockerfile",
+          f"FROM golang:{GO_VERSION}-alpine", f"FROM golang:{FAKE_GO}-alpine",
+          "Go の版が揃っていない", "go-api の Dockerfile"),
+    Probe("S", GO_VERSION_CHECK, "apps/go-api/go.mod",
+          f"toolchain go{GO_VERSION}", f"toolchain go{FAKE_GO}",
+          "Go の版が揃っていない", "go-api の go.mod の toolchain"),
+    Probe("T", GO_VERSION_CHECK, "templates/go-service/.github/workflows/ci.yml",
+          f"  GO_VERSION: '{GO_VERSION}'", f"  GO_VERSION: '{FAKE_GO}'",
+          "ひな形の ci.yml", "ひな形の CI の GO_VERSION (ADR 0027)"),
+    Probe("U", GO_VERSION_CHECK, "templates/go-service/Dockerfile",
+          f"FROM golang:{GO_VERSION}-alpine", f"FROM golang:{FAKE_GO}-alpine",
+          "ひな形の Dockerfile", "ひな形の Dockerfile (ADR 0027)"),
+    Probe("V", GO_VERSION_CHECK, "templates/go-service/go.mod",
+          f"toolchain go{GO_VERSION}", f"toolchain go{FAKE_GO}",
+          "ひな形の go.mod", "ひな形の go.mod の toolchain (ADR 0027)"),
+    Probe("W", GO_VERSION_CHECK, "tools/new-service/go.mod",
+          f"toolchain go{GO_VERSION}", f"toolchain go{FAKE_GO}",
+          "tools/new-service/go.mod", "ジェネレータの go.mod の toolchain (ADR 0027)"),
+
+    # ---- make verify-template-versions ----------------------------------
+    # ルートだけツールの版を上げると、生成するサービスに古い版が固定され続ける。
+    Probe("X", TEMPLATE_VERSIONS_CHECK, "templates/go-service/Makefile",
+          f"GOLANGCI_LINT_VERSION := {TPL_GOLANGCI}", "GOLANGCI_LINT_VERSION := v0.0.1",
+          "GOLANGCI_LINT_VERSION が", "ひな形の golangci-lint の版 (ADR 0027)"),
+    Probe("Y", TEMPLATE_VERSIONS_CHECK, "templates/go-service/Makefile",
+          f"GOVULNCHECK_VERSION   := {TPL_GOVULN}", "GOVULNCHECK_VERSION   := v0.0.1",
+          "GOVULNCHECK_VERSION が", "ひな形の govulncheck の版 (ADR 0027)"),
 ]
 
 
@@ -221,14 +283,18 @@ class Restorer:
 
 
 def run_checker(name: str) -> tuple[int, str]:
-    proc = subprocess.run([str(SCRIPTS / name)], capture_output=True, text=True)
+    if name.startswith("make "):
+        cmd = ["make", "-s", "--no-print-directory", name.removeprefix("make ")]
+    else:
+        cmd = [str(SCRIPTS / name)]
+    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     return proc.returncode, proc.stdout + proc.stderr
 
 
 def main() -> int:
     # 壊す前の状態を確認する。ここが赤いと以降の結果はすべて意味を失う。
     print(f"{DIM}壊す前の検査を確認しています...{OFF}", flush=True)
-    for checker in (LOG_EVENTS, CONSTRAINTS):
+    for checker in (LOG_EVENTS, CONSTRAINTS, GO_VERSION_CHECK, TEMPLATE_VERSIONS_CHECK):
         rc, out = run_checker(checker)
         if rc != 0:
             print(f"{RED}壊す前の時点で {checker} が落ちています。"

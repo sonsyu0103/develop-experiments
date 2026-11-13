@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # **patch まで固定する。** Dockerfile と go.mod の toolchain と揃える。
+  GO_VERSION: '1.26.11'
+  # ツールの版は Makefile に書く (ここには書かない。2 か所にするとずれる)。
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: 生成物が仕様書と一致するか
+        run: make verify-generated
+      - name: lint
+        run: |
+          make tools
+          make lint
+      - name: test
+        run: make test
+      # Go 本体の脆弱性でも落ちるので、GO_VERSION を上げる合図にもなる。
+      - name: govulncheck
+        run: make vulncheck
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 本番用イメージのビルド
+        run: docker build --target prod -t ci:${{ github.sha }} .
+
+  k8s:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: マニフェストが組み立てられるか
+        run: kubectl kustomize deploy/k8s > /dev/null
