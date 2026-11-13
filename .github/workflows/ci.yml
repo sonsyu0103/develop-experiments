@@ -423,14 +423,22 @@ jobs:
           POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C.UTF-8"
         ports:
           - 5432:5432
+        # health-cmd は compose.yaml の postgres の healthcheck と同じにする
+        # (make verify-pg-healthcheck が突き合わせる)。理由はそちらのコメント。
+        # ここがソケット越しだと、初期化中に「healthy」になって後続の
+        # psql -h localhost (Create extensions) が connection refused で落ちうる。
         options: >-
-          --health-cmd "pg_isready -q -h 127.0.0.1 -U app -d bbs"
+          --health-cmd "psql -h 127.0.0.1 -U app -d bbs -tAc 'SELECT 1'"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
 
     steps:
       - uses: actions/checkout@v4
+
+      # 上の services の health-cmd が compose と同じかを見る。
+      - name: Verify postgres healthcheck matches compose
+        run: make verify-pg-healthcheck
 
       # S3 互換ストレージ (docs/adr/0007-image-storage.md)。
       #

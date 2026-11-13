@@ -888,6 +888,17 @@ tools: ## 開発ツール (sqlc / golangci-lint / go-arch-lint) をインスト�
 	go install github.com/fe3dback/go-arch-lint@$(GO_ARCH_LINT_VERSION)
 
 .PHONY: verify-tidy
+.PHONY: verify-pg-healthcheck
+verify-pg-healthcheck: ## postgres の healthcheck が compose と CI で同じか検査する
+	# **2 か所に同じコマンドを書いているので、ずれたら落とす。**
+	# 以前は compose が「pg_isready && SELECT 1」、CI が「pg_isready」だけで、
+	# 既にずれていた (どちらもソケット越しで初期化中に通っていた)。
+	@cmd="psql -h 127.0.0.1 -U app -d bbs -tAc 'SELECT 1'"; \
+	for f in compose.yaml .github/workflows/ci.yml; do \
+		grep -qF "$$cmd" $$f || { echo "NG: $$f の postgres の healthcheck が「$${cmd}」ではない"; exit 1; }; \
+	done; \
+	echo "OK: postgres の healthcheck は compose と CI で同じ"
+
 verify-tidy: ## go.mod / go.sum が最新か検査する
 	# **check が「CI と同じ検証」を名乗るなら、これも要る。**
 	# CI の Go Checks は最初にこれを回している。ここに無かったせいで、
@@ -915,7 +926,7 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 		fi
 
 .PHONY: check
-check: lint test cover verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test cover verify-pg-healthcheck verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
 # **test-live は smoke の後ろに置く。** 前に置くと、スタックが落ちている
