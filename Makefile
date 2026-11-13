@@ -888,6 +888,22 @@ tools: ## 開発ツール (sqlc / golangci-lint / go-arch-lint) をインスト�
 	go install github.com/fe3dback/go-arch-lint@$(GO_ARCH_LINT_VERSION)
 
 .PHONY: verify-tidy
+.PHONY: verify-go-version
+verify-go-version: ## CI・Dockerfile・go.mod の Go の版が揃っているか検査する
+	# **3 か所に書いてある Go の版がずれていないかを見る。**
+	# 2026-11 までは CI が 1.25.13、Dockerfile が浮動タグの 1.26 で、
+	# 脆弱性の修正が 1.26 系にしか出なくなって初めてずれに気づいた。
+	# 本番のバイナリを作るのは Dockerfile なので、CI の govulncheck が
+	# 緑でも、配っているものが同じ Go で作られている保証にならない。
+	@ci=$$(sed -n "s/^  GO_VERSION: '\(.*\)'/\1/p" .github/workflows/ci.yml); \
+	docker=$$(sed -n 's/^FROM golang:\([0-9.]*\)-alpine.*/\1/p' $(GO_API_DIR)/Dockerfile); \
+	mod=$$(sed -n 's/^toolchain go//p' $(GO_API_DIR)/go.mod); \
+	if [ -z "$$ci" ] || [ "$$ci" != "$$docker" ] || [ "$$ci" != "$$mod" ]; then \
+		echo "NG: Go の版が揃っていない (ci.yml=$$ci / Dockerfile=$$docker / go.mod toolchain=$$mod)"; \
+		exit 1; \
+	fi; \
+	echo "OK: Go の版は $$ci で揃っている"
+
 verify-tidy: ## go.mod / go.sum が最新か検査する
 	# **check が「CI と同じ検証」を名乗るなら、これも要る。**
 	# CI の Go Checks は最初にこれを回している。ここに無かったせいで、
@@ -915,7 +931,7 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 		fi
 
 .PHONY: check
-check: lint test cover verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test cover verify-go-version verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
 
 .PHONY: check-all
 # **test-live は smoke の後ろに置く。** 前に置くと、スタックが落ちている
