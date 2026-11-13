@@ -2,6 +2,8 @@ module develop-experiments/apps/go-api
 
 go 1.26.0
 
+toolchain go1.26.11
+
 require (
 	github.com/HugoSmits86/nativewebp v1.3.0
 	github.com/aws/aws-sdk-go-v2 v1.43.5

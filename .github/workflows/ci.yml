@@ -28,7 +28,8 @@ env:
   # **1.25 系はもう直らない** (2026-11-13)。GO-2026-6859 など net/http・crypto/x509 の
   # 脆弱性は 1.26.9〜1.26.11 と 1.27 系にしか修正が出ず、1.25.13 のままでは
   # govulncheck が恒久的に落ちる。サポート期間 (最新 2 系統) から外れたため。
-  # Dockerfile (golang:1.26-alpine) と系統も揃う —— 以前は CI だけ 1.25 だった。
+  # Dockerfile と go.mod の toolchain も同じ patch に揃える (make verify-go-version)。
+  # 以前は CI だけ 1.25、Dockerfile は浮動タグの 1.26 だった。
   GO_VERSION: '1.26.11'
   NODE_VERSION: '22'
   # バージョンを固定する理由:
@@ -126,6 +127,10 @@ jobs:
       - name: Download Go modules
         run: go mod download
 
+      - name: Verify Go version is consistent
+        working-directory: .
+        run: make verify-go-version
+
       - name: Verify go.mod is tidy
         run: |
           go mod tidy
@@ -146,9 +151,6 @@ jobs:
           # 無いと、GO_VERSION を上げても古い Go で作ったバイナリが復元される。
           key: gotools-${{ runner.os }}-${{ runner.arch }}-go${{ env.GO_VERSION }}-golangci${{ env.GOLANGCI_LINT_VERSION }}-archlint${{ env.GO_ARCH_LINT_VERSION }}
 
-      # Go のバージョンはキーに含めていない。ここで作るのは実行可能な
-      # バイナリであり、Go を上げても動くため。上げるたびに作り直すと
-      # キャッシュの意味が薄れる
       - name: Install Go tools
         if: steps.cache-go-tools.outputs.cache-hit != 'true'
         run: |
@@ -373,7 +375,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/go/bin
-          key: generators-${{ runner.os }}-${{ runner.arch }}-sqlc${{ env.SQLC_VERSION }}-oapi${{ env.OAPI_CODEGEN_VERSION }}
+          # gotools と同じく Go の版もキーに入れる。生成器はいまは Go のコードを
+          # 型解析しないので古い Go 製でも動くが、2 つのキャッシュで規則を分けると
+          # 手元 (新しい Go 製) と CI で別物のツールが動く (PR #71 のレビュー指摘)。
+          key: generators-${{ runner.os }}-${{ runner.arch }}-go${{ env.GO_VERSION }}-sqlc${{ env.SQLC_VERSION }}-oapi${{ env.OAPI_CODEGEN_VERSION }}
 
       - name: Install code generators
         if: steps.cache-generators.outputs.cache-hit != 'true'
