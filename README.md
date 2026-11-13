@@ -1100,7 +1100,7 @@ api/openapi.yaml を書く
 
 ## 技術スタック
 
-Go 1.25 / Gin / pgx v5 / sqlc / oapi-codegen / PostgreSQL 17 /
+Go 1.26 / Gin / pgx v5 / sqlc / oapi-codegen / PostgreSQL 17 /
 Next.js 16 (App Router, RSC) / React 19 / TypeScript 5.9 / ESLint 9 /
 Caddy (ローカルの TLS 終端) / Terraform (AWS) / ECS Fargate / CloudFront
 
