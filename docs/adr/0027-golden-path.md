@@ -279,6 +279,7 @@ CLAUDE.md は「ツールのバージョンは Makefile 冒頭で固定」と約
 ### 9. Golden Path ジョブが golangci-lint を毎回ビルドしていた
 
 初回の CI で 50 秒かかった。go-ci と同じ鍵でツールのキャッシュを復元する (保存は go-ci に任せる)。
+修正後の CI でキャッシュが当たり、ジョブ全体が 181 秒から 94 秒になった。
 
 ### 10. `make check` の前提が増えたのに書いていなかった
 
@@ -294,7 +295,8 @@ Docker とネットワーク (`go mod tidy`、govulncheck の DB) が要るよ�
 
 ## まだ確かめていないこと
 
-- **Golden Path ジョブで、ツールのキャッシュが当たる経路は CI でまだ走っていない** (レビュー指摘 9 の修正後)
+- **Golden Path ジョブで、ツールのキャッシュが外れる経路は修正後に走っていない。** 当たる経路は run 43458875908 で
+  確かめた (Install golangci-lint が skipped、ジョブ全体 181 秒 → 94 秒)。外れたときは修正前と同じ `go install` を通る
 - **生成したサービスの `.github/workflows/ci.yml` は一度も走っていない。** actionlint は通した
   (v1.7.7、exit 0)。別のリポジトリに置いて push しないと確かめられない
 - **完全に冷えた状態の time to first deploy** (決定 5)。`docker builder prune` は
