@@ -57,9 +57,20 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./apps/go-api/db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      # pg_isready だけだと初期化スクリプト実行中でも通ってしまうため、
-      # 実際にクエリを投げて確認する。
-      test: ["CMD-SHELL", "pg_isready -U app -d bbs && psql -U app -d bbs -c 'SELECT 1' > /dev/null"]
+      # **TCP (127.0.0.1) で確かめる。Unix ソケットでは確かめない。**
+      #
+      # postgres イメージは初期化中 (initdb と init スクリプトの実行中)、
+      # TCP を閉じた一時サーバをソケットだけで立てる。ソケット越しの確認は
+      # 何を足しても初期化中に通る。
+      #
+      # 以前は「pg_isready だけだと初期化中も通るので SELECT 1 を足す」と
+      # していたが、**SELECT 1 もソケット越しだったので防げていなかった。**
+      # init スクリプトをわざと 20 秒止めて 2 秒ごとに測ると、
+      # ソケット越しの pg_isready && SELECT 1 は初期化中ずっと ok、
+      # TCP 越しの pg_isready は初期化が終わるまで ng だった (2026-11-13)。
+      #
+      # 実害が出ていなかったのは、db-init と migrate が別に待ち合わせているため。
+      test: ["CMD-SHELL", "pg_isready -q -h 127.0.0.1 -U app -d bbs"]
       interval: 5s
       timeout: 5s
       retries: 20
