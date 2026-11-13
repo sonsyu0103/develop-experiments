@@ -1,6 +1,10 @@
 // Command new-service は templates/go-service から新しい Go サービスを作る。
 //
-//	go run ./tools/new-service -name billing-api -module github.com/acme/billing-api -out ../billing-api
+//	make new-service NAME=billing-api MODULE=github.com/acme/billing-api   # リポジトリ直下から
+//	cd tools/new-service && go run . -name billing-api -out ../../../billing-api
+//
+// **go run はこのディレクトリの中で叩く。** リポジトリ直下には go.mod も go.work も無い。
+// -template の既定値も、このディレクトリから見た相対パスにしてある。
 //
 // **ひな形は `{{ }}` を埋め込んだテンプレートではなく、そのままビルドできるサービス**
 // にしてある (gonew と同じ考え方)。ここでやるのは 2 つの文字列の置き換えだけ:
@@ -19,6 +23,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -52,7 +57,7 @@ func main() {
 	var o options
 	flag.StringVar(&o.name, "name", "", "サービス名 (例: billing-api)。k8s の名前にも使う")
 	flag.StringVar(&o.module, "module", "", "Go のモジュールパス (既定: example.com/<name>)")
-	flag.StringVar(&o.template, "template", "templates/go-service", "ひな形のディレクトリ")
+	flag.StringVar(&o.template, "template", "../../templates/go-service", "ひな形のディレクトリ (既定は tools/new-service から見た位置)")
 	flag.StringVar(&o.out, "out", "", "生成先 (空か、存在しないディレクトリ)")
 	flag.Parse()
 
@@ -97,7 +102,7 @@ func generate(o options) (int, error) {
 	}
 	info, err := os.Stat(o.template)
 	if err != nil || !info.IsDir() {
-		return 0, fmt.Errorf("ひな形 %s が見つからない (リポジトリ直下で実行する)", o.template)
+		return 0, fmt.Errorf("ひな形 %s が見つからない (tools/new-service の中で実行するか、-template を指定する)", o.template)
 	}
 
 	// **1 回の走査で置き換える。** 2 回に分けると、-module に go-service が
@@ -105,38 +110,80 @@ func generate(o options) (int, error) {
 	// 2 回目が書き換えてしまう。strings.Replacer は置き換え後の文字列を再走査しない。
 	r := strings.NewReplacer(placeholderModule, o.module, placeholderName, o.name)
 
-	count := 0
-	err = filepath.WalkDir(o.template, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(o.template, path)
-		if err != nil {
-			return err
-		}
-		dst := filepath.Join(o.out, r.Replace(rel))
-		if d.IsDir() {
-			return os.MkdirAll(dst, 0o755)
-		}
-		if !d.Type().IsRegular() {
-			return fmt.Errorf("%s: 通常のファイル以外はひな形に置かない", rel)
-		}
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		if bytes.IndexByte(b, 0) >= 0 {
-			return fmt.Errorf("%s: バイナリはひな形に置かない (置き換えで壊れる)", rel)
-		}
-		fi, err := d.Info()
-		if err != nil {
-			return err
-		}
-		count++
-		return os.WriteFile(dst, []byte(r.Replace(string(b))), fi.Mode().Perm())
-	})
+	files, err := listFiles(o.template)
 	if err != nil {
 		return 0, err
 	}
+	count := 0
+	for _, rel := range files {
+		src := filepath.Join(o.template, rel)
+		fi, err := os.Lstat(src)
+		if errors.Is(err, fs.ErrNotExist) {
+			// git には載っているが作業ツリーで消したファイル。消した側を正とする。
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if !fi.Mode().IsRegular() {
+			return 0, fmt.Errorf("%s: 通常のファイル以外はひな形に置かない", rel)
+		}
+		b, err := os.ReadFile(src)
+		if err != nil {
+			return 0, err
+		}
+		if bytes.IndexByte(b, 0) >= 0 {
+			return 0, fmt.Errorf("%s: バイナリはひな形に置かない (置き換えで壊れる)", rel)
+		}
+		dst := filepath.Join(o.out, r.Replace(rel))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return 0, err
+		}
+		if err := os.WriteFile(dst, []byte(r.Replace(string(b))), fi.Mode().Perm()); err != nil {
+			return 0, err
+		}
+		count++
+	}
 	return count, nil
+}
+
+// listFiles は写すファイルを、ひな形からの相対パスで返す。
+//
+// **git の管理下なら、git が無視するファイルは写さない。** ディレクトリを丸ごと歩くと、
+// Finder が作る .DS_Store、手元の .env、ひな形の中で試しに作ったバイナリまで
+// 生成先に写る (レビュー指摘)。CI はクリーンな checkout なので、この経路は
+// CI では見えない。
+//
+// 未追跡でも無視されていないファイル (--others --exclude-standard) は含める。
+// ひな形にファイルを足した直後、コミット前に試せるようにするため。
+// git の外 (ひな形だけを配った場合など) では、ディレクトリを丸ごと歩く。
+func listFiles(template string) ([]string, error) {
+	out, err := exec.Command("git", "-C", template, "ls-files", "-z",
+		"--cached", "--others", "--exclude-standard").Output()
+	if err == nil {
+		var files []string
+		seen := map[string]bool{}
+		for _, f := range strings.Split(string(out), "\x00") {
+			if f == "" || seen[f] {
+				continue
+			}
+			seen[f] = true
+			files = append(files, filepath.FromSlash(f))
+		}
+		return files, nil
+	}
+
+	var files []string
+	err = filepath.WalkDir(template, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel(template, path)
+		if err != nil {
+			return err
+		}
+		files = append(files, rel)
+		return nil
+	})
+	return files, err
 }

@@ -8,9 +8,12 @@ CLUSTER ?= kind
 KIND    ?= kind
 KUBECTL ?= kubectl --context kind-$(CLUSTER)
 
-# 版の固定。@latest にしない —— ある日ルールが増えて CI が突然赤くなるのを避ける。
+# **ツールの版はここだけに書く** (ci.yml は make を呼ぶだけ)。@latest にしない ——
+# ある日ルールが増えて CI が突然赤くなるのを避ける。
 # oapi-codegen は go.mod の tool ディレクティブが固定している。
 GOLANGCI_LINT_VERSION := v2.12.2
+GOVULNCHECK_VERSION   := v1.9.0
+GOLANGCI_LINT         ?= golangci-lint
 
 .PHONY: help
 help: ## このヘルプを表示する
@@ -37,10 +40,22 @@ verify-generated: ## 生成物が仕様書と一致するか検査する (作業
 test: ## テスト (race detector + カバレッジ)
 	go test -race -cover ./...
 
+.PHONY: tools
+tools: ## golangci-lint を固定の版で入れる
+	# **配布バイナリではなく go install で入れる。** 配布バイナリはビルドした Go より
+	# 新しい言語版のコードを読めない。Go を上げた日に lint だけが理由の分からない形で落ちる。
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+
 .PHONY: lint
 lint: ## 静的解析
 	go vet ./...
-	golangci-lint run ./...
+	$(GOLANGCI_LINT) run ./...
+
+.PHONY: vulncheck
+vulncheck: ## 既知の脆弱性を調べる
+	# **ツールの版を固定しても脆弱性 DB は古くならない。** DB は実行のたびに
+	# vuln.go.dev から取る (-db の既定)。Go 本体の脆弱性でも落ちる。
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 .PHONY: run
 run: ## 手元で起動する (http://localhost:8080)

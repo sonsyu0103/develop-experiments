@@ -975,7 +975,7 @@ DB の中で待たれると全員が一緒に遅くなる。
 | Phase 12 | ローカルのエッジ (TLS 終端) と、プロキシ配下の実測 | **完了** ([ADR 0023](docs/adr/0023-local-edge-and-https.md)) |
 | Phase 13 | AWS の IaC (Terraform) と CD | **完了** (apply → verify → destroy を実機で一周。CD の実行のみ未検証) ([ADR 0024](docs/adr/0024-aws-deployment.md)) |
 | Phase 14 | Kubernetes (kind) と GitOps (Argo CD) | **完了** (作業ブランチと既定の枝 `develop` の両方から同期し、`k8s-verify` が全項目通過) ([ADR 0026](docs/adr/0026-kubernetes-and-gitops.md)) |
-| Phase 15 | ゴールデンパス (`make new-service`) | **完了** (生成から kind で Ready まで 35 秒。CI のジョブは未実行) ([ADR 0027](docs/adr/0027-golden-path.md)) |
+| Phase 15 | ゴールデンパス (`make new-service`) | **完了** (生成から kind で Ready まで 26〜35 秒。CI の Golden Path ジョブが毎回生成して検査する) ([ADR 0027](docs/adr/0027-golden-path.md)) |
 
 ### 着手順
 

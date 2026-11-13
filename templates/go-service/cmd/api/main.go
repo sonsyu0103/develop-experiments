@@ -17,8 +17,8 @@ import (
 )
 
 // shutdownTimeout は SIGTERM を受けてから処理中のリクエストを待つ上限。
-// k8s の terminationGracePeriodSeconds (既定 30 秒) より短くしておく。
-// 長いと、待っている途中で SIGKILL され、レスポンスが途中で切れる。
+// deploy/k8s の preStop (5 秒) と足して terminationGracePeriodSeconds (30 秒) に
+// 収める。超えると、待っている途中で SIGKILL され、レスポンスが途中で切れる。
 const shutdownTimeout = 20 * time.Second
 
 func main() {
@@ -65,6 +65,8 @@ func run() error {
 	}
 
 	// **SIGTERM で即終了しない。** ローリング更新のたびに処理中のリクエストが落ちる。
+	// 新しい接続を受けなくなるのはここから。振り分け先から外れるのを待つのは
+	// k8s の preStop の仕事 (deploy/k8s/deployment.yaml)。
 	slog.Info("shutting_down")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()

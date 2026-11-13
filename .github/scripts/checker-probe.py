@@ -46,7 +46,8 @@ DB もネットワークも要らないので CI で回せる。
 
 【make のターゲットも対象にする】(2026-11-14、ADR 0027)
 
-    make verify-go-version   CI・go-api・ひな形・ジェネレータの Go の版
+    make verify-go-version         CI・go-api・ひな形・ジェネレータの Go の版
+    make verify-template-versions  ひな形の Makefile のツールの版
 
 シェルの途中に書いた # で後ろが丸ごとコメントになり、版をずらしても
 exit 0 で通ったことがある。それまでこの検査には変異が 1 件も無かった。
@@ -87,6 +88,7 @@ ROLE_MIGRATION_FILE = "apps/go-api/db/migrations/000003_add_user_role.up.sql"
 # **スクリプトではなく make のターゲットも検査する。** 先頭が "make " のものは
 # make -s <ターゲット> として走らせる。
 GO_VERSION_CHECK = "make verify-go-version"
+TEMPLATE_VERSIONS_CHECK = "make verify-template-versions"
 
 # **版を直書きしない。** 1.26.11 と書くと、Go を上げた日に置換対象が 0 件になる
 # (このスクリプトはそれを NG として知らせるが、毎回直すことになる)。
@@ -94,6 +96,11 @@ GO_VERSION = re.search(r"^  GO_VERSION: '([0-9.]+)'$",
                         (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8"),
                         re.M).group(1)
 FAKE_GO = "0.0.1"
+
+# ひな形の Makefile に書いたツールの版。こちらも直書きしない。
+_TPL_MAKEFILE = (ROOT / "templates/go-service/Makefile").read_text(encoding="utf-8")
+TPL_GOLANGCI = re.search(r"^GOLANGCI_LINT_VERSION := (\S+)$", _TPL_MAKEFILE, re.M).group(1)
+TPL_GOVULN = re.search(r"^GOVULNCHECK_VERSION   := (\S+)$", _TPL_MAKEFILE, re.M).group(1)
 
 # 共通で差し替えるログ行。**起動時に必ず 1 回出る行**なので、
 # 消えたときは置換が 0 件になり、このスクリプトが先に気づく。
@@ -231,6 +238,15 @@ PROBES = [
     Probe("W", GO_VERSION_CHECK, "tools/new-service/go.mod",
           f"toolchain go{GO_VERSION}", f"toolchain go{FAKE_GO}",
           "tools/new-service/go.mod", "ジェネレータの go.mod の toolchain (ADR 0027)"),
+
+    # ---- make verify-template-versions ----------------------------------
+    # ルートだけツールの版を上げると、生成するサービスに古い版が固定され続ける。
+    Probe("X", TEMPLATE_VERSIONS_CHECK, "templates/go-service/Makefile",
+          f"GOLANGCI_LINT_VERSION := {TPL_GOLANGCI}", "GOLANGCI_LINT_VERSION := v0.0.1",
+          "GOLANGCI_LINT_VERSION が", "ひな形の golangci-lint の版 (ADR 0027)"),
+    Probe("Y", TEMPLATE_VERSIONS_CHECK, "templates/go-service/Makefile",
+          f"GOVULNCHECK_VERSION   := {TPL_GOVULN}", "GOVULNCHECK_VERSION   := v0.0.1",
+          "GOVULNCHECK_VERSION が", "ひな形の govulncheck の版 (ADR 0027)"),
 ]
 
 
@@ -278,7 +294,7 @@ def run_checker(name: str) -> tuple[int, str]:
 def main() -> int:
     # 壊す前の状態を確認する。ここが赤いと以降の結果はすべて意味を失う。
     print(f"{DIM}壊す前の検査を確認しています...{OFF}", flush=True)
-    for checker in (LOG_EVENTS, CONSTRAINTS, GO_VERSION_CHECK):
+    for checker in (LOG_EVENTS, CONSTRAINTS, GO_VERSION_CHECK, TEMPLATE_VERSIONS_CHECK):
         rc, out = run_checker(checker)
         if rc != 0:
             print(f"{RED}壊す前の時点で {checker} が落ちています。"

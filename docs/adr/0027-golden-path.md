@@ -3,7 +3,8 @@
 - ステータス: **採用 (実装済み・手元で実測済み)**。
   `templates/go-service` / `tools/new-service` / `make new-service` /
   `make verify-golden-path` / `make golden-path-kind` (2026-11-14)。
-  CI の Golden Path ジョブは**まだ一度も CI 上で走っていない** (「まだ確かめていないこと」)
+  CI の Golden Path ジョブは PR #73 で初めて CI 上で走り、通過した (181 秒)。
+  PR #73 のレビューで 10 件の指摘を受けて直した (「レビューで見つかったこと」)
 - 日付: 2026-11-14
 
 ## 背景
@@ -77,7 +78,9 @@
 
 1. 名前を検査する (k8s の名前に使えるか。英小文字で始まる 63 文字以内)
 2. 空でない出力先には書かない (上書きしない)
-3. ひな形をコピーしながら、`example.com/go-service` → `-module`、`go-service` → `-name` を
+3. 写すファイルは、ひな形が git の管理下なら `git ls-files --cached --others --exclude-standard`
+   (git が無視するものは写さない。「レビューで見つかったこと」4)
+4. ひな形をコピーしながら、`example.com/go-service` → `-module`、`go-service` → `-name` を
    **1 回の走査で**置き換える (罠 1)
 
 決め手は、**ひな形そのものに lint とテストをかけられる**こと。
@@ -122,7 +125,7 @@ v0.57.0 で、govulncheck が 4 件 (GO-2026-6603 / 6611 / 6612 / 6617、修正�
 | Go の版を patch まで固定し、3 か所を揃える | PR #71 |
 | 仕様書でリクエストを検証し、仕様に無いメソッドは 405 | ADR 0002 / `apps/go-api` の `respondSpecError` |
 | golangci-lint は配布バイナリではなく `go install` で入れる | `.github/workflows/ci.yml` の go-ci |
-| SIGTERM で処理中のリクエストを待つ (20 秒 < `terminationGracePeriodSeconds` 30 秒) | 新規 |
+| SIGTERM の前に `preStop` で 5 秒待ち、処理中のリクエストを最大 20 秒待つ (計 25 秒 < `terminationGracePeriodSeconds` 30 秒) | 新規。レビュー指摘で `preStop` を足した (「レビューで見つかったこと」5) |
 | oapi-codegen は `go.mod` の `tool` ディレクティブで固定 (`go tool oapi-codegen`) | 新規。利用者が道具を入れなくて済む |
 
 **Argo CD の Application は含めない。** ひな形の利用者がどの GitOps の道具を使うかは
@@ -142,6 +145,9 @@ v0.57.0 で、govulncheck が 4 件 (GO-2026-6603 / 6611 / 6612 / 6617、修正�
 | 1 | **35** | Docker の依存レイヤ (`go mod download`) は直前の `verify-golden-path` でキャッシュ済み。ノードにイメージは無い |
 | 2 | 5 | ビルドのキャッシュ・ノード上のイメージとも残っている |
 | 3 | 4 | 同上 |
+
+レビュー対応のあと (`preStop` を足し、クラスタを作り直した状態) にもう一度測ると 26 秒だった。
+冷え方の条件を揃えていないので、35 と 26 の差に意味は無い。
 
 **完全に冷えた状態 (Docker のビルドキャッシュなし) は測っていない** (「まだ確かめていないこと」)。
 
@@ -210,6 +216,74 @@ make は行末の `\` で 1 行につなげてシェルに渡すので、**`#` �
 検査を含めて —— が丸ごとコメントになり、版をずらしても exit 0 で通った。**
 `OK` の表示すら出なかったことで気づいた。コメントはシェルの外 (レシピの先頭) に出した。
 
+## レビューで見つかったこと (PR #73、2026-11-14)
+
+10 件。重い順に。
+
+### 1. `kill $${pf:-0}` は、pf が空のときプロセスグループ全体を殺す
+
+`golden-path-kind` の後始末が `kill ${pf:-0}` だった。port-forward より前で落ちると
+`kill 0` になり、**make 自身を含むプロセスグループ全体に SIGTERM が飛ぶ。**
+本来の失敗の出力が `Terminated` に埋もれる。pf が立っているときだけ kill するようにし、
+Dockerfile をわざと壊して、本来の原因 (`go mod: unknown command`) がそのまま見えることを確かめた。
+
+### 2. 疎通の確認が失敗しても OK を出していた
+
+curl の再試行が 20 回とも失敗しても、ループを抜けて「OK: 生成から Ready まで N 秒」を出していた。
+**計測の値が、疎通していない状態のものになりうる。** 応答の中身まで突き合わせ、違えば NG にした
+(`/hello` の応答をわざと変えて、NG になることを確かめた)。
+
+### 3. ジェネレータの既定値で動く場所が無かった
+
+doc コメントはリポジトリ直下からの `go run ./tools/new-service` を案内していたが、
+直下には go.mod も go.work も無いので動かない。中に入って叩くと、今度は既定の
+`-template` (`templates/go-service`) が見つからない。`make new-service` は値を明示していたので
+気づかなかった。既定値を `tools/new-service` から見た相対パスにし、そこで生成できることを確かめた。
+
+### 4. 未追跡のファイルまで写していた
+
+ディレクトリを丸ごと歩いていたので、Finder が作る `.DS_Store`、手元の `.env`、ひな形の中で
+試しに作ったバイナリまで写す (バイナリはエラーになり、テキストは黙って写る)。
+**CI はクリーンな checkout なので、この経路は検証網に掛からない。**
+`git ls-files --cached --others --exclude-standard` で写すものを決めるようにした。
+未追跡でも無視されていないファイルは写す (ひな形に足した直後、コミット前に試せるように)。
+
+### 5. SIGTERM ですぐにリスナを閉じると、ローリング更新の間に新しい接続が拒否される
+
+k8s は Pod を消すとき、SIGTERM の送信と、Service の振り分け先 (EndpointSlice) から外す処理を
+**並行に**走らせる。すぐにリスナを閉じると、外れる前に届いた接続が拒否される。
+「ローリング更新で処理中のリクエストを落とさない」と書いていたが、守れていたのは処理中のものだけで、
+**新しく来るものは守れていなかった。**
+
+`lifecycle.preStop.sleep` (5 秒) を足した。distroless にはシェルが無いので、
+`exec: sleep` の書き方は使えない。kind (v1.37) で Pod を消し、
+削除の開始から `shutting_down` のログまで **5.1 秒**空くことを確かめた。
+
+### 6. ひな形のツールの版が見張られていなかった
+
+ひな形の Makefile の `GOLANGCI_LINT_VERSION` はどこからも使われておらず、ひな形の `ci.yml` に
+別の版が書いてあった。ルートの版を上げても、生成するサービスには古い版が固定され続ける。
+ひな形の中では版を Makefile の 1 か所に寄せ (`ci.yml` は `make tools` / `make vulncheck` を呼ぶだけ)、
+`make verify-template-versions` がルートの Makefile と突き合わせる。`checker-probe` に変異 X・Y を足した。
+
+### 7. `GOVULNCHECK_VERSION` を Makefile の途中で定義していた
+
+CLAUDE.md は「ツールのバージョンは Makefile 冒頭で固定」と約束している。冒頭の並びへ移した。
+
+### 8. 検査が、ひな形の Makefile の手順を書き直していた
+
+`verify-golden-path` が `go vet` / `golangci-lint` / `go test` をその場で書いていた。
+ひな形の Makefile の手順を変えると「CI と同じ検査を通る」がずれる。
+生成したサービスの `make lint` / `make test` / `make vulncheck` を呼ぶようにした。
+
+### 9. Golden Path ジョブが golangci-lint を毎回ビルドしていた
+
+初回の CI で 50 秒かかった。go-ci と同じ鍵でツールのキャッシュを復元する (保存は go-ci に任せる)。
+
+### 10. `make check` の前提が増えたのに書いていなかった
+
+Docker とネットワーク (`go mod tidy`、govulncheck の DB) が要るようになった。help に書いた。
+
 ## ほかに見つかったこと
 
 - **リポジトリの CI は govulncheck を `@latest` で入れている** (go-ci の
@@ -220,8 +294,7 @@ make は行末の `\` で 1 行につなげてシェルに渡すので、**`#` �
 
 ## まだ確かめていないこと
 
-- **CI の Golden Path ジョブは一度も CI 上で走っていない。** 手元の `make verify-golden-path` は
-  42 秒で通ったが、CI では golangci-lint のビルドと依存の取得が乗る
+- **Golden Path ジョブで、ツールのキャッシュが当たる経路は CI でまだ走っていない** (レビュー指摘 9 の修正後)
 - **生成したサービスの `.github/workflows/ci.yml` は一度も走っていない。** actionlint は通した
   (v1.7.7、exit 0)。別のリポジトリに置いて push しないと確かめられない
 - **完全に冷えた状態の time to first deploy** (決定 5)。`docker builder prune` は
@@ -237,10 +310,12 @@ make は行末の `\` で 1 行につなげてシェルに渡すので、**`#` �
   (README に明記した)。copier の `update` や、生成元の版を記録して差分を当てる仕組みが要る。
   覆す条件: ひな形から作ったサービスが 2 つ以上になり、片方にだけ直したいものが出たら、copier へ移す
 - **見本 (`apps/go-api`) とひな形の 2 系統を保つ。** 教訓は go-api で見つかり、手でひな形に写す。
-  写し忘れは検査できない (罠 4 は、たまたまテストで気づいた)
+  写し忘れは検査できない (罠 4 は、たまたまテストで気づいた)。逆向きもある ——
+  `preStop` はひな形にだけ入り、掲示板の `infra/k8s/bbs/go-api.yaml` には無い
+  (レビュー指摘 5 と同じ穴が残っている。go-api は distroless なので同じく `sleep` で塞げる)
 - **ひな形の依存を誰かが上げ続ける必要がある。** govulncheck が落ちたら、ひな形の `go.mod` を上げる。
   CI の Golden Path ジョブが赤くなることが合図になる
-- **`make check` が Docker を要するようになった。** 以前から e2e が要っていたので増分は小さい
+- **`make check` が Docker とネットワークを要するようになった** (help に明記)
 - **手元の golangci-lint が Go 1.25 製だと `verify-golden-path` が落ちる。** go-api の `make lint` と同じ。
   `GOLANGCI_LINT=` で Go 1.26 製のものを渡す
 

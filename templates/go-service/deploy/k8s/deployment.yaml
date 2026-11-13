@@ -14,8 +14,9 @@ spec:
       labels:
         app.kubernetes.io/name: go-service
     spec:
-      # main.go の shutdownTimeout (20 秒) より長くする。短いと、処理中の
-      # リクエストを待っている途中で SIGKILL される。
+      # **preStop (5 秒) + main.go の shutdownTimeout (20 秒) より長くする。**
+      # preStop の待ちもこの猶予に数えられる。短いと、処理中のリクエストを
+      # 待っている途中で SIGKILL される。
       terminationGracePeriodSeconds: 30
       # API サーバのトークンを使わないなら載せない。侵入されたときの足場を減らす。
       automountServiceAccountToken: false
@@ -32,6 +33,16 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          # **SIGTERM の前に 5 秒待つ。** Pod を消すとき、SIGTERM の送信と
+          # Service の振り分け先 (EndpointSlice) から外す処理は並行に走る。
+          # すぐにリスナを閉じると、外れる前に届いた新しい接続が拒否される
+          # (レビュー指摘)。sleep はコンテナの中にシェルが要らない書き方で、
+          # distroless でも使える。古いクラスタには無い機能なので、apply で
+          # 弾かれたらクラスタの版を確かめる (kind の v1.37 で動作を実測)。
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           # **生存は /healthz (依存先を見ない)、受付可否は /readyz (見る)。**
           # 生存に依存先を混ぜると、依存先の瞬断で Pod が再起動ループに入る。
           livenessProbe:

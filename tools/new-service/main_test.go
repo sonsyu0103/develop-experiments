@@ -3,6 +3,7 @@ package main
 import (
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -121,5 +122,54 @@ func TestTemplate_HasNoUnreplaceableVariants(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// **git が無視するファイルは写さない** (.DS_Store・.env・試しに作ったバイナリ)。
+// 未追跡でも無視されていないファイルは写す (ひな形に足した直後に試せるように)。
+func TestGenerate_SkipsGitIgnoredFiles(t *testing.T) {
+	tpl := t.TempDir()
+	write := func(rel, body string) {
+		t.Helper()
+		p := filepath.Join(tpl, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(".gitignore", ".DS_Store\n.env\n/api\n")
+	write("go.mod", "module example.com/go-service\n")
+	write("cmd/api/main.go", "package main\n")
+	write("new-untracked.txt", "go-service\n")
+	write(".DS_Store", "x")
+	write(".env", "SECRET=1\n")
+	write("api", "\x00binary")
+
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", tpl}, args...)...)
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("add", ".gitignore", "go.mod", "cmd/api/main.go")
+
+	out := filepath.Join(t.TempDir(), "svc")
+	if _, err := generate(options{name: "svc", module: "example.com/svc", template: tpl, out: out}); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{".gitignore", "go.mod", "cmd/api/main.go", "new-untracked.txt"} {
+		if _, err := os.Stat(filepath.Join(out, want)); err != nil {
+			t.Errorf("%s が写っていない: %v", want, err)
+		}
+	}
+	for _, unwanted := range []string{".DS_Store", ".env", "api"} {
+		if _, err := os.Stat(filepath.Join(out, unwanted)); err == nil {
+			t.Errorf("git が無視する %s まで写っている", unwanted)
+		}
 	}
 }

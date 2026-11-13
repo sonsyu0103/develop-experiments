@@ -32,6 +32,7 @@ GOLANGCI_LINT_VERSION := v2.12.2
 SQLC_VERSION          := v1.31.1
 OAPI_CODEGEN_VERSION  := v2.8.0
 GO_ARCH_LINT_VERSION  := v1.17.0
+GOVULNCHECK_VERSION   := v1.9.0
 
 .PHONY: help
 help: ## このヘルプを表示する
@@ -690,7 +691,6 @@ generate: sqlc openapi ## 生成物をすべて作り直す
 
 GOLDEN_TEMPLATE     := templates/go-service
 GOLDEN_TOOL         := tools/new-service
-GOVULNCHECK_VERSION := v1.9.0
 # 手元の golangci-lint が古い Go 製だと、Go 1.26 のコードを読めずに落ちる。
 # そのときは Go 1.26 で入れ直したものを渡す (make verify-golden-path GOLANGCI_LINT=...)。
 GOLANGCI_LINT       ?= golangci-lint
@@ -701,10 +701,26 @@ new-service: ## ひな形から Go サービスを作る (NAME=必須 MODULE=exa
 	@cd $(GOLDEN_TOOL) && go run . -name "$(NAME)" -module "$(MODULE)" \
 		-template "$(CURDIR)/$(GOLDEN_TEMPLATE)" -out "$(abspath $(or $(OUT),../$(NAME)))"
 
+.PHONY: verify-template-versions
+verify-template-versions: ## ひな形に書いたツールの版が、この Makefile の版と同じか検査する
+	# **ひな形の Makefile にはツールの版を別に書いている** (生成したサービスは
+	# このリポジトリの外で動くので、ここの Makefile を読めない)。
+	# ルートだけ上げると、生成するサービスに古い版が固定され続ける (レビュー指摘)。
+	@f=$(GOLDEN_TEMPLATE)/Makefile; \
+	for pair in "GOLANGCI_LINT_VERSION=$(GOLANGCI_LINT_VERSION)" "GOVULNCHECK_VERSION=$(GOVULNCHECK_VERSION)"; do \
+		key=$${pair%%=*}; want=$${pair#*=}; \
+		got=$$(sed -n "s/^$${key} *:= *//p" $$f); \
+		[ "$$got" = "$$want" ] || { echo "NG: $$f の $${key} が $${got:-(無い)} (Makefile は $${want})"; exit 1; }; \
+	done; \
+	echo "OK: ひな形のツールの版は Makefile と同じ"
+
 .PHONY: verify-golden-path
-verify-golden-path: ## ひな形から生成したサービスが CI と同じ検査を通るか確かめる (Docker が要る)
+verify-golden-path: verify-template-versions $(KUBECTL_BIN) ## ひな形から生成したサービスが CI と同じ検査を通るか確かめる (Docker とネットワークが要る)
 	# **ひな形そのものではなく、生成した結果を検査する。** 置き換え漏れや、
 	# ひな形の中でだけ通る相対パスは、生成してみないと見つからない。
+	#
+	# **lint と test は、生成したサービス自身の Makefile を呼ぶ。** ここに
+	# 手順を書き直すと、ひな形の Makefile を変えたときに「CI と同じ」がずれる (レビュー指摘)。
 	#
 	# **golangci-lint のキャッシュは使い捨てにする。** 共有のキャッシュだと、前回の
 	# (もう消えた) 一時ディレクトリのパスつきで結果が返り、生成コードの除外が
@@ -726,11 +742,10 @@ verify-golden-path: ## ひな形から生成したサービスが CI と同じ�
 	diff -u "$$tmp/go.mod.before" go.mod && diff -u "$$tmp/go.sum.before" go.sum \
 		|| { echo "NG: ひな形の go.mod / go.sum が tidy ではない"; exit 1; }; \
 	echo "== 生成物が仕様書と一致するか"; make --no-print-directory verify-generated > /dev/null; \
-	echo "== lint"; go vet ./...; \
-	GOLANGCI_LINT_CACHE="$$tmp/lint-cache" $(GOLANGCI_LINT) run ./...; \
-	echo "== test"; go test -race ./... > /dev/null; \
-	echo "== govulncheck"; go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./... > /dev/null \
-		|| { echo "NG: 既知の脆弱性がある (go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./... で詳細)"; exit 1; }; \
+	echo "== lint"; GOLANGCI_LINT_CACHE="$$tmp/lint-cache" make --no-print-directory lint GOLANGCI_LINT="$(GOLANGCI_LINT)"; \
+	echo "== test"; make --no-print-directory test > /dev/null; \
+	echo "== govulncheck"; make --no-print-directory vulncheck > /dev/null \
+		|| { echo "NG: 既知の脆弱性がある (生成したサービスで make vulncheck を叩くと詳細が出る)"; exit 1; }; \
 	echo "== k8s のマニフェスト"; \
 	out=$$($(KUBECTL_BIN) kustomize deploy/k8s); \
 	if echo "$$out" | grep -q go-service; then echo "NG: マニフェストに go-service が残っている"; exit 1; fi; \
@@ -740,7 +755,6 @@ verify-golden-path: ## ひな形から生成したサービスが CI と同じ�
 	echo "== 本番用イメージ"; docker build -q --target prod -t smoke-svc:verify . > /dev/null; \
 	docker image rm smoke-svc:verify > /dev/null; \
 	echo "OK: ひな形から生成したサービスは CI と同じ検査を通る"
-verify-golden-path: $(KUBECTL_BIN)
 
 # ゴールデンパスの効果を測る: 「作り始めてから Pod が Ready になるまで」の秒数。
 # 掲示板のクラスタ (bbs) とは別の、素の kind クラスタを使う。
@@ -748,6 +762,9 @@ GOLDEN_CLUSTER := golden-path
 
 .PHONY: golden-path-kind
 golden-path-kind: $(KIND) $(KUBECTL_BIN) ## ひな形から作ったサービスを kind に載せ、Ready までの秒数を測る
+	# **kill は pf が立っているときだけ。** 空のときに kill 0 と書くと、
+	# プロセスグループ全体 (make 自身も含む) に SIGTERM が飛び、
+	# kind-deploy が落ちた本来の理由が "Terminated" に埋もれる (レビュー指摘)。
 	@set -eu; \
 	if ! $(KIND) get clusters 2>/dev/null | grep -qx $(GOLDEN_CLUSTER); then \
 		echo "== kind のクラスタ $(GOLDEN_CLUSTER) を作る (計測には含めない)"; \
@@ -755,7 +772,7 @@ golden-path-kind: $(KIND) $(KUBECTL_BIN) ## ひな形から作ったサービス
 	fi; \
 	kubectl="$(KUBECTL_BIN) --context kind-$(GOLDEN_CLUSTER)"; \
 	$$kubectl delete namespace hello-svc --ignore-not-found --wait=true > /dev/null; \
-	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"; kill $${pf:-0} 2>/dev/null || true' EXIT; \
+	pf=; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"; [ -z "$$pf" ] || kill "$$pf" 2>/dev/null || true' EXIT; \
 	start=$$(date +%s); \
 	(cd $(GOLDEN_TOOL) && go run . -name hello-svc -module github.com/acme/hello-svc \
 		-template "$(CURDIR)/$(GOLDEN_TEMPLATE)" -out "$$tmp/hello-svc") > /dev/null; \
@@ -763,7 +780,10 @@ golden-path-kind: $(KIND) $(KUBECTL_BIN) ## ひな形から作ったサービス
 		CLUSTER=$(GOLDEN_CLUSTER) KIND=$(KIND) KUBECTL="$$kubectl"; \
 	end=$$(date +%s); \
 	$$kubectl -n hello-svc port-forward svc/hello-svc 18080:8080 > /dev/null 2>&1 & pf=$$!; \
-	for i in $$(seq 1 20); do curl -fsS "http://localhost:18080/hello?name=golden" 2>/dev/null && break; sleep 0.5; done; echo; \
+	body=; for i in $$(seq 1 20); do body=$$(curl -fsS "http://localhost:18080/hello?name=golden" 2>/dev/null) && break; sleep 0.5; done; \
+	[ "$$body" = '{"message":"hello, golden"}' ] \
+		|| { echo "NG: Ready にはなったが /hello が期待どおりに応答しない (受け取ったもの: $${body:-なし})"; exit 1; }; \
+	echo "$$body"; \
 	echo "OK: 生成から Ready まで $$((end - start)) 秒 (イメージのビルドを含む)"
 
 .PHONY: golden-path-kind-down
@@ -1220,7 +1240,7 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 		fi
 
 .PHONY: check
-check: lint test cover verify-go-version verify-pg-healthcheck verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe k8s-lint verify-golden-path e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test cover verify-go-version verify-pg-healthcheck verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe k8s-lint verify-golden-path e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要。Docker とネットワークは要る)
 
 .PHONY: check-all
 # **test-live は smoke の後ろに置く。** 前に置くと、スタックが落ちている
