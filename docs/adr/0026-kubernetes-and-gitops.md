@@ -3,8 +3,8 @@
 - ステータス: **採用 (実装済み・手元で実測済み)**。
   `infra/k8s` / `make k8s-up` / `make k8s-verify` (2026-11-13)。
   **Argo CD が作業ブランチ (`feat/k8s-gitops`) から同期し、`make k8s-verify` が
-  全項目通った。** 既定の枝 (`develop`) から同期したことはまだ無い
-  (下の「まだ確かめていないこと」)。PR #70 のレビューで 10 件の指摘を受けて直した
+  全項目通った。** PR #70 のマージ後、既定の枝 (`develop`) からの同期も確かめた
+  (2026-11-14、「実機で確かめたこと」)。PR #70 のレビューで 10 件の指摘を受けて直した
   (「レビューと CI で見つかったこと」)
 - 日付: 2026-11-13
 
@@ -531,6 +531,7 @@ Argo CD が `feat/k8s-gitops` から同期した状態で、全項目が通っ�
 | 3 MiB の画像のアップロード (DB に直接作ったセッションで) | 201。エッジ経由の取り出しも 200 |
 | マニフェストの無い枝 (`main`) を指させる | 1 秒で NG (以前は 600 秒のタイムアウト) |
 | postgres の Pod を消して作り直す (PVC の永続性) | スレッド 2・ユーザー 1・マイグレーション 14 のまま (前後で同じ)。readiness の変更で StatefulSet が作り直されたときも同じだった |
+| PR #70 のマージ後、既定の枝 `develop` に向け直す (2026-11-14) | 既存のクラスタで `application.yaml` を当て直すと `develop` に戻り、develop の先頭 (813843a) に Synced / Healthy、`make k8s-verify` 全項目 OK。向け直す前は、作業ブランチが消えたため `unable to resolve 'feat/k8s-gitops' to a commit SHA` で同期できなくなっていた |
 
 **検査の効きも確かめた** ([ADR 0022](0022-probing-the-checkers.md) と同じ考え方):
 
@@ -542,9 +543,11 @@ Argo CD が `feat/k8s-gitops` から同期した状態で、全項目が通っ�
 
 ## まだ確かめていないこと
 
-- **既定の枝 (`develop`) から同期したことが無い。** `develop` にはまだ `infra/k8s` が無い。
-  マージ後に `make k8s-up` (K8S_REVISION なし) を通すまでは、
-  application.yaml の既定のまま動くかは未確認
+- **まっさらから `make k8s-up` (K8S_REVISION なし) を通したことが無い。** `develop` からの
+  同期は、既存のクラスタで Application を当て直して確かめた (「実機で確かめたこと」)。
+  ゼロからの一発通しは、作業ブランチを指した状態 (`K8S_REVISION=feat/k8s-gitops`) でしかやっていない
+- **作業ブランチを試したあとは、ブランチを消す前に `develop` へ戻す。** 戻さないと上のとおり
+  同期できなくなる。`make k8s-app` (K8S_REVISION なし) で戻る
 - **Google のログインを通していない** (OIDC 未設定)。アップロードは DB に
   直接作ったセッションで確かめたので、ログインの往復 (リダイレクトと Cookie の発行) は
   k8s 上では一度も通っていない

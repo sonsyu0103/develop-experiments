@@ -57,13 +57,41 @@ services:
       - postgres-data:/var/lib/postgresql/data
       - ./apps/go-api/db/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      # pg_isready だけだと初期化スクリプト実行中でも通ってしまうため、
-      # 実際にクエリを投げて確認する。
-      test: ["CMD-SHELL", "pg_isready -U app -d bbs && psql -U app -d bbs -c 'SELECT 1' > /dev/null"]
+      # **この確認が保証すること: 初期化が終わり、TCP で app ロールが bbs に
+      # ログインしてクエリを返せる。** db-init / migrate はこれだけを待って
+      # postgres:5432 に TCP で繋ぐ (db-init には自前の待ちも再起動も無い)。
+      #
+      # 【ソケット越しでは確かめない】
+      # postgres イメージは初期化中 (initdb と init スクリプトの実行中)、
+      # TCP を閉じた一時サーバをソケットだけで立てる。ソケット越しの確認は
+      # 何を足しても初期化中に通る。以前は「pg_isready だけだと初期化中も
+      # 通るので SELECT 1 を足す」としていたが、**SELECT 1 もソケット越しで
+      # 防げていなかった。** init をわざと 20 秒止めて 2 秒ごとに測ると、
+      # ソケット越しの pg_isready && SELECT 1 は初期化中ずっと ok、
+      # TCP 越しは初期化が終わるまで ng だった (2026-11-13)。
+      #
+      # **実害が出ていなかったのは偶然。** 初期化 (拡張 2 つ) が最初の確認
+      # (5 秒後) より先に終わっていただけで、遅い初期化なら db-init が
+      # connection refused で落ち、make up が止まっていた。
+      #
+      # 【pg_isready ではなく psql】
+      # pg_isready は「接続を受け付けるか」しか見ず、存在しない DB を指しても
+      # 0 を返す (実測)。psql なら app ロールと bbs が無ければ落ちる。
+      # 127.0.0.1 は pg_hba で trust なのでパスワードは要らない。
+      #
+      # 【見ていないこと】
+      # 依存側は 127.0.0.1 ではなくネットワーク越し (postgres:5432、scram 認証) で
+      # 繋ぐ。listen_addresses を絞ったり pg_hba を変えたりすると、ここは通るのに
+      # 依存側が届かない。その設定を足すときはここも見直す。
+      #
+      # **CI の services と同じコマンドにする** (make verify-pg-healthcheck)。
+      test: ["CMD-SHELL", "psql -h 127.0.0.1 -U app -d bbs -tAc 'SELECT 1'"]
       interval: 5s
       timeout: 5s
       retries: 20
-      start_period: 10s
+      # 初期化が終わるまで通らない確認になったので、猶予を初期化の時間に合わせる。
+      # 猶予中の失敗は数えないので、長くしても healthy になるのは遅れない。
+      start_period: 60s
 
   # 拡張を作って終了する使い捨てコンテナ。
   #
