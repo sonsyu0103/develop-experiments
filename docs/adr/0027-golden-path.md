@@ -291,7 +291,10 @@ Docker とネットワーク (`go mod tidy`、govulncheck の DB) が要るよ�
   「Run Vulnerability Check」)。理由は「脆弱性データベースは新しいほうが良い」だが、
   **データベースはツールの版と無関係に、実行のたびに `https://vuln.go.dev` から取る**
   (`govulncheck -h` の `-db` の既定値で確認)。ツールを固定しても DB は古くならない。
-  ひな形では `v1.9.0` に固定した。リポジトリ側は**この ADR では直していない** (別の PR で揃える)
+  ひな形では `v1.9.0` に固定した。リポジトリ側も 2026-11-14 に固定し、Makefile と ci.yml の
+  ツールの版 5 つを突き合わせる `make verify-tool-versions` を足した (それまで検査が無かった)
+- **掲示板の go-api にも `preStop` が無かった** (レビュー指摘 5 と同じ穴)。2026-11-14 に足し、
+  ローリング更新中の失敗が 20〜31 件から 0 件になることを実測した ([ADR 0026](0026-kubernetes-and-gitops.md)「その後」)
 
 ## まだ確かめていないこと
 
@@ -313,8 +316,8 @@ Docker とネットワーク (`go mod tidy`、govulncheck の DB) が要るよ�
   覆す条件: ひな形から作ったサービスが 2 つ以上になり、片方にだけ直したいものが出たら、copier へ移す
 - **見本 (`apps/go-api`) とひな形の 2 系統を保つ。** 教訓は go-api で見つかり、手でひな形に写す。
   写し忘れは検査できない (罠 4 は、たまたまテストで気づいた)。逆向きもある ——
-  `preStop` はひな形にだけ入り、掲示板の `infra/k8s/bbs/go-api.yaml` には無い
-  (レビュー指摘 5 と同じ穴が残っている。go-api は distroless なので同じく `sleep` で塞げる)
+  `preStop` は最初ひな形にだけ入り、掲示板の `infra/k8s/bbs/go-api.yaml` には無かった
+  (あとで足した。「ほかに見つかったこと」)
 - **ひな形の依存を誰かが上げ続ける必要がある。** govulncheck が落ちたら、ひな形の `go.mod` を上げる。
   CI の Golden Path ジョブが赤くなることが合図になる
 - **`make check` が Docker とネットワークを要するようになった** (help に明記)

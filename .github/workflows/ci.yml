@@ -39,6 +39,7 @@ env:
   SQLC_VERSION: v1.31.1
   OAPI_CODEGEN_VERSION: v2.8.0
   GO_ARCH_LINT_VERSION: v1.17.0
+  GOVULNCHECK_VERSION: v1.9.0
   # MinIO とそのクライアント。compose.yaml と同じタグに揃える
   # (docs/adr/0007-image-storage.md)
   # **取得元は bitnamilegacy (2026-09-26 に 3 回目の移転)。**
@@ -153,6 +154,10 @@ jobs:
         working-directory: .
         run: make verify-go-version
 
+      - name: Verify tool versions match the Makefile
+        working-directory: .
+        run: make verify-tool-versions
+
       - name: Verify go.mod is tidy
         run: |
           go mod tidy
@@ -161,7 +166,7 @@ jobs:
 
       # ツールはバージョンを固定しているので、ビルド済みのバイナリを
       # そのまま再利用できる。キーに @latest のものを含めてはいけない
-      # (govulncheck は毎回入れ直す。下のステップを参照)
+      # (govulncheck は鍵に入れず毎回入れ直す。下のステップを参照)
       - name: Cache Go tools
         id: cache-go-tools
         uses: actions/cache@v4
@@ -235,13 +240,17 @@ jobs:
         run: .github/scripts/checker-probe.py
 
       - name: Run Vulnerability Check (govulncheck)
-        # 脆弱性データベースは新しいほうが良いので、ここだけは latest を使う。
-        # そのためキャッシュの対象にせず、毎回入れ直す。
-        # ~/go/bin がキャッシュから復元されていても、この go install が
-        # 上書きするので古いバイナリが残ることはない
+        # **ツールの版を固定しても、脆弱性データベースは古くならない。**
+        # DB は実行のたびに https://vuln.go.dev から取る (govulncheck -h の -db の既定)。
+        # 以前は「DB は新しいほうが良い」を理由に @latest にしていたが、
+        # 版と DB は別物で、@latest は「ある日ツールの挙動が変わって赤くなる」危険だけを
+        # 背負っていた (ADR 0027「ほかに見つかったこと」)。
+        #
+        # キャッシュの鍵には入れず、毎回入れ直す (数秒)。~/go/bin がキャッシュから
+        # 復元されていても、この go install が上書きする
         run: |
           export GOTOOLCHAIN=auto
-          go install golang.org/x/vuln/cmd/govulncheck@latest
+          go install golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }}
           govulncheck ./...
 
       - name: Run Go Tests with Race Detector
