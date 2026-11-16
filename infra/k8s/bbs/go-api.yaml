@@ -33,6 +33,11 @@ spec:
       labels:
         app.kubernetes.io/name: go-api
     spec:
+      # **明示する (既定と同じ 30 秒でも)。** preStop (5 秒) + SHUTDOWN_TIMEOUT_SECONDS
+      # (env で変えられる。既定 10 秒、上限 3600 秒) がこれを超えると、Shutdown・
+      # 定期処理の待ち・閲覧数のフラッシュの途中で SIGKILL され、未反映の閲覧数が消える。
+      # SHUTDOWN_TIMEOUT_SECONDS を上げるときは、ここも一緒に上げる (PR #74 のレビュー指摘)。
+      terminationGracePeriodSeconds: 30
       containers:
         - name: go-api
           image: bbs/go-api:local
@@ -104,7 +109,7 @@ spec:
           #
           # distroless にはシェルが無いので exec: sleep は使えない。sleep アクションで書く。
           # 猶予は preStop 5 秒 + SHUTDOWN_TIMEOUT_SECONDS (既定 10 秒) で、
-          # terminationGracePeriodSeconds の既定 30 秒に収まる。
+          # 下の terminationGracePeriodSeconds (30 秒) に収まる。
           lifecycle:
             preStop:
               sleep:

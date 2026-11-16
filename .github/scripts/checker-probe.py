@@ -258,6 +258,15 @@ PROBES = [
     Probe("AA", TOOL_VERSIONS_CHECK, ".github/workflows/ci.yml",
           "govulncheck@${{ env.GOVULNCHECK_VERSION }}", "govulncheck@latest",
           "GOVULNCHECK_VERSION を使っていない", "govulncheck を @latest に戻す"),
+    # **正しい行を残したまま、別の行に @latest を足す。** 初版の検査は
+    # 「env を使う文字列がどこかにあるか」しか見ておらず、これが通った (PR #74 のレビュー指摘)。
+    Probe("AB", TOOL_VERSIONS_CHECK, ".github/workflows/ci.yml",
+          "        run: govulncheck ./...\n",
+          "        run: |\n          go install golang.org/x/vuln/cmd/govulncheck@latest\n          govulncheck ./...\n",
+          "GOVULNCHECK_VERSION を使っていない", "正しい行を残して、別の行で @latest を入れる"),
+    Probe("AC", TOOL_VERSIONS_CHECK, "Makefile",
+          "golangci-lint@$(GOLANGCI_LINT_VERSION)", "golangci-lint@v2.11.0",
+          "GOLANGCI_LINT_VERSION を使っていない", "Makefile の install 行に版を直書きする"),
 ]
 
 

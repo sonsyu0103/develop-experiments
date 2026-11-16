@@ -703,19 +703,14 @@ new-service: ## ひな形から Go サービスを作る (NAME=必須 MODULE=exa
 
 .PHONY: verify-tool-versions
 verify-tool-versions: ## Makefile と CI (ci.yml) に書いたツールの版が同じか検査する
-	# **ツールの版は Makefile と ci.yml の 2 か所に書いてある。** 手元 (make tools) と
-	# CI (env) で別の版が入ると、手元で通った lint が CI で落ちる (またはその逆)。
-	# 2026-11 まで突き合わせる検査は無く、govulncheck に至っては CI だけ @latest だった。
-	@for pair in "GOLANGCI_LINT_VERSION=$(GOLANGCI_LINT_VERSION)" "SQLC_VERSION=$(SQLC_VERSION)" \
-		"OAPI_CODEGEN_VERSION=$(OAPI_CODEGEN_VERSION)" "GO_ARCH_LINT_VERSION=$(GO_ARCH_LINT_VERSION)" \
-		"GOVULNCHECK_VERSION=$(GOVULNCHECK_VERSION)"; do \
-		key=$${pair%%=*}; want=$${pair#*=}; \
-		got=$$(sed -n "s/^  $${key}: //p" .github/workflows/ci.yml); \
-		[ "$$got" = "$$want" ] || { echo "NG: ci.yml の $${key} が $${got:-(無い)} (Makefile は $${want})"; exit 1; }; \
-	done; \
-	grep -q 'govulncheck@$${{ env.GOVULNCHECK_VERSION }}' .github/workflows/ci.yml \
-		|| { echo "NG: ci.yml の govulncheck が GOVULNCHECK_VERSION を使っていない"; exit 1; }; \
-	echo "OK: Makefile と ci.yml のツールの版は同じ"
+	# 何を見ているか (と、初版の穴) はスクリプトの冒頭を参照。
+	.github/scripts/verify-tool-versions.py
+
+.PHONY: vulncheck
+vulncheck: ## go-api の既知の脆弱性を調べる (CI の govulncheck と同じ版)
+	# **ツールの版を固定しても脆弱性 DB は古くならない。** DB は実行のたびに
+	# https://vuln.go.dev から取る (-db の既定)。ネットワークが要る。
+	cd $(GO_API_DIR) && go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 .PHONY: verify-template-versions
 verify-template-versions: ## ひな形に書いたツールの版が、この Makefile の版と同じか検査する
@@ -1256,7 +1251,7 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 		fi
 
 .PHONY: check
-check: lint test cover verify-go-version verify-tool-versions verify-pg-healthcheck verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe k8s-lint verify-golden-path e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要。Docker とネットワークは要る)
+check: lint test cover vulncheck verify-go-version verify-tool-versions verify-pg-healthcheck verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe k8s-lint verify-golden-path e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要。Docker とネットワークは要る)
 
 .PHONY: check-all
 # **test-live は smoke の後ろに置く。** 前に置くと、スタックが落ちている

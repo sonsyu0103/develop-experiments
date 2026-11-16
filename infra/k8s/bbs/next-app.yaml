@@ -40,6 +40,12 @@ spec:
           ports:
             - name: http
               containerPort: 3000
+          # **SIGTERM の前に 5 秒待つ。** 理由は go-api.yaml の preStop を参照
+          # (SIGTERM の送信と EndpointSlice から外す処理が並行に走る)。
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           readinessProbe:
             httpGet:
               path: /

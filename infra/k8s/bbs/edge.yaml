@@ -50,6 +50,13 @@ spec:
           ports:
             - name: http
               containerPort: 80
+          # **SIGTERM の前に 5 秒待つ。** 理由は go-api.yaml の preStop を参照
+          # (SIGTERM の送信と EndpointSlice から外す処理が並行に走る)。
+          # **エッジは掲示板の入口なので、ここで落とした分はそのまま利用者に返る。**
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           readinessProbe:
             httpGet:
               path: /edge-healthz
