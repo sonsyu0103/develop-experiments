@@ -97,6 +97,18 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          # **SIGTERM の前に 5 秒待つ。** Pod を消すとき、SIGTERM の送信と Service の
+          # 振り分け先 (EndpointSlice) から外す処理は並行に走る。すぐにリスナを閉じると、
+          # 外れる前に届いた新しい接続が拒否される (ADR 0027「レビューで見つかったこと」5。
+          # ひな形にだけ入れて、こちらに入れ忘れていた)。
+          #
+          # distroless にはシェルが無いので exec: sleep は使えない。sleep アクションで書く。
+          # 猶予は preStop 5 秒 + SHUTDOWN_TIMEOUT_SECONDS (既定 10 秒) で、
+          # terminationGracePeriodSeconds の既定 30 秒に収まる。
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           # **生存は /healthz (DB を見ない)、受付可否は /readyz (DB を見る)。**
           # 生存に DB を混ぜると、DB の瞬断で Pod が再起動ループに入る
           # (httpapi/server.go の GetHealthz のコメントと同じ理由)。
