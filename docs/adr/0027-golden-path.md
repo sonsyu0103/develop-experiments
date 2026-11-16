@@ -292,14 +292,16 @@ Docker とネットワーク (`go mod tidy`、govulncheck の DB) が要るよ�
   **データベースはツールの版と無関係に、実行のたびに `https://vuln.go.dev` から取る**
   (`govulncheck -h` の `-db` の既定値で確認)。ツールを固定しても DB は古くならない。
   ひな形では `v1.9.0` に固定した。リポジトリ側も 2026-11-14 に固定し、Makefile と ci.yml の
-  ツールの版 5 つを突き合わせる `make verify-tool-versions` を足した (それまで検査が無かった)
-- **掲示板の go-api にも `preStop` が無かった** (レビュー指摘 5 と同じ穴)。2026-11-14 に足し、
-  ローリング更新中の失敗が 20〜31 件から 0 件になることを実測した ([ADR 0026](0026-kubernetes-and-gitops.md)「その後」)
+  ツールの版 5 つと、それぞれを入れる行がすべて変数の版を使っているかを見る `make verify-tool-versions` を
+  足した (それまで検査が無かった)。手元でも `make vulncheck` で go-api に同じ版を当てる (`make check` に含む)
+- **掲示板の go-api・エッジ・next-app にも `preStop` が無かった** (レビュー指摘 5 と同じ穴)。2026-11-14 に足し、
+  ローリング更新中の失敗が 8〜35 件から 0 件になることを 3 つとも実測した ([ADR 0026](0026-kubernetes-and-gitops.md)「その後」)
 
 ## まだ確かめていないこと
 
-- **Golden Path ジョブで、ツールのキャッシュが外れる経路は修正後に走っていない。** 当たる経路は run 43458875908 で
-  確かめた (Install golangci-lint が skipped、ジョブ全体 181 秒 → 94 秒)。外れたときは修正前と同じ `go install` を通る
+- ~~**Golden Path ジョブで、ツールのキャッシュが外れる経路は修正後に走っていない。**~~ —— 当たる経路は
+  run 43458875908 で、外れる経路は run 43834028207 (PR #74 でキャッシュの鍵に govulncheck の版を足した直後) で
+  確かめた (Restore Go tools が外れ、Install golangci-lint が走って success)
 - **生成したサービスの `.github/workflows/ci.yml` は一度も走っていない。** actionlint は通した
   (v1.7.7、exit 0)。別のリポジトリに置いて push しないと確かめられない
 - **完全に冷えた状態の time to first deploy** (決定 5)。`docker builder prune` は
