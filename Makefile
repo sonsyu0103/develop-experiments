@@ -384,6 +384,10 @@ tf-fmt: ## Terraform の書式を揃える
 tf-validate: ## Terraform の構成を検査する (AWS に触らない)
 	$(TF) validate
 
+.PHONY: tf-test
+tf-test: ## Terraform の検査を mock のプロバイダで回す (AWS に触らない。tests/*.tftest.hcl)
+	$(TF) test
+
 .PHONY: tf-plan
 tf-plan: ## 何が作られるかを見る (課金は発生しない)
 	$(TF) plan

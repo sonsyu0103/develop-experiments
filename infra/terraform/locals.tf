@@ -2,6 +2,13 @@ locals {
   name = var.project
 
   # サブネットの CIDR は modules/network/locals.tf で VPC の CIDR から切り出す。
+
+  # 固定されていなければ、使える AZ の先頭から az_count 個 (variables.tf の availability_zones)。
+  availability_zones = (
+    length(var.availability_zones) > 0
+    ? var.availability_zones
+    : slice(data.aws_availability_zones.available.names, 0, var.az_count)
+  )
 }
 
 data "aws_availability_zones" "available" {
