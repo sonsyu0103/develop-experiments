@@ -313,7 +313,7 @@ resource "aws_ecs_service" "api" {
   }
 
   network_configuration {
-    subnets         = aws_subnet.public[*].id
+    subnets         = module.network.public_subnet_ids
     security_groups = [aws_security_group.ecs.id]
 
     # **パブリック IP を付ける。** NAT を置かない代わりに、
@@ -360,7 +360,7 @@ resource "aws_ecs_service" "web" {
   }
 
   network_configuration {
-    subnets          = aws_subnet.public[*].id
+    subnets          = module.network.public_subnet_ids
     security_groups  = [aws_security_group.ecs.id]
     assign_public_ip = true
   }
