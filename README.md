@@ -78,14 +78,37 @@ NAT Gateway (月 $33) もドメインも使わない構成にして **1 日 $1.3
 [ADR 0024](docs/adr/0024-aws-deployment.md) に全部残した ——
 多くは `terraform validate` と `plan` を通り抜け、**実際に動かして初めて分かった**もの。
 
-## この 3 つを支えているもの
+### 4. 開発基盤まで作る —— Git どおりに揃え、ひな形は毎回生成して検査する
+
+```bash
+make k8s-up           # kind に掲示板を立て、Argo CD に Git どおり揃えさせる (課金なし)
+make k8s-verify       # 手で崩して、Git の状態に戻るかを実測する
+make new-service NAME=billing-api   # 他チームが使う想定の Go サービスのひな形を、隣のディレクトリ ../billing-api に生成する
+make tf-init && make tf-test        # Terraform の検査を mock のプロバイダで回す (AWS に触らない。init は最初の 1 回)
+```
+
+- **GitOps**: Argo CD が Git の `infra/k8s/bbs` を見てクラスタを揃え続ける。
+  手で go-api を 0 台にしても 2〜11 秒、Service を消しても 6〜50 秒で戻る (2 回の測定。ばらつきの原因は見ていない)。
+  ローリング更新の間に落ちていたリクエスト (go-api・エッジ・next-app を各 2 回入れ替えて、951〜2,116 件中 8〜35 件) は、
+  停止前に待つ (`preStop`) ようにして 0 件にした (各 2 回)
+  ([ADR 0026](docs/adr/0026-kubernetes-and-gitops.md))
+- **ゴールデンパス**: OpenAPI からの生成・CI・Dockerfile・k8s のマニフェスト入りのひな形を 1 コマンドで作る。
+  ひな形はそれ自体が動くサービスで、**CI が毎回生成して検査して捨てる** —— 使われない間に腐らせない。
+  生成から kind 上で動くまで、ビルドキャッシュが空でも 48〜49 秒 (2 回)。クラスタの作成・空の builder の起動・
+  Go のツールチェーンは含めず、手元のスクリプトで測った値 (`make golden-path-kind` では再現しない。ADR 0027 決定 5)
+  ([ADR 0027](docs/adr/0027-golden-path.md))
+- **state を壊さない組み替え**: Terraform のネットワークを module に切り出し、`moved` で state の住所を移した。
+  AWS に触らず、mock のプロバイダで「12 件移動・変更 0 件」を確かめた。`moved` を外すと VPC ごと作り直しになる
+  ([ADR 0028](docs/adr/0028-terraform-network-module.md))
+
+## この 4 つを支えているもの
 
 | | |
 | --- | --- |
-| **設計判断の記録** | [ADR 25 本](docs/adr/)。決定だけでなく**実装後に分かったこと**を追記している |
+| **設計判断の記録** | [ADR](docs/adr/)。決定だけでなく**実装後に分かったこと**を追記している |
 | **単一の情報源** | [`api/openapi.yaml`](api/openapi.yaml) から Go スタブと TS 型を生成。CI がドリフトを検出 |
 | **境界の強制** | `go-arch-lint` でモジュール間の依存方向を機械的に検査 ([ADR 0017](docs/adr/0017-arch-lint-and-depguard.md)。境界そのものは [ADR 0004](docs/adr/0004-modular-monolith.md)) |
-| **CI** | 静的解析 / race detector / カバレッジ下限 / 脆弱性検査 / 生成物のドリフト / Terraform |
+| **CI** | 静的解析 / race detector / カバレッジ下限 / 脆弱性検査 / 生成物のドリフト / Terraform (mock のテスト込み) / k8s のマニフェスト / ひな形の生成と検査 |
 
 ---
 
@@ -147,6 +170,9 @@ NAT Gateway (月 $33) もドメインも使わない構成にして **1 日 $1.3
 ├── infra/
 │   ├── caddy/                   ローカルのエッジ (TLS 終端。CloudFront + ALB 相当)
 │   ├── terraform/               AWS の構成 (ECS Fargate / RDS / CloudFront)
+│   │   ├── modules/network/     VPC・サブネット・ルーティング (ADR 0028)
+│   │   └── tests/               mock のプロバイダで回す検査 (make tf-test)
+│   ├── k8s/                     kind と Argo CD のマニフェスト (ADR 0026)
 │   ├── scripts/                 push / migrate / deploy の手順
 │   ├── fluent-bit/              ログ転送の設定 (本番の FireLens と共通)
 │   ├── athena/                  テーブル定義 (列の正) と分析クエリ
@@ -155,6 +181,8 @@ NAT Gateway (月 $33) もドメインも使わない構成にして **1 日 $1.3
 │   ├── adr/                     設計判断の記録
 │   ├── infrastructure.md        AWS の理想構成 (Terraform で出すのはこの一部)
 │   └── postgres-ssi.md          SSI (直列化スナップショット分離) の解説
+├── templates/go-service/        ゴールデンパスのひな形。それ自体が動くサービス (ADR 0027)
+├── tools/new-service/           ひな形からサービスを生成するジェネレータ
 └── compose.yaml
 ```
 
@@ -216,6 +244,7 @@ make tf-migrate  # マイグレーションを流す
 make tf-url      # 公開 URL
 make tf-verify   # 立てた環境を実測する (手元の https-verify の AWS 版)
 make tf-destroy  # 消す
+make tf-test     # mock のプロバイダで検査する (AWS に触らない。課金なし)
 ```
 
 **常時公開しない運用にしている** ([ADR 0024](docs/adr/0024-aws-deployment.md))。
@@ -249,6 +278,10 @@ CloudFront ←→ ALB を HTTP にすると ALB が `X-Forwarded-Proto` を
 残る未検証は CD (GitHub Actions からのデプロイ) で、
 ADR 0024 の「まだ確かめていないこと」に挙げてある。
 
+ネットワーク (VPC・サブネット・ルーティング) は `modules/network` に切り出してある。
+Security Group はアプリの経路を知っているので、module に入れず呼び出し側に残した
+([ADR 0028](docs/adr/0028-terraform-network-module.md))。
+
 ## Kubernetes (kind) と GitOps (Argo CD)
 
 ```bash
@@ -263,8 +296,11 @@ make k8s-down     # クラスタを丸ごと消す
 
 Argo CD は Git の `infra/k8s/bbs` を見て、クラスタをそのとおりに揃え続ける。
 `kubectl scale` で go-api を 0 台にしても 2 秒で 1 台に戻り、
-Service を消しても 6 秒で作り直される —— `make k8s-verify` がこれを毎回実際に崩して確かめる。
+Service を消しても 6 秒で作り直される (まっさらから立て直した回では 11 秒と 50 秒だった。ADR 0026 の「まだ確かめていないこと」) —— `make k8s-verify` がこれを毎回実際に崩して確かめる。
 selfHeal を切ると戻らないことも確かめてある。
+push してから反映されるまでは 51 秒 (同期の間隔 60 秒・揺らぎ 0 の設定で、1 回の測定)。
+go-api・エッジ・next-app には `preStop` を入れてあり、ローリング更新の間に落ちていた
+リクエスト (各 2 回の入れ替えで 951〜2,116 件中 8〜35 件) を 0 件にしている。
 
 マイグレーションと `Caddyfile` は compose と同じファイルを読む (コピーしない)。
 イメージの中身は Git に載らない (手元でビルドして kind に読み込む) ので、
@@ -976,6 +1012,7 @@ DB の中で待たれると全員が一緒に遅くなる。
 | Phase 13 | AWS の IaC (Terraform) と CD | **完了** (apply → verify → destroy を実機で一周。CD の実行のみ未検証) ([ADR 0024](docs/adr/0024-aws-deployment.md)) |
 | Phase 14 | Kubernetes (kind) と GitOps (Argo CD) | **完了** (作業ブランチと既定の枝 `develop` の両方から同期し、`k8s-verify` が全項目通過) ([ADR 0026](docs/adr/0026-kubernetes-and-gitops.md)) |
 | Phase 15 | ゴールデンパス (`make new-service`) | **完了** (生成から kind で Ready まで 26〜35 秒、ビルドキャッシュが空でも 48〜49 秒 (クラスタの作成は含めない)。CI の Golden Path ジョブが毎回生成して検査する) ([ADR 0027](docs/adr/0027-golden-path.md)) |
+| Phase 16 | Terraform の module 化 (`moved` で state を移す) | **完了** (mock のプロバイダで 12 件移動・変更 0 件。`make tf-test` を CI で回す) ([ADR 0028](docs/adr/0028-terraform-network-module.md)) |
 
 ### 着手順
 
@@ -1147,7 +1184,8 @@ api/openapi.yaml を書く
 
 Go 1.26 / Gin / pgx v5 / sqlc / oapi-codegen / PostgreSQL 17 /
 Next.js 16 (App Router, RSC) / React 19 / TypeScript 5.9 / ESLint 9 /
-Caddy (ローカルの TLS 終端) / Terraform (AWS) / ECS Fargate / CloudFront
+Caddy (ローカルの TLS 終端) / Terraform (AWS) / ECS Fargate / CloudFront /
+Kubernetes (kind) / Argo CD / kustomize
 
 **なぜこれを選んだかは [ADR 0025](docs/adr/0025-language-and-framework.md)。**
 最重要の理由は「速いから」でも「安全だから」でもなく、
