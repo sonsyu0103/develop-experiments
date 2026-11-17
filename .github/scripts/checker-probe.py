@@ -48,6 +48,7 @@ DB もネットワークも要らないので CI で回せる。
 
     make verify-go-version         CI・go-api・ひな形・ジェネレータの Go の版
     make verify-template-versions  ひな形の Makefile のツールの版
+    make verify-tool-versions      Makefile と ci.yml のツールの版
 
 シェルの途中に書いた # で後ろが丸ごとコメントになり、版をずらしても
 exit 0 で通ったことがある。それまでこの検査には変異が 1 件も無かった。
@@ -89,6 +90,7 @@ ROLE_MIGRATION_FILE = "apps/go-api/db/migrations/000003_add_user_role.up.sql"
 # make -s <ターゲット> として走らせる。
 GO_VERSION_CHECK = "make verify-go-version"
 TEMPLATE_VERSIONS_CHECK = "make verify-template-versions"
+TOOL_VERSIONS_CHECK = "make verify-tool-versions"
 
 # **版を直書きしない。** 1.26.11 と書くと、Go を上げた日に置換対象が 0 件になる
 # (このスクリプトはそれを NG として知らせるが、毎回直すことになる)。
@@ -247,6 +249,24 @@ PROBES = [
     Probe("Y", TEMPLATE_VERSIONS_CHECK, "templates/go-service/Makefile",
           f"GOVULNCHECK_VERSION   := {TPL_GOVULN}", "GOVULNCHECK_VERSION   := v0.0.1",
           "GOVULNCHECK_VERSION が", "ひな形の govulncheck の版 (ADR 0027)"),
+
+    # ---- make verify-tool-versions --------------------------------------
+    # Makefile と ci.yml のツールの版。govulncheck は CI だけ @latest だった。
+    Probe("Z", TOOL_VERSIONS_CHECK, ".github/workflows/ci.yml",
+          "  SQLC_VERSION: v", "  SQLC_VERSION: v0.0.1-",
+          "SQLC_VERSION が", "CI の sqlc の版だけずらす"),
+    Probe("AA", TOOL_VERSIONS_CHECK, ".github/workflows/ci.yml",
+          "govulncheck@${{ env.GOVULNCHECK_VERSION }}", "govulncheck@latest",
+          "GOVULNCHECK_VERSION を使っていない", "govulncheck を @latest に戻す"),
+    # **正しい行を残したまま、別の行に @latest を足す。** 初版の検査は
+    # 「env を使う文字列がどこかにあるか」しか見ておらず、これが通った (PR #74 のレビュー指摘)。
+    Probe("AB", TOOL_VERSIONS_CHECK, ".github/workflows/ci.yml",
+          "        run: govulncheck ./...\n",
+          "        run: |\n          go install golang.org/x/vuln/cmd/govulncheck@latest\n          govulncheck ./...\n",
+          "GOVULNCHECK_VERSION を使っていない", "正しい行を残して、別の行で @latest を入れる"),
+    Probe("AC", TOOL_VERSIONS_CHECK, "Makefile",
+          "golangci-lint@$(GOLANGCI_LINT_VERSION)", "golangci-lint@v2.11.0",
+          "GOLANGCI_LINT_VERSION を使っていない", "Makefile の install 行に版を直書きする"),
 ]
 
 
@@ -294,7 +314,8 @@ def run_checker(name: str) -> tuple[int, str]:
 def main() -> int:
     # 壊す前の状態を確認する。ここが赤いと以降の結果はすべて意味を失う。
     print(f"{DIM}壊す前の検査を確認しています...{OFF}", flush=True)
-    for checker in (LOG_EVENTS, CONSTRAINTS, GO_VERSION_CHECK, TEMPLATE_VERSIONS_CHECK):
+    for checker in (LOG_EVENTS, CONSTRAINTS, GO_VERSION_CHECK, TEMPLATE_VERSIONS_CHECK,
+                    TOOL_VERSIONS_CHECK):
         rc, out = run_checker(checker)
         if rc != 0:
             print(f"{RED}壊す前の時点で {checker} が落ちています。"
