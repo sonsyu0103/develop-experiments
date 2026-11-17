@@ -47,7 +47,7 @@ output "db_secret_arn" {
 output "run_task_network_configuration" {
   description = "aws ecs run-task に渡すネットワーク設定"
   value = {
-    subnets        = aws_subnet.public[*].id
+    subnets        = module.network.public_subnet_ids
     securityGroups = [aws_security_group.ecs.id]
     assignPublicIp = "ENABLED"
   }

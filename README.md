@@ -249,6 +249,46 @@ CloudFront ←→ ALB を HTTP にすると ALB が `X-Forwarded-Proto` を
 残る未検証は CD (GitHub Actions からのデプロイ) で、
 ADR 0024 の「まだ確かめていないこと」に挙げてある。
 
+## Kubernetes (kind) と GitOps (Argo CD)
+
+```bash
+make k8s-up       # kind を作り、イメージを読み込み、Argo CD を入れて同期を待つ
+make k8s-verify   # 疎通と、手で崩しても Git の状態へ戻るか (selfHeal) を実測する
+make k8s-down     # クラスタを丸ごと消す
+```
+
+- 掲示板: http://localhost:8088 (エッジ経由。compose の up-https と同じ `Caddyfile`)
+- Argo CD: http://localhost:8089 (admin / `make k8s-argocd-password`)
+- **課金なし。** 全部この PC の中で動く。AWS の経路は ECS のまま
+
+Argo CD は Git の `infra/k8s/bbs` を見て、クラスタをそのとおりに揃え続ける。
+`kubectl scale` で go-api を 0 台にしても 2 秒で 1 台に戻り、
+Service を消しても 6 秒で作り直される —— `make k8s-verify` がこれを毎回実際に崩して確かめる。
+selfHeal を切ると戻らないことも確かめてある。
+
+マイグレーションと `Caddyfile` は compose と同じファイルを読む (コピーしない)。
+イメージの中身は Git に載らない (手元でビルドして kind に読み込む) ので、
+**GitOps と呼べるのはマニフェストまで。** 理由とつまずきの記録は
+[ADR 0026](docs/adr/0026-kubernetes-and-gitops.md)。
+
+## ゴールデンパス (`make new-service`)
+
+```bash
+make new-service NAME=billing-api MODULE=github.com/acme/billing-api   # ../billing-api に生成
+make verify-golden-path   # ひな形から生成して、CI と同じ検査を通るか確かめて捨てる
+make golden-path-kind     # 生成から kind 上で Ready になるまでの秒数を測る
+```
+
+**他チーム向けのひな形**で、生成したサービスはこのリポジトリにはコミットしない
+(掲示板はモジュラモノリスのまま。[ADR 0004](docs/adr/0004-modular-monolith.md))。
+OpenAPI からの生成・CI・distroless の Dockerfile・k8s のマニフェストが最初から入っていて、
+非 root・読み取り専用のルート・プローブの分け方など、[ADR 0026](docs/adr/0026-kubernetes-and-gitops.md)
+で踏んだ穴は既定値として塞いである。
+
+ひな形 (`templates/go-service`) は**テンプレート言語で書かず、それ自体が動くサービス**にしてある。
+使われない間に腐るので、CI が毎回生成して検査する —— 作った初日に、依存の脆弱性 4 件をこれで見つけた。
+理由と、検査の穴をわざと壊して見つけた記録は [ADR 0027](docs/adr/0027-golden-path.md)。
+
 ## 開発
 
 ```bash
@@ -934,6 +974,8 @@ DB の中で待たれると全員が一緒に遅くなる。
 | Phase 11 | スレッド検索 (`pg_trgm`) | **完了** |
 | Phase 12 | ローカルのエッジ (TLS 終端) と、プロキシ配下の実測 | **完了** ([ADR 0023](docs/adr/0023-local-edge-and-https.md)) |
 | Phase 13 | AWS の IaC (Terraform) と CD | **完了** (apply → verify → destroy を実機で一周。CD の実行のみ未検証) ([ADR 0024](docs/adr/0024-aws-deployment.md)) |
+| Phase 14 | Kubernetes (kind) と GitOps (Argo CD) | **完了** (作業ブランチと既定の枝 `develop` の両方から同期し、`k8s-verify` が全項目通過) ([ADR 0026](docs/adr/0026-kubernetes-and-gitops.md)) |
+| Phase 15 | ゴールデンパス (`make new-service`) | **完了** (生成から kind で Ready まで 26〜35 秒、ビルドキャッシュが空でも 48〜49 秒 (クラスタの作成は含めない)。CI の Golden Path ジョブが毎回生成して検査する) ([ADR 0027](docs/adr/0027-golden-path.md)) |
 
 ### 着手順
 
@@ -1090,6 +1132,9 @@ api/openapi.yaml を書く
 | [ADR 0023](docs/adr/0023-local-edge-and-https.md) | ローカルにエッジを置き、「本番ならこう動く」を実測に変える |
 | [ADR 0024](docs/adr/0024-aws-deployment.md) | AWS へのデプロイ —— 「消せること」を構成の要件にする |
 | [ADR 0025](docs/adr/0025-language-and-framework.md) | 言語とフレームワークの選択と、その使い方 (Gin は薄く使う) |
+| [ADR 0026](docs/adr/0026-kubernetes-and-gitops.md) | 掲示板を kind 上で動かし、Argo CD に Git どおり揃えさせる —— AWS の経路は ECS のまま |
+| [ADR 0027](docs/adr/0027-golden-path.md) | ゴールデンパスは他チーム向けのひな形として置き、掲示板は分割しない —— CI で毎回生成して捨てる |
+| [ADR 0028](docs/adr/0028-terraform-network-module.md) | network.tf の VPC・サブネット・ルーティングを module に切り出し、`moved` で state を移す —— SG は呼び出し側に残す |
 | [インフラ構成](docs/infrastructure.md) | AWS の理想構成 (Terraform で出すのはこの一部) |
 
 [ADR 0015](docs/adr/0015-idempotency.md) と
@@ -1100,7 +1145,7 @@ api/openapi.yaml を書く
 
 ## 技術スタック
 
-Go 1.25 / Gin / pgx v5 / sqlc / oapi-codegen / PostgreSQL 17 /
+Go 1.26 / Gin / pgx v5 / sqlc / oapi-codegen / PostgreSQL 17 /
 Next.js 16 (App Router, RSC) / React 19 / TypeScript 5.9 / ESLint 9 /
 Caddy (ローカルの TLS 終端) / Terraform (AWS) / ECS Fargate / CloudFront
 

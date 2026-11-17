@@ -29,6 +29,24 @@ variable "az_count" {
   }
 }
 
+# **AZ を名前で固定する (任意)。** 空なら、使える AZ の先頭から az_count 個を使う。
+#
+# 先頭から取る形だと、AZ の一覧が変わった日 (ある AZ が available でなくなる、など) に
+# 選ばれる AZ がずれる。サブネットの availability_zone は作り直しを伴う属性なので、
+# DB サブネットグループ・ALB・ECS サービスまで巻き込まれる。
+# apply 済みの環境を長く持つなら、そのとき選ばれた AZ をここに書いて固定する。
+# 指定したときは az_count を見ない。
+variable "availability_zones" {
+  description = "サブネットを置く AZ の名前 (空なら自動で選ぶ)"
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = length(var.availability_zones) == 0 || length(var.availability_zones) >= 2
+    error_message = "指定するなら 2 つ以上 (ALB が最低 2 AZ を要求する)。"
+  }
+}
+
 variable "db_instance_class" {
   description = "RDS のインスタンスクラス"
   type        = string

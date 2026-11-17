@@ -1,0 +1,113 @@
+# =============================================================================
+# このサービスの API 仕様書。**ここが唯一の正**。
+#
+#   api/openapi.yaml ── oapi-codegen ──→ internal/httpapi/oapigen/ (Go)
+#
+# エンドポイントを足すときはここを編集して `make generate` を回す。
+# ハンドラは生成された ServerInterface を実装するので、
+# 仕様に足したのに実装し忘れるとコンパイルエラーになる。
+#
+# **info.title にサービス名を書かない。** make new-service はサービス名を
+# 置き換えるが、生成物 (oapigen.gen.go) には仕様書が圧縮されて埋め込まれている。
+# ここに名前があると、置き換えた直後に生成物とずれて verify-generated が落ちる。
+# =============================================================================
+openapi: 3.0.3
+info:
+  title: Service API
+  version: 0.1.0
+
+paths:
+  /healthz:
+    get:
+      operationId: getHealthz
+      tags: [health]
+      summary: Liveness プローブ
+      description: |
+        プロセスが生きているかだけを返す。依存先 (DB など) は見ない。
+        ここで依存先を見ると、依存先の一時的な不調で Pod が再起動ループに入る。
+      responses:
+        '200':
+          description: 正常
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /readyz:
+    get:
+      operationId: getReadyz
+      tags: [health]
+      summary: Readiness プローブ
+      description: |
+        リクエストを受けられる状態かを返す。依存先を足したらここで見る。
+        受けられないときは 503 を返し、Service の振り分けから外れる。
+      responses:
+        '200':
+          description: 受付可能
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+        '503':
+          description: 受付不可
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  # 見本のエンドポイント。置き換えて使う。
+  # maxLength は飾りではなく、リクエスト検証のミドルウェアが実際に強制する。
+  /hello:
+    get:
+      operationId: getHello
+      tags: [example]
+      summary: 挨拶を返す (見本)
+      parameters:
+        - name: name
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 50
+      responses:
+        '200':
+          description: 挨拶
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Greeting'
+        '400':
+          description: パラメータが仕様に合わない
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+        reason:
+          type: string
+          description: 異常時のみ設定される
+
+    Greeting:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          example: hello, world
+
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string

@@ -1,0 +1,21 @@
+# Argo CD 本体のインストール (ADR 0026)。
+#
+# **公式の install.yaml を版で固定して取り込み、差分だけを重ねる。**
+# 版を上げるときは URL の v3.5.6 を書き換える (Makefile の ARGOCD_VERSION と揃える)。
+# @latest / stable にしないのは、Makefile 冒頭のツール固定と同じ理由。
+#
+# Argo CD 自身は Argo CD に管理させない (make k8s-argocd で kubectl apply する)。
+# 「Argo CD が自分を同期して壊れたら、直す手段も一緒に壊れる」のを避けるため。
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: argocd
+
+resources:
+  - namespace.yaml
+  - https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.6/manifests/install.yaml
+
+patches:
+  - path: argocd-cm.yaml
+  - path: argocd-cmd-params-cm.yaml
+  - path: argocd-server-nodeport.yaml

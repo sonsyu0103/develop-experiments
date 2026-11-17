@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+data:
+  # **kustomize のファイル読み込み制限を外す。**
+  # bbs/kustomization.yaml はマイグレーションや Caddyfile をリポジトリの正本から
+  # 読む (コピーしない) ため、kustomization のあるディレクトリの外に出る。
+  # 既定の LoadRestrictionsRootOnly のままだと、手元の make k8s-render は通るのに
+  # Argo CD だけが ComparisonError で止まる (手元にも同じフラグを付けているため)。
+  kustomize.buildOptions: --load-restrictor LoadRestrictionsNone
+  # Git を見に行く間隔。既定は 120 秒。手元の検証用なので短くする。
+  timeout.reconciliation: 60s
+  # **間隔とは別に「揺らぎ」が乗る (既定 0〜60 秒)。** 間隔だけ 60 秒にした
+  # 初回は、push から同期まで 123 秒かかった。揺らぎは Application が多いときに
+  # repo-server への問い合わせを分散させるためのもので、1 つしか無いここでは不要。
+  timeout.reconciliation.jitter: 0s

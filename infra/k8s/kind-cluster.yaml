@@ -1,0 +1,30 @@
+# kind のクラスタ定義 (ADR 0026)。
+#
+# **ノードは 1 台。** 掲示板 + Argo CD を載せるだけなら control-plane が
+# ワーカーを兼ねて足りる。台数を増やしても、この PC 1 台の CPU とメモリを
+# 分け合うだけで、検証できることは増えない。
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: bbs
+networking:
+  # **Pod の CIDR を明示する。** go-api の TRUSTED_PROXIES がこの範囲を
+  # 信じる (bbs/go-api.yaml)。kind の既定と同じ値だが、暗黙の既定に
+  # 依存させると、既定が変わった日にエッジ経由の書き込みだけが 403 になる。
+  podSubnet: 10.244.0.0/16
+nodes:
+  - role: control-plane
+    # ダイジェストまで固定する (kind のリリースノートの推奨)。
+    # kind の版とノードイメージは組で作られており、別の組み合わせは保証外。
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    extraPortMappings:
+      # エッジ (Caddy) の NodePort をホストへ出す。
+      # compose の up-https (443) とぶつけないよう、別の番号にする。
+      - containerPort: 30080
+        hostPort: 8088
+        listenAddress: 127.0.0.1
+        protocol: TCP
+      # Argo CD の画面 (argocd/argocd-server-nodeport.yaml)。
+      - containerPort: 30443
+        hostPort: 8089
+        listenAddress: 127.0.0.1
+        protocol: TCP

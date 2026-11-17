@@ -25,7 +25,7 @@
 resource "aws_lb" "main" {
   name               = local.name
   load_balancer_type = "application"
-  subnets            = aws_subnet.public[*].id
+  subnets            = module.network.public_subnet_ids
   # **SG を 2 つ付ける。** 評価はすべての SG の和集合になる。
   # 分けている理由は network.tf (プレフィックスリストがルール枠を
   # 46 個ぶん消費するため)。
@@ -53,7 +53,7 @@ resource "aws_lb_target_group" "api" {
   name        = "${local.name}-api"
   port        = 8080
   protocol    = "HTTP"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = module.network.vpc_id
   target_type = "ip"
 
   health_check {
@@ -77,7 +77,7 @@ resource "aws_lb_target_group" "web" {
   name        = "${local.name}-web"
   port        = 3000
   protocol    = "HTTP"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = module.network.vpc_id
   target_type = "ip"
 
   health_check {

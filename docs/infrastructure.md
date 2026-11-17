@@ -135,6 +135,10 @@ flowchart TB
 | 環境変数 (`.env`) | Secrets Manager | 下記 |
 | — | CloudFront / WAF / ALB / NAT | ローカルには対応物がない |
 
+同じ構成を **kind (Kubernetes) の上にも置いている** (`infra/k8s`、`make k8s-up`)。
+Argo CD が Git の `infra/k8s/bbs` どおりに揃え続ける。AWS の経路は ECS のままで、
+k8s は置き換えではない ([ADR 0026](adr/0026-kubernetes-and-gitops.md))。
+
 **MinIO / Mailpit / Fluent Bit の 3 つを `compose.yaml` に追加する必要がある。**
 (Mailpit は Phase 8 で追加済み。受信箱は http://localhost:8025 で開く)
 いずれも「本番の外部サービスをローカルで代替する」役割で、

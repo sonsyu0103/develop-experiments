@@ -1,0 +1,80 @@
+# 既定値は「何も考えずに使っても安全側」に倒してある。
+# 外すときは理由をコメントに残すこと。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: go-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: go-service
+    spec:
+      # **preStop (5 秒) + main.go の shutdownTimeout (20 秒) より長くする。**
+      # preStop の待ちもこの猶予に数えられる。短いと、処理中のリクエストを
+      # 待っている途中で SIGKILL される。
+      terminationGracePeriodSeconds: 30
+      # API サーバのトークンを使わないなら載せない。侵入されたときの足場を減らす。
+      automountServiceAccountToken: false
+      containers:
+        - name: go-service
+          # タグは kustomization.yaml の images で決める。
+          image: go-service
+          # タグが latest でなければ既定も IfNotPresent だが、明示しておく。
+          # kind に `kind load docker-image` で入れたイメージはこれで使われる。
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ADDR
+              value: ":8080"
+          ports:
+            - name: http
+              containerPort: 8080
+          # **SIGTERM の前に 5 秒待つ。** Pod を消すとき、SIGTERM の送信と
+          # Service の振り分け先 (EndpointSlice) から外す処理は並行に走る。
+          # すぐにリスナを閉じると、外れる前に届いた新しい接続が拒否される
+          # (レビュー指摘)。sleep はコンテナの中にシェルが要らない書き方で、
+          # distroless でも使える。古いクラスタには無い機能なので、apply で
+          # 弾かれたらクラスタの版を確かめる (kind の v1.37 で動作を実測)。
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          # **生存は /healthz (依存先を見ない)、受付可否は /readyz (見る)。**
+          # 生存に依存先を混ぜると、依存先の瞬断で Pod が再起動ループに入る。
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+          # requests が無いと、スケジューラが詰め込みすぎて隣の Pod ごと落ちる。
+          # CPU の limits は付けない (スロットリングで遅延が跳ねる)。メモリだけ上限を置く。
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            # **数字で書く。** Dockerfile が名前で USER を書いていると、
+            # runAsNonRoot だけでは CreateContainerConfigError で止まる。
+            runAsUser: 65532
+            runAsGroup: 65532
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            # ルートを読み取り専用にしても /tmp は書けるようにしておく。
+            # multipart のアップロードなど、標準ライブラリが黙って /tmp に書く処理が
+            # k8s でだけ失敗する (掲示板の ADR 0026 で実際に踏んだ)。
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

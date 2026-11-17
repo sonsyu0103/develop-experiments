@@ -1,0 +1,9 @@
+# ビルドに要らないものをコンテキストから外す。
+.git
+.github
+deploy
+*.out
+.env
+.env*
+Dockerfile
+.dockerignore

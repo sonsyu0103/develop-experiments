@@ -1,0 +1,18 @@
+# Argo CD の画面を NodePort で出す (kind-cluster.yaml で 127.0.0.1:8089 に繋がる)。
+# port-forward を張りっぱなしにしなくても開けるようにするため。
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-server
+spec:
+  type: NodePort
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      # **protocol を省かない。** Service の ports は port と protocol の組で
+      # 突き合わせて合成される。省くと別の要素と見なされ、type: NodePort は
+      # 効くのに nodePort だけが黙って落ちる (ランダムな番号になり、
+      # kind の extraPortMappings に繋がらない)。実測で踏んだ。
+      protocol: TCP
+      nodePort: 30443

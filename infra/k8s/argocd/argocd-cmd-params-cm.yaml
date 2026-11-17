@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cmd-params-cm
+data:
+  # 画面を http で出す。kind の外 (127.0.0.1:8089) からしか届かない手元専用なので、
+  # 自己署名証明書の警告を毎回踏ませる理由がない。
+  server.insecure: "true"

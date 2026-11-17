@@ -3,7 +3,12 @@
 # =============================================================================
 # base: 依存関係の解決までを共通化する
 # =============================================================================
-FROM golang:1.26-alpine AS base
+# **patch まで固定する。** 浮動タグ (golang:1.26-alpine) だと、手元や CD の
+# ビルダーに残っている古い 1.26.x で本番のバイナリが作られうる。公式イメージは
+# GOTOOLCHAIN=local なので go.mod の toolchain 行も効かず、警告も出ない
+# (PR #71 のレビュー指摘)。CI の GO_VERSION・go.mod の toolchain と揃える
+# —— make verify-go-version が突き合わせる。
+FROM golang:1.26.11-alpine AS base
 
 WORKDIR /app
 

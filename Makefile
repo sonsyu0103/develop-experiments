@@ -32,6 +32,7 @@ GOLANGCI_LINT_VERSION := v2.12.2
 SQLC_VERSION          := v1.31.1
 OAPI_CODEGEN_VERSION  := v2.8.0
 GO_ARCH_LINT_VERSION  := v1.17.0
+GOVULNCHECK_VERSION   := v1.9.0
 
 .PHONY: help
 help: ## このヘルプを表示する
@@ -178,6 +179,180 @@ https-verify: ## エッジ配下でしか通らない分岐を実測する (XFP 
 	@$(HTTPS_ENV) bash .github/scripts/https-probe.sh
 
 # ---------------------------------------------------------------------------
+# Kubernetes (kind) + GitOps (Argo CD) —— 手元で立てて壊す
+# ---------------------------------------------------------------------------
+#
+# 掲示板を kind 上で動かし、Argo CD に Git (infra/k8s/bbs) どおりに揃えさせる
+# (docs/adr/0026-kubernetes-and-gitops.md)。**課金は無い。** 全部この PC の中。
+#
+# **kubectl には必ず --context kind-bbs を付ける。** 素の kubectl は
+# 「いま選ばれているクラスタ」に向かうので、別のクラスタを触っていた日に
+# k8s-down 相当の操作が他所へ飛ぶ。
+
+# ツールはリポジトリの bin/ に版を固定して入れる (bin/ は .gitignore 済み)。
+#   - kind とノードイメージは組で作られている。ノードイメージは kind-cluster.yaml で固定
+#   - kubectl はクラスタとの版差 ±1 までが保証範囲。手元の古い kubectl を使わせない
+#   - ARGOCD_VERSION は infra/k8s/argocd/kustomization.yaml の URL と揃える
+#     (k8s-lint が突き合わせる)
+KIND_VERSION    := v0.33.0
+KUBECTL_VERSION := v1.37.0
+ARGOCD_VERSION  := v3.5.6
+
+# **ファイル名に版を入れる。** bin/kind のような版なしの名前だと、
+# KIND_VERSION を上げても「ファイルはもうある」と見なされて入れ直されず、
+# 古い版のまま動き続ける (レビュー指摘)。版ごとに別のファイルにしておけば、
+# 上げた瞬間に新しい版が入る。
+K8S_BIN     := $(CURDIR)/bin
+KIND        := $(K8S_BIN)/kind-$(KIND_VERSION)
+KUBECTL_BIN := $(K8S_BIN)/kubectl-$(KUBECTL_VERSION)
+K8S_CLUSTER := bbs
+KUBECTL     := $(KUBECTL_BIN) --context kind-$(K8S_CLUSTER)
+K8S_DIR     := infra/k8s
+# マイグレーションと Caddyfile をリポジトリの正本から読むため、
+# ディレクトリの外を読む許可が要る (Argo CD 側は argocd-cm で同じ指定)。
+KUSTOMIZE   := $(KUBECTL) kustomize --load-restrictor LoadRestrictionsNone
+
+# Argo CD が見る枝。既定は application.yaml に書いた develop。
+# 作業ブランチを試すとき: make k8s-up K8S_REVISION=feat/xxx (push 済みであること)
+K8S_REVISION ?=
+
+$(KIND):
+	@mkdir -p $(K8S_BIN)
+	@tmp=$$(mktemp -d) && GOBIN=$$tmp go install sigs.k8s.io/kind@$(KIND_VERSION) && mv $$tmp/kind $@ && rmdir $$tmp
+
+# **Go に頼らずに OS とアーキテクチャを決める。** k8s-lint は kubectl だけで済むので、
+# CI のジョブに Go を入れなくて済むようにする。
+$(KUBECTL_BIN):
+	@mkdir -p $(K8S_BIN)
+	@os=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	arch=$$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/'); \
+	curl -fsSL -o $@.tmp https://dl.k8s.io/release/$(KUBECTL_VERSION)/bin/$$os/$$arch/kubectl && \
+	chmod +x $@.tmp && mv $@.tmp $@
+
+.PHONY: k8s-tools
+k8s-tools: $(KIND) $(KUBECTL_BIN) ## kind と kubectl を固定の版で bin/ に入れる
+	@$(KIND) version
+	@$(KUBECTL_BIN) version --client | head -1
+
+.PHONY: k8s-render
+k8s-render: $(KUBECTL_BIN) ## Argo CD が適用するマニフェストを手元で組み立てて表示する
+	@$(KUSTOMIZE) $(K8S_DIR)/bbs
+
+.PHONY: k8s-lint
+k8s-lint: $(KUBECTL_BIN) ## k8s のマニフェストが組み立てられ、正本と食い違っていないか検査する
+	# **マイグレーションの一覧はディレクトリと一致していなければならない。**
+	# kustomize は glob を受けないので一覧を手で並べている。足し忘れると
+	# k8s だけ古いスキーマで動き、エラーはどこにも出ない (go-api が
+	# 無い列を引いた瞬間に初めて落ちる)。
+	@want=$$(ls $(GO_API_DIR)/db/migrations | sort); \
+	got=$$(sed -n 's#^ *- \.\./\.\./\.\./apps/go-api/db/migrations/##p' $(K8S_DIR)/bbs/kustomization.yaml | sort); \
+	if [ "$$want" != "$$got" ]; then \
+		echo "NG: infra/k8s/bbs/kustomization.yaml のマイグレーション一覧がディレクトリと違う"; \
+		for f in $$want; do echo "$$got" | grep -qx "$$f" || echo "  足りない: $$f"; done; \
+		for f in $$got; do echo "$$want" | grep -qx "$$f" || echo "  余分:     $$f"; done; \
+		exit 1; \
+	fi
+	@grep -q "argo-cd/$(ARGOCD_VERSION)/manifests/install.yaml" $(K8S_DIR)/argocd/kustomization.yaml || { \
+		echo "NG: ARGOCD_VERSION ($(ARGOCD_VERSION)) と argocd/kustomization.yaml の URL が違う"; exit 1; }
+	@$(KUSTOMIZE) $(K8S_DIR)/bbs > /dev/null
+	@$(KUSTOMIZE) $(K8S_DIR)/argocd > /dev/null
+	@echo "OK: k8s のマニフェストは組み立てられ、正本と一致している"
+
+.PHONY: k8s-cluster
+k8s-cluster: $(KIND) $(KUBECTL_BIN) ## kind のクラスタを作る (既にあれば何もしない)
+	@if $(KIND) get clusters 2>/dev/null | grep -qx $(K8S_CLUSTER); then \
+		echo "クラスタ $(K8S_CLUSTER) は既にある"; \
+	else \
+		$(KIND) create cluster --config $(K8S_DIR)/kind-cluster.yaml --wait 120s; \
+	fi
+
+.PHONY: k8s-images
+k8s-images: k8s-cluster ## go-api / next-app の本番イメージをビルドして kind に読み込む
+	# **レジストリを経由しない。** kind のノードへ直接読み込むので、
+	# マニフェストは imagePullPolicy: Never で :local を指す。
+	# 読み込んだだけでは動いている Pod は入れ替わらない —— 作り直す。
+	docker build --target prod -t bbs/go-api:local $(GO_API_DIR)
+	docker build --target prod -t bbs/next-app:local $(NEXT_DIR)
+	$(KIND) load docker-image --name $(K8S_CLUSTER) bbs/go-api:local bbs/next-app:local
+	# **他所のイメージ (postgres / minio など) もホストから読み込む。**
+	# kind のノードはホストの Docker のキャッシュを共有しない。放っておくと
+	# ノードが Docker Hub から引き直し、初回は postgres だけで 10 分を超えた。
+	# 一覧はマニフェストから引く (ここに二重に書かない)。
+	@for img in $$($(KUSTOMIZE) $(K8S_DIR)/bbs | sed -n 's/^ *image: *//p' | grep -v '^bbs/' | sort -u); do \
+		docker image inspect $$img >/dev/null 2>&1 || docker pull -q $$img; \
+		$(KIND) load docker-image --name $(K8S_CLUSTER) $$img; \
+	done
+	@if $(KUBECTL) get namespace bbs >/dev/null 2>&1; then \
+		$(KUBECTL) -n bbs rollout restart deployment/go-api deployment/next-app; \
+	fi
+
+.PHONY: k8s-argocd
+k8s-argocd: k8s-cluster ## Argo CD をクラスタに入れる (版は ARGOCD_VERSION)
+	# **server-side apply にする。** Argo CD の CRD は大きく、client-side apply だと
+	# last-applied-configuration 注釈が上限 (256KiB) を超えて落ちる。
+	$(KUSTOMIZE) $(K8S_DIR)/argocd | $(KUBECTL) apply --server-side --force-conflicts -f - > /dev/null
+	$(KUBECTL) -n argocd rollout status deployment/argocd-server --timeout=300s
+	$(KUBECTL) -n argocd rollout status deployment/argocd-repo-server --timeout=300s
+	$(KUBECTL) -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
+	# argocd-cm を変えても、読み込み済みのプロセスには効かない設定がある
+	# (kustomize.buildOptions は repo-server が持つ)。2 回目以降の実行で
+	# 設定だけ変えた場合に備えて作り直す。
+	$(KUBECTL) -n argocd rollout restart deployment/argocd-repo-server statefulset/argocd-application-controller
+	$(KUBECTL) -n argocd rollout status deployment/argocd-repo-server --timeout=300s
+	$(KUBECTL) -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
+
+# **依存関係で順序を書く** (k8s-up の前提の並び順に頼らない)。
+# 並び順に頼ると make -j で k8s-app が Argo CD より先に走り、
+# CRD が無くて「no matches for kind」で落ちる (レビュー指摘)。
+# 代わりに k8s-app を単独で叩くと Argo CD の apply も走る (冪等なので壊れない)。
+.PHONY: k8s-app
+k8s-app: k8s-argocd k8s-images ## Argo CD に掲示板の Application を登録し、その枝の先頭に揃うまで待つ
+	# **CRD と同じ apply に入れない。** Application の CRD が登録される前に
+	# Application を送ると「no matches for kind」で落ちる。
+	$(KUBECTL) apply -f $(K8S_DIR)/argocd/application.yaml
+	@if [ -n "$(K8S_REVISION)" ]; then \
+		echo "見る枝を $(K8S_REVISION) に上書きする (Git の application.yaml は書き換えない)"; \
+		$(KUBECTL) -n argocd patch application bbs --type merge \
+			-p '{"spec":{"source":{"targetRevision":"$(K8S_REVISION)"}}}'; \
+	fi
+	@KUBECTL="$(KUBECTL)" bash .github/scripts/k8s-sync-wait.sh
+
+.PHONY: k8s-up
+k8s-up: k8s-lint k8s-app ## kind + Argo CD で掲示板を立てる (http://localhost:8088)
+	@echo
+	@echo "  http://localhost:8088   掲示板 (エッジ経由)"
+	@echo "  http://localhost:8089   Argo CD (admin / make k8s-argocd-password)"
+
+.PHONY: k8s-apply-local
+k8s-apply-local: k8s-lint k8s-images ## Argo CD を通さず、手元のマニフェストを直接入れる (push 前の確認用)
+	# **Argo CD が居るクラスタでは使わない。** selfHeal が Git の状態へ戻すので、
+	# 手元の変更は数十秒で消える (それ自体が ADR 0026 で確かめたい動き)。
+	@if $(KUBECTL) -n argocd get application bbs >/dev/null 2>&1; then \
+		echo "NG: Application bbs が居る。手元の変更は Argo CD に戻される"; exit 1; \
+	fi
+	# **初期化の Job は消してから入れ直す。** Argo CD を通さないと Job はただの
+	# リソースになり、spec.template を変えられない。マイグレーションを足すと
+	# ConfigMap 名のハッシュが変わり、apply が「field is immutable」で落ちる
+	# (Argo CD 側は Sync フックで同じ問題を避けている。ADR 0026 決定 6)。
+	$(KUBECTL) -n bbs delete job migrate minio-init --ignore-not-found --wait=true
+	$(KUSTOMIZE) $(K8S_DIR)/bbs | $(KUBECTL) apply -f -
+	$(KUBECTL) -n bbs wait job/migrate job/minio-init --for=condition=Complete --timeout=300s
+	$(KUBECTL) -n bbs rollout status deployment/go-api --timeout=300s
+	$(KUBECTL) -n bbs rollout status deployment/next-app --timeout=300s
+
+.PHONY: k8s-verify
+k8s-verify: $(KUBECTL_BIN) ## kind 上の掲示板と、Argo CD の selfHeal を実測する (クラスタを一時的に崩す)
+	@KUBECTL="$(KUBECTL)" bash .github/scripts/k8s-probe.sh
+
+.PHONY: k8s-argocd-password
+k8s-argocd-password: $(KUBECTL_BIN) ## Argo CD の admin の初期パスワードを表示する
+	@$(KUBECTL) -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo
+
+.PHONY: k8s-down
+k8s-down: $(KIND) ## kind のクラスタを丸ごと消す (データも消える)
+	$(KIND) delete cluster --name $(K8S_CLUSTER)
+
+# ---------------------------------------------------------------------------
 # AWS (Terraform) —— 必要な日だけ立てる
 # ---------------------------------------------------------------------------
 #
@@ -208,6 +383,10 @@ tf-fmt: ## Terraform の書式を揃える
 .PHONY: tf-validate
 tf-validate: ## Terraform の構成を検査する (AWS に触らない)
 	$(TF) validate
+
+.PHONY: tf-test
+tf-test: ## Terraform の検査を mock のプロバイダで回す (AWS に触らない。tests/*.tftest.hcl)
+	$(TF) test
 
 .PHONY: tf-plan
 tf-plan: ## 何が作られるかを見る (課金は発生しない)
@@ -503,6 +682,128 @@ openapi: ## openapi.yaml から Go スタブと TypeScript 型を生成する
 
 .PHONY: generate
 generate: sqlc openapi ## 生成物をすべて作り直す
+
+# ---------------------------------------------------------------------------
+# ゴールデンパス (docs/adr/0027-golden-path.md)
+# ---------------------------------------------------------------------------
+# templates/go-service は**他チーム向けのひな形**で、生成したサービスは
+# このリポジトリにはコミットしない (掲示板はモジュラモノリスのまま。ADR 0004)。
+#
+# ひな形は使われない間に腐る。だから「生成して、検査して、捨てる」を
+# CI で毎回回す (verify-golden-path)。
+# ---------------------------------------------------------------------------
+
+GOLDEN_TEMPLATE     := templates/go-service
+GOLDEN_TOOL         := tools/new-service
+# 手元の golangci-lint が古い Go 製だと、Go 1.26 のコードを読めずに落ちる。
+# そのときは Go 1.26 で入れ直したものを渡す (make verify-golden-path GOLANGCI_LINT=...)。
+GOLANGCI_LINT       ?= golangci-lint
+
+.PHONY: new-service
+new-service: ## ひな形から Go サービスを作る (NAME=必須 MODULE=example.com/NAME OUT=../NAME)
+	@test -n "$(NAME)" || { echo "NAME を指定する (例: make new-service NAME=billing-api MODULE=github.com/acme/billing-api)"; exit 1; }
+	@cd $(GOLDEN_TOOL) && go run . -name "$(NAME)" -module "$(MODULE)" \
+		-template "$(CURDIR)/$(GOLDEN_TEMPLATE)" -out "$(abspath $(or $(OUT),../$(NAME)))"
+
+.PHONY: verify-tool-versions
+verify-tool-versions: ## Makefile と CI (ci.yml) に書いたツールの版が同じか検査する
+	# 何を見ているか (と、初版の穴) はスクリプトの冒頭を参照。
+	.github/scripts/verify-tool-versions.py
+
+.PHONY: vulncheck
+vulncheck: ## go-api の既知の脆弱性を調べる (CI の govulncheck と同じ版)
+	# **ツールの版を固定しても脆弱性 DB は古くならない。** DB は実行のたびに
+	# https://vuln.go.dev から取る (-db の既定)。ネットワークが要る。
+	cd $(GO_API_DIR) && go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+
+.PHONY: verify-template-versions
+verify-template-versions: ## ひな形に書いたツールの版が、この Makefile の版と同じか検査する
+	# **ひな形の Makefile にはツールの版を別に書いている** (生成したサービスは
+	# このリポジトリの外で動くので、ここの Makefile を読めない)。
+	# ルートだけ上げると、生成するサービスに古い版が固定され続ける (レビュー指摘)。
+	@f=$(GOLDEN_TEMPLATE)/Makefile; \
+	for pair in "GOLANGCI_LINT_VERSION=$(GOLANGCI_LINT_VERSION)" "GOVULNCHECK_VERSION=$(GOVULNCHECK_VERSION)"; do \
+		key=$${pair%%=*}; want=$${pair#*=}; \
+		got=$$(sed -n "s/^$${key} *:= *//p" $$f); \
+		[ "$$got" = "$$want" ] || { echo "NG: $$f の $${key} が $${got:-(無い)} (Makefile は $${want})"; exit 1; }; \
+	done; \
+	echo "OK: ひな形のツールの版は Makefile と同じ"
+
+.PHONY: verify-golden-path
+verify-golden-path: verify-template-versions $(KUBECTL_BIN) ## ひな形から生成したサービスが CI と同じ検査を通るか確かめる (Docker とネットワークが要る)
+	# **ひな形そのものではなく、生成した結果を検査する。** 置き換え漏れや、
+	# ひな形の中でだけ通る相対パスは、生成してみないと見つからない。
+	#
+	# **lint と test は、生成したサービス自身の Makefile を呼ぶ。** ここに
+	# 手順を書き直すと、ひな形の Makefile を変えたときに「CI と同じ」がずれる (レビュー指摘)。
+	#
+	# **golangci-lint のキャッシュは使い捨てにする。** 共有のキャッシュだと、前回の
+	# (もう消えた) 一時ディレクトリのパスつきで結果が返り、生成コードの除外が
+	# ファイルを開けずに効かなくなる。1 回目は通り、2 回目から落ちる (実測)。
+	#
+	# **ジェネレータのテストは -count=1 でキャッシュを切る。** テストが読むひな形は
+	# tools/new-service モジュールの外にあり、go test はモジュール外のファイルの
+	# 変化をキャッシュの鍵に入れない。ひな形を壊しても「ok (cached)」が返る (実測)。
+	cd $(GOLDEN_TOOL) && go vet ./... && go test -race -count=1 ./...
+	@set -eu; \
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	svc="$$tmp/smoke-svc"; \
+	(cd $(GOLDEN_TOOL) && go run . -name smoke-svc -module github.com/acme/smoke-svc \
+		-template "$(CURDIR)/$(GOLDEN_TEMPLATE)" -out "$$svc") > /dev/null; \
+	cd "$$svc"; \
+	echo "== go.mod / go.sum が tidy か"; \
+	cp go.mod "$$tmp/go.mod.before"; cp go.sum "$$tmp/go.sum.before"; \
+	go mod tidy; \
+	diff -u "$$tmp/go.mod.before" go.mod && diff -u "$$tmp/go.sum.before" go.sum \
+		|| { echo "NG: ひな形の go.mod / go.sum が tidy ではない"; exit 1; }; \
+	echo "== 生成物が仕様書と一致するか"; make --no-print-directory verify-generated > /dev/null; \
+	echo "== lint"; GOLANGCI_LINT_CACHE="$$tmp/lint-cache" make --no-print-directory lint GOLANGCI_LINT="$(GOLANGCI_LINT)"; \
+	echo "== test"; make --no-print-directory test > /dev/null; \
+	echo "== govulncheck"; make --no-print-directory vulncheck > /dev/null \
+		|| { echo "NG: 既知の脆弱性がある (生成したサービスで make vulncheck を叩くと詳細が出る)"; exit 1; }; \
+	echo "== k8s のマニフェスト"; \
+	out=$$($(KUBECTL_BIN) kustomize deploy/k8s); \
+	if echo "$$out" | grep -q go-service; then echo "NG: マニフェストに go-service が残っている"; exit 1; fi; \
+	for kind in Namespace Service Deployment; do \
+		echo "$$out" | grep -q "^kind: $$kind$$" || { echo "NG: $$kind が無い"; exit 1; }; \
+	done; \
+	echo "== 本番用イメージ"; docker build -q --target prod -t smoke-svc:verify . > /dev/null; \
+	docker image rm smoke-svc:verify > /dev/null; \
+	echo "OK: ひな形から生成したサービスは CI と同じ検査を通る"
+
+# ゴールデンパスの効果を測る: 「作り始めてから Pod が Ready になるまで」の秒数。
+# 掲示板のクラスタ (bbs) とは別の、素の kind クラスタを使う。
+GOLDEN_CLUSTER := golden-path
+
+.PHONY: golden-path-kind
+golden-path-kind: $(KIND) $(KUBECTL_BIN) ## ひな形から作ったサービスを kind に載せ、Ready までの秒数を測る
+	# **kill は pf が立っているときだけ。** 空のときに kill 0 と書くと、
+	# プロセスグループ全体 (make 自身も含む) に SIGTERM が飛び、
+	# kind-deploy が落ちた本来の理由が "Terminated" に埋もれる (レビュー指摘)。
+	@set -eu; \
+	if ! $(KIND) get clusters 2>/dev/null | grep -qx $(GOLDEN_CLUSTER); then \
+		echo "== kind のクラスタ $(GOLDEN_CLUSTER) を作る (計測には含めない)"; \
+		$(KIND) create cluster --name $(GOLDEN_CLUSTER) --wait 120s; \
+	fi; \
+	kubectl="$(KUBECTL_BIN) --context kind-$(GOLDEN_CLUSTER)"; \
+	$$kubectl delete namespace hello-svc --ignore-not-found --wait=true > /dev/null; \
+	pf=; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"; [ -z "$$pf" ] || kill "$$pf" 2>/dev/null || true' EXIT; \
+	start=$$(date +%s); \
+	(cd $(GOLDEN_TOOL) && go run . -name hello-svc -module github.com/acme/hello-svc \
+		-template "$(CURDIR)/$(GOLDEN_TEMPLATE)" -out "$$tmp/hello-svc") > /dev/null; \
+	make --no-print-directory -C "$$tmp/hello-svc" kind-deploy \
+		CLUSTER=$(GOLDEN_CLUSTER) KIND=$(KIND) KUBECTL="$$kubectl"; \
+	end=$$(date +%s); \
+	$$kubectl -n hello-svc port-forward svc/hello-svc 18080:8080 > /dev/null 2>&1 & pf=$$!; \
+	body=; for i in $$(seq 1 20); do body=$$(curl -fsS "http://localhost:18080/hello?name=golden" 2>/dev/null) && break; sleep 0.5; done; \
+	[ "$$body" = '{"message":"hello, golden"}' ] \
+		|| { echo "NG: Ready にはなったが /hello が期待どおりに応答しない (受け取ったもの: $${body:-なし})"; exit 1; }; \
+	echo "$$body"; \
+	echo "OK: 生成から Ready まで $$((end - start)) 秒 (イメージのビルドを含む)"
+
+.PHONY: golden-path-kind-down
+golden-path-kind-down: $(KIND) ## golden-path-kind のクラスタを消す
+	$(KIND) delete cluster --name $(GOLDEN_CLUSTER)
 
 # ---------------------------------------------------------------------------
 # 検証
@@ -888,6 +1189,45 @@ tools: ## 開発ツール (sqlc / golangci-lint / go-arch-lint) をインスト�
 	go install github.com/fe3dback/go-arch-lint@$(GO_ARCH_LINT_VERSION)
 
 .PHONY: verify-tidy
+.PHONY: verify-go-version
+verify-go-version: ## CI・Dockerfile・go.mod の Go の版が揃っているか検査する
+	# **ひな形とジェネレータも同じ版に揃える** (ADR 0027)。ひな形は使われない間に
+	# 取り残され、生成した日から古い Go で動くサービスができる。
+	#
+	# (下のシェルの中に # でコメントを書かないこと。行末の \ で 1 行につながるので、
+	#  そこから後ろの検査が丸ごとコメントになり、黙って通る。実際に一度そうなった)
+	# **3 か所に書いてある Go の版がずれていないかを見る。**
+	# 2026-11 までは CI が 1.25.13、Dockerfile が浮動タグの 1.26 で、
+	# 脆弱性の修正が 1.26 系にしか出なくなって初めてずれに気づいた。
+	# 本番のバイナリを作るのは Dockerfile なので、CI の govulncheck が
+	# 緑でも、配っているものが同じ Go で作られている保証にならない。
+	@ci=$$(sed -n "s/^  GO_VERSION: '\(.*\)'/\1/p" .github/workflows/ci.yml); \
+	docker=$$(sed -n 's/^FROM golang:\([0-9.]*\)-alpine.*/\1/p' $(GO_API_DIR)/Dockerfile); \
+	mod=$$(sed -n 's/^toolchain go//p' $(GO_API_DIR)/go.mod); \
+	if [ -z "$$ci" ] || [ "$$ci" != "$$docker" ] || [ "$$ci" != "$$mod" ]; then \
+		echo "NG: Go の版が揃っていない (ci.yml=$$ci / Dockerfile=$$docker / go.mod toolchain=$$mod)"; \
+		exit 1; \
+	fi; \
+	tci=$$(sed -n "s/^  GO_VERSION: '\(.*\)'/\1/p" $(GOLDEN_TEMPLATE)/.github/workflows/ci.yml); \
+	tdocker=$$(sed -n 's/^FROM golang:\([0-9.]*\)-alpine.*/\1/p' $(GOLDEN_TEMPLATE)/Dockerfile); \
+	tmod=$$(sed -n 's/^toolchain go//p' $(GOLDEN_TEMPLATE)/go.mod); \
+	gmod=$$(sed -n 's/^toolchain go//p' $(GOLDEN_TOOL)/go.mod); \
+	for v in "ひな形の ci.yml=$$tci" "ひな形の Dockerfile=$$tdocker" "ひな形の go.mod=$$tmod" "$(GOLDEN_TOOL)/go.mod=$$gmod"; do \
+		[ "$${v##*=}" = "$$ci" ] || { echo "NG: Go の版が $$ci ではない: $$v"; exit 1; }; \
+	done; \
+	echo "OK: Go の版は $$ci で揃っている (ひな形とジェネレータを含む)"
+
+.PHONY: verify-pg-healthcheck
+verify-pg-healthcheck: ## postgres の healthcheck が compose と CI で同じか検査する
+	# **2 か所に同じコマンドを書いているので、ずれたら落とす。**
+	# 以前は compose が「pg_isready && SELECT 1」、CI が「pg_isready」だけで、
+	# 既にずれていた (どちらもソケット越しで初期化中に通っていた)。
+	@cmd="psql -h 127.0.0.1 -U app -d bbs -tAc 'SELECT 1'"; \
+	for f in compose.yaml .github/workflows/ci.yml; do \
+		grep -qF "$$cmd" $$f || { echo "NG: $$f の postgres の healthcheck が「$${cmd}」ではない"; exit 1; }; \
+	done; \
+	echo "OK: postgres の healthcheck は compose と CI で同じ"
+
 verify-tidy: ## go.mod / go.sum が最新か検査する
 	# **check が「CI と同じ検証」を名乗るなら、これも要る。**
 	# CI の Go Checks は最初にこれを回している。ここに無かったせいで、
@@ -915,7 +1255,7 @@ verify-tidy: ## go.mod / go.sum が最新か検査する
 		fi
 
 .PHONY: check
-check: lint test cover verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要)
+check: lint test cover vulncheck verify-go-version verify-tool-versions verify-pg-healthcheck verify-tidy verify-generated verify-log-events verify-constraint-checks checker-probe arch-probe k8s-lint verify-golden-path e2e ## CI と同じ検証をローカルで一通り実行する (DB 不要。Docker とネットワークは要る)
 
 .PHONY: check-all
 # **test-live は smoke の後ろに置く。** 前に置くと、スタックが落ちている
