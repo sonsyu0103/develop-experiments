@@ -83,17 +83,19 @@ NAT Gateway (月 $33) もドメインも使わない構成にして **1 日 $1.3
 ```bash
 make k8s-up           # kind に掲示板を立て、Argo CD に Git どおり揃えさせる (課金なし)
 make k8s-verify       # 手で崩して、Git の状態に戻るかを実測する
-make new-service NAME=billing-api   # 他チームが使う想定の Go サービスのひな形を生成する
-make tf-test          # Terraform の検査を mock のプロバイダで回す (AWS に触らない)
+make new-service NAME=billing-api   # 他チームが使う想定の Go サービスのひな形を、隣のディレクトリ ../billing-api に生成する
+make tf-init && make tf-test        # Terraform の検査を mock のプロバイダで回す (AWS に触らない。init は最初の 1 回)
 ```
 
 - **GitOps**: Argo CD が Git の `infra/k8s/bbs` を見てクラスタを揃え続ける。
-  手で go-api を 0 台にしても 2 秒、Service を消しても 6 秒で戻る。
-  ローリング更新の間に 8〜35 件落ちていたリクエストは、停止前に待つ (`preStop`) ようにして 0 件にした
+  手で go-api を 0 台にしても 2〜11 秒、Service を消しても 6〜50 秒で戻る (2 回の測定。ばらつきの原因は見ていない)。
+  ローリング更新の間に落ちていたリクエスト (go-api・エッジ・next-app を各 2 回入れ替えて、951〜2,116 件中 8〜35 件) は、
+  停止前に待つ (`preStop`) ようにして 0 件にした (各 2 回)
   ([ADR 0026](docs/adr/0026-kubernetes-and-gitops.md))
 - **ゴールデンパス**: OpenAPI からの生成・CI・Dockerfile・k8s のマニフェスト入りのひな形を 1 コマンドで作る。
   ひな形はそれ自体が動くサービスで、**CI が毎回生成して検査して捨てる** —— 使われない間に腐らせない。
-  生成から kind 上で動くまで、ビルドキャッシュが空でも 49 秒 (クラスタの作成は含めない)
+  生成から kind 上で動くまで、ビルドキャッシュが空でも 48〜49 秒 (2 回)。クラスタの作成・空の builder の起動・
+  Go のツールチェーンは含めず、手元のスクリプトで測った値 (`make golden-path-kind` では再現しない。ADR 0027 決定 5)
   ([ADR 0027](docs/adr/0027-golden-path.md))
 - **state を壊さない組み替え**: Terraform のネットワークを module に切り出し、`moved` で state の住所を移した。
   AWS に触らず、mock のプロバイダで「12 件移動・変更 0 件」を確かめた。`moved` を外すと VPC ごと作り直しになる
@@ -103,7 +105,7 @@ make tf-test          # Terraform の検査を mock のプロバイダで回す 
 
 | | |
 | --- | --- |
-| **設計判断の記録** | [ADR 28 本](docs/adr/)。決定だけでなく**実装後に分かったこと**を追記している |
+| **設計判断の記録** | [ADR](docs/adr/)。決定だけでなく**実装後に分かったこと**を追記している |
 | **単一の情報源** | [`api/openapi.yaml`](api/openapi.yaml) から Go スタブと TS 型を生成。CI がドリフトを検出 |
 | **境界の強制** | `go-arch-lint` でモジュール間の依存方向を機械的に検査 ([ADR 0017](docs/adr/0017-arch-lint-and-depguard.md)。境界そのものは [ADR 0004](docs/adr/0004-modular-monolith.md)) |
 | **CI** | 静的解析 / race detector / カバレッジ下限 / 脆弱性検査 / 生成物のドリフト / Terraform (mock のテスト込み) / k8s のマニフェスト / ひな形の生成と検査 |
@@ -294,11 +296,11 @@ make k8s-down     # クラスタを丸ごと消す
 
 Argo CD は Git の `infra/k8s/bbs` を見て、クラスタをそのとおりに揃え続ける。
 `kubectl scale` で go-api を 0 台にしても 2 秒で 1 台に戻り、
-Service を消しても 6 秒で作り直される —— `make k8s-verify` がこれを毎回実際に崩して確かめる。
+Service を消しても 6 秒で作り直される (まっさらから立て直した回では 11 秒と 50 秒だった。ADR 0026 の「まだ確かめていないこと」) —— `make k8s-verify` がこれを毎回実際に崩して確かめる。
 selfHeal を切ると戻らないことも確かめてある。
 push してから反映されるまでは 51 秒 (同期の間隔 60 秒・揺らぎ 0 の設定で、1 回の測定)。
 go-api・エッジ・next-app には `preStop` を入れてあり、ローリング更新の間に落ちていた
-リクエスト (8〜35 件) を 0 件にしている。
+リクエスト (各 2 回の入れ替えで 951〜2,116 件中 8〜35 件) を 0 件にしている。
 
 マイグレーションと `Caddyfile` は compose と同じファイルを読む (コピーしない)。
 イメージの中身は Git に載らない (手元でビルドして kind に読み込む) ので、
