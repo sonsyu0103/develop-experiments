@@ -846,13 +846,18 @@ docker: Error response from daemon:
 | `resource` ブロック (静的) | 70 |
 | うち固定 (展開なし) | 60 |
 | ECR: `for_each = local.ecr_repositories` (api / web / migrate) × 2 ブロック | **6** |
-| network: `count = var.az_count` (既定 2) × 4 ブロック | **8** |
+| network: `count = length(var.availability_zones)` (既定 2) × 4 ブロック (`modules/network`) | **8** |
 | IAM: GitHub OIDC プロバイダ (三項で 1 か 0 のどちらか) | **1** |
 | monitoring: SNS 購読 (`var.alarm_email` 既定 `""` なので 0) | **0** |
 | secrets: google の secret + version (`google_client_secret` 既定 `""` なので 0) | **0** |
 | **合計** | **75** |
 
-60 + 6 + 8 + 1 + 0 + 0 = 75。**`alarm_email` を設定して apply すると 76、
+60 + 6 + 8 + 1 + 0 + 0 = 75。
+
+> **2026-11-17**: network の 8 ブロックは `modules/network` に移った ([ADR 0028](0028-terraform-network-module.md))。
+> 件数は変わらないが、`infra/terraform/*.tf` を grep すると 62 件しか出ない (`modules/` も含めて 70)。
+
+**`alarm_email` を設定して apply すると 76、
 さらに `google_client_secret` も設定すると 78 になる。**
 
 > **2026-09-26 に 74 → 75 を訂正した。** 決定 7 の作業中に

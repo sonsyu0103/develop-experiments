@@ -98,6 +98,11 @@ jobs:
       - name: Validate
         run: terraform -chdir=infra/terraform validate
 
+      - name: Test (mock provider)
+        # **AWS に触らない。** tests/*.tftest.hcl は mock_provider で plan するだけ。
+        # AZ の選び方と modules/network の入力の検査を見る (ADR 0028)。
+        run: terraform -chdir=infra/terraform test
+
   # --------------------------------------------------
   # Kubernetes Manifest Checks
   # --------------------------------------------------

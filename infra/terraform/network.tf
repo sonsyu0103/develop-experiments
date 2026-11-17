@@ -1,5 +1,8 @@
 # ネットワーク。
 #
+# VPC・サブネット・ルーティングは modules/network にある (ADR 0028)。
+# ここに残しているのは module の呼び出しと、アプリの経路を知っている Security Group。
+#
 # ── **NAT Gateway を置かない** ─────────────────────────────
 #
 # 教科書どおりの構成では ECS タスクをプライベートサブネットに置き、
@@ -34,84 +37,66 @@
 # CloudFront の comment や CloudWatch の alarm_description は
 # UTF-8 を受け付けるので、そちらは日本語のままでよい。
 
-resource "aws_vpc" "main" {
-  cidr_block = var.vpc_cidr
-
-  # RDS のエンドポイントを名前で引くために要る。
-  enable_dns_support   = true
-  enable_dns_hostnames = true
-
-  tags = { Name = local.name }
-}
-
-resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
-  tags   = { Name = local.name }
-}
-
 # ---------------------------------------------------------------------------
-# サブネット
+# VPC・サブネット・ルーティング (modules/network)
 # ---------------------------------------------------------------------------
 
-resource "aws_subnet" "public" {
-  count = var.az_count
+module "network" {
+  source = "./modules/network"
 
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = local.public_subnet_cidrs[count.index]
-  availability_zone = data.aws_availability_zones.available.names[count.index]
-
-  # **タスクにパブリック IP を配る。** これが NAT の代わりになる。
-  map_public_ip_on_launch = true
-
-  tags = { Name = "${local.name}-public-${count.index}" }
+  name               = local.name
+  vpc_cidr           = var.vpc_cidr
+  availability_zones = local.availability_zones
 }
 
-resource "aws_subnet" "private" {
-  count = var.az_count
-
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = local.private_subnet_cidrs[count.index]
-  availability_zone = data.aws_availability_zones.available.names[count.index]
-
-  tags = { Name = "${local.name}-private-${count.index}" }
+# **module に移した資源の state を付け替える。**
+#
+# これが無いと Terraform は「旧アドレスの資源を消して、module の中に新しく作る」と
+# 計画する —— VPC ごと作り直しになり、RDS も ALB も巻き込まれる。
+# moved は state の中の住所を書き換えるだけで、AWS には何も送らない。
+#
+# count 付きの資源は、資源ごと書けば [0] [1] … もまとめて移る。
+#
+# 消してよいのは、この構成で apply された state がすべて移り終わってから。
+# 早く消すと、古い state を持つ環境で上の「作り直し」が起きる。
+moved {
+  from = aws_vpc.main
+  to   = module.network.aws_vpc.main
 }
 
-# ---------------------------------------------------------------------------
-# ルーティング
-# ---------------------------------------------------------------------------
-
-resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.main.id
-  }
-
-  tags = { Name = "${local.name}-public" }
+moved {
+  from = aws_internet_gateway.main
+  to   = module.network.aws_internet_gateway.main
 }
 
-resource "aws_route_table_association" "public" {
-  count = var.az_count
-
-  subnet_id      = aws_subnet.public[count.index].id
-  route_table_id = aws_route_table.public.id
+moved {
+  from = aws_subnet.public
+  to   = module.network.aws_subnet.public
 }
 
-# **プライベート用のルートテーブルを明示的に作る。**
-# 作らないと VPC のデフォルトルートテーブルが使われる。
-# 動作は同じ (VPC 内のみ到達) だが、デフォルトに何かが足された日に
-# 意図せずプライベートサブネットまで巻き込まれる。
-resource "aws_route_table" "private" {
-  vpc_id = aws_vpc.main.id
-  tags   = { Name = "${local.name}-private" }
+moved {
+  from = aws_subnet.private
+  to   = module.network.aws_subnet.private
 }
 
-resource "aws_route_table_association" "private" {
-  count = var.az_count
+moved {
+  from = aws_route_table.public
+  to   = module.network.aws_route_table.public
+}
 
-  subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.private.id
+moved {
+  from = aws_route_table_association.public
+  to   = module.network.aws_route_table_association.public
+}
+
+moved {
+  from = aws_route_table.private
+  to   = module.network.aws_route_table.private
+}
+
+moved {
+  from = aws_route_table_association.private
+  to   = module.network.aws_route_table_association.private
 }
 
 # ---------------------------------------------------------------------------
@@ -155,7 +140,7 @@ data "aws_ec2_managed_prefix_list" "cloudfront_origin_facing" {
 resource "aws_security_group" "alb_web" {
   name        = "${local.name}-alb-web"
   description = "ALB web listener. HTTP from CloudFront edge only"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = module.network.vpc_id
 
   tags = { Name = "${local.name}-alb-web" }
 }
@@ -181,7 +166,7 @@ resource "aws_vpc_security_group_egress_rule" "alb_web_all" {
 resource "aws_security_group" "alb_api" {
   name        = "${local.name}-alb-api"
   description = "ALB api listener. From CloudFront edge and ECS tasks"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = module.network.vpc_id
 
   tags = { Name = "${local.name}-alb-api" }
 }
@@ -225,7 +210,7 @@ resource "aws_vpc_security_group_egress_rule" "alb_api_all" {
 resource "aws_security_group" "ecs" {
   name        = "${local.name}-ecs"
   description = "ECS tasks. Ingress from ALB only, egress allowed"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = module.network.vpc_id
 
   tags = { Name = "${local.name}-ecs" }
 }
@@ -264,7 +249,7 @@ resource "aws_vpc_security_group_egress_rule" "ecs_all" {
 resource "aws_security_group" "rds" {
   name        = "${local.name}-rds"
   description = "RDS. Ingress from ECS tasks only"
-  vpc_id      = aws_vpc.main.id
+  vpc_id      = module.network.vpc_id
 
   tags = { Name = "${local.name}-rds" }
 }

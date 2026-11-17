@@ -1134,6 +1134,7 @@ api/openapi.yaml を書く
 | [ADR 0025](docs/adr/0025-language-and-framework.md) | 言語とフレームワークの選択と、その使い方 (Gin は薄く使う) |
 | [ADR 0026](docs/adr/0026-kubernetes-and-gitops.md) | 掲示板を kind 上で動かし、Argo CD に Git どおり揃えさせる —— AWS の経路は ECS のまま |
 | [ADR 0027](docs/adr/0027-golden-path.md) | ゴールデンパスは他チーム向けのひな形として置き、掲示板は分割しない —— CI で毎回生成して捨てる |
+| [ADR 0028](docs/adr/0028-terraform-network-module.md) | network.tf の VPC・サブネット・ルーティングを module に切り出し、`moved` で state を移す —— SG は呼び出し側に残す |
 | [インフラ構成](docs/infrastructure.md) | AWS の理想構成 (Terraform で出すのはこの一部) |
 
 [ADR 0015](docs/adr/0015-idempotency.md) と
